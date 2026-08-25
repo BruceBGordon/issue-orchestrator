@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from ...control.executor_admission import (
     ActiveExecutorLease,
@@ -28,12 +28,11 @@ from ...domain.executor_host import ExecutorHostCpuUtilization
 from ...domain.executor_monitoring import ExecutorRequestId
 from ._types import RecordedExecutorObservation
 from ._host_observation import ExecutorHostLoadObservation
+from ..strict_wire_record import StrictWireRecord
 
 
-class ExecutorStrictRecord(BaseModel):
+class ExecutorStrictRecord(StrictWireRecord):
     """Strict base for every persisted executor record."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
 class CapacityRecord(ExecutorStrictRecord):

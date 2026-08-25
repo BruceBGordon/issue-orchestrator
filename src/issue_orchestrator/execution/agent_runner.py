@@ -19,10 +19,12 @@ import shlex
 import shutil
 import signal
 import time
+from functools import partial
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import pexpect
+from ptyprocess import PtyProcess
 
 from issue_orchestrator.execution.agent_runner_base import (
     BaseAgentRunner,
@@ -66,6 +68,42 @@ class _PtyProcessInternals(Protocol):
 
 class _PexpectSpawnInternals(Protocol):
     ptyproc: _PtyProcessInternals
+
+
+class _PexpectSpawnWithFileDescriptors(pexpect.spawn):
+    """Expose ptyprocess's exact pass_fds support through pexpect."""
+
+    def __init__(
+        self,
+        command: str,
+        arguments: list[str],
+        inherited_file_descriptors: tuple[int, ...],
+        **kwargs: Any,
+    ) -> None:
+        self._inherited_file_descriptors = inherited_file_descriptors
+        super().__init__(command, arguments, **kwargs)
+
+    def _spawnpty(self, args: list[str], **kwargs: Any) -> PtyProcess:
+        return PtyProcess.spawn(
+            args,
+            pass_fds=self._inherited_file_descriptors,
+            **kwargs,
+        )
+
+
+def _pty_preexec_with_file_descriptors(
+    inherited_file_descriptors: tuple[int, ...],
+) -> None:
+    """Preserve selected descriptors through ptyprocess's final exec.
+
+    ``ptyprocess`` excludes ``pass_fds`` from its child-side close sweep but,
+    unlike ``subprocess.Popen``, does not clear their PEP 446 close-on-exec
+    flags.  Clear those flags only in the already-forked child so concurrent
+    parent launches cannot inherit lifecycle descriptors accidentally.
+    """
+    for descriptor in inherited_file_descriptors:
+        os.set_inheritable(descriptor, True)
+    _pty_preexec()
 
 
 class AgentSession:
@@ -300,6 +338,64 @@ class AgentRunner(BaseAgentRunner):
         The caller is responsible for calling :meth:`AgentSession.wait`
         or :meth:`AgentSession.kill` when done.
         """
+        shell_command = shlex.join(spec.command)
+        return self._start_pty(
+            spec,
+            executable="/bin/bash",
+            arguments=("-c", shell_command),
+            interaction_handler=interaction_handler,
+            inherited_file_descriptors=(),
+        )
+
+    def start_direct(
+        self,
+        spec: AgentSpec,
+        interaction_handler: SessionInteractionHandler | None = None,
+    ) -> AgentSession:
+        """Start one already-tokenized command without an extra shell layer."""
+        return self._start_pty(
+            spec,
+            executable=spec.command[0],
+            arguments=tuple(spec.command[1:]),
+            interaction_handler=interaction_handler,
+            inherited_file_descriptors=(),
+        )
+
+    def start_direct_with_file_descriptors(
+        self,
+        spec: AgentSpec,
+        inherited_file_descriptors: tuple[int, ...],
+        interaction_handler: SessionInteractionHandler | None = None,
+    ) -> AgentSession:
+        """Start a tokenized command with exact lifecycle descriptors."""
+        if type(inherited_file_descriptors) is not tuple or any(
+            type(descriptor) is not int or descriptor < 0
+            for descriptor in inherited_file_descriptors
+        ):
+            raise ValueError(
+                "inherited_file_descriptors must be non-negative integers"
+            )
+        if len(set(inherited_file_descriptors)) != len(
+            inherited_file_descriptors
+        ):
+            raise ValueError("inherited_file_descriptors must be unique")
+        return self._start_pty(
+            spec,
+            executable=spec.command[0],
+            arguments=tuple(spec.command[1:]),
+            interaction_handler=interaction_handler,
+            inherited_file_descriptors=inherited_file_descriptors,
+        )
+
+    @staticmethod
+    def _start_pty(
+        spec: AgentSpec,
+        *,
+        executable: str,
+        arguments: tuple[str, ...],
+        interaction_handler: SessionInteractionHandler | None,
+        inherited_file_descriptors: tuple[int, ...],
+    ) -> AgentSession:
         spec.output_dir.mkdir(parents=True, exist_ok=True)
         if spec.log_path is not None:
             spec.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -329,15 +425,23 @@ class AgentRunner(BaseAgentRunner):
                 initial_cols=cols,
             )
 
-        shell_cmd = shlex.join(spec.command)
-        child = pexpect.spawn(
-            "/bin/bash",
-            ["-c", shell_cmd],
+        preexec_fn = (
+            _pty_preexec
+            if not inherited_file_descriptors
+            else partial(
+                _pty_preexec_with_file_descriptors,
+                inherited_file_descriptors,
+            )
+        )
+        child = _PexpectSpawnWithFileDescriptors(
+            executable,
+            list(arguments),
+            inherited_file_descriptors,
             cwd=str(spec.working_dir),
             env=env,
             logfile=log_writer,
             timeout=None,
-            preexec_fn=_pty_preexec,
+            preexec_fn=preexec_fn,
             dimensions=(rows, cols),
         )
 

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from issue_orchestrator.domain.terminal_session_termination import (
+    TerminalSessionContainmentReport,
+    TerminalSessionOwnerContainmentOutcome,
     TerminalSessionProcess,
     TerminalSessionStatus,
     TerminalSessionTerminationOutcome,
+    UnregisteredTerminalSessionOwnership,
 )
 from issue_orchestrator.domain.process_group import (
     ProcessBirthIdentity,
@@ -33,6 +36,7 @@ class RecordingTerminalSessionTerminator:
         self._status = status
         self._termination_outcome = termination_outcome
         self._processes: list[TerminalSessionProcess] = []
+        self.recovered_ownership: list[UnregisteredTerminalSessionOwnership] = []
         self.identified_process_ids: list[int] = []
 
     @property
@@ -63,3 +67,17 @@ class RecordingTerminalSessionTerminator:
             )
         self._processes.append(process)
         return self._termination_outcome
+
+    def recover_unregistered(
+        self,
+        ownership: UnregisteredTerminalSessionOwnership,
+    ) -> TerminalSessionContainmentReport:
+        if type(ownership) is not UnregisteredTerminalSessionOwnership:
+            raise ValueError(
+                "RecordingTerminalSessionTerminator requires typed ownership"
+            )
+        self.recovered_ownership.append(ownership)
+        return TerminalSessionContainmentReport(
+            terminal_owner=TerminalSessionOwnerContainmentOutcome.ABSENT,
+            guardian_owner=TerminalSessionOwnerContainmentOutcome.ABSENT,
+        )

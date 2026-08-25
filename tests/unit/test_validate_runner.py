@@ -25,13 +25,12 @@ from issue_orchestrator.domain.process_group import (
     ProcessGroupWait,
 )
 from issue_orchestrator.execution.contained_command_capture import (
+    OsContainedCommandOutputPipeFactory,
     PosixContainedCommandCapture,
 )
 from issue_orchestrator.domain.contained_command import ContainedCommandOutputPolicy
 from issue_orchestrator.infra.validation_timings import (
     ValidateTimingRecorder,
-    ValidationConfiguration,
-    ValidationConfigurationEntry,
 )
 from issue_orchestrator.entrypoints.cli_tools.validate_runner import (
     ValidationRunnerClock,
@@ -39,7 +38,11 @@ from issue_orchestrator.entrypoints.cli_tools.validate_runner import (
 )
 from issue_orchestrator.entrypoints.bootstrap import (
     build_contained_command_capture,
+    build_posix_process_launcher,
     build_process_group_supervisor,
+)
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_retained_thread_factory,
 )
 from issue_orchestrator.ports.process_group_supervisor import (
     ProcessGroupInterruption,
@@ -62,7 +65,9 @@ def _with_repo_on_pythonpath(env: dict[str, str]) -> dict[str, str]:
     repo_root = Path(__file__).resolve().parents[2]
     pythonpath = env.get("PYTHONPATH")
     env = dict(env)
-    env["PYTHONPATH"] = str(repo_root / "src") + (os.pathsep + pythonpath if pythonpath else "")
+    env["PYTHONPATH"] = str(repo_root / "src") + (
+        os.pathsep + pythonpath if pythonpath else ""
+    )
     return env
 
 
@@ -135,17 +140,21 @@ class TestValidateRunner:
 
         result = _run_validation_cli(
             [
-                sys.executable, "-m",
+                sys.executable,
+                "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
-                "--command", "echo 'test output'"
+                "--command",
+                "echo 'test output'",
             ],
             cwd=fake_git_repo,
             capture_output=True,
             text=True,
-            env=_with_repo_on_pythonpath({
-                **os.environ,
-                "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
-            }),
+            env=_with_repo_on_pythonpath(
+                {
+                    **os.environ,
+                    "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
+                }
+            ),
         )
 
         assert result.returncode == 0
@@ -157,20 +166,31 @@ class TestValidateRunner:
         """Test that output falls back to .issue-orchestrator/diagnostics/."""
         result = _run_validation_cli(
             [
-                sys.executable, "-m",
+                sys.executable,
+                "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
-                "--command", "echo 'fallback test'"
+                "--command",
+                "echo 'fallback test'",
             ],
             cwd=fake_git_repo,
             capture_output=True,
             text=True,
-            env=_with_repo_on_pythonpath({
-                k: v for k, v in os.environ.items() if not k.startswith("ISSUE_ORCHESTRATOR")
-            }),
+            env=_with_repo_on_pythonpath(
+                {
+                    k: v
+                    for k, v in os.environ.items()
+                    if not k.startswith("ISSUE_ORCHESTRATOR")
+                }
+            ),
         )
 
         assert result.returncode == 0
-        output_file = fake_git_repo / ".issue-orchestrator" / "diagnostics" / "validation-output.log"
+        output_file = (
+            fake_git_repo
+            / ".issue-orchestrator"
+            / "diagnostics"
+            / "validation-output.log"
+        )
         assert output_file.exists()
         assert "fallback test" in output_file.read_text()
 
@@ -181,17 +201,21 @@ class TestValidateRunner:
 
         result = _run_validation_cli(
             [
-                sys.executable, "-m",
+                sys.executable,
+                "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
-                "--command", "exit 1"
+                "--command",
+                "exit 1",
             ],
             cwd=fake_git_repo,
             capture_output=True,
             text=True,
-            env=_with_repo_on_pythonpath({
-                **os.environ,
-                "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
-            }),
+            env=_with_repo_on_pythonpath(
+                {
+                    **os.environ,
+                    "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
+                }
+            ),
         )
 
         assert result.returncode == 1
@@ -206,34 +230,42 @@ class TestValidateRunner:
         # Test exit code 0
         result = _run_validation_cli(
             [
-                sys.executable, "-m",
+                sys.executable,
+                "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
-                "--command", "exit 0"
+                "--command",
+                "exit 0",
             ],
             cwd=fake_git_repo,
             capture_output=True,
             text=True,
-            env=_with_repo_on_pythonpath({
-                **os.environ,
-                "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
-            }),
+            env=_with_repo_on_pythonpath(
+                {
+                    **os.environ,
+                    "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
+                }
+            ),
         )
         assert result.returncode == 0
 
         # Test exit code 42
         result = _run_validation_cli(
             [
-                sys.executable, "-m",
+                sys.executable,
+                "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
-                "--command", "exit 42"
+                "--command",
+                "exit 42",
             ],
             cwd=fake_git_repo,
             capture_output=True,
             text=True,
-            env=_with_repo_on_pythonpath({
-                **os.environ,
-                "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
-            }),
+            env=_with_repo_on_pythonpath(
+                {
+                    **os.environ,
+                    "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
+                }
+            ),
         )
         assert result.returncode == 42
 
@@ -244,17 +276,21 @@ class TestValidateRunner:
 
         _run_validation_cli(
             [
-                sys.executable, "-m",
+                sys.executable,
+                "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
-                "--command", "echo 'stderr message' >&2"
+                "--command",
+                "echo 'stderr message' >&2",
             ],
             cwd=fake_git_repo,
             capture_output=True,
             text=True,
-            env=_with_repo_on_pythonpath({
-                **os.environ,
-                "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
-            }),
+            env=_with_repo_on_pythonpath(
+                {
+                    **os.environ,
+                    "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
+                }
+            ),
         )
 
         output_file = output_dir / "validation-output.log"
@@ -268,16 +304,19 @@ class TestValidateRunner:
 
         result = _run_validation_cli(
             [
-                sys.executable, "-m",
+                sys.executable,
+                "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
             ],
             cwd=fake_git_repo,
             capture_output=True,
             text=True,
-            env=_with_repo_on_pythonpath({
-                **os.environ,
-                "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
-            }),
+            env=_with_repo_on_pythonpath(
+                {
+                    **os.environ,
+                    "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
+                }
+            ),
         )
 
         assert result.returncode == 2
@@ -290,17 +329,21 @@ class TestValidateRunner:
 
         result = _run_validation_cli(
             [
-                sys.executable, "-m",
+                sys.executable,
+                "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
-                "--command", "echo 'visible output'"
+                "--command",
+                "echo 'visible output'",
             ],
             cwd=fake_git_repo,
             capture_output=True,
             text=True,
-            env=_with_repo_on_pythonpath({
-                **os.environ,
-                "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
-            }),
+            env=_with_repo_on_pythonpath(
+                {
+                    **os.environ,
+                    "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
+                }
+            ),
         )
 
         # Output should appear in terminal (stdout)
@@ -310,31 +353,40 @@ class TestValidateRunner:
         output_file = output_dir / "validation-output.log"
         assert "visible output" in output_file.read_text()
 
-    def test_orchestrated_runs_emit_concise_lifecycle_markers(self, fake_git_repo: Path, tmp_path: Path):
+    def test_orchestrated_runs_emit_concise_lifecycle_markers(
+        self, fake_git_repo: Path, tmp_path: Path
+    ):
         """Orchestrated validation should summarize stdout but keep full file output."""
         output_dir = tmp_path / "session-output"
         output_dir.mkdir()
 
         result = _run_validation_cli(
             [
-                sys.executable, "-m",
+                sys.executable,
+                "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
-                "--command", "printf 'line one\\nline two\\n'"
+                "--command",
+                "printf 'line one\\nline two\\n'",
             ],
             cwd=fake_git_repo,
             capture_output=True,
             text=True,
-            env=_with_repo_on_pythonpath({
-                **os.environ,
-                "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
-            }),
+            env=_with_repo_on_pythonpath(
+                {
+                    **os.environ,
+                    "ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR": str(output_dir),
+                }
+            ),
         )
 
         assert result.returncode == 0
         stdout_lines = result.stdout.splitlines()
         assert "line one" not in stdout_lines
         assert "line two" not in stdout_lines
-        assert "[orchestrated] full output -> file; terminal shows lifecycle markers only" in result.stdout
+        assert (
+            "[orchestrated] full output -> file; terminal shows lifecycle markers only"
+            in result.stdout
+        )
         assert "[validate_runner] child_started pid=" in result.stdout
         assert "[validate_runner] stdout_eof pid=" in result.stdout
         assert "[validate_runner] child_exited pid=" in result.stdout
@@ -360,24 +412,34 @@ class TestValidateRunner:
 
         result = _run_validation_cli(
             [
-                sys.executable, "-m",
+                sys.executable,
+                "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
-                "--command", command,
+                "--command",
+                command,
             ],
             cwd=fake_git_repo,
             capture_output=True,
             text=True,
-            env=_with_repo_on_pythonpath({
-                k: v for k, v in os.environ.items() if not k.startswith("ISSUE_ORCHESTRATOR")
-            }),
+            env=_with_repo_on_pythonpath(
+                {
+                    k: v
+                    for k, v in os.environ.items()
+                    if not k.startswith("ISSUE_ORCHESTRATOR")
+                }
+            ),
         )
 
         assert result.returncode == 0
-        timings_file = fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+        timings_file = (
+            fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+        )
         assert timings_file.exists()
 
         records = [json.loads(line) for line in timings_file.read_text().splitlines()]
-        target_record = next(record for record in records if record["kind"] == "target_timing")
+        target_record = next(
+            record for record in records if record["kind"] == "target_timing"
+        )
         assert target_record["target"] == "test-unit"
         assert target_record["elapsed_seconds"] == 12
         assert target_record["validate_jobs"] == "10"
@@ -405,18 +467,19 @@ class TestValidateRunner:
         fake_git_repo: Path,
     ) -> None:
         """Profiler corruption is explicit but cannot replace command semantics."""
-        recorder = ValidateTimingRecorder(worktree=fake_git_repo, command="make validate")
+        recorder = ValidateTimingRecorder(
+            worktree=fake_git_repo, command="make validate"
+        )
 
-        recorder.process_line("[validate-timing] CONFIG validate_jobs=10 unit_parallel=auto\n")
+        recorder.process_line(
+            "[validate-timing] CONFIG validate_jobs=10 unit_parallel=auto\n"
+        )
         recorder.process_line("[validate-timing] CONFIG \n")
 
         records = [
             json.loads(line)
             for line in (
-                fake_git_repo
-                / ".git"
-                / "issue-orchestrator"
-                / "validate-timings.jsonl"
+                fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
             )
             .read_text(encoding="utf-8")
             .splitlines()
@@ -436,6 +499,16 @@ class TestValidateRunner:
                 "printf '[validate-timing] END target=missing status=0 "
                 "elapsed=1s at=now\\n'",
                 "end-without-start",
+            ),
+            (
+                "printf '[validate-timing] CONFIG host_cpus=18 host_cpus=19\\n'",
+                "malformed-marker",
+            ),
+            (
+                "printf '[validate-timing] START target=invalid-status at=one\\n' "
+                "&& printf '[validate-timing] END target=invalid-status "
+                "status=-9223372036854775809 elapsed=1s at=two\\n'",
+                "malformed-marker",
             ),
             (
                 "printf '[validate-timing] malformed\\n'",
@@ -466,6 +539,7 @@ class TestValidateRunner:
                 time.monotonic,
             ),
             contained_command_capture=build_contained_command_capture(),
+            retained_thread_factory=build_retained_thread_factory(),
         )
 
         assert exit_code == 0
@@ -478,10 +552,7 @@ class TestValidateRunner:
         records = [
             json.loads(line)
             for line in (
-                fake_git_repo
-                / ".git"
-                / "issue-orchestrator"
-                / "validate-timings.jsonl"
+                fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
             )
             .read_text(encoding="utf-8")
             .splitlines()
@@ -512,8 +583,7 @@ class TestValidateRunner:
             ("capture-ready",),
         ).python_source()
         command = (
-            f"exec {shlex.quote(sys.executable)} -c "
-            f"{shlex.quote(cooperative_leader)}"
+            f"exec {shlex.quote(sys.executable)} -c {shlex.quote(cooperative_leader)}"
         )
         sampler_threads_before = {
             thread.ident
@@ -538,13 +608,16 @@ class TestValidateRunner:
                     time.monotonic,
                 ),
                 contained_command_capture=PosixContainedCommandCapture(
+                    build_posix_process_launcher(),
                     supervisor,
                     ContainedCommandOutputPolicy(
                         poll_interval_seconds=0.01,
                         shutdown_timeout_seconds=1.0,
                         final_drain_byte_limit=1_048_576,
                     ),
+                    OsContainedCommandOutputPipeFactory(),
                 ),
+                retained_thread_factory=build_retained_thread_factory(),
             )
 
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
@@ -558,10 +631,7 @@ class TestValidateRunner:
         records = [
             json.loads(line)
             for line in (
-                fake_git_repo
-                / ".git"
-                / "issue-orchestrator"
-                / "validate-timings.jsonl"
+                fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
             )
             .read_text(encoding="utf-8")
             .splitlines()
@@ -583,24 +653,34 @@ class TestValidateRunner:
         """Each validate run should append a run summary record."""
         result = _run_validation_cli(
             [
-                sys.executable, "-m",
+                sys.executable,
+                "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
-                "--command", "echo ok",
+                "--command",
+                "echo ok",
             ],
             cwd=fake_git_repo,
             capture_output=True,
             text=True,
-            env=_with_repo_on_pythonpath({
-                k: v for k, v in os.environ.items() if not k.startswith("ISSUE_ORCHESTRATOR")
-            }),
+            env=_with_repo_on_pythonpath(
+                {
+                    k: v
+                    for k, v in os.environ.items()
+                    if not k.startswith("ISSUE_ORCHESTRATOR")
+                }
+            ),
         )
 
         assert result.returncode == 0
-        timings_file = fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+        timings_file = (
+            fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+        )
         assert timings_file.exists()
 
         records = [json.loads(line) for line in timings_file.read_text().splitlines()]
-        summary_record = next(record for record in records if record["kind"] == "run_summary")
+        summary_record = next(
+            record for record in records if record["kind"] == "run_summary"
+        )
         assert summary_record["command"] == "echo ok"
         assert summary_record["worktree"] == str(fake_git_repo)
         assert summary_record["exit_code"] == 0
@@ -626,9 +706,7 @@ class TestValidateRunner:
         fake_git_repo: Path,
         tmp_path: Path,
     ) -> None:
-        descendant_pid_path = (
-            tmp_path / "natural-validation-descendant.pid"
-        ).resolve()
+        descendant_pid_path = (tmp_path / "natural-validation-descendant.pid").resolve()
         natural_leader = ExitingTermResistantProcessTreeProgram(
             descendant_pid_path,
             300,
@@ -646,6 +724,7 @@ class TestValidateRunner:
                 time.monotonic,
             ),
             contained_command_capture=build_contained_command_capture(),
+            retained_thread_factory=build_retained_thread_factory(),
         )
         try:
             PROCESS_COMPLETION_WATCHDOG.join_thread(
@@ -670,22 +749,32 @@ class TestValidateRunner:
         """Validate runs should persist periodic resource samples."""
         result = _run_validation_cli(
             [
-                sys.executable, "-m",
+                sys.executable,
+                "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
-                "--command", f"\"{sys.executable}\" -c \"import time; time.sleep(0.5)\"",
+                "--command",
+                f'"{sys.executable}" -c "import time; time.sleep(0.5)"',
             ],
             cwd=fake_git_repo,
             capture_output=True,
             text=True,
-            env=_with_repo_on_pythonpath({
-                k: v for k, v in os.environ.items() if not k.startswith("ISSUE_ORCHESTRATOR")
-            }),
+            env=_with_repo_on_pythonpath(
+                {
+                    k: v
+                    for k, v in os.environ.items()
+                    if not k.startswith("ISSUE_ORCHESTRATOR")
+                }
+            ),
         )
 
         assert result.returncode == 0
-        timings_file = fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+        timings_file = (
+            fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+        )
         records = [json.loads(line) for line in timings_file.read_text().splitlines()]
-        resource_records = [record for record in records if record["kind"] == "resource_sample"]
+        resource_records = [
+            record for record in records if record["kind"] == "resource_sample"
+        ]
         assert resource_records, "expected at least one resource_sample record"
         sample = resource_records[0]
         assert sample["worktree"] == str(fake_git_repo)
@@ -719,16 +808,14 @@ class TestValidateRunner:
             fake_git_repo,
             clock=ValidationRunnerClock(wall_now, monotonic_now),
             contained_command_capture=build_contained_command_capture(),
+            retained_thread_factory=build_retained_thread_factory(),
         )
 
         assert result == 0
         records = [
             json.loads(line)
             for line in (
-                fake_git_repo
-                / ".git"
-                / "issue-orchestrator"
-                / "validate-timings.jsonl"
+                fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
             )
             .read_text(encoding="utf-8")
             .splitlines()
@@ -779,7 +866,8 @@ class TestReadHeadSha:
         (git / "HEAD").write_text("ref: refs/heads/main\n")
         (git / "packed-refs").write_text(
             "# pack-refs with: peeled fully-peeled sorted\n"
-            + "c" * 40 + " refs/heads/main\n"
+            + "c" * 40
+            + " refs/heads/main\n"
         )
 
         assert read_head_sha(tmp_path) == "c" * 40

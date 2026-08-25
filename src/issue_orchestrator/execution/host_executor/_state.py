@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import BinaryIO, Generator, TypeVar
+from typing import BinaryIO, Generator, NoReturn, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -32,7 +32,14 @@ from ._contracts import (
     GroupServiceRecord,
     QueuedWorkRecord,
 )
-from ..atomic_record_store import ExecutorAtomicRecordStore
+from ..atomic_record_store import AtomicRecordStore
+from ..independent_cleanup import (
+    CleanupAction,
+    CleanupOutcome,
+    IndependentCleanupPlan,
+    raise_cleanup_failures,
+    raise_primary_with_cleanup,
+)
 
 
 _RecordType = TypeVar("_RecordType", bound=BaseModel)
@@ -50,14 +57,35 @@ class OwnedQueuedRequest:
     def release(self) -> None:
         if self._released:
             raise RuntimeError("queued executor request was released twice")
+        outcome = _cleanup_record_and_handles(self.path, [self._handle])
+        self._released = True
+        raise_cleanup_failures(
+            "queued executor request cleanup failures",
+            outcome,
+        )
+
+    def release_after_failure(self, primary_error: BaseException) -> NoReturn:
+        """Preserve a queue-body failure beside every retirement failure."""
+        raise_primary_with_cleanup(
+            "executor queue body and request cleanup failures",
+            primary_error,
+            IndependentCleanupPlan(
+                (CleanupAction("release queued executor request", self.release),)
+            ).run(),
+        )
+
+    def release_after_grant(self, lease: HostExecutorLease) -> None:
+        """Retire the queue entry or roll back its newly admitted lease."""
         try:
-            self.path.unlink(missing_ok=True)
-        finally:
-            try:
-                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
-            finally:
-                self._handle.close()
-                self._released = True
+            self.release()
+        except BaseException as queue_cleanup_error:
+            raise_primary_with_cleanup(
+                "executor queue retirement and admitted lease rollback failures",
+                queue_cleanup_error,
+                IndependentCleanupPlan(
+                    (CleanupAction("release admitted executor lease", lease.release),)
+                ).run(),
+            )
 
     def __enter__(self) -> OwnedQueuedRequest:
         if self._released:
@@ -77,6 +105,35 @@ class _HostExecutorLeaseOwnership(Enum):
     LOCAL = "local"
     GUARDIAN = "guardian"
     RELEASED = "released"
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardianLeaseRecordRetired:
+    """This logical owner removed the now-unlocked lease record."""
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardianLeaseRecordAlreadyReconciled:
+    """A competing state observer already retired the unlocked record."""
+
+
+_GuardianLeaseRecordRetirement = (
+    _GuardianLeaseRecordRetired | _GuardianLeaseRecordAlreadyReconciled
+)
+
+
+def _retire_guardian_lease_record(path: Path) -> _GuardianLeaseRecordRetirement:
+    """Retire one shared record after its guardian released the lock.
+
+    Once guardian descriptors close, any queue observer may prove the record
+    stale and unlink it before the originating process resumes.  Absence here
+    is therefore an explicit reconciliation outcome, not suppressed cleanup.
+    """
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return _GuardianLeaseRecordAlreadyReconciled()
+    return _GuardianLeaseRecordRetired()
 
 
 class HostExecutorLease:
@@ -104,33 +161,34 @@ class HostExecutorLease:
         """Make the spawned guardian the sole descriptor owner without unlocking."""
         if self._ownership is not _HostExecutorLeaseOwnership.LOCAL:
             raise RuntimeError("host executor lease can be transferred only once")
-        close_errors: list[BaseException] = []
-        for handle in reversed(self._handles):
-            try:
-                # flock ownership follows the inherited open-file description.
-                # Explicit LOCK_UN here would also unlock the guardian's copy.
-                handle.close()
-            except BaseException as error:
-                error.add_note("failed to close local executor lease descriptor")
-                close_errors.append(error)
+        # flock ownership follows the inherited open-file description. Explicit
+        # LOCK_UN here would also unlock the guardian's copy.
+        outcome = _close_handles(self._handles)
         self._handles.clear()
         self._ownership = _HostExecutorLeaseOwnership.GUARDIAN
-        if close_errors:
-            raise BaseExceptionGroup(
-                "executor lease transfer descriptor failures",
-                close_errors,
-            )
+        raise_cleanup_failures(
+            "executor lease transfer descriptor failures",
+            outcome,
+        )
 
     def release(self) -> None:
         if self._ownership is _HostExecutorLeaseOwnership.RELEASED:
             raise RuntimeError("host executor lease was released twice")
-        try:
-            self.path.unlink(missing_ok=True)
-        finally:
-            if self._ownership is _HostExecutorLeaseOwnership.LOCAL:
-                _release_handles(self._handles)
-                self._handles.clear()
-            self._ownership = _HostExecutorLeaseOwnership.RELEASED
+        outcome = (
+            _cleanup_record_and_handles(self.path, self._handles)
+            if self._ownership is _HostExecutorLeaseOwnership.LOCAL
+            else IndependentCleanupPlan(
+                (
+                    CleanupAction(
+                        "retire guardian executor lease record",
+                        lambda: _retire_guardian_lease_record(self.path),
+                    ),
+                )
+            ).run()
+        )
+        self._handles.clear()
+        self._ownership = _HostExecutorLeaseOwnership.RELEASED
+        raise_cleanup_failures("executor lease cleanup failures", outcome)
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +212,7 @@ class HostExecutorState:
         self,
         pool_dir: Path,
         host_cpu_slots: int,
-        atomic_records: ExecutorAtomicRecordStore,
+        atomic_records: AtomicRecordStore,
     ) -> None:
         if type(host_cpu_slots) is not int or host_cpu_slots < 1:
             raise ValueError("HostExecutorState capacity must be a positive integer")
@@ -188,36 +246,29 @@ class HostExecutorState:
             self._reset_inactive_group_service_before_enqueue()
             path.parent.mkdir(parents=True, exist_ok=True)
             handle: BinaryIO | None = None
+            created = False
             try:
                 handle = path.open("x+b")
+                created = True
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 self._write_locked(handle, QueuedWorkRecord.from_domain(work))
             except BaseException as publication_error:
                 # A failed publication must not leave a locked, partial request
                 # that poisons every peer until this process happens to exit.
-                cleanup_errors: list[BaseException] = []
-                try:
-                    path.unlink(missing_ok=True)
-                except BaseException as cleanup_error:
-                    cleanup_error.add_note("failed to unlink partial queue record")
-                    cleanup_errors.append(cleanup_error)
-                if handle is not None:
-                    try:
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                    except BaseException as cleanup_error:
-                        cleanup_error.add_note("failed to unlock partial queue record")
-                        cleanup_errors.append(cleanup_error)
-                    try:
-                        handle.close()
-                    except BaseException as cleanup_error:
-                        cleanup_error.add_note("failed to close partial queue record")
-                        cleanup_errors.append(cleanup_error)
-                if cleanup_errors:
-                    raise BaseExceptionGroup(
-                        "host executor queue publication and cleanup failures",
-                        (publication_error, *cleanup_errors),
+                # Never unlink a record whose exclusive creation failed: that
+                # path belongs to the colliding request owner.
+                actions: list[CleanupAction] = []
+                if created:
+                    actions.append(
+                        CleanupAction("unlink partial queue record", path.unlink)
                     )
-                raise
+                if handle is not None:
+                    actions.extend(_locked_handle_cleanup_actions((handle,)))
+                raise_primary_with_cleanup(
+                    "host executor queue publication and cleanup failures",
+                    publication_error,
+                    IndependentCleanupPlan(tuple(actions)).run(),
+                )
         return OwnedQueuedRequest(work, path, handle)
 
     def _reset_inactive_group_service_before_enqueue(self) -> None:
@@ -289,9 +340,12 @@ class HostExecutorState:
                     current.work,
                     decision.grant,
                 )
-            except BaseException:
-                _release_handles(handles)
-                raise
+            except BaseException as lease_publication_error:
+                raise_primary_with_cleanup(
+                    "executor lease publication and resource cleanup failures",
+                    lease_publication_error,
+                    _cleanup_handles(handles),
+                )
             handles.append(lease_handle)
             try:
                 self._write_group_service(
@@ -301,12 +355,12 @@ class HostExecutorState:
                         decision.grant.cpu_slots,
                     )
                 )
-            except BaseException:
-                try:
-                    lease_path.unlink(missing_ok=True)
-                finally:
-                    _release_handles(handles)
-                raise
+            except BaseException as service_publication_error:
+                raise_primary_with_cleanup(
+                    "executor service publication and lease cleanup failures",
+                    service_publication_error,
+                    _cleanup_record_and_handles(lease_path, handles),
+                )
             return HostAdmissionGranted(
                 HostExecutorLease(decision.grant, lease_path, handles),
                 decision,
@@ -467,12 +521,12 @@ class HostExecutorState:
                     )
                 ),
             )
-        except BaseException:
-            try:
-                path.unlink(missing_ok=True)
-            finally:
-                handle.close()
-            raise
+        except BaseException as publication_error:
+            raise_primary_with_cleanup(
+                "executor lease record publication and cleanup failures",
+                publication_error,
+                _cleanup_record_and_handles(path, [handle]),
+            )
         return path, handle
 
     def _try_acquire_resources(
@@ -534,13 +588,79 @@ def _try_lock(path: Path) -> BinaryIO | None:
     handle = path.open("a+b")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.close()
-        return None
+    except BaseException as primary_error:
+        close_outcome = IndependentCleanupPlan(
+            (CleanupAction("unacquired-executor-lock-close", handle.close),)
+        ).run()
+        if isinstance(primary_error, BlockingIOError):
+            raise_cleanup_failures(
+                "unacquired executor lock cleanup failed",
+                close_outcome,
+            )
+            return None
+        raise_primary_with_cleanup(
+            "executor lock acquisition and cleanup failed",
+            primary_error,
+            close_outcome,
+        )
     return handle
 
 
 def _release_handles(handles: list[BinaryIO]) -> None:
-    for handle in reversed(handles):
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+    raise_cleanup_failures(
+        "executor lock cleanup failures",
+        _cleanup_handles(handles),
+    )
+
+
+def _cleanup_record_and_handles(
+    path: Path,
+    handles: list[BinaryIO],
+) -> CleanupOutcome:
+    return IndependentCleanupPlan(
+        (
+            CleanupAction("unlink executor state record", path.unlink),
+            *_locked_handle_cleanup_actions(tuple(reversed(handles))),
+        )
+    ).run()
+
+
+def _cleanup_handles(handles: list[BinaryIO]) -> CleanupOutcome:
+    return IndependentCleanupPlan(
+        _locked_handle_cleanup_actions(tuple(reversed(handles)))
+    ).run()
+
+
+def _close_handles(handles: list[BinaryIO]) -> CleanupOutcome:
+    return IndependentCleanupPlan(
+        tuple(
+            CleanupAction(
+                "close transferred executor descriptor",
+                handle.close,
+            )
+            for handle in reversed(handles)
+        )
+    ).run()
+
+
+def _locked_handle_cleanup_actions(
+    handles: tuple[BinaryIO, ...],
+) -> tuple[CleanupAction, ...]:
+    actions: list[CleanupAction] = []
+    for handle in handles:
+        actions.extend(
+            (
+                CleanupAction(
+                    "unlock executor state descriptor",
+                    lambda owned_handle=handle: fcntl.flock(
+                        owned_handle.fileno(),
+                        fcntl.LOCK_UN,
+                    ),
+                ),
+                CleanupAction(
+                    "close executor state descriptor",
+                    handle.close,
+                ),
+            )
+        )
+    return tuple(actions)

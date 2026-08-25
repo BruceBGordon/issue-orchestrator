@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import struct
 import time
 from collections.abc import Mapping, MutableMapping
@@ -24,11 +25,12 @@ class ValidationExecutorAcknowledgement:
     def __post_init__(self) -> None:
         if (
             type(self.acknowledged_at_monotonic) is not float
+            or not math.isfinite(self.acknowledged_at_monotonic)
             or self.acknowledged_at_monotonic <= 0
         ):
             raise ValueError(
                 "ValidationExecutorAcknowledgement.acknowledged_at_monotonic "
-                "must be a positive float"
+                "must be a positive finite float"
             )
 
 

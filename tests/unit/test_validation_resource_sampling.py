@@ -12,7 +12,12 @@ from issue_orchestrator.domain.validation_resource_sampling import (
     ValidationResourceSamplerFailed,
     ValidationResourceSamplerShutdownFailed,
     ValidationResourceSamplerStopped,
+    ValidationResourceSamplerStarted,
     ValidationResourceSamplingPolicy,
+)
+from issue_orchestrator.execution.retained_thread import (
+    MaskedThreadStartPrimitive,
+    ThreadingRetainedThreadFactory,
 )
 from issue_orchestrator.execution.validation_resource_sampling import (
     ValidationResourceSampler,
@@ -23,6 +28,10 @@ from issue_orchestrator.infra.validation_timings import (
     ValidationResourceSample,
 )
 from tests.process_completion_fixture import PROCESS_COMPLETION_WATCHDOG
+
+
+def _retained_thread_factory() -> ThreadingRetainedThreadFactory:
+    return ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
 
 
 def _sample() -> ValidationResourceSample:
@@ -47,7 +56,10 @@ class _BlockingResourceProbe:
         self.collection_count += 1
         if self.collection_count > 1:
             self.blocked.set()
-            self.release.wait()
+            PROCESS_COMPLETION_WATCHDOG.wait_for_event(
+                self.release,
+                operation="blocked validation resource probe release",
+            )
         return _sample()
 
 
@@ -92,22 +104,37 @@ def test_blocked_sampler_reports_typed_shutdown_and_cannot_append_late(
         probe_timeout_seconds=0.01,
         shutdown_timeout_seconds=0.1,
     )
-    sampler = ValidationResourceSampler(recorder, probe, policy)
-    sampler.start()
-    PROCESS_COMPLETION_WATCHDOG.wait_for_event(
-        blocked,
-        operation="resource sampler blocked probe",
+    sampler = ValidationResourceSampler(
+        recorder,
+        probe,
+        policy,
+        _retained_thread_factory(),
     )
+    assert type(sampler.start()) is ValidationResourceSamplerStarted
+    try:
+        PROCESS_COMPLETION_WATCHDOG.wait_for_event(
+            blocked,
+            operation="resource sampler blocked probe",
+        )
 
-    first_shutdown = sampler.stop()
-    timing_path = worktree / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
-    lines_after_failed_shutdown = timing_path.read_text(encoding="utf-8").splitlines()
-    release.set()
+        first_shutdown = sampler.stop()
+        timing_path = (
+            worktree / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+        )
+        lines_after_failed_shutdown = timing_path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    finally:
+        release.set()
     final_shutdown = sampler.stop()
     lines_after_probe_release = timing_path.read_text(encoding="utf-8").splitlines()
 
     assert type(first_shutdown) is ValidationResourceSamplerShutdownFailed
-    assert type(first_shutdown.error) is TimeoutError
+    assert type(first_shutdown.error) is ExceptionGroup
+    assert len(first_shutdown.error.exceptions) == 2
+    assert all(type(error) is TimeoutError for error in first_shutdown.error.exceptions)
+    assert "initial" in str(first_shutdown.error.exceptions[0])
+    assert "recovery" in str(first_shutdown.error.exceptions[1])
     assert type(final_shutdown) is ValidationResourceSamplerStopped
     assert lines_after_probe_release == lines_after_failed_shutdown
 
@@ -127,8 +154,9 @@ def test_periodic_probe_failure_is_returned_as_typed_terminal_evidence(
             probe_timeout_seconds=0.01,
             shutdown_timeout_seconds=0.1,
         ),
+        _retained_thread_factory(),
     )
-    sampler.start()
+    assert type(sampler.start()) is ValidationResourceSamplerStarted
     PROCESS_COMPLETION_WATCHDOG.wait_for_event(
         failure_observed,
         operation="periodic resource probe failure",

@@ -21,7 +21,11 @@ from tests.process_completion_fixture import (
     ProcessCleanupPlan,
     ProcessCleanupStep,
 )
-from tests.process_tree_fixture import ProcessTreeMember, TermResistantChildProgram
+from tests.process_tree_fixture import (
+    DirectChildProcessCohort,
+    ProcessTreeMember,
+    TermResistantChildProgram,
+)
 
 
 POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
@@ -97,8 +101,27 @@ class CloseFdsTreePressureCommand:
             _recorded_process_id(self.descendant_pid_path)
         ).assert_contained()
 
-    def request_guardian_termination(self) -> None:
-        os.kill(_recorded_process_id(self.guardian_pid_path), signal.SIGTERM)
+    def crash_guardian(self) -> None:
+        """Hard-kill the guardian so only its independent sentinel remains."""
+        os.kill(_recorded_process_id(self.guardian_pid_path), signal.SIGKILL)
+
+    def crash_sentinel(self) -> None:
+        """Hard-kill the guardian's exact sentinel child."""
+        guardian_pid = _recorded_process_id(self.guardian_pid_path)
+        DirectChildProcessCohort.observe_exact(
+            parent_process_id=guardian_pid,
+            module_name="issue_orchestrator.execution.process_group_sentinel",
+            expected_count=1,
+        ).crash_one()
+
+    def require_descendant_executable(self) -> None:
+        descendant = ProcessTreeMember(
+            _recorded_process_id(self.descendant_pid_path)
+        )
+        if not descendant.is_executable():
+            raise AssertionError(
+                "pressure descendant stopped before containment was requested"
+            )
 
     def cleanup(self) -> None:
         _contain_recorded_guardian(self.guardian_pid_path)
@@ -436,6 +459,17 @@ class _ControlledPressureProcess:
         )
         self._completion_observed = True
         assert self._process.returncode == 0, self._unexpected_exit()
+
+    def wait_until_expected_failure(self) -> None:
+        PROCESS_COMPLETION_WATCHDOG.wait(
+            self._process,
+            operation=f"pressure work {self.work.label} expected failure",
+        )
+        self._completion_observed = True
+        if self._process.returncode in (None, 0):
+            raise AssertionError(
+                f"pressure work {self.work.label} unexpectedly succeeded"
+            )
 
     def kill_parent(self) -> None:
         self._process.kill()
@@ -846,6 +880,10 @@ class PressureRig:
     def crash_parent(self, job: PressureJob) -> None:
         """Kill a job's executor parent while its guardian retains the lease."""
         self._process(job).kill_parent()
+
+    def require_failed(self, job: PressureJob) -> None:
+        """Require an intentionally faulted executor parent to fail cleanly."""
+        self._process(job).wait_until_expected_failure()
 
     def release_orphaned_child(self, job: PressureJob) -> None:
         """Release a command whose executor parent was explicitly killed."""

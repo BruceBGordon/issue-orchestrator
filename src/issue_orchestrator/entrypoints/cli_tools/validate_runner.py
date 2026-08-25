@@ -49,6 +49,10 @@ from ...infra.validation_timings import (
     ValidateTimingRecorder,
 )
 from ...domain.validation_resource_sampling import (
+    ValidationResourceSamplerStart,
+    ValidationResourceSamplerStarted,
+    ValidationResourceSamplerStartIndeterminate,
+    ValidationResourceSamplerStartRejected,
     ValidationResourceSamplingPolicy,
     validation_resource_sampler_shutdown_failure,
 )
@@ -62,6 +66,7 @@ from ...ports.contained_command import (
     ContainedCommandOutput,
     ContainedShellCommand,
 )
+from ...ports.retained_thread import RetainedThreadFactory
 
 _RESOURCE_SAMPLING_POLICY = ValidationResourceSamplingPolicy(
     sample_interval_seconds=5.0,
@@ -209,9 +214,7 @@ class _ValidationTimingLineObserver(ContainedCommandLineObserver):
 
     def __post_init__(self) -> None:
         if type(self.recorder) is not ValidateTimingRecorder:
-            raise ValueError(
-                "validation line observer requires ValidateTimingRecorder"
-            )
+            raise ValueError("validation line observer requires ValidateTimingRecorder")
 
     def observe_line(self, line: str) -> None:
         self.recorder.process_line(line)
@@ -309,22 +312,25 @@ def _not_started_capture_failure(
 def _finalize_validation_evidence(
     *,
     sampler: ValidationResourceSampler,
-    sampler_started: bool,
+    sampler_start: ValidationResourceSamplerStart,
     recorder: ValidateTimingRecorder,
     result: _TimedValidationCommandResult,
     wall_started_at: datetime,
     monotonic_started_at: float,
 ) -> _TimedValidationCommandResult:
     finalized_result = result
-    if sampler_started:
-        shutdown_failure = validation_resource_sampler_shutdown_failure(
-            sampler.stop()
-        )
+    if type(sampler_start) in (
+        ValidationResourceSamplerStarted,
+        ValidationResourceSamplerStartIndeterminate,
+    ):
+        shutdown_failure = validation_resource_sampler_shutdown_failure(sampler.stop())
         if shutdown_failure is not None:
             finalized_result = _with_sampler_shutdown_failure(
                 result,
                 ContainedCommandFailure(shutdown_failure),
             )
+    elif type(sampler_start) is not ValidationResourceSamplerStartRejected:
+        raise AssertionError("validation resource sampler start is a closed union")
     recorder.finalize(
         command_result=finalized_result.command_result,
         total_elapsed_seconds=finalized_result.duration_seconds,
@@ -401,6 +407,7 @@ def run_validation(
     *,
     clock: ValidationRunnerClock,
     contained_command_capture: ContainedCommandCapture,
+    retained_thread_factory: RetainedThreadFactory,
 ) -> int:
     """Run validation command and capture output.
 
@@ -424,6 +431,7 @@ def run_validation(
         recorder=timing_recorder,
         probe=resource_probe,
         policy=_RESOURCE_SAMPLING_POLICY,
+        thread_factory=retained_thread_factory,
     )
 
     print(f"Running: {command}")
@@ -436,21 +444,20 @@ def run_validation(
 
     wall_start = clock.wall_now()
     start = clock.monotonic_now()
-    sampler_started = False
     with open(output_file, "w", buffering=1) as output_handle:
         output_handle.write(
             f"[validate_runner] start pid={os.getpid()} cwd={worktree} "
             f"command={command}\n"
         )
         output_handle.flush()
-        try:
-            resource_sampler.start()
-        except BaseException as sampler_start_error:
+        sampler_start = resource_sampler.start()
+        if type(sampler_start) is ValidationResourceSamplerStartRejected:
             command_result: ContainedCommandResult = _not_started_capture_failure(
-                sampler_start_error
+                sampler_start.error
             )
-        else:
-            sampler_started = True
+        elif type(sampler_start) is ValidationResourceSamplerStartIndeterminate:
+            command_result = _not_started_capture_failure(sampler_start.error)
+        elif type(sampler_start) is ValidationResourceSamplerStarted:
             command_result = contained_command_capture.capture(
                 ContainedShellCommand(command=command, working_directory=worktree),
                 _ValidationCommandOutput(
@@ -459,6 +466,8 @@ def run_validation(
                 ),
                 _ValidationTimingLineObserver(timing_recorder),
             )
+        else:
+            raise AssertionError("validation resource sampler start is a closed union")
 
     wall_end = clock.wall_now()
     monotonic_end = clock.monotonic_now()
@@ -470,7 +479,7 @@ def run_validation(
     )
     result = _finalize_validation_evidence(
         sampler=resource_sampler,
-        sampler_started=sampler_started,
+        sampler_start=sampler_start,
         recorder=timing_recorder,
         result=result,
         wall_started_at=wall_start,
@@ -541,6 +550,7 @@ def main() -> None:
         sys.exit(2)
 
     from ..bootstrap import build_contained_command_capture
+    from ..bootstrap_executor import build_retained_thread_factory
 
     exit_code = run_validation(
         command,
@@ -548,6 +558,7 @@ def main() -> None:
         worktree,
         clock=SYSTEM_VALIDATION_RUNNER_CLOCK,
         contained_command_capture=build_contained_command_capture(),
+        retained_thread_factory=build_retained_thread_factory(),
     )
     sys.exit(exit_code)
 

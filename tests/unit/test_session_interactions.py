@@ -80,6 +80,18 @@ def test_builtin_session_interaction_rules_are_scoped_to_claude() -> None:
         TerminalInteractionIntent.classify("FOO=1 claude --model sonnet 'fix it'")
         is claude
     )
+    for command in (
+        "FOO=1;claude",
+        "FOO=1 &&claude",
+        "env -u CLAUDE_CONFIG_DIR claude",
+        "command -- claude",
+        "exec -a custom-name claude",
+    ):
+        assert TerminalInteractionIntent.classify(command) is claude
+    assert (
+        TerminalInteractionIntent.classify("command -v claude")
+        is TerminalInteractionIntent.NONE
+    )
     assert (
         TerminalInteractionIntent.classify("cat prompt.md | claude --print")
         is TerminalInteractionIntent.NONE
@@ -112,6 +124,12 @@ def test_builtin_session_interaction_rules_include_interactive_codex_only() -> N
     assert (
         TerminalInteractionIntent.classify(
             "env CODEX_HOME=/tmp/runtime codex --ask-for-approval never 'review this'"
+        )
+        is codex
+    )
+    assert (
+        TerminalInteractionIntent.classify(
+            "exec env -u CODEX_HOME command -- codex 'review this'"
         )
         is codex
     )

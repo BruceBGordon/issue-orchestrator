@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-import signal
+from dataclasses import dataclass
 
 import pytest
 
@@ -12,7 +12,6 @@ from issue_orchestrator.domain.executor import (
 )
 from issue_orchestrator.domain.process_group import (
     ProcessBirthIdentity,
-    ProcessGroupAbsent,
     ProcessGroupExecutable,
     ProcessGroupObservation,
     ProcessGroupPermissionDenied,
@@ -26,13 +25,13 @@ from issue_orchestrator.domain.process_group import (
     ProcessSessionObservation,
 )
 from issue_orchestrator.domain.terminal_session_termination import (
+    TerminalSessionContainmentReport,
+    TerminalSessionOwnerCancellation,
+    TerminalSessionOwnerContainmentOutcome,
     TerminalSessionProcess,
     TerminalSessionStatus,
     TerminalSessionTerminationOutcome,
     TerminalSessionTerminationPolicy,
-)
-from issue_orchestrator.execution.executor_guardian_cancellation import (
-    ExecutorSessionGuardianCanceller,
 )
 from issue_orchestrator.execution.session_process_group_terminator import (
     PosixTerminalSessionProcessGroupTerminator,
@@ -74,10 +73,25 @@ class _LeaderDisappearsBeforeReusedGroupObserver:
         return ProcessSessionLeaderAbsent()
 
 
+@dataclass(frozen=True, slots=True)
+class _RecordingContainmentOwner:
+    report: TerminalSessionContainmentReport
+
+    def contain(
+        self,
+        process: TerminalSessionProcess,
+    ) -> TerminalSessionContainmentReport:
+        del process
+        return self.report
+
+
 def _process(tmp_path: Path) -> TerminalSessionProcess:
     return TerminalSessionProcess(
         process_id=42,
         birth_identity=ProcessBirthIdentity("darwin-timeval:1700000000:100"),
+        terminal_cancellation=TerminalSessionOwnerCancellation.for_run_dir(
+            tmp_path.resolve()
+        ),
         executor_cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
             tmp_path.resolve()
         ),
@@ -86,17 +100,24 @@ def _process(tmp_path: Path) -> TerminalSessionProcess:
 
 def _terminator(
     observer: ProcessGroupObserver,
+    owner_outcome: TerminalSessionOwnerContainmentOutcome = (
+        TerminalSessionOwnerContainmentOutcome.STALE_RETIRED
+    ),
 ) -> PosixTerminalSessionProcessGroupTerminator:
     return PosixTerminalSessionProcessGroupTerminator(
         TerminalSessionTerminationPolicy(0.1, 0.1),
-        ExecutorSessionGuardianCanceller(0.1, observer),
+        _RecordingContainmentOwner(
+            TerminalSessionContainmentReport(
+                terminal_owner=owner_outcome,
+                guardian_owner=TerminalSessionOwnerContainmentOutcome.ABSENT,
+            )
+        ),
         observer,
     )
 
 
 def test_recycled_pid_is_retired_without_signalling(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observer = RecordingProcessGroupObserver(
         process_observation=ProcessIdentityPresent(
@@ -104,11 +125,6 @@ def test_recycled_pid_is_retired_without_signalling(
             42,
         )
     )
-    monkeypatch.setattr(
-        "issue_orchestrator.execution.session_process_group_terminator.os.killpg",
-        lambda *_arguments: pytest.fail("a recycled PID must never be signalled"),
-    )
-
     outcome = _terminator(observer).terminate(_process(tmp_path))
 
     assert outcome is TerminalSessionTerminationOutcome.STALE_IDENTITY_RETIRED
@@ -131,24 +147,15 @@ def test_zombie_only_group_is_contained(tmp_path: Path) -> None:
 
 def test_absent_leader_prevents_signalling_a_reused_group(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observer = _LeaderDisappearsBeforeReusedGroupObserver()
-    signals: list[signal.Signals] = []
 
-    def record_signal(process_group_id: int, signal_number: signal.Signals) -> None:
-        assert process_group_id == 42
-        signals.append(signal_number)
-
-    monkeypatch.setattr(
-        "issue_orchestrator.execution.session_process_group_terminator.os.killpg",
-        record_signal,
-    )
-
-    outcome = _terminator(observer).terminate(_process(tmp_path))
+    outcome = _terminator(
+        observer,
+        TerminalSessionOwnerContainmentOutcome.CONTAINED,
+    ).terminate(_process(tmp_path))
 
     assert outcome is TerminalSessionTerminationOutcome.STALE_IDENTITY_RETIRED
-    assert signals == [signal.SIGTERM]
 
 @pytest.mark.parametrize(
     ("observer", "detail"),

@@ -161,7 +161,7 @@ def test_atomic_replace_failure_removes_its_temporary_record(tmp_path: Path) -> 
 
     [attempt] = replacement.attempts
     assert attempt[1] == pool_dir / "policy.json"
-    assert tuple(pool_dir.glob(".io-executor-atomic-*.tmp")) == ()
+    assert attempt[0].exists() is False
 
 
 def test_executor_prunes_only_recognizable_atomic_crash_remnants(
@@ -171,10 +171,18 @@ def test_executor_prunes_only_recognizable_atomic_crash_remnants(
     pool_dir = tmp_path / "pool"
     history_dir = pool_dir / "work-history"
     history_dir.mkdir(parents=True)
-    pool_remnant = pool_dir / ".io-executor-atomic-abandoned.tmp"
-    history_remnant = history_dir / ".io-executor-atomic-abandoned.tmp"
+    current_pool_remnant = pool_dir / ".io-atomic-record-current.tmp"
+    legacy_pool_remnant = pool_dir / ".io-executor-atomic-legacy.tmp"
+    current_history_remnant = history_dir / ".io-atomic-record-current.tmp"
+    legacy_history_remnant = history_dir / ".io-executor-atomic-legacy.tmp"
     unrelated_hidden_file = pool_dir / ".unrelated.tmp"
-    for path in (pool_remnant, history_remnant, unrelated_hidden_file):
+    crash_remnants = (
+        current_pool_remnant,
+        legacy_pool_remnant,
+        current_history_remnant,
+        legacy_history_remnant,
+    )
+    for path in (*crash_remnants, unrelated_hidden_file):
         path.write_text("crash debris", encoding="utf-8")
     executor = _executor(
         pool_dir,
@@ -187,9 +195,72 @@ def test_executor_prunes_only_recognizable_atomic_crash_remnants(
 
     assert _run_work(executor, "atomic:prune").exit_code == 0
 
-    assert pool_remnant.exists() is False
-    assert history_remnant.exists() is False
+    assert all(path.exists() is False for path in crash_remnants)
     assert unrelated_hidden_file.exists() is True
+
+
+def test_retention_delete_sync_failure_surfaces_and_stops_later_pruning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool_dir = tmp_path / "pool"
+    history_dir = pool_dir / "work-history"
+    retention_lock = PosixExecutorHistoryRetentionLock(
+        (history_dir / "retention.lock").resolve()
+    )
+    seed_executor = _executor(
+        pool_dir,
+        ExecutorHistoryRetentionPolicy(4, 2),
+        retention_lock,
+        request_nonce="1" * 32,
+        atomic_path_replacement=OsAtomicPathReplacement(),
+    )
+    assert _run_work(seed_executor, "retention:first").exit_code == 0
+    assert _run_work(seed_executor, "retention:second").exit_code == 0
+    seeded_profiles = tuple(sorted(history_dir.glob("*.json")))
+    assert len(seeded_profiles) == 2
+    for position, path in enumerate(seeded_profiles, start=1):
+        timestamp = position * 1_000_000_000
+        os.utime(path, ns=(timestamp, timestamp))
+    oldest_first = tuple(
+        sorted(
+            seeded_profiles,
+            key=lambda path: (path.stat().st_mtime_ns, path.name),
+        )
+    )
+
+    pruning_executor = _executor(
+        pool_dir,
+        ExecutorHistoryRetentionPolicy(1, 2),
+        retention_lock,
+        request_nonce="2" * 32,
+        atomic_path_replacement=OsAtomicPathReplacement(),
+    )
+    history_directory_identity = history_dir.stat()
+    original_fsync = os.fsync
+    history_directory_syncs = 0
+
+    def fail_second_history_directory_sync(file_descriptor: int) -> None:
+        nonlocal history_directory_syncs
+        descriptor_identity = os.fstat(file_descriptor)
+        if (
+            descriptor_identity.st_dev == history_directory_identity.st_dev
+            and descriptor_identity.st_ino == history_directory_identity.st_ino
+        ):
+            history_directory_syncs += 1
+            if history_directory_syncs == 2:
+                raise OSError("simulated retention directory sync failure")
+        original_fsync(file_descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_second_history_directory_sync)
+
+    with pytest.raises(OSError, match="simulated retention directory sync failure"):
+        _run_work(pruning_executor, "retention:new")
+
+    assert history_directory_syncs == 2
+    assert oldest_first[0].exists() is False
+    assert oldest_first[1].exists() is True
+    assert len(tuple(history_dir.glob("*.json"))) == 2
 
 
 class _BlockingFirstSharedRetentionLock:

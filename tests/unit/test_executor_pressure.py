@@ -239,13 +239,42 @@ def test_pressure_guardian_retains_capacity_until_close_fds_tree_is_contained(
             )
         )
         rig.crash_parent(crashed_parent)
-        tree.request_guardian_termination()
+        tree.crash_guardian()
         follower = rig.defer(PressureWork("FOLLOWER", "pressure-follower"))
         rig.require_none_started((follower,))
 
         rig.release_orphaned_child(crashed_parent)
         rig.require_started(follower)
         tree.require_descendant_contained()
+        rig.release(follower)
+
+
+def test_pressure_guardian_retains_capacity_after_sentinel_hard_crash(
+    tmp_path: Path,
+) -> None:
+    """A dead sentinel cannot uncharge work still owned by its guardian."""
+    pool_dir = tmp_path / "pool"
+    tree = CloseFdsTreePressureCommand(
+        guardian_pid_path=(tmp_path / "sentinel-crash-guardian.pid").resolve(),
+        descendant_pid_path=(tmp_path / "sentinel-crash-descendant.pid").resolve(),
+    )
+    with PressureRig(pool_dir, host_cpu_slots=1) as rig:
+        holder = rig.admit(
+            PressureWork(
+                "SENTINEL-CRASH",
+                "pressure-sentinel-crash",
+                command=tree,
+            )
+        )
+        follower = rig.defer(PressureWork("FOLLOWER", "pressure-follower"))
+        rig.require_none_started((follower,))
+        tree.require_descendant_executable()
+
+        tree.crash_sentinel()
+        rig.require_none_started((follower,))
+        rig.require_started(follower)
+        tree.require_descendant_contained()
+        rig.require_failed(holder)
         rig.release(follower)
 
 

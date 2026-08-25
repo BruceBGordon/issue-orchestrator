@@ -531,6 +531,16 @@ class TestValidationRunner:
                 "[validate-timing] END target=missing status=0 elapsed=1s at=now\\n",
                 "end-without-start",
             ),
+            (
+                "[validate-timing] CONFIG host_cpus=18 host_cpus=19\\n",
+                "malformed-marker",
+            ),
+            (
+                "[validate-timing] START target=invalid-status at=one\\n"
+                "[validate-timing] END target=invalid-status "
+                "status=-9223372036854775809 elapsed=1s at=two\\n",
+                "malformed-marker",
+            ),
             ("[validate-timing] malformed\\n", "malformed-marker"),
         ),
     )
@@ -560,6 +570,13 @@ class TestValidationRunner:
             if item["kind"] == "timing_protocol_failure"
         ]
         assert diagnostics[-1]["failure_kind"] == failure_kind
+        if "invalid-status" in markers:
+            assert diagnostics[-1]["target"] == "invalid-status"
+        assert not [
+            item
+            for item in _shared_timing_records(temp_worktree)
+            if item["kind"] == "target_timing"
+        ]
 
     def test_run_does_not_write_record_to_non_session_dir(self, runner, temp_worktree):
         """Non-session output dirs should not get run-scoped validation-record.json."""

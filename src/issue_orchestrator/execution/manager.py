@@ -14,6 +14,9 @@ from ..domain.terminal_launch import TerminalLaunch
 from ..domain.terminal_session_lifecycle import TerminalSessionWatcherPolicy
 from ..ports.process_group_supervisor import ProcessGroupSupervisor
 from ..ports.terminal_session_terminator import TerminalSessionTerminator
+from ..ports.terminal_session_owner import TerminalSessionOwner
+from ..ports.terminal_session_registry import TerminalSessionRegistry
+from .terminal_session_lifecycle import TerminalSessionWatcherFactory
 
 from ..infra.hooks.hookspec import PROJECT_NAME, TerminalSpec, LifecycleSpec
 
@@ -32,8 +35,11 @@ UI_MODE_PLUGINS = {
 
 class _BuiltinPluginKwargs(TypedDict):
     session_terminator: TerminalSessionTerminator
+    terminal_session_owner: TerminalSessionOwner
+    registry: TerminalSessionRegistry
     process_group_supervisor: ProcessGroupSupervisor
     watcher_policy: TerminalSessionWatcherPolicy
+    watcher_factory: TerminalSessionWatcherFactory
     session_interactions_enabled: bool
     worktree_base: Path | None
 
@@ -66,8 +72,11 @@ def _load_plugin_class(
 
 def create_plugin_manager(
     terminal_session_terminator: TerminalSessionTerminator,
+    terminal_session_owner: TerminalSessionOwner,
+    terminal_session_registry: TerminalSessionRegistry,
     process_group_supervisor: ProcessGroupSupervisor,
     watcher_policy: TerminalSessionWatcherPolicy,
+    watcher_factory: TerminalSessionWatcherFactory,
     terminal_plugin: Optional[str] = None,
     ui_mode: str = "web",
     session_interactions_enabled: bool = False,
@@ -79,9 +88,12 @@ def create_plugin_manager(
     Args:
         terminal_session_terminator: Required behavior-level owner for stopping
             persisted terminal sessions.
+        terminal_session_owner: Required pre-registry process-group owner.
+        terminal_session_registry: Required durable pending/session owner.
         process_group_supervisor: Required child-process owner for containing
             sessions that fail before durable registry publication.
         watcher_policy: Required shutdown watchdog for the PTY completion owner.
+        watcher_factory: Required construction boundary for PTY completion owners.
         terminal_plugin: Explicit terminal plugin to load.
             Can be: "tmux" or a class path like "mypackage:MyPlugin"
         ui_mode: Fallback UI mode if terminal_plugin not specified.
@@ -96,6 +108,16 @@ def create_plugin_manager(
             "create_plugin_manager.terminal_session_terminator must be a "
             "TerminalSessionTerminator"
         )
+    if not isinstance(terminal_session_owner, TerminalSessionOwner):
+        raise ValueError(
+            "create_plugin_manager.terminal_session_owner must implement "
+            "TerminalSessionOwner"
+        )
+    if not isinstance(terminal_session_registry, TerminalSessionRegistry):
+        raise ValueError(
+            "create_plugin_manager.terminal_session_registry must implement "
+            "TerminalSessionRegistry"
+        )
     if not isinstance(process_group_supervisor, ProcessGroupSupervisor):
         raise ValueError(
             "create_plugin_manager.process_group_supervisor must implement "
@@ -105,6 +127,11 @@ def create_plugin_manager(
         raise ValueError(
             "create_plugin_manager.watcher_policy must be "
             "TerminalSessionWatcherPolicy"
+        )
+    if not isinstance(watcher_factory, TerminalSessionWatcherFactory):
+        raise ValueError(
+            "create_plugin_manager.watcher_factory must implement "
+            "TerminalSessionWatcherFactory"
         )
 
     # Register hook specifications
@@ -129,8 +156,11 @@ def create_plugin_manager(
         if plugin_ref in BUILTIN_PLUGINS:
             plugin_kwargs = _BuiltinPluginKwargs(
                 session_terminator=terminal_session_terminator,
+                terminal_session_owner=terminal_session_owner,
+                registry=terminal_session_registry,
                 process_group_supervisor=process_group_supervisor,
                 watcher_policy=watcher_policy,
+                watcher_factory=watcher_factory,
                 session_interactions_enabled=session_interactions_enabled,
                 worktree_base=worktree_base,
             )
@@ -159,8 +189,11 @@ class PluginManager:
     def __init__(
         self,
         terminal_session_terminator: TerminalSessionTerminator,
+        terminal_session_owner: TerminalSessionOwner,
+        terminal_session_registry: TerminalSessionRegistry,
         process_group_supervisor: ProcessGroupSupervisor,
         watcher_policy: TerminalSessionWatcherPolicy,
+        watcher_factory: TerminalSessionWatcherFactory,
         terminal_plugin: Optional[str] = None,
         ui_mode: str = "web",
         session_interactions_enabled: bool = False,
@@ -176,8 +209,11 @@ class PluginManager:
         """
         self._pm = create_plugin_manager(
             terminal_session_terminator=terminal_session_terminator,
+            terminal_session_owner=terminal_session_owner,
+            terminal_session_registry=terminal_session_registry,
             process_group_supervisor=process_group_supervisor,
             watcher_policy=watcher_policy,
+            watcher_factory=watcher_factory,
             terminal_plugin=terminal_plugin,
             ui_mode=ui_mode,
             session_interactions_enabled=session_interactions_enabled,

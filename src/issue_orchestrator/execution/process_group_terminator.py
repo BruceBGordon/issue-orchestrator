@@ -8,6 +8,13 @@ import time
 
 from ..domain.executor import ExecutorProcessTerminationPolicy
 from ..domain.process_group import OwnedProcessGroupLeader, ProcessGroupTermination
+from ..domain.process_group import (
+    ProcessGroupAbsent,
+    ProcessGroupExecutable,
+    ProcessGroupPermissionDenied,
+    ProcessGroupZombiesOnly,
+)
+from ..ports.process_group_observer import ProcessGroupObserver
 
 
 class ProcessGroupTerminationError(RuntimeError):
@@ -24,13 +31,23 @@ class PosixProcessGroupTerminator:
     recycled between the courtesy signal and the containment signal.
     """
 
-    def __init__(self, policy: ExecutorProcessTerminationPolicy) -> None:
+    def __init__(
+        self,
+        policy: ExecutorProcessTerminationPolicy,
+        process_group_observer: ProcessGroupObserver,
+    ) -> None:
         if type(policy) is not ExecutorProcessTerminationPolicy:
             raise ValueError(
                 "PosixProcessGroupTerminator.policy must be an "
                 "ExecutorProcessTerminationPolicy"
             )
         self._policy = policy
+        if not isinstance(process_group_observer, ProcessGroupObserver):
+            raise ValueError(
+                "PosixProcessGroupTerminator.process_group_observer must "
+                "implement ProcessGroupObserver"
+            )
+        self._process_group_observer = process_group_observer
 
     def terminate(
         self,
@@ -61,15 +78,36 @@ class PosixProcessGroupTerminator:
             )
         )
 
-    @staticmethod
-    def _signal_group(process_group_id: int, signal_number: signal.Signals) -> None:
+    def _signal_group(
+        self,
+        process_group_id: int,
+        signal_number: signal.Signals,
+    ) -> None:
         try:
             os.killpg(process_group_id, signal_number)
-        except (ProcessLookupError, PermissionError):
-            # ESRCH means the group is gone.  macOS reports EPERM when its only
-            # remaining member is the unreaped zombie leader; neither state has
-            # executable user code left to contain.
+        except ProcessLookupError:
             return
+        except PermissionError as exc:
+            observation = self._process_group_observer.observe_group(
+                process_group_id
+            )
+            if type(observation) in (ProcessGroupAbsent, ProcessGroupZombiesOnly):
+                # macOS can report EPERM for a zombie-only group.  Suppression is
+                # safe only after the injected observer proves that no member can
+                # execute user code.
+                return
+            if type(observation) is ProcessGroupExecutable:
+                detail = (
+                    f"{observation.member_count} executable member(s) remain"
+                )
+            elif type(observation) is ProcessGroupPermissionDenied:
+                detail = f"membership observation denied: {observation.detail}"
+            else:
+                raise AssertionError("process-group observation is a closed union")
+            raise ProcessGroupTerminationError(
+                f"permission denied signalling process group {process_group_id} "
+                f"with {signal_number.name}: {detail}"
+            ) from exc
 
     @staticmethod
     def _await_leader_exit_without_reaping(

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import math
+import struct
 
 import pytest
 
@@ -62,3 +64,9 @@ def test_malformed_requested_handshake_fails_fast(raw_descriptor: str) -> None:
 def test_malformed_handshake_payload_fails_fast() -> None:
     with pytest.raises(RuntimeError, match="payload is malformed"):
         validate_executor_handshake_payload(b"\x01\x02")
+
+
+@pytest.mark.parametrize("timestamp", (math.nan, math.inf, -math.inf))
+def test_non_finite_handshake_timestamp_fails_fast(timestamp: float) -> None:
+    with pytest.raises(ValueError, match="positive finite float"):
+        validate_executor_handshake_payload(struct.pack("!Bd", 1, timestamp))

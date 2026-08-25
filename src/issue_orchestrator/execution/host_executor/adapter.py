@@ -70,7 +70,13 @@ from ._types import (
 )
 from .host_policy import ExecutorPolicyStore
 from .request_identity import ExecutorRequestIdentityFactory
-from ..atomic_record_store import ExecutorAtomicRecordStore
+from ..atomic_record_store import AtomicRecordStore
+from ..independent_cleanup import (
+    CleanupAction,
+    IndependentCleanupPlan,
+    raise_cleanup_failures,
+    raise_primary_with_cleanup,
+)
 
 
 EXECUTOR_CONCURRENCY_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_CONCURRENCY"
@@ -165,7 +171,7 @@ class HostExecutor(Executor):
         _require_atomic_path_replacement(atomic_path_replacement)
         self._queue_settle_seconds = queue_settle_seconds
         self._queue_poll_seconds = queue_poll_seconds
-        pool_records = ExecutorAtomicRecordStore(
+        pool_records = AtomicRecordStore(
             pool_dir,
             atomic_path_replacement,
         )
@@ -178,7 +184,7 @@ class HostExecutor(Executor):
             pool_dir / "work-history",
             history_retention_policy,
             history_retention_lock,
-            ExecutorAtomicRecordStore(
+            AtomicRecordStore(
                 pool_dir / "work-history",
                 atomic_path_replacement,
             ),
@@ -238,7 +244,9 @@ class HostExecutor(Executor):
             aggressiveness=effective_policy.aggressiveness,
             exclusive_resources=specification.exclusive_resources,
         )
-        with self._state.enqueue(work) as owned_request:
+        owned_request = self._state.enqueue(work)
+        lease: HostExecutorLease
+        try:
             self._events.enqueued(
                 identity=identity,
                 work=work,
@@ -278,6 +286,9 @@ class HostExecutor(Executor):
                     phase=ExecutorDeadlinePhase.ADMISSION,
                 )
                 raise
+        except BaseException as queue_body_error:
+            owned_request.release_after_failure(queue_body_error)
+        owned_request.release_after_grant(lease)
         result = self._run_command(
             identity,
             work,
@@ -350,9 +361,19 @@ class HostExecutor(Executor):
                         host_load=host_load,
                         host_cpu_utilization=host_cpu_utilization,
                     )
-                except BaseException:
-                    outcome.lease.release()
-                    raise
+                except BaseException as admission_publication_error:
+                    raise_primary_with_cleanup(
+                        "executor admission publication and lease cleanup failures",
+                        admission_publication_error,
+                        IndependentCleanupPlan(
+                            (
+                                CleanupAction(
+                                    "release unpublished executor lease",
+                                    outcome.lease.release,
+                                ),
+                            )
+                        ).run(),
+                    )
                 self._report_admission(
                     "acquired",
                     owned_request.work,
@@ -459,9 +480,38 @@ class HostExecutor(Executor):
                     started_at_monotonic=started,
                 )
         finally:
-            elapsed = time.monotonic() - started
-            usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
-            lease.release()
+            primary_error = sys.exception()
+            completion_observation: tuple[float, resource.struct_rusage] | None = None
+
+            def observe_completion_resources() -> None:
+                nonlocal completion_observation
+                completion_observation = (
+                    time.monotonic() - started,
+                    resource.getrusage(resource.RUSAGE_CHILDREN),
+                )
+
+            cleanup = IndependentCleanupPlan(
+                (
+                    CleanupAction(
+                        "observe executor command completion resources",
+                        observe_completion_resources,
+                    ),
+                    CleanupAction("release executor command lease", lease.release),
+                )
+            ).run()
+            if primary_error is not None:
+                raise_primary_with_cleanup(
+                    "executor command and completion cleanup failures",
+                    primary_error,
+                    cleanup,
+                )
+            raise_cleanup_failures(
+                "executor command completion cleanup failures",
+                cleanup,
+            )
+        if completion_observation is None:
+            raise AssertionError("executor completion resources were not observed")
+        elapsed, usage_after = completion_observation
         observation = ExecutorResourceObservation(
             concurrency=lease.grant.concurrency,
             wall_seconds=elapsed,

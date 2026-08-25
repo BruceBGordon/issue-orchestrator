@@ -22,9 +22,11 @@ from ..domain.executor import (
 from ..domain.executor_guardian import ExecutorGuardianTerminationPolicy
 from ..domain.terminal_launch import TerminalShell
 from ..domain.terminal_session_lifecycle import TerminalSessionWatcherPolicy
+from ..domain.terminal_session_owner import TerminalSessionOwnerPolicy
 from ..domain.terminal_session_termination import TerminalSessionTerminationPolicy
 from ..execution.agent_phase_command_scheduler import HostAgentPhaseCommandScheduler
 from ..ports.agent_phase_command_scheduler import AgentPhaseCommandScheduler
+from ..ports.atomic_record_store import AtomicRecordStoreFactory
 from ..ports.contained_command import ContainedCommandCapture
 from ..ports.executor import Executor
 from ..ports.executor_command_guardian import ExecutorCommandGuardian
@@ -32,9 +34,17 @@ from ..ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ..ports.executor_monitor import ExecutorMonitor
 from ..ports.host_cpu_utilization import HostCpuUtilizationObserver
 from ..ports.process_group_supervisor import ProcessGroupSupervisor
+from ..ports.posix_process import PosixProcessLauncher
 from ..ports.process_group_observer import ProcessGroupObserver
+from ..ports.retained_thread import RetainedThreadFactory
 from ..ports.terminal_session_terminator import TerminalSessionTerminator
+from ..ports.terminal_session_owner import TerminalSessionOwner
+from ..ports.terminal_session_registry import TerminalSessionRegistry
 from ..ports.validation_command_runner import ValidationCommandRunner
+from ..execution.terminal_session_lifecycle import (
+    TerminalSessionWatcherFactory,
+    ThreadTerminalSessionWatcherFactory,
+)
 
 
 _PROCESS_TERMINATION = ExecutorProcessTerminationPolicy(
@@ -47,6 +57,10 @@ _TERMINAL_SESSION_GUARDIAN_RELAY_SECONDS = (
     + _PROCESS_TERMINATION.forceful_shutdown_seconds
     + _TERMINAL_SESSION_RELAY_MARGIN_SECONDS
 )
+_TERMINAL_SESSION_OWNER_CONTAINMENT_SECONDS = (
+    _TERMINAL_SESSION_GUARDIAN_RELAY_SECONDS
+    + _PROCESS_TERMINATION.graceful_shutdown_seconds
+)
 _TERMINAL_SESSION_TERMINATION = TerminalSessionTerminationPolicy(
     # The outer wrapper gets enough courtesy time to relay SIGTERM and let its
     # executor supervisor spend both inner TERM/KILL bounds, plus one margin.
@@ -55,6 +69,10 @@ _TERMINAL_SESSION_TERMINATION = TerminalSessionTerminationPolicy(
 )
 _TERMINAL_SESSION_WATCHER = TerminalSessionWatcherPolicy(
     shutdown_timeout_seconds=_TERMINAL_SESSION_GUARDIAN_RELAY_SECONDS,
+)
+_TERMINAL_SESSION_OWNER = TerminalSessionOwnerPolicy(
+    startup_timeout_seconds=30.0,
+    graceful_shutdown_seconds=_PROCESS_TERMINATION.graceful_shutdown_seconds,
 )
 _HISTORY_RETENTION = ExecutorHistoryRetentionPolicy(
     maximum_profiles=2048,
@@ -72,6 +90,30 @@ def build_agent_phase_command_scheduler() -> AgentPhaseCommandScheduler:
         python_executable=Path(sys.executable),
         application_shell=TerminalShell.BASH,
         outer_watchdog_policy=_OUTER_WATCHDOG,
+    )
+
+
+def build_atomic_record_store_factory() -> AtomicRecordStoreFactory:
+    """Compose crash-safe JSON persistence for lifecycle owners."""
+    from ..execution.atomic_record_store import OsAtomicRecordStoreFactory
+
+    return OsAtomicRecordStoreFactory()
+
+
+def build_process_group_observer() -> ProcessGroupObserver:
+    """Compose the portable host process-table observer."""
+    from ..adapters.kernel_process_identity import (
+        build_kernel_process_identity_observer,
+    )
+    from ..adapters.ps_process_group_observer import (
+        PsProcessGroupObserver,
+        PsProcessObservationPolicy,
+    )
+
+    return PsProcessGroupObserver(
+        Path("/bin/ps"),
+        PsProcessObservationPolicy(command_timeout_seconds=2.0),
+        build_kernel_process_identity_observer(),
     )
 
 
@@ -120,13 +162,90 @@ def build_process_group_supervisor() -> ProcessGroupSupervisor:
     from ..execution.process_group_terminator import PosixProcessGroupTerminator
 
     return PosixProcessGroupSupervisor(
-        PosixProcessGroupTerminator(_PROCESS_TERMINATION)
+        PosixProcessGroupTerminator(
+            _PROCESS_TERMINATION,
+            build_process_group_observer(),
+        )
+    )
+
+
+def build_posix_process_launcher() -> PosixProcessLauncher:
+    """Compose the gap-free retained child-process activation owner."""
+    _require_posix_process_groups()
+    from ..domain.posix_process import PosixProcessProgram
+    from ..execution.posix_process import (
+        MaskedPosixSpawnPrimitive,
+        RetainedPosixProcessLauncher,
+    )
+
+    return RetainedPosixProcessLauncher(
+        PosixProcessProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.entrypoints.posix_process_child",
+            )
+        ),
+        MaskedPosixSpawnPrimitive(),
+        build_process_group_supervisor(),
+        _PROCESS_TERMINATION,
     )
 
 
 def terminal_session_watcher_policy() -> TerminalSessionWatcherPolicy:
     """Return the composition-root-owned PTY watcher shutdown policy."""
     return _TERMINAL_SESSION_WATCHER
+
+
+def build_terminal_session_watcher_factory() -> TerminalSessionWatcherFactory:
+    """Compose the thread-backed PTY completion-owner factory."""
+    return ThreadTerminalSessionWatcherFactory(build_retained_thread_factory())
+
+
+def build_retained_thread_factory() -> RetainedThreadFactory:
+    """Compose the single owner for retained background-thread lifecycles."""
+    from ..execution.retained_thread import (
+        MaskedThreadStartPrimitive,
+        ThreadingRetainedThreadFactory,
+    )
+
+    return ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+
+
+def build_terminal_session_owner() -> TerminalSessionOwner:
+    """Compose the pre-registry terminal process-group ownership wrapper."""
+    _require_posix_process_groups()
+    from ..execution.terminal_session_owner import (
+        PosixTerminalSessionOwner,
+        TerminalSessionOwnerProgram,
+    )
+    from ..domain.process_group_sentinel import ProcessGroupSentinelProgram
+
+    owner_program = (
+        str(Path(sys.executable)),
+        "-m",
+        "issue_orchestrator.entrypoints.terminal_session_owner_child",
+    )
+    sentinel_program = (
+        str(Path(sys.executable)),
+        "-m",
+        "issue_orchestrator.execution.process_group_sentinel",
+    )
+    return PosixTerminalSessionOwner(
+        TerminalSessionOwnerProgram(owner_program),
+        ProcessGroupSentinelProgram(sentinel_program),
+        _TERMINAL_SESSION_OWNER,
+        build_atomic_record_store_factory(),
+    )
+
+
+def build_terminal_session_registry(repo_root: Path) -> TerminalSessionRegistry:
+    """Compose durable pending-to-identified terminal launch ownership."""
+    from ..execution.terminal_session_registry import (
+        SqliteTerminalSessionRegistry,
+    )
+
+    return SqliteTerminalSessionRegistry(repo_root.resolve())
 
 
 def compose_terminal_session_terminator(
@@ -142,17 +261,30 @@ def compose_terminal_session_terminator(
     from ..execution.executor_guardian_cancellation import (
         ExecutorSessionGuardianCanceller,
     )
+    from ..execution.process_cancellation_endpoint import (
+        ProcessCancellationEndpointRequester,
+    )
     from ..execution.session_process_group_terminator import (
         PosixTerminalSessionProcessGroupTerminator,
+    )
+    from ..execution.terminal_session_containment import (
+        OwnerMediatedTerminalSessionContainment,
     )
 
     return PosixTerminalSessionProcessGroupTerminator(
         _TERMINAL_SESSION_TERMINATION,
-        ExecutorSessionGuardianCanceller(
-            forceful_shutdown_seconds=(
-                _TERMINAL_SESSION_TERMINATION.forceful_shutdown_seconds
+        OwnerMediatedTerminalSessionContainment(
+            ProcessCancellationEndpointRequester(
+                _TERMINAL_SESSION_OWNER_CONTAINMENT_SECONDS,
+                build_atomic_record_store_factory(),
             ),
-            process_group_observer=process_group_observer,
+            ExecutorSessionGuardianCanceller(
+                containment_timeout_seconds=(
+                    _TERMINAL_SESSION_OWNER_CONTAINMENT_SECONDS
+                ),
+                record_stores=build_atomic_record_store_factory(),
+            ),
+            _TERMINAL_SESSION_OWNER_CONTAINMENT_SECONDS,
         ),
         process_group_observer,
     )
@@ -162,15 +294,20 @@ def build_contained_command_capture() -> ContainedCommandCapture:
     """Compose streamed command capture behind one process-lifecycle owner."""
     _require_posix_process_groups()
     from ..domain.contained_command import ContainedCommandOutputPolicy
-    from ..execution.contained_command_capture import PosixContainedCommandCapture
+    from ..execution.contained_command_capture import (
+        OsContainedCommandOutputPipeFactory,
+        PosixContainedCommandCapture,
+    )
 
     return PosixContainedCommandCapture(
+        build_posix_process_launcher(),
         build_process_group_supervisor(),
         ContainedCommandOutputPolicy(
             poll_interval_seconds=0.05,
             shutdown_timeout_seconds=2.0,
             final_drain_byte_limit=1_048_576,
         ),
+        OsContainedCommandOutputPipeFactory(),
     )
 
 
@@ -180,15 +317,26 @@ def build_validation_command_runner() -> ValidationCommandRunner:
     from ..domain.contained_command import ContainedCommandOutputPolicy
     from ..execution.contained_validation_command import (
         PosixContainedValidationCommandRunner,
+        PosixValidationPipeCaptureFactory,
+    )
+    from ..execution.validation_pipe_resources import (
+        default_validation_pipe_selector,
+    )
+    from ..execution.posix_pipe import OsPosixPipeFactory
+    from ..execution.validation_launch_pipes import (
+        PosixValidationLaunchPipesFactory,
     )
 
     return PosixContainedValidationCommandRunner(
+        build_posix_process_launcher(),
         build_process_group_supervisor(),
         ContainedCommandOutputPolicy(
             poll_interval_seconds=0.05,
             shutdown_timeout_seconds=2.0,
             final_drain_byte_limit=4_194_304,
         ),
+        PosixValidationPipeCaptureFactory(default_validation_pipe_selector),
+        PosixValidationLaunchPipesFactory(OsPosixPipeFactory()),
     )
 
 
@@ -199,6 +347,10 @@ def build_executor_command_guardian() -> ExecutorCommandGuardian:
         ExecutorGuardianProgram,
         PosixExecutorCommandGuardian,
     )
+    from ..domain.process_group_sentinel import (
+        ProcessGroupSentinelPolicy,
+        ProcessGroupSentinelProgram,
+    )
 
     return PosixExecutorCommandGuardian(
         ExecutorGuardianProgram(
@@ -208,6 +360,18 @@ def build_executor_command_guardian() -> ExecutorCommandGuardian:
                 "issue_orchestrator.execution.host_executor.guardian",
             )
         ),
+        ProcessGroupSentinelProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.execution.process_group_sentinel",
+            )
+        ),
+        ProcessGroupSentinelPolicy(
+            graceful_shutdown_seconds=(_PROCESS_TERMINATION.graceful_shutdown_seconds),
+            startup_timeout_seconds=_TERMINAL_SESSION_OWNER.startup_timeout_seconds,
+        ),
+        build_atomic_record_store_factory(),
         build_process_group_supervisor(),
         ExecutorGuardianTerminationPolicy(
             _PROCESS_TERMINATION.graceful_shutdown_seconds

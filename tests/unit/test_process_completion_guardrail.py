@@ -19,6 +19,8 @@ EXECUTOR_COMPLETION_CLIENTS = (
     REPO_ROOT / "tests/unit/test_validate_runner.py",
     REPO_ROOT / "tests/unit/test_contained_command_capture.py",
     REPO_ROOT / "tests/unit/test_process_completion_fixture.py",
+    REPO_ROOT / "tests/unit/test_process_group_terminator.py",
+    REPO_ROOT / "tests/unit/test_validation_resource_sampling.py",
 )
 
 

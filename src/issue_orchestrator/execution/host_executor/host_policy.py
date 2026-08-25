@@ -17,7 +17,7 @@ from ...domain.executor import (
     ExecutorPolicySource,
 )
 from ._contracts import PersistedPolicyRecord
-from ..atomic_record_store import ExecutorAtomicRecordStore
+from ..atomic_record_store import AtomicRecordStore
 
 
 EXECUTOR_POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
@@ -64,7 +64,7 @@ class ExecutorPolicyStore:
     def __init__(
         self,
         pool_dir: Path,
-        atomic_records: ExecutorAtomicRecordStore,
+        atomic_records: AtomicRecordStore,
     ) -> None:
         self._pool_dir = pool_dir
         self._path = pool_dir / "policy.json"

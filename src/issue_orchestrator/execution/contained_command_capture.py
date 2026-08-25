@@ -5,10 +5,10 @@ from __future__ import annotations
 import codecs
 import os
 import selectors
-import subprocess
-import threading
+import signal
+import tempfile
 from dataclasses import dataclass, field
-from typing import BinaryIO, cast
+from typing import TextIO, cast
 
 from ..domain.contained_command import (
     ContainedCommandCaptureAborted,
@@ -23,6 +23,8 @@ from ..domain.contained_command import (
     ContainedCommandMetrics,
     ContainedCommandNotStarted,
     ContainedCommandOutputPolicy,
+    ContainedCommandOutputPipeClosed,
+    ContainedCommandOutputPipeCloseFailed,
     ContainedCommandResult,
     ContainedCommandStarted,
     ContainedCommandSupervised,
@@ -34,14 +36,39 @@ from ..domain.process_group import (
     ProcessGroupSupervision,
     ProcessGroupUnboundedWait,
 )
+from ..domain.posix_process import (
+    PosixDescriptorMapping,
+    PosixProcessEnvironment,
+    PosixProcessGroupMode,
+    PosixProcessLaunchSpec,
+    PosixProcessProgram,
+    PosixProcessWithoutTerminal,
+)
 from ..ports.contained_command import (
     ContainedCommandLineObserver,
     ContainedCommandOutput,
+    ContainedCommandOutputPipe,
+    ContainedCommandOutputPipeFactory,
+    ContainedCommandOutputReader,
     ContainedShellCommand,
 )
 from ..ports.process_group_supervisor import (
     ProcessGroupInterruption,
     ProcessGroupSupervisor,
+)
+from ..ports.posix_process import (
+    PosixProcessHandle,
+    PosixProcessLauncher,
+    PosixProcessLaunchRecovered,
+    PosixProcessLaunchRecoveryFailed,
+    PosixProcessLaunchRejected,
+    PosixProcessLaunchStarted,
+)
+from .independent_cleanup import (
+    CleanupAction,
+    CleanupFailed,
+    CleanupSucceeded,
+    IndependentCleanupPlan,
 )
 
 
@@ -57,6 +84,157 @@ def _combine_failures(
     )
 
 
+def _combine_base_errors(
+    message: str,
+    primary: BaseException,
+    secondary: BaseException | None,
+) -> BaseException:
+    if secondary is None:
+        return primary
+    return BaseExceptionGroup(message, (primary, secondary))
+
+
+class OsContainedCommandOutputPipe:
+    """Incrementally own the one parent/child output pipe."""
+
+    def __init__(self) -> None:
+        self._read_descriptor, self._write_descriptor = os.pipe()
+
+    @property
+    def descriptor_mappings(self) -> tuple[PosixDescriptorMapping, ...]:
+        return (
+            PosixDescriptorMapping(self._write_descriptor, 1),
+            PosixDescriptorMapping(self._write_descriptor, 2),
+        )
+
+    def open_reader_after_launch(self) -> ContainedCommandOutputReader:
+        previous_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK,
+            (signal.SIGHUP, signal.SIGINT, signal.SIGTERM),
+        )
+        reader: ContainedCommandOutputReader | None = None
+        try:
+            os.close(self._write_descriptor)
+            self._write_descriptor = -1
+            reader = os.fdopen(self._read_descriptor, "rb", buffering=0)
+            self._read_descriptor = -1
+        except BaseException as transfer_error:
+            restoration_error = _restore_signal_mask(previous_mask)
+            reader_close_error = _close_reader(reader)
+            raise _combine_many_errors(
+                "output reader transfer failed",
+                transfer_error,
+                restoration_error,
+                reader_close_error,
+            )
+        restoration_error = _restore_signal_mask(previous_mask)
+        if restoration_error is not None:
+            reader_close_error = _close_reader(reader)
+            raise _combine_many_errors(
+                "output reader signal restoration failed",
+                restoration_error,
+                reader_close_error,
+            )
+        return reader
+
+    def close(
+        self,
+    ) -> ContainedCommandOutputPipeClosed | ContainedCommandOutputPipeCloseFailed:
+        actions = tuple(
+            CleanupAction(
+                f"captured-command-fd-{descriptor}-close",
+                lambda fd=descriptor: os.close(fd),
+            )
+            for descriptor in (self._read_descriptor, self._write_descriptor)
+            if descriptor >= 0
+        )
+        self._read_descriptor = -1
+        self._write_descriptor = -1
+        outcome = IndependentCleanupPlan(actions).run()
+        if type(outcome) is CleanupSucceeded:
+            return ContainedCommandOutputPipeClosed()
+        if type(outcome) is not CleanupFailed:
+            raise AssertionError("cleanup outcome is a closed union")
+        errors = tuple(failure.error for failure in outcome.failures)
+        if len(errors) == 1:
+            return ContainedCommandOutputPipeCloseFailed(errors[0])
+        return ContainedCommandOutputPipeCloseFailed(
+            BaseExceptionGroup("captured command pipe cleanup failed", errors)
+        )
+
+
+class OsContainedCommandOutputPipeFactory:
+    """Acquire the production kernel pipe behind its typed port."""
+
+    def create(self) -> ContainedCommandOutputPipe:
+        return OsContainedCommandOutputPipe()
+
+
+def _pipe_close_error(pipe: ContainedCommandOutputPipe) -> BaseException | None:
+    try:
+        outcome = pipe.close()
+    except BaseException as error:
+        return error
+    if type(outcome) is ContainedCommandOutputPipeClosed:
+        return None
+    if type(outcome) is not ContainedCommandOutputPipeCloseFailed:
+        raise AssertionError("output pipe close result is a closed union")
+    return outcome.error
+
+
+def _restore_signal_mask(
+    previous_mask: set[int | signal.Signals],
+) -> BaseException | None:
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    except BaseException as error:
+        return error
+    return None
+
+
+def _close_reader(reader: ContainedCommandOutputReader | None) -> BaseException | None:
+    if reader is None:
+        return None
+    try:
+        reader.close()
+    except BaseException as error:
+        return error
+    return None
+
+
+def _combine_many_errors(
+    message: str,
+    first: BaseException,
+    *others: BaseException | None,
+) -> BaseException:
+    errors = (first, *(error for error in others if error is not None))
+    if len(errors) == 1:
+        return first
+    return BaseExceptionGroup(message, errors)
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedCommandActivated:
+    process: PosixProcessHandle
+    stdout: ContainedCommandOutputReader
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.process, PosixProcessHandle):
+            raise ValueError("captured command process must implement its port")
+        if not hasattr(self.stdout, "fileno"):
+            raise ValueError("captured command stdout must expose fileno")
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedCommandActivationClosed:
+    result: ContainedCommandResult
+
+
+_CapturedCommandActivation = (
+    _CapturedCommandActivated | _CapturedCommandActivationClosed
+)
+
+
 @dataclass(frozen=True, slots=True)
 class _OutputPumpFinalized:
     """The pump stopped and its stdout stream closed."""
@@ -64,7 +242,7 @@ class _OutputPumpFinalized:
 
 @dataclass(frozen=True, slots=True)
 class _OutputPumpFinalizationFailed:
-    """Pump shutdown failed after the command group was already contained."""
+    """Pump stopped, but finalization or owned-resource closure failed."""
 
     failure: ContainedCommandFailure
 
@@ -79,226 +257,197 @@ class _OutputPumpFinalizationFailed:
 _OutputPumpFinalization = _OutputPumpFinalized | _OutputPumpFinalizationFailed
 
 
-@dataclass(frozen=True, slots=True)
-class _OutputPumpDetached:
-    """The pump can no longer call either caller-owned output sink."""
+class _CapturedOutputJournal:
+    """Own output between synchronous collection and caller publication."""
 
+    def __init__(self) -> None:
+        self._stream = cast(
+            TextIO,
+            tempfile.SpooledTemporaryFile(
+                max_size=1_048_576,
+                mode="w+t",
+                encoding="utf-8",
+                newline="",
+            ),
+        )
+        self._closed = False
 
-@dataclass(frozen=True, slots=True)
-class _OutputPumpDetachmentFailed:
-    """The pump could not be detached from caller-owned sinks."""
+    def append(self, line: str) -> None:
+        if self._closed:
+            raise RuntimeError("captured output journal is closed")
+        self._stream.write(line)
 
-    failure: ContainedCommandFailure
+    def publish_and_close(
+        self,
+        output: ContainedCommandOutput,
+        line_observer: ContainedCommandLineObserver,
+    ) -> ContainedCommandFailure | None:
+        """Invoke caller code synchronously, then close this owned journal."""
+        failure: ContainedCommandFailure | None = None
+        try:
+            self._stream.seek(0)
+            for line in self._stream:
+                output.write_line(line)
+                line_observer.observe_line(line)
+        except BaseException as error:
+            failure = ContainedCommandFailure(error)
+        close_failure = self.close()
+        if close_failure is None:
+            return failure
+        if failure is None:
+            return close_failure
+        return _combine_failures(
+            failure,
+            close_failure,
+            "output publication and journal close both failed",
+        )
 
-    def __post_init__(self) -> None:
-        if type(self.failure) is not ContainedCommandFailure:
-            raise ValueError(
-                "_OutputPumpDetachmentFailed.failure must be a ContainedCommandFailure"
-            )
-
-
-_OutputPumpDetachment = _OutputPumpDetached | _OutputPumpDetachmentFailed
-
-
-@dataclass(frozen=True, slots=True)
-class _OutputReadPending:
-    """No bytes were ready; the pump should continue polling."""
-
-
-@dataclass(frozen=True, slots=True)
-class _OutputReadFinished:
-    """EOF or the bounded final drain ended output consumption."""
-
-
-@dataclass(frozen=True, slots=True)
-class _OutputReadChunk:
-    """One byte chunk plus the remaining post-containment drain budget."""
-
-    data: bytes
-    remaining_final_bytes: int
-
-    def __post_init__(self) -> None:
-        if type(self.data) is not bytes or not self.data:
-            raise ValueError("_OutputReadChunk.data must not be empty")
-        if (
-            type(self.remaining_final_bytes) is not int
-            or self.remaining_final_bytes < 0
-        ):
-            raise ValueError(
-                "_OutputReadChunk.remaining_final_bytes must be non-negative"
-            )
-
-
-_OutputRead = _OutputReadPending | _OutputReadFinished | _OutputReadChunk
+    def close(self) -> ContainedCommandFailure | None:
+        if self._closed:
+            return None
+        self._closed = True
+        try:
+            self._stream.close()
+        except BaseException as error:
+            return ContainedCommandFailure(error)
+        return None
 
 
 @dataclass(slots=True)
 class _CapturedOutputPump(ProcessGroupInterruption):
-    """Drain output while exposing the first observer failure as interruption."""
+    """Synchronously drain output from the supervisor's polling loop."""
 
-    stdout: BinaryIO
-    output: ContainedCommandOutput
-    line_observer: ContainedCommandLineObserver
+    stdout: ContainedCommandOutputReader
     policy: ContainedCommandOutputPolicy
-    _interruption: threading.Event = field(default_factory=threading.Event, init=False)
-    _stop_requested: threading.Event = field(
-        default_factory=threading.Event,
-        init=False,
-    )
-    _sink_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
-    _thread: threading.Thread = field(init=False)
+    _journal: _CapturedOutputJournal = field(init=False)
+    _selector: selectors.BaseSelector = field(init=False)
+    _decoder: codecs.IncrementalDecoder = field(init=False)
     _failure: ContainedCommandFailure | None = field(default=None, init=False)
-    _accepting_output: bool = field(default=True, init=False)
+    _pending_text: str = field(default="", init=False)
+    _finished: bool = field(default=False, init=False)
     _line_count: int = field(default=0, init=False)
     _byte_count: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.output, ContainedCommandOutput):
-            raise ValueError(
-                "_CapturedOutputPump.output must implement ContainedCommandOutput"
-            )
-        if not isinstance(self.line_observer, ContainedCommandLineObserver):
-            raise ValueError(
-                "_CapturedOutputPump.line_observer must implement "
-                "ContainedCommandLineObserver"
-            )
         if type(self.policy) is not ContainedCommandOutputPolicy:
             raise ValueError(
                 "_CapturedOutputPump.policy must be ContainedCommandOutputPolicy"
             )
-        self._thread = threading.Thread(
-            target=self._drain,
-            name="contained-command-output",
-            daemon=True,
-        )
-
-    def start(self) -> None:
-        self._thread.start()
+        self._journal = _CapturedOutputJournal()
+        self._selector = selectors.DefaultSelector()
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            self._selector.register(self.stdout.fileno(), selectors.EVENT_READ)
+        except BaseException as setup_error:
+            failures: list[BaseException] = [setup_error]
+            for close in (self._selector.close, self.stdout.close):
+                try:
+                    close()
+                except BaseException as cleanup_error:
+                    failures.append(cleanup_error)
+            journal_failure = self._journal.close()
+            if journal_failure is not None:
+                failures.append(journal_failure.error)
+            if len(failures) == 1:
+                raise setup_error
+            raise BaseExceptionGroup(
+                "output collector setup and cleanup both failed",
+                failures,
+            )
 
     def wait_for_request(self, timeout_seconds: float) -> bool:
         if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
             raise ValueError("output interruption wait must be a positive float")
-        return self._interruption.wait(timeout_seconds)
+        if self._failure is not None:
+            return True
+        try:
+            self._consume_one_read(timeout_seconds, 65_536)
+        except BaseException as error:
+            self._record_failure(error)
+        return self._failure is not None
 
     def finalize_after_containment(self) -> _OutputPumpFinalization:
-        failure: ContainedCommandFailure | None = None
-        self._stop_requested.set()
+        finalization_failure: ContainedCommandFailure | None = None
+        remaining_bytes = self.policy.final_drain_byte_limit
         try:
-            self._thread.join(timeout=self.policy.shutdown_timeout_seconds)
-            if self._thread.is_alive():
-                raise TimeoutError(
-                    "contained command output pump did not stop after group "
-                    f"containment within {self.policy.shutdown_timeout_seconds}s"
+            while not self._finished and remaining_bytes > 0:
+                consumed = self._consume_one_read(0.0, remaining_bytes)
+                if consumed == 0:
+                    break
+                remaining_bytes -= consumed
+            if not self._finished and remaining_bytes == 0:
+                finalization_failure = ContainedCommandFailure(
+                    RuntimeError(
+                        "contained command final output drain exceeded "
+                        f"{self.policy.final_drain_byte_limit} bytes"
+                    )
                 )
         except BaseException as error:
-            failure = ContainedCommandFailure(error)
-            detachment = self.detach_after_cleanup_failure()
-            if type(detachment) is _OutputPumpDetachmentFailed:
-                failure = _combine_failures(
-                    failure,
-                    detachment.failure,
-                    "output pump join and sink detach both failed",
-                )
-        try:
-            self.stdout.close()
-        except BaseException as close_error:
-            close_failure = ContainedCommandFailure(close_error)
-            failure = (
-                close_failure
-                if failure is None
-                else _combine_failures(
-                    failure,
-                    close_failure,
-                    "output pump finalization failed more than once",
-                )
-            )
-        if failure is None:
+            finalization_failure = ContainedCommandFailure(error)
+        close_failure = self._close_capture_resources()
+        if finalization_failure is None and close_failure is None:
             return _OutputPumpFinalized()
+        failure = finalization_failure
+        if failure is None:
+            if close_failure is None:
+                raise AssertionError("output finalization failure must exist")
+            failure = close_failure
+        else:
+            failure = _combine_failures(
+                failure,
+                close_failure,
+                "output drain and resource close both failed",
+            )
         return _OutputPumpFinalizationFailed(failure)
 
-    def detach_after_cleanup_failure(self) -> _OutputPumpDetachment:
-        """Prevent a still-blocked daemon pump from touching caller-owned sinks."""
-        try:
-            with self._sink_lock:
-                self._accepting_output = False
-        except BaseException as error:
-            return _OutputPumpDetachmentFailed(ContainedCommandFailure(error))
-        return _OutputPumpDetached()
+    def stop_without_waiting(self) -> None:
+        """Close every collector resource when group containment itself failed."""
+        close_failure = self._close_capture_resources()
+        if close_failure is not None:
+            self._record_failure(close_failure.error)
+        journal_failure = self._journal.close()
+        if journal_failure is not None:
+            self._record_failure(journal_failure.error)
+
+    def publish_after_finalization(
+        self,
+        output: ContainedCommandOutput,
+        line_observer: ContainedCommandLineObserver,
+    ) -> ContainedCommandFailure | None:
+        """Publish only after synchronous collection has reached containment."""
+        return self._journal.publish_and_close(output, line_observer)
 
     @property
     def failure(self) -> ContainedCommandFailure | None:
-        with self._sink_lock:
-            return self._failure
+        return self._failure
 
     @property
     def metrics(self) -> ContainedCommandMetrics:
-        with self._sink_lock:
-            return ContainedCommandMetrics(
-                line_count=self._line_count,
-                byte_count=self._byte_count,
-            )
-
-    def _drain(self) -> None:
-        selector = selectors.DefaultSelector()
-        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        try:
-            selector.register(self.stdout.fileno(), selectors.EVENT_READ)
-            pending_text = self._drain_chunks(selector, decoder)
-            pending_text += decoder.decode(b"", final=True)
-            if pending_text:
-                self._emit_line(pending_text)
-        except BaseException as error:
-            self._record_failure(error)
-        finally:
-            selector.close()
-
-    def _drain_chunks(
-        self,
-        selector: selectors.BaseSelector,
-        decoder: codecs.IncrementalDecoder,
-    ) -> str:
-        pending_text = ""
-        remaining_final_bytes = self.policy.final_drain_byte_limit
-        while True:
-            output_read = self._read_next_chunk(selector, remaining_final_bytes)
-            if type(output_read) is _OutputReadPending:
-                continue
-            if type(output_read) is _OutputReadFinished:
-                return pending_text
-            if type(output_read) is not _OutputReadChunk:
-                raise AssertionError("output read is a closed union")
-            self._record_byte_count(len(output_read.data))
-            pending_text = self._consume_decoded_text(
-                pending_text + decoder.decode(output_read.data)
-            )
-            remaining_final_bytes = output_read.remaining_final_bytes
-
-    def _read_next_chunk(
-        self,
-        selector: selectors.BaseSelector,
-        remaining_final_bytes: int,
-    ) -> _OutputRead:
-        stopping = self._stop_requested.is_set()
-        if stopping and remaining_final_bytes == 0:
-            return _OutputReadFinished()
-        selected = selector.select(
-            timeout=0.0 if stopping else self.policy.poll_interval_seconds
+        return ContainedCommandMetrics(
+            line_count=self._line_count,
+            byte_count=self._byte_count,
         )
+
+    def _consume_one_read(self, timeout_seconds: float, byte_limit: int) -> int:
+        if self._finished:
+            return 0
+        selected = self._selector.select(timeout_seconds)
         if not selected:
-            return _OutputReadFinished() if stopping else _OutputReadPending()
-        read_size = min(65_536, remaining_final_bytes) if stopping else 65_536
+            return 0
+        read_size = min(65_536, byte_limit)
         chunk = os.read(self.stdout.fileno(), read_size)
         if not chunk:
-            return _OutputReadFinished()
-        return _OutputReadChunk(
-            chunk,
-            remaining_final_bytes - len(chunk) if stopping else remaining_final_bytes,
+            self._finished = True
+            self._pending_text += self._decoder.decode(b"", final=True)
+            if self._pending_text:
+                self._emit_line(self._pending_text)
+                self._pending_text = ""
+            return 0
+        self._byte_count += len(chunk)
+        self._pending_text = self._consume_decoded_text(
+            self._pending_text + self._decoder.decode(chunk)
         )
-
-    def _record_byte_count(self, byte_count: int) -> None:
-        with self._sink_lock:
-            if self._accepting_output:
-                self._byte_count += byte_count
+        return len(chunk)
 
     def _consume_decoded_text(self, text: str) -> str:
         while True:
@@ -309,34 +458,33 @@ class _CapturedOutputPump(ProcessGroupInterruption):
             text = text[newline + 1 :]
 
     def _emit_line(self, line: str) -> None:
-        self._consume_line(line)
-
-    def _consume_line(self, line: str) -> None:
-        # Never hold the detachment lock across arbitrary caller code.  A sink
-        # may block forever; containment still has to return at its declared
-        # shutdown bound and atomically prevent any later callback from
-        # starting.
-        with self._sink_lock:
-            if not self._accepting_output:
-                return
-            output = self.output
-            line_observer = self.line_observer
-            self._line_count += 1
+        if self._failure is not None:
+            return
         try:
-            output.write_line(line)
-            with self._sink_lock:
-                if not self._accepting_output or self._failure is not None:
-                    return
-            line_observer.observe_line(line)
+            self._journal.append(line)
         except BaseException as error:
             self._record_failure(error)
+            return
+        self._line_count += 1
 
     def _record_failure(self, error: BaseException) -> None:
-        with self._sink_lock:
-            if not self._accepting_output or self._failure is not None:
-                return
+        if self._failure is None:
             self._failure = ContainedCommandFailure(error)
-        self._interruption.set()
+
+    def _close_capture_resources(self) -> ContainedCommandFailure | None:
+        failures: list[BaseException] = []
+        for close in (self._selector.close, self.stdout.close):
+            try:
+                close()
+            except BaseException as error:
+                failures.append(error)
+        if not failures:
+            return None
+        if len(failures) == 1:
+            return ContainedCommandFailure(failures[0])
+        return ContainedCommandFailure(
+            BaseExceptionGroup("output collector resource close failed", failures)
+        )
 
 
 class PosixContainedCommandCapture:
@@ -344,9 +492,17 @@ class PosixContainedCommandCapture:
 
     def __init__(
         self,
+        process_launcher: PosixProcessLauncher,
         process_group_supervisor: ProcessGroupSupervisor,
         output_policy: ContainedCommandOutputPolicy,
+        output_pipe_factory: ContainedCommandOutputPipeFactory,
     ) -> None:
+        if not isinstance(process_launcher, PosixProcessLauncher):
+            raise ValueError(
+                "PosixContainedCommandCapture.process_launcher must implement "
+                "PosixProcessLauncher"
+            )
+        self._process_launcher = process_launcher
         if not isinstance(process_group_supervisor, ProcessGroupSupervisor):
             raise ValueError(
                 "PosixContainedCommandCapture.process_group_supervisor must "
@@ -359,6 +515,12 @@ class PosixContainedCommandCapture:
                 "ContainedCommandOutputPolicy"
             )
         self._output_policy = output_policy
+        if not isinstance(output_pipe_factory, ContainedCommandOutputPipeFactory):
+            raise ValueError(
+                "PosixContainedCommandCapture.output_pipe_factory must implement "
+                "ContainedCommandOutputPipeFactory"
+            )
+        self._output_pipe_factory = output_pipe_factory
 
     def capture(
         self,
@@ -369,10 +531,14 @@ class PosixContainedCommandCapture:
         """Return a closed typed result without leaking operational exceptions."""
         self._require_capture_request(command, output, line_observer)
         try:
-            process = self._spawn(command)
+            activation = self._activate(command)
         except BaseException as error:
             return self._not_started(error)
-        return self._capture_started_process(process, output, line_observer)
+        if type(activation) is _CapturedCommandActivationClosed:
+            return activation.result
+        if type(activation) is not _CapturedCommandActivated:
+            raise AssertionError("captured command activation is a closed union")
+        return self._capture_started_process(activation, output, line_observer)
 
     @staticmethod
     def _require_capture_request(
@@ -394,17 +560,135 @@ class PosixContainedCommandCapture:
                 "ContainedCommandLineObserver"
             )
 
-    @staticmethod
-    def _spawn(command: ContainedShellCommand) -> subprocess.Popen[bytes]:
-        return subprocess.Popen(
-            command.command,
-            shell=True,
-            cwd=command.working_directory,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=False,
-            bufsize=0,
-            start_new_session=True,
+    def _activate(self, command: ContainedShellCommand) -> _CapturedCommandActivation:
+        pipes = self._output_pipe_factory.create()
+        try:
+            launch = self._process_launcher.launch(
+                PosixProcessLaunchSpec(
+                    program=PosixProcessProgram(("/bin/sh", "-c", command.command)),
+                    working_directory=command.working_directory,
+                    environment=PosixProcessEnvironment.from_mapping(os.environ),
+                    group_mode=PosixProcessGroupMode.NEW_SESSION,
+                    descriptor_mappings=pipes.descriptor_mappings,
+                    terminal=PosixProcessWithoutTerminal(),
+                )
+            )
+        except BaseException as activation_error:
+            return _CapturedCommandActivationClosed(
+                self._not_started(
+                    _combine_base_errors(
+                        "captured command pre-launch setup and pipe cleanup failed",
+                        activation_error,
+                        _pipe_close_error(pipes),
+                    )
+                )
+            )
+        if type(launch) is PosixProcessLaunchRejected:
+            cleanup_error = _pipe_close_error(pipes)
+            return _CapturedCommandActivationClosed(
+                self._not_started(
+                    _combine_base_errors(
+                        "captured command activation and pipe cleanup both failed",
+                        launch.error,
+                        cleanup_error,
+                    )
+                )
+            )
+        if type(launch) is PosixProcessLaunchRecovered:
+            cleanup_error = _pipe_close_error(pipes)
+            return _CapturedCommandActivationClosed(
+                ContainedCommandCaptureFailed(
+                    child=ContainedCommandExited(
+                        launch.process_id,
+                        launch.exit_code,
+                    ),
+                    cleanup=ContainedCommandCaptureAborted(),
+                    failure=ContainedCommandFailure(
+                        _combine_base_errors(
+                            "captured command activation and pipe cleanup both failed",
+                            launch.activation_error,
+                            cleanup_error,
+                        )
+                    ),
+                    metrics=ContainedCommandMetrics(line_count=0, byte_count=0),
+                )
+            )
+        if type(launch) is PosixProcessLaunchRecoveryFailed:
+            cleanup_error = _pipe_close_error(pipes)
+            return _CapturedCommandActivationClosed(
+                ContainedCommandCleanupFailed(
+                    child=ContainedCommandExitUnknown(launch.process_id),
+                    capture=ContainedCommandCaptureInterrupted(
+                        ContainedCommandFailure(launch.activation_error)
+                    ),
+                    cleanup_failure=ContainedCommandFailure(
+                        _combine_base_errors(
+                            "captured command recovery and pipe cleanup both failed",
+                            launch.recovery_error,
+                            cleanup_error,
+                        )
+                    ),
+                    metrics=ContainedCommandMetrics(line_count=0, byte_count=0),
+                )
+            )
+        if type(launch) is not PosixProcessLaunchStarted:
+            raise AssertionError("POSIX process launch is a closed union")
+        return self._finish_activation(
+            launch.process,
+            pipes,
+        )
+
+    def _finish_activation(
+        self,
+        process: PosixProcessHandle,
+        pipes: ContainedCommandOutputPipe,
+    ) -> _CapturedCommandActivation:
+        try:
+            stdout = pipes.open_reader_after_launch()
+        except BaseException as setup_error:
+            return _CapturedCommandActivationClosed(
+                self._abort_after_activation_setup_failure(
+                    process,
+                    pipes,
+                    setup_error,
+                )
+            )
+        return _CapturedCommandActivated(process, stdout)
+
+    def _abort_after_activation_setup_failure(
+        self,
+        process: PosixProcessHandle,
+        pipes: ContainedCommandOutputPipe,
+        setup_error: BaseException,
+    ) -> ContainedCommandResult:
+        descriptor_error = _pipe_close_error(pipes)
+        capture_error = _combine_base_errors(
+            "captured command setup and descriptor cleanup both failed",
+            setup_error,
+            descriptor_error,
+        )
+        try:
+            termination = self._process_group_supervisor.abort(
+                OwnedProcessGroupLeader(process.process_id)
+            )
+        except BaseException as recovery_error:
+            return ContainedCommandCleanupFailed(
+                child=ContainedCommandExitUnknown(process.process_id),
+                capture=ContainedCommandCaptureInterrupted(
+                    ContainedCommandFailure(capture_error)
+                ),
+                cleanup_failure=ContainedCommandFailure(recovery_error),
+                metrics=ContainedCommandMetrics(line_count=0, byte_count=0),
+            )
+        process.record_external_reap(termination.leader_exit_code)
+        return ContainedCommandCaptureFailed(
+            child=ContainedCommandExited(
+                process.process_id,
+                termination.leader_exit_code,
+            ),
+            cleanup=ContainedCommandCaptureAborted(),
+            failure=ContainedCommandFailure(capture_error),
+            metrics=ContainedCommandMetrics(line_count=0, byte_count=0),
         )
 
     @staticmethod
@@ -418,40 +702,31 @@ class PosixContainedCommandCapture:
 
     def _capture_started_process(
         self,
-        process: subprocess.Popen[bytes],
+        started: _CapturedCommandActivated,
         output: ContainedCommandOutput,
         line_observer: ContainedCommandLineObserver,
     ) -> ContainedCommandResult:
-        leader = OwnedProcessGroupLeader(process.pid)
+        process = started.process
+        leader = OwnedProcessGroupLeader(process.process_id)
         try:
-            output.child_started(ContainedCommandStarted(process.pid))
+            output.child_started(ContainedCommandStarted(process.process_id))
         except BaseException as error:
             return self._abort_without_pump(
                 process,
+                started.stdout,
                 leader,
                 ContainedCommandFailure(error),
             )
 
-        if process.stdout is None:
-            return self._abort_without_pump(
-                process,
-                leader,
-                ContainedCommandFailure(
-                    RuntimeError("contained command did not expose stdout")
-                ),
-            )
-
         try:
             pump = _CapturedOutputPump(
-                cast(BinaryIO, process.stdout),
-                output,
-                line_observer,
+                started.stdout,
                 self._output_policy,
             )
-            pump.start()
         except BaseException as error:
             return self._abort_without_pump(
                 process,
+                started.stdout,
                 leader,
                 ContainedCommandFailure(error),
             )
@@ -466,17 +741,24 @@ class PosixContainedCommandCapture:
                 process,
                 leader,
                 pump,
+                output,
+                line_observer,
                 ContainedCommandFailure(supervision_error),
             )
 
-        process.returncode = supervision.termination.leader_exit_code
+        process.record_external_reap(supervision.termination.leader_exit_code)
         finalization = pump.finalize_after_containment()
-        child = ContainedCommandExited(process.pid, process.returncode)
+        publication_failure = pump.publish_after_finalization(output, line_observer)
+        child = ContainedCommandExited(
+            process.process_id,
+            supervision.termination.leader_exit_code,
+        )
         return self._closed_result_after_supervision(
             supervision,
             child,
             pump,
             finalization,
+            publication_failure,
         )
 
     @staticmethod
@@ -485,6 +767,7 @@ class PosixContainedCommandCapture:
         child: ContainedCommandExited,
         pump: _CapturedOutputPump,
         finalization: _OutputPumpFinalization,
+        publication_failure: ContainedCommandFailure | None,
     ) -> ContainedCommandResult:
         """Interpret terminal supervision and pump evidence after containment."""
         if type(supervision) is ProcessGroupInterrupted:
@@ -499,6 +782,11 @@ class PosixContainedCommandCapture:
                     finalization.failure,
                     "output capture and pump finalization both failed",
                 )
+            failure = _combine_failures(
+                failure,
+                publication_failure,
+                "output capture and synchronous publication both failed",
+            )
             return ContainedCommandCaptureFailed(
                 child=child,
                 cleanup=ContainedCommandCaptureAborted(),
@@ -518,6 +806,16 @@ class PosixContainedCommandCapture:
                     "output capture and pump finalization both failed",
                 )
             )
+        if publication_failure is not None:
+            failure = (
+                publication_failure
+                if failure is None
+                else _combine_failures(
+                    failure,
+                    publication_failure,
+                    "output capture and synchronous publication both failed",
+                )
+            )
         if failure is not None:
             return ContainedCommandCaptureFailed(
                 child=child,
@@ -529,16 +827,17 @@ class PosixContainedCommandCapture:
 
     def _abort_without_pump(
         self,
-        process: subprocess.Popen[bytes],
+        process: PosixProcessHandle,
+        stdout: ContainedCommandOutputReader,
         leader: OwnedProcessGroupLeader,
         capture_failure: ContainedCommandFailure,
     ) -> ContainedCommandResult:
         try:
             termination = self._process_group_supervisor.abort(leader)
         except BaseException as cleanup_error:
-            stdout_close_failure = self._close_unpumped_stdout(process)
+            stdout_close_failure = self._close_unpumped_stdout(stdout)
             return ContainedCommandCleanupFailed(
-                child=ContainedCommandExitUnknown(process.pid),
+                child=ContainedCommandExitUnknown(process.process_id),
                 capture=ContainedCommandCaptureInterrupted(capture_failure),
                 cleanup_failure=_combine_failures(
                     ContainedCommandFailure(cleanup_error),
@@ -547,10 +846,13 @@ class PosixContainedCommandCapture:
                 ),
                 metrics=ContainedCommandMetrics(line_count=0, byte_count=0),
             )
-        process.returncode = termination.leader_exit_code
-        stdout_close_failure = self._close_unpumped_stdout(process)
+        process.record_external_reap(termination.leader_exit_code)
+        stdout_close_failure = self._close_unpumped_stdout(stdout)
         return ContainedCommandCaptureFailed(
-            child=ContainedCommandExited(process.pid, process.returncode),
+            child=ContainedCommandExited(
+                process.process_id,
+                termination.leader_exit_code,
+            ),
             cleanup=ContainedCommandCaptureAborted(),
             failure=_combine_failures(
                 capture_failure,
@@ -562,11 +864,8 @@ class PosixContainedCommandCapture:
 
     @staticmethod
     def _close_unpumped_stdout(
-        process: subprocess.Popen[bytes],
+        stdout: ContainedCommandOutputReader,
     ) -> ContainedCommandFailure | None:
-        stdout = process.stdout
-        if stdout is None:
-            return None
         try:
             stdout.close()
         except BaseException as error:
@@ -575,37 +874,33 @@ class PosixContainedCommandCapture:
 
     def _recover_after_supervision_failure(
         self,
-        process: subprocess.Popen[bytes],
+        process: PosixProcessHandle,
         leader: OwnedProcessGroupLeader,
         pump: _CapturedOutputPump,
+        output: ContainedCommandOutput,
+        line_observer: ContainedCommandLineObserver,
         supervision_failure: ContainedCommandFailure,
     ) -> ContainedCommandResult:
-        if pump.failure is None:
+        initial_pump_failure = pump.failure
+        if initial_pump_failure is None:
             failure = supervision_failure
         else:
             failure = _combine_failures(
-                pump.failure,
+                initial_pump_failure,
                 supervision_failure,
                 "output capture and command supervision both failed",
             )
         try:
             termination = self._process_group_supervisor.abort(leader)
         except BaseException as cleanup_error:
-            cleanup_failure = ContainedCommandFailure(cleanup_error)
-            detachment = pump.detach_after_cleanup_failure()
-            if type(detachment) is _OutputPumpDetachmentFailed:
-                cleanup_failure = _combine_failures(
-                    cleanup_failure,
-                    detachment.failure,
-                    "command group abort and output sink detach both failed",
-                )
+            pump.stop_without_waiting()
             return ContainedCommandCleanupFailed(
-                child=ContainedCommandExitUnknown(process.pid),
+                child=ContainedCommandExitUnknown(process.process_id),
                 capture=ContainedCommandCaptureInterrupted(failure),
-                cleanup_failure=cleanup_failure,
+                cleanup_failure=ContainedCommandFailure(cleanup_error),
                 metrics=pump.metrics,
             )
-        process.returncode = termination.leader_exit_code
+        process.record_external_reap(termination.leader_exit_code)
         finalization = pump.finalize_after_containment()
         if type(finalization) is _OutputPumpFinalizationFailed:
             failure = _combine_failures(
@@ -613,8 +908,27 @@ class PosixContainedCommandCapture:
                 finalization.failure,
                 "command supervision and pump finalization both failed",
             )
+        elif type(finalization) is _OutputPumpFinalized:
+            final_pump_failure = pump.failure
+            if (
+                final_pump_failure is not None
+                and final_pump_failure is not initial_pump_failure
+            ):
+                failure = _combine_failures(
+                    failure,
+                    final_pump_failure,
+                    "command supervision and output pumping both failed",
+                )
+        failure = _combine_failures(
+            failure,
+            pump.publish_after_finalization(output, line_observer),
+            "command supervision and synchronous publication both failed",
+        )
         return ContainedCommandCaptureFailed(
-            child=ContainedCommandExited(process.pid, process.returncode),
+            child=ContainedCommandExited(
+                process.process_id,
+                termination.leader_exit_code,
+            ),
             cleanup=ContainedCommandCaptureAborted(),
             failure=failure,
             metrics=pump.metrics,

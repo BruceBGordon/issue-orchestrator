@@ -7,6 +7,32 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
+class ValidationResourceSamplerStarted:
+    """The sampler target acknowledged activation."""
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationResourceSamplerStartRejected:
+    """No sampler target can execute after startup rejection."""
+
+    error: BaseException
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationResourceSamplerStartIndeterminate:
+    """A retained sampler target may still acknowledge activation."""
+
+    error: BaseException
+
+
+ValidationResourceSamplerStart = (
+    ValidationResourceSamplerStarted
+    | ValidationResourceSamplerStartRejected
+    | ValidationResourceSamplerStartIndeterminate
+)
+
+
+@dataclass(frozen=True, slots=True)
 class ValidationResourceSamplingPolicy:
     """Bounds every host probe and the sampler's complete shutdown."""
 

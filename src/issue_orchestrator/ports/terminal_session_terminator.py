@@ -6,9 +6,11 @@ from typing import Protocol, runtime_checkable
 
 from ..domain.process_group import ProcessIdentityObservation
 from ..domain.terminal_session_termination import (
+    TerminalSessionContainmentReport,
     TerminalSessionProcess,
     TerminalSessionStatus,
     TerminalSessionTerminationOutcome,
+    UnregisteredTerminalSessionOwnership,
 )
 
 
@@ -29,4 +31,11 @@ class TerminalSessionTerminator(Protocol):
         process: TerminalSessionProcess,
     ) -> TerminalSessionTerminationOutcome:
         """Return only after the complete terminal session is contained."""
+        ...
+
+    def recover_unregistered(
+        self,
+        ownership: UnregisteredTerminalSessionOwnership,
+    ) -> TerminalSessionContainmentReport:
+        """Contain work whose launch intent committed before its PID row."""
         ...

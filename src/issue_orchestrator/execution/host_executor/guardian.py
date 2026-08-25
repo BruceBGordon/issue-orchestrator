@@ -1,5 +1,5 @@
 # pyright: strict
-"""Child-side lease guardian for one opaque executor command group."""
+"""Child-side command worker protected by an independent group sentinel."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import os
 import signal
 import subprocess
+import time
 from dataclasses import dataclass, field
 from types import FrameType
 
@@ -24,34 +25,31 @@ from ...domain.executor_guardian import (
     ExecutorGuardianTerminationPolicy,
     ExecutorGuardianUnboundedBudget,
 )
+from ..process_cancellation_endpoint import ProcessCancellationOwnerControls
+from ..process_group_sentinel import (
+    ProcessGroupSentinelController,
+    ProcessGroupSentinelWithoutCancellation,
+)
 from ._guardian_contracts import (
     GUARDIAN_START_SIGNAL,
+    GuardianDetachedCancellationControlRecord,
+    GuardianInteractiveCancellationControlRecord,
     GuardianInvocationRecord,
     guardian_terminal_record,
 )
 
 
 _MAX_TERMINAL_RECORD_BYTES = 4096
+_COMMAND_POLL_SECONDS = 0.05
+_OWNER_READY_SIGNAL = b"R"
 
 
 def _retain_lease_until_contained(
     signal_number: int,
     frame: FrameType | None,
 ) -> None:
-    """Keep TERM from destroying the sole lease owner before containment."""
+    """Keep TERM from destroying the worker before its sentinel contains all."""
     del signal_number, frame
-
-
-def _await_start(start_file_descriptor: int) -> None:
-    """Do not spawn opaque work before the launcher establishes ownership."""
-    if type(start_file_descriptor) is not int or start_file_descriptor < 0:
-        raise ValueError("guardian start descriptor must be non-negative")
-    try:
-        signal_byte = os.read(start_file_descriptor, 1)
-    finally:
-        os.close(start_file_descriptor)
-    if signal_byte != GUARDIAN_START_SIGNAL:
-        raise RuntimeError("executor guardian start gate closed without a grant")
 
 
 @dataclass(slots=True)
@@ -81,8 +79,86 @@ class _GuardianResultWriter:
             self._closed = True
 
 
+@dataclass(frozen=True, slots=True)
+class _GuardianCommandTerminal:
+    terminal: ExecutorGuardianTerminal
+
+    def __post_init__(self) -> None:
+        if type(self.terminal) not in (
+            ExecutorGuardianCommandCompleted,
+            ExecutorGuardianCommandTimedOut,
+            ExecutorGuardianInternalFailed,
+        ):
+            raise ValueError("_GuardianCommandTerminal requires a terminal fact")
+
+
+@dataclass(slots=True)
+class _SentinelGuardianGroupOwner:
+    """Dual guardian/sentinel owner that survives either single failure."""
+
+    controller: ProcessGroupSentinelController
+
+    def retire_before_opaque_work(self) -> None:
+        self.controller.retire_without_group()
+
+    def require_sentinel_alive(self) -> None:
+        self.controller.require_alive()
+
+    def contain(
+        self,
+        process: subprocess.Popen[bytes],
+        terminal: ExecutorGuardianTerminal,
+        termination_policy: ExecutorGuardianTerminationPolicy,
+    ) -> None:
+        del process, terminal
+        try:
+            self.controller.request_containment()
+        except BaseException:
+            # The guardian deliberately retains the lease descriptors, so a
+            # dead sentinel cannot uncharge this work. The guardian becomes
+            # the containment owner for the same exact process group.
+            pass
+        self._contain_from_guardian(termination_policy)
+
+    @staticmethod
+    def _contain_from_guardian(
+        termination_policy: ExecutorGuardianTerminationPolicy,
+    ) -> None:
+        errors: list[BaseException] = []
+        try:
+            os.killpg(os.getpgrp(), signal.SIGTERM)
+        except BaseException as error:
+            errors.append(error)
+        deadline = (
+            time.monotonic()
+            + termination_policy.graceful_shutdown_seconds
+        )
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                time.sleep(remaining)
+            except InterruptedError:
+                continue
+            except BaseException as error:
+                errors.append(error)
+                break
+        try:
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+        except BaseException as force_error:
+            raise BaseExceptionGroup(
+                "guardian could not forcefully contain its process group",
+                (*errors, force_error),
+            )
+        raise AssertionError("guardian SIGKILL unexpectedly returned")
+
+
+_GuardianGroupOwner = _SentinelGuardianGroupOwner
+
+
 class PosixExecutorGuardianChild:
-    """Hold lease FDs while enforcing deadline and containing the opaque group."""
+    """Run one opaque command while a minimal sibling owns its group identity."""
 
     def __init__(
         self,
@@ -97,107 +173,199 @@ class PosixExecutorGuardianChild:
 
     def run(
         self,
-        arguments: tuple[str, ...],
-        budget: ExecutorGuardianBudget,
+        invocation: GuardianInvocationRecord,
         result_writer: _GuardianResultWriter,
-        lifecycle: ExecutorCommandLifecycle,
     ) -> int:
-        """Run the command; started-command paths end by killing this group."""
-        self._require_request(arguments, budget, result_writer, lifecycle)
-        # A caught disposition resets to default across exec, unlike SIG_IGN.
-        # The guardian therefore survives TERM while its opaque child retains
-        # the normal TERM behavior expected by command cleanup.
+        """Run the command; every started path ends in whole-group containment."""
+        if type(invocation) is not GuardianInvocationRecord:
+            raise ValueError("guardian requires its typed invocation")
+        if type(result_writer) is not _GuardianResultWriter:
+            raise ValueError("guardian requires its typed result writer")
         signal.signal(signal.SIGTERM, _retain_lease_until_contained)
-        if lifecycle is ExecutorCommandLifecycle.INTERACTIVE_SESSION:
-            # Exiting a PTY session leader sends SIGHUP to its foreground group.
-            # Interactive guardians and their opaque commands must outlive an
-            # accidental outer-wrapper crash; deliberate stop uses SIGTERM.
+        if invocation.lifecycle is ExecutorCommandLifecycle.INTERACTIVE_SESSION:
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
-        elif lifecycle is not ExecutorCommandLifecycle.DETACHED:
+        elif invocation.lifecycle is not ExecutorCommandLifecycle.DETACHED:
             raise AssertionError("ExecutorCommandLifecycle is a closed enum")
+
+        try:
+            group_owner = self._build_group_owner(invocation)
+        except BaseException as error:
+            try:
+                result_writer.write(
+                    ExecutorGuardianInternalFailed(type(error).__name__, repr(error))
+                )
+            finally:
+                os.close(invocation.owner_ready_file_descriptor)
+            return 1
+        self._publish_owner_ready(invocation.owner_ready_file_descriptor)
+        try:
+            self._await_start(invocation.start_file_descriptor)
+        except BaseException as error:
+            try:
+                result_writer.write(
+                    ExecutorGuardianInternalFailed(type(error).__name__, repr(error))
+                )
+            finally:
+                group_owner.retire_before_opaque_work()
+            return 1
+        return self._run_started_command(invocation, result_writer, group_owner)
+
+    @staticmethod
+    def _publish_owner_ready(file_descriptor: int) -> None:
+        try:
+            if os.write(file_descriptor, _OWNER_READY_SIGNAL) != len(
+                _OWNER_READY_SIGNAL
+            ):
+                raise RuntimeError(
+                    "guardian owner readiness channel performed a short write"
+                )
+        finally:
+            os.close(file_descriptor)
+
+    @staticmethod
+    def _build_group_owner(
+        invocation: GuardianInvocationRecord,
+    ) -> _GuardianGroupOwner:
+        cancellation = invocation.cancellation
+        if type(cancellation) is GuardianDetachedCancellationControlRecord:
+            sentinel_cancellation = ProcessGroupSentinelWithoutCancellation()
+            cancellation_descriptors: tuple[int, ...] = ()
+        elif type(cancellation) is GuardianInteractiveCancellationControlRecord:
+            controls = ProcessCancellationOwnerControls(
+                cancellation.listener_file_descriptor,
+                cancellation.owner_lock_file_descriptor,
+            )
+            sentinel_cancellation = controls
+            cancellation_descriptors = (
+                controls.listener_file_descriptor,
+                controls.owner_lock_file_descriptor,
+            )
+        else:
+            raise AssertionError("guardian cancellation is a closed union")
+        controller = ProcessGroupSentinelController.start(
+            invocation.process_group_sentinel_program(),
+            sentinel_cancellation,
+            invocation.process_group_sentinel_policy(),
+            invocation.lease_file_descriptors,
+        )
+        cleanup_errors: list[BaseException] = []
+        for descriptor in cancellation_descriptors:
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            try:
+                controller.abort_before_opaque_work()
+            except BaseException as error:
+                cleanup_errors.append(error)
+            raise BaseExceptionGroup(
+                "guardian could not transfer cancellation ownership to sentinel",
+                cleanup_errors,
+            )
+        return _SentinelGuardianGroupOwner(controller)
+
+    def _run_started_command(
+        self,
+        invocation: GuardianInvocationRecord,
+        result_writer: _GuardianResultWriter,
+        group_owner: _GuardianGroupOwner,
+    ) -> int:
+        arguments = invocation.arguments
+        self._require_arguments(arguments)
         try:
             process = subprocess.Popen(list(arguments), close_fds=True)
         except OSError as error:
-            result_writer.write(
-                ExecutorGuardianCommandStartFailed(
-                    type(error).__name__,
-                    f"{error!r}; executable={arguments[0]!r}",
+            try:
+                result_writer.write(
+                    ExecutorGuardianCommandStartFailed(
+                        type(error).__name__,
+                        f"{error!r}; executable={arguments[0]!r}",
+                    )
                 )
-            )
+            finally:
+                group_owner.retire_before_opaque_work()
             return 0
         except BaseException as error:
-            result_writer.write(
-                ExecutorGuardianInternalFailed(type(error).__name__, repr(error))
-            )
+            try:
+                result_writer.write(
+                    ExecutorGuardianInternalFailed(type(error).__name__, repr(error))
+                )
+            finally:
+                group_owner.retire_before_opaque_work()
             return 1
 
-        terminal = self._wait_for_terminal(process, budget)
+        outcome = self._wait_for_outcome(
+            process,
+            invocation.domain_budget(),
+            group_owner,
+        )
         try:
-            result_writer.write(terminal)
+            result_writer.write(outcome.terminal)
         finally:
-            self._contain_own_process_group(process, terminal)
-        raise AssertionError("SIGKILL unexpectedly returned to executor guardian")
+            group_owner.contain(
+                process,
+                outcome.terminal,
+                self._termination_policy,
+            )
+        raise AssertionError("group containment unexpectedly returned to guardian")
 
     @staticmethod
-    def _require_request(
-        arguments: tuple[str, ...],
-        budget: ExecutorGuardianBudget,
-        result_writer: _GuardianResultWriter,
-        lifecycle: ExecutorCommandLifecycle,
-    ) -> None:
+    def _require_arguments(arguments: tuple[str, ...]) -> None:
         if type(arguments) is not tuple or not arguments:
             raise ValueError("executor guardian arguments must be a non-empty tuple")
         if any(type(argument) is not str for argument in arguments):
             raise ValueError("executor guardian arguments must contain strings")
-        if type(budget) not in (
-            ExecutorGuardianUnboundedBudget,
-            ExecutorGuardianBoundedBudget,
-        ):
-            raise ValueError("executor guardian requires an explicit budget")
-        if type(result_writer) is not _GuardianResultWriter:
-            raise ValueError("executor guardian requires its typed result writer")
-        if type(lifecycle) is not ExecutorCommandLifecycle:
-            raise ValueError("executor guardian requires a typed command lifecycle")
 
     @staticmethod
-    def _wait_for_terminal(
+    def _await_start(start_file_descriptor: int) -> None:
+        if type(start_file_descriptor) is not int or start_file_descriptor < 0:
+            raise ValueError("guardian start descriptor must be non-negative")
+        try:
+            signal_byte = os.read(start_file_descriptor, 1)
+        finally:
+            os.close(start_file_descriptor)
+        if signal_byte != GUARDIAN_START_SIGNAL:
+            raise RuntimeError("executor guardian start gate closed without a grant")
+
+    @classmethod
+    def _wait_for_outcome(
+        cls,
         process: subprocess.Popen[bytes],
         budget: ExecutorGuardianBudget,
-    ) -> ExecutorGuardianTerminal:
-        try:
-            if type(budget) is ExecutorGuardianUnboundedBudget:
-                return ExecutorGuardianCommandCompleted(process.wait())
-            if type(budget) is ExecutorGuardianBoundedBudget:
-                try:
-                    return ExecutorGuardianCommandCompleted(
-                        process.wait(timeout=budget.timeout_seconds)
-                    )
-                except subprocess.TimeoutExpired:
-                    return ExecutorGuardianCommandTimedOut(budget.reason)
+        group_owner: _GuardianGroupOwner,
+    ) -> _GuardianCommandTerminal:
+        if type(budget) is ExecutorGuardianUnboundedBudget:
+            deadline: float | None = None
+        elif type(budget) is ExecutorGuardianBoundedBudget:
+            deadline = time.monotonic() + budget.timeout_seconds
+        else:
             raise AssertionError("guardian budget is a closed union")
-        except BaseException as error:
-            return ExecutorGuardianInternalFailed(type(error).__name__, repr(error))
-
-    def _contain_own_process_group(
-        self,
-        process: subprocess.Popen[bytes],
-        terminal: ExecutorGuardianTerminal,
-    ) -> None:
-        # The opaque child inherited the default TERM disposition. Install the
-        # guardian's immunity only after spawn, then retain this live group
-        # leader as the PGID reservation through the unconditional group KILL.
-        process_group_id = os.getpgrp()
         try:
-            os.killpg(process_group_id, signal.SIGTERM)
-            if type(terminal) is ExecutorGuardianCommandTimedOut:
-                try:
-                    process.wait(
-                        timeout=self._termination_policy.graceful_shutdown_seconds
+            while True:
+                group_owner.require_sentinel_alive()
+                return_code = process.poll()
+                if return_code is not None:
+                    return _GuardianCommandTerminal(
+                        ExecutorGuardianCommandCompleted(return_code)
                     )
-                except subprocess.TimeoutExpired:
-                    pass
-        finally:
-            os.killpg(process_group_id, signal.SIGKILL)
+                sleep_seconds = _COMMAND_POLL_SECONDS
+                if deadline is not None:
+                    remaining_seconds = deadline - time.monotonic()
+                    if remaining_seconds <= 0:
+                        if type(budget) is not ExecutorGuardianBoundedBudget:
+                            raise AssertionError(
+                                "only a bounded budget can reach its deadline"
+                            )
+                        return _GuardianCommandTerminal(
+                            ExecutorGuardianCommandTimedOut(budget.reason)
+                        )
+                    sleep_seconds = min(sleep_seconds, remaining_seconds)
+                time.sleep(sleep_seconds)
+        except BaseException as error:
+            return _GuardianCommandTerminal(
+                ExecutorGuardianInternalFailed(type(error).__name__, repr(error))
+            )
 
 
 def _parse_invocation(raw_request: str) -> GuardianInvocationRecord:
@@ -212,19 +380,9 @@ def main() -> int:
     parser.add_argument("--request-json", required=True)
     arguments = parser.parse_args()
     invocation = _parse_invocation(arguments.request_json)
-    result_writer = _GuardianResultWriter(invocation.result_file_descriptor)
-    try:
-        _await_start(invocation.start_file_descriptor)
-    except BaseException as error:
-        result_writer.write(
-            ExecutorGuardianInternalFailed(type(error).__name__, repr(error))
-        )
-        return 1
     return PosixExecutorGuardianChild(invocation.termination_policy()).run(
-        invocation.arguments,
-        invocation.domain_budget(),
-        result_writer,
-        invocation.lifecycle,
+        invocation,
+        _GuardianResultWriter(invocation.result_file_descriptor),
     )
 
 

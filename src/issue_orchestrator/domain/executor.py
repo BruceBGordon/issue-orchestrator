@@ -370,6 +370,7 @@ class ExecutorCommandLifecycle(StrEnum):
     DETACHED = "detached"
     INTERACTIVE_SESSION = "interactive-session"
 
+
     def require_cancellation_contract(self, cancellation: object, owner: str) -> None:
         """Enforce the one valid cancellation contract for this lifecycle."""
         if type(cancellation) not in (
@@ -384,6 +385,14 @@ class ExecutorCommandLifecycle(StrEnum):
         )
         if type(cancellation) is not expected_type:
             raise ValueError(f"{owner}.lifecycle and cancellation contract disagree")
+
+
+class ExecutorSessionContainmentOutcome(StrEnum):
+    """Exact durable-owner state observed while stopping a session."""
+
+    ABSENT = "absent"
+    STALE_RETIRED = "stale-retired"
+    CONTAINED = "contained"
 
 
 @dataclass(frozen=True, slots=True)

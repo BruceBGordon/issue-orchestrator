@@ -1,5 +1,5 @@
 # pyright: strict
-"""One crash-safe atomic persistence owner for executor JSON records."""
+"""One crash-safe atomic persistence owner for strict JSON records."""
 
 from __future__ import annotations
 
@@ -14,9 +14,17 @@ from typing import Generator
 from pydantic import BaseModel
 
 from ..ports.atomic_path_replacement import AtomicPathReplacement
+from ..ports.atomic_record_store import AtomicRecordPersistence
+from .independent_cleanup import (
+    CleanupAction,
+    IndependentCleanupPlan,
+    raise_cleanup_failures,
+    raise_primary_with_cleanup,
+)
 
 
-_CRASH_REMNANT_PREFIX = ".io-executor-atomic-"
+_CRASH_REMNANT_PREFIX = ".io-atomic-record-"
+_LEGACY_CRASH_REMNANT_PREFIX = ".io-executor-atomic-"
 _CRASH_REMNANT_SUFFIX = ".tmp"
 
 
@@ -34,7 +42,7 @@ class OsAtomicPathReplacement:
         os.replace(source, destination)
 
 
-class ExecutorAtomicRecordStore:
+class AtomicRecordStore:
     """Deep owner of temporary naming, sync, replacement, and crash pruning."""
 
     def __init__(
@@ -44,7 +52,7 @@ class ExecutorAtomicRecordStore:
     ) -> None:
         if not directory.is_absolute():
             raise ValueError(
-                "ExecutorAtomicRecordStore.directory must be an absolute path"
+                "AtomicRecordStore.directory must be an absolute path"
             )
         self._directory = directory
         self._replacement = replacement
@@ -63,44 +71,85 @@ class ExecutorAtomicRecordStore:
             )
             temporary = Path(temporary_name)
             descriptor_owned = True
+            handle = None
             try:
-                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    descriptor_owned = False
-                    handle.write(record.model_dump_json() + "\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                handle = os.fdopen(descriptor, "w", encoding="utf-8")
+                descriptor_owned = False
+                handle.write(record.model_dump_json() + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+                handle.close()
+                handle = None
                 self._replacement.replace(temporary, path)
                 self._sync_directory()
-            finally:
+            except BaseException as write_error:
+                actions: list[CleanupAction] = []
                 if descriptor_owned:
-                    os.close(descriptor)
-                temporary_still_exists = temporary.exists()
-                temporary.unlink(missing_ok=True)
-                if temporary_still_exists:
-                    self._sync_directory()
+                    actions.append(
+                        CleanupAction(
+                            "close atomic-record descriptor",
+                            lambda: os.close(descriptor),
+                        )
+                    )
+                if handle is not None:
+                    actions.append(
+                        CleanupAction(
+                            "close atomic-record stream",
+                            handle.close,
+                        )
+                    )
+                actions.extend(
+                    (
+                        CleanupAction(
+                            "unlink atomic-record temporary",
+                            lambda: temporary.unlink(missing_ok=True),
+                        ),
+                        CleanupAction(
+                            "sync atomic-record directory after cleanup",
+                            self._sync_directory,
+                        ),
+                    )
+                )
+                raise_primary_with_cleanup(
+                    "atomic record write and cleanup failures",
+                    write_error,
+                    IndependentCleanupPlan(tuple(actions)).run(),
+                )
 
     def prune_crash_remnants(self) -> AtomicRecordPruneResult:
-        """Remove only recognizable executor atomic debris under its owner lock."""
+        """Remove only recognizable atomic-record debris under its owner lock."""
         self._directory.mkdir(parents=True, exist_ok=True)
         with self._locked():
             return self._prune_crash_remnants_unlocked()
 
+    def delete(self, path: Path) -> bool:
+        """Durably remove one owned record under the atomic-record lock."""
+        self._require_owned_path(path)
+        self._directory.mkdir(parents=True, exist_ok=True)
+        with self._locked():
+            existed = path.exists()
+            path.unlink(missing_ok=True)
+            if existed:
+                self._sync_directory()
+            return existed
+
     def _prune_crash_remnants_unlocked(self) -> AtomicRecordPruneResult:
         removed: list[Path] = []
-        pattern = f"{_CRASH_REMNANT_PREFIX}*{_CRASH_REMNANT_SUFFIX}"
-        for path in sorted(self._directory.glob(pattern)):
-            path.unlink()
-            removed.append(path)
+        for prefix in (_CRASH_REMNANT_PREFIX, _LEGACY_CRASH_REMNANT_PREFIX):
+            pattern = f"{prefix}*{_CRASH_REMNANT_SUFFIX}"
+            for path in sorted(self._directory.glob(pattern)):
+                path.unlink()
+                removed.append(path)
         if removed:
             self._sync_directory()
         return AtomicRecordPruneResult(tuple(removed))
 
     def _require_owned_path(self, path: Path) -> None:
         if not path.is_absolute():
-            raise ValueError("ExecutorAtomicRecordStore.path must be absolute")
+            raise ValueError("AtomicRecordStore.path must be absolute")
         if path.parent != self._directory:
             raise ValueError(
-                "ExecutorAtomicRecordStore.path must be a direct child of its "
+                "AtomicRecordStore.path must be a direct child of its "
                 "owned directory"
             )
 
@@ -114,5 +163,34 @@ class ExecutorAtomicRecordStore:
         descriptor = os.open(self._directory, os.O_RDONLY)
         try:
             os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        except BaseException as sync_error:
+            raise_primary_with_cleanup(
+                "atomic-record directory sync and cleanup failures",
+                sync_error,
+                IndependentCleanupPlan(
+                    (
+                        CleanupAction(
+                            "close atomic-record directory descriptor",
+                            lambda: os.close(descriptor),
+                        ),
+                    )
+                ).run(),
+            )
+        raise_cleanup_failures(
+            "atomic-record directory descriptor cleanup failures",
+            IndependentCleanupPlan(
+                (
+                    CleanupAction(
+                        "close atomic-record directory descriptor",
+                        lambda: os.close(descriptor),
+                    ),
+                )
+            ).run(),
+        )
+
+
+class OsAtomicRecordStoreFactory:
+    """Production composition adapter for crash-safe atomic JSON stores."""
+
+    def create(self, directory: Path) -> AtomicRecordPersistence:
+        return AtomicRecordStore(directory, OsAtomicPathReplacement())

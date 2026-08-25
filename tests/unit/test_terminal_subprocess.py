@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 import base64
+import os
 import shlex
 import sys
 from datetime import datetime
@@ -24,21 +25,35 @@ from issue_orchestrator.domain.process_group import (
     ProcessIdentityObservation,
 )
 from issue_orchestrator.domain.terminal_session_termination import (
+    TerminalSessionOwnerCancellation,
     TerminalSessionProcess,
     TerminalSessionStatus,
     TerminalSessionTerminationOutcome,
 )
+from issue_orchestrator.domain.terminal_session_registry import (
+    PendingTerminalSessionRecord,
+    TerminalSessionRecord,
+)
 from issue_orchestrator.execution.terminal_subprocess import (
     SubprocessPlugin,
-    SubprocessRegistryError,
-    _SessionRecord,
-    _SubprocessRegistry,
+)
+from issue_orchestrator.execution.terminal_session_lifecycle import (
+    ThreadTerminalSessionWatcherFactory,
+)
+from issue_orchestrator.execution.retained_thread import (
+    MaskedThreadStartPrimitive,
+    ThreadingRetainedThreadFactory,
+)
+from issue_orchestrator.execution.terminal_session_registry import (
+    SqliteTerminalSessionRegistry,
+    TerminalSessionRegistryError,
 )
 from issue_orchestrator.entrypoints.bootstrap import (
     build_terminal_session_terminator,
 )
 from issue_orchestrator.entrypoints.bootstrap_executor import (
     build_process_group_supervisor,
+    build_terminal_session_owner,
     terminal_session_watcher_policy,
 )
 from issue_orchestrator.infra.env import ENV_PREFIX
@@ -50,9 +65,14 @@ from tests.process_tree_fixture import (
 from tests.unit.terminal_session_termination_helpers import (
     RecordingTerminalSessionTerminator,
 )
+from tests.unit.terminal_session_owner_helpers import (
+    RecordingTerminalSessionOwner,
+    TerminalSessionSentinelCohort,
+)
 
 
 def _plugin(
+    repo_root: Path,
     *,
     session_interactions_enabled: bool = False,
     worktree_base: Path | None = None,
@@ -60,8 +80,13 @@ def _plugin(
 ) -> SubprocessPlugin:
     return SubprocessPlugin(
         RecordingTerminalSessionTerminator(status=terminal_status),
+        RecordingTerminalSessionOwner(),
+        SqliteTerminalSessionRegistry(repo_root.resolve()),
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
+        ThreadTerminalSessionWatcherFactory(
+            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+        ),
         session_interactions_enabled=session_interactions_enabled,
         worktree_base=worktree_base,
     )
@@ -76,14 +101,17 @@ def _session_record(
     process_id: int,
     tab_name: str,
     is_review: bool,
-) -> _SessionRecord:
-    return _SessionRecord(
+) -> TerminalSessionRecord:
+    return TerminalSessionRecord(
         session_name=session_name,
         issue_number=issue_number,
         worktree_path=worktree.resolve(),
         process=TerminalSessionProcess(
             process_id=process_id,
             birth_identity=ProcessBirthIdentity("darwin-timeval:1700000000:100"),
+            terminal_cancellation=(
+                TerminalSessionOwnerCancellation.for_run_dir(run_dir.resolve())
+            ),
             executor_cancellation=(
                 ExecutorInteractiveSessionCancellation.for_run_dir(run_dir.resolve())
             ),
@@ -105,7 +133,9 @@ def _read_recording_output(path):
             continue
         data_b64 = event.get("data_b64")
         if isinstance(data_b64, str) and data_b64:
-            output_chunks.append(base64.b64decode(data_b64).decode("utf-8", errors="ignore"))
+            output_chunks.append(
+                base64.b64decode(data_b64).decode("utf-8", errors="ignore")
+            )
     return "".join(output_chunks)
 
 
@@ -165,6 +195,48 @@ class _IdentityObservationFailureTerminalSessionTerminator(
         raise RuntimeError("injected process identity observation failure")
 
 
+class _CommitFailureTerminalSessionRegistry:
+    """Typed fault adapter that fails only the pending-to-identified commit."""
+
+    def __init__(
+        self,
+        delegate: SqliteTerminalSessionRegistry,
+        descendant_pid_path: Path,
+    ) -> None:
+        self._delegate = delegate
+        self._descendant_pid_path = descendant_pid_path
+
+    def load(self) -> dict[str, TerminalSessionRecord]:
+        return self._delegate.load()
+
+    def load_pending(self) -> tuple[PendingTerminalSessionRecord, ...]:
+        return self._delegate.load_pending()
+
+    def begin_launch(self, record: PendingTerminalSessionRecord) -> None:
+        self._delegate.begin_launch(record)
+
+    def upsert(self, record: TerminalSessionRecord) -> None:
+        self._delegate.upsert(record)
+
+    def commit_launch(
+        self,
+        pending: PendingTerminalSessionRecord,
+        record: TerminalSessionRecord,
+    ) -> None:
+        del pending, record
+        PROCESS_COMPLETION_WATCHDOG.wait_for_path(
+            self._descendant_pid_path,
+            operation="TERM-resistant terminal descendant readiness",
+        )
+        raise TerminalSessionRegistryError("injected registry publication failure")
+
+    def remove_pending(self, session_name: str) -> None:
+        self._delegate.remove_pending(session_name)
+
+    def remove(self, session_name: str) -> None:
+        self._delegate.remove(session_name)
+
+
 def test_identity_observation_failure_contains_unregistered_process_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -174,10 +246,16 @@ def test_identity_observation_failure_contains_unregistered_process_tree(
     worktree.mkdir(parents=True)
     descendant_pid_path = (tmp_path / "identity-failure-descendant.pid").resolve()
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
+    registry = SqliteTerminalSessionRegistry(repo_root.resolve())
     plugin = SubprocessPlugin(
         _IdentityObservationFailureTerminalSessionTerminator(descendant_pid_path),
+        RecordingTerminalSessionOwner(),
+        registry,
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
+        ThreadTerminalSessionWatcherFactory(
+            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+        ),
     )
     launch, _run_dir = _term_resistant_launch(
         worktree,
@@ -200,7 +278,7 @@ def test_identity_observation_failure_contains_unregistered_process_tree(
     ProcessTreeMember(
         int(descendant_pid_path.read_text(encoding="utf-8"))
     ).assert_contained()
-    assert plugin._registry.load() == {}  # noqa: SLF001
+    assert registry.load() == {}
 
 
 def test_registry_publication_failure_contains_unregistered_process_tree(
@@ -212,10 +290,19 @@ def test_registry_publication_failure_contains_unregistered_process_tree(
     worktree.mkdir(parents=True)
     descendant_pid_path = (tmp_path / "registry-failure-descendant.pid").resolve()
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
+    registry = SqliteTerminalSessionRegistry(repo_root.resolve())
     plugin = SubprocessPlugin(
         build_terminal_session_terminator(),
+        RecordingTerminalSessionOwner(),
+        _CommitFailureTerminalSessionRegistry(
+            registry,
+            descendant_pid_path,
+        ),
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
+        ThreadTerminalSessionWatcherFactory(
+            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+        ),
     )
     launch, _run_dir = _term_resistant_launch(
         worktree,
@@ -223,17 +310,8 @@ def test_registry_publication_failure_contains_unregistered_process_tree(
         descendant_pid_path,
     )
 
-    def fail_registry_publication(_record: _SessionRecord) -> None:
-        PROCESS_COMPLETION_WATCHDOG.wait_for_path(
-            descendant_pid_path,
-            operation="TERM-resistant terminal descendant readiness",
-        )
-        raise SubprocessRegistryError("injected registry publication failure")
-
-    monkeypatch.setattr(plugin._registry, "upsert", fail_registry_publication)  # noqa: SLF001
-
     with pytest.raises(
-        SubprocessRegistryError,
+        TerminalSessionRegistryError,
         match="injected registry publication failure",
     ):
         plugin.create_session(
@@ -247,7 +325,60 @@ def test_registry_publication_failure_contains_unregistered_process_tree(
     ProcessTreeMember(
         int(descendant_pid_path.read_text(encoding="utf-8"))
     ).assert_contained()
-    assert plugin._registry.load() == {}  # noqa: SLF001
+    assert registry.load() == {}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_terminal_owner_survives_one_sentinel_hard_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One crashed sentinel cannot strand a live terminal process group."""
+    repo_root = tmp_path / "repo"
+    worktree = repo_root / "wt"
+    worktree.mkdir(parents=True)
+    descendant_pid_path = (tmp_path / "sentinel-descendant.pid").resolve()
+    monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
+    registry = SqliteTerminalSessionRegistry(repo_root.resolve())
+    plugin = SubprocessPlugin(
+        build_terminal_session_terminator(),
+        build_terminal_session_owner(),
+        registry,
+        build_process_group_supervisor(),
+        terminal_session_watcher_policy(),
+        ThreadTerminalSessionWatcherFactory(
+            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+        ),
+    )
+    launch, _run_dir = _term_resistant_launch(
+        worktree,
+        "issue-903",
+        descendant_pid_path,
+    )
+
+    assert (
+        plugin.create_session(
+            session_id=903,
+            launch=launch,
+            working_dir=str(worktree),
+            title="Sentinel crash",
+            session_name="issue-903",
+        )
+        is True
+    )
+    PROCESS_COMPLETION_WATCHDOG.wait_for_path(
+        descendant_pid_path,
+        operation="TERM-resistant terminal descendant readiness",
+    )
+    process = registry.load()["issue-903"].process
+    sentinels = TerminalSessionSentinelCohort.observe(process.process_id)
+    sentinels.crash_one()
+
+    assert plugin.kill_session(903, "issue-903") is True
+    ProcessTreeMember(
+        int(descendant_pid_path.read_text(encoding="utf-8"))
+    ).assert_contained()
+    assert registry.load() == {}
 
 
 def test_subprocess_session_writes_log(tmp_path, monkeypatch):
@@ -262,7 +393,17 @@ def test_subprocess_session_writes_log(tmp_path, monkeypatch):
     worktree.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = _plugin()
+    registry = SqliteTerminalSessionRegistry(repo_root.resolve())
+    plugin = SubprocessPlugin(
+        RecordingTerminalSessionTerminator(),
+        RecordingTerminalSessionOwner(),
+        registry,
+        build_process_group_supervisor(),
+        terminal_session_watcher_policy(),
+        ThreadTerminalSessionWatcherFactory(
+            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+        ),
+    )
     launch, run_dir = _launch_with_run_dir(
         worktree,
         "issue-123",
@@ -291,7 +432,9 @@ def test_subprocess_session_writes_log(tmp_path, monkeypatch):
     assert events[0]["event_type"] == "resize"
     event = next(event for event in events if event.get("event_type") == "output")
     payload = base64.b64decode(event["data_b64"]).decode("utf-8", errors="replace")
-    assert "hello from subprocess" in payload, f"Expected decoded output not in recording payload. Content: {content!r}"
+    assert "hello from subprocess" in payload, (
+        f"Expected decoded output not in recording payload. Content: {content!r}"
+    )
 
 
 def test_subprocess_registry_rejects_legacy_index_without_birth_identity(tmp_path):
@@ -312,8 +455,8 @@ def test_subprocess_registry_rejects_legacy_index_without_birth_identity(tmp_pat
         )
     )
 
-    with pytest.raises(SubprocessRegistryError, match="birth identities"):
-        _SubprocessRegistry(repo_root)
+    with pytest.raises(TerminalSessionRegistryError, match="birth identities"):
+        SqliteTerminalSessionRegistry(repo_root.resolve())
 
 
 def test_session_exists_returns_false_when_session_not_alive(tmp_path, monkeypatch):
@@ -328,7 +471,17 @@ def test_session_exists_returns_false_when_session_not_alive(tmp_path, monkeypat
     worktree.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = _plugin()
+    registry = SqliteTerminalSessionRegistry(repo_root.resolve())
+    plugin = SubprocessPlugin(
+        RecordingTerminalSessionTerminator(),
+        RecordingTerminalSessionOwner(),
+        registry,
+        build_process_group_supervisor(),
+        terminal_session_watcher_policy(),
+        ThreadTerminalSessionWatcherFactory(
+            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+        ),
+    )
 
     # Register a session in the registry so session_exists finds it
     record = _session_record(
@@ -340,25 +493,34 @@ def test_session_exists_returns_false_when_session_not_alive(tmp_path, monkeypat
         tab_name="Issue 1",
         is_review=False,
     )
-    plugin._registry.upsert(record)  # noqa: SLF001
+    registry.upsert(record)
 
     assert plugin.session_exists(1, "issue-1") is False
-    assert "issue-1" not in plugin._registry.load()  # noqa: SLF001
+    assert "issue-1" not in registry.load()
 
 
-def test_discover_running_sessions_includes_canonical_session_name(tmp_path, monkeypatch):
+def test_discover_running_sessions_includes_canonical_session_name(
+    tmp_path, monkeypatch
+):
     """Registry discovery exposes the persisted terminal id to callers."""
     repo_root = tmp_path / "repo"
     worktree = repo_root / "wt"
     worktree.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = _plugin(terminal_status=TerminalSessionStatus.ACTIVE)
+    registry = SqliteTerminalSessionRegistry(repo_root.resolve())
+    plugin = SubprocessPlugin(
+        RecordingTerminalSessionTerminator(status=TerminalSessionStatus.ACTIVE),
+        RecordingTerminalSessionOwner(),
+        registry,
+        build_process_group_supervisor(),
+        terminal_session_watcher_policy(),
+        ThreadTerminalSessionWatcherFactory(
+            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+        ),
+    )
     run_dir = (
-        worktree
-        / ".issue-orchestrator"
-        / "sessions"
-        / "20260221-000000Z__review-456"
+        worktree / ".issue-orchestrator" / "sessions" / "20260221-000000Z__review-456"
     )
     record = _session_record(
         session_name="review-456",
@@ -369,7 +531,7 @@ def test_discover_running_sessions_includes_canonical_session_name(tmp_path, mon
         tab_name="Review PR #456",
         is_review=True,
     )
-    plugin._registry.upsert(record)  # noqa: SLF001
+    registry.upsert(record)
 
     assert plugin.discover_running_sessions() == [
         {
@@ -388,7 +550,7 @@ def test_terminal_destination_does_not_depend_on_shell_text(tmp_path, monkeypatc
     worktree.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = _plugin()
+    plugin = _plugin(repo_root)
     launch, run_dir = _launch_with_run_dir(
         worktree,
         "20260221-000000Z__coding with spaces",
@@ -431,7 +593,11 @@ def test_subprocess_session_auto_accepts_claude_trust_prompt(tmp_path, monkeypat
     fake_claude.chmod(0o755)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = _plugin(session_interactions_enabled=True, worktree_base=repo_root)
+    plugin = _plugin(
+        repo_root,
+        session_interactions_enabled=True,
+        worktree_base=repo_root,
+    )
     launch, run_dir = _launch_with_run_dir(
         worktree,
         "issue-123",
@@ -457,7 +623,9 @@ def test_subprocess_session_auto_accepts_claude_trust_prompt(tmp_path, monkeypat
     assert "AUTO-RESPONSE:" in _read_recording_output(log_path)
 
 
-def test_subprocess_session_interactions_require_worktree_under_base(tmp_path, monkeypatch):
+def test_subprocess_session_interactions_require_worktree_under_base(
+    tmp_path, monkeypatch
+):
     repo_root = tmp_path / "repo"
     allowed_base = repo_root / "allowed"
     allowed_base.mkdir(parents=True)
@@ -465,7 +633,11 @@ def test_subprocess_session_interactions_require_worktree_under_base(tmp_path, m
     outside_worktree.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = _plugin(session_interactions_enabled=True, worktree_base=allowed_base)
+    plugin = _plugin(
+        repo_root,
+        session_interactions_enabled=True,
+        worktree_base=allowed_base,
+    )
 
     handler = plugin._interaction_handler(  # noqa: SLF001
         TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE,
@@ -476,13 +648,19 @@ def test_subprocess_session_interactions_require_worktree_under_base(tmp_path, m
     assert handler is None
 
 
-def test_subprocess_session_interactions_require_configured_worktree_base(tmp_path, monkeypatch, caplog):
+def test_subprocess_session_interactions_require_configured_worktree_base(
+    tmp_path, monkeypatch, caplog
+):
     repo_root = tmp_path / "repo"
     worktree = repo_root / "wt"
     worktree.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = _plugin(session_interactions_enabled=True, worktree_base=None)
+    plugin = _plugin(
+        repo_root,
+        session_interactions_enabled=True,
+        worktree_base=None,
+    )
 
     handler = plugin._interaction_handler(  # noqa: SLF001
         TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE,
@@ -504,10 +682,16 @@ def test_kill_session_delegates_complete_containment_to_typed_port(
     run_dir.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
     terminator = RecordingTerminalSessionTerminator()
+    registry = SqliteTerminalSessionRegistry(repo_root.resolve())
     plugin = SubprocessPlugin(
         terminator,
+        RecordingTerminalSessionOwner(),
+        registry,
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
+        ThreadTerminalSessionWatcherFactory(
+            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+        ),
     )
     record = _session_record(
         session_name="issue-71",
@@ -518,13 +702,14 @@ def test_kill_session_delegates_complete_containment_to_typed_port(
         tab_name="Issue 71",
         is_review=False,
     )
-    plugin._registry.upsert(record)  # noqa: SLF001
+    registry.upsert(record)
 
     assert plugin.kill_session(71, "issue-71") is True
     assert terminator.processes == (
         TerminalSessionProcess(
             4271,
             ProcessBirthIdentity("darwin-timeval:1700000000:100"),
+            TerminalSessionOwnerCancellation.for_run_dir(run_dir.resolve()),
             ExecutorInteractiveSessionCancellation.for_run_dir(run_dir.resolve()),
         ),
     )
@@ -541,14 +726,18 @@ def test_recycled_session_pid_is_retired_through_typed_terminator(
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
     terminator = RecordingTerminalSessionTerminator(
         status=TerminalSessionStatus.STALE_IDENTITY,
-        termination_outcome=(
-            TerminalSessionTerminationOutcome.STALE_IDENTITY_RETIRED
-        ),
+        termination_outcome=(TerminalSessionTerminationOutcome.STALE_IDENTITY_RETIRED),
     )
+    registry = SqliteTerminalSessionRegistry(repo_root.resolve())
     plugin = SubprocessPlugin(
         terminator,
+        RecordingTerminalSessionOwner(),
+        registry,
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
+        ThreadTerminalSessionWatcherFactory(
+            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+        ),
     )
     record = _session_record(
         session_name="issue-72",
@@ -559,16 +748,14 @@ def test_recycled_session_pid_is_retired_through_typed_terminator(
         tab_name="Issue 72",
         is_review=False,
     )
-    plugin._registry.upsert(record)  # noqa: SLF001
+    registry.upsert(record)
 
     assert plugin.session_exists(72, "issue-72") is False
     assert terminator.processes == (record.process,)
-    assert plugin._registry.load() == {}  # noqa: SLF001
+    assert registry.load() == {}
 
 
-class _SelectiveFailureTerminalSessionTerminator(
-    RecordingTerminalSessionTerminator
-):
+class _SelectiveFailureTerminalSessionTerminator(RecordingTerminalSessionTerminator):
     def __init__(self, failing_process_id: int) -> None:
         super().__init__(status=TerminalSessionStatus.ACTIVE)
         self._failing_process_id = failing_process_id
@@ -594,10 +781,16 @@ def test_shutdown_attempts_every_session_and_preserves_failed_registry_rows(
     run_dir_b.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
     terminator = _SelectiveFailureTerminalSessionTerminator(4281)
+    registry = SqliteTerminalSessionRegistry(repo_root.resolve())
     plugin = SubprocessPlugin(
         terminator,
+        RecordingTerminalSessionOwner(),
+        registry,
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
+        ThreadTerminalSessionWatcherFactory(
+            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+        ),
     )
     first = _session_record(
         session_name="issue-81",
@@ -617,11 +810,11 @@ def test_shutdown_attempts_every_session_and_preserves_failed_registry_rows(
         tab_name="Issue 82",
         is_review=False,
     )
-    plugin._registry.upsert(first)  # noqa: SLF001
-    plugin._registry.upsert(second)  # noqa: SLF001
+    registry.upsert(first)
+    registry.upsert(second)
 
     with pytest.raises(BaseExceptionGroup, match="could not be contained"):
         plugin.on_orchestrator_shutdown()
 
     assert terminator.processes == (second.process,)
-    assert tuple(plugin._registry.load()) == ("issue-81",)  # noqa: SLF001
+    assert tuple(registry.load()) == ("issue-81",)

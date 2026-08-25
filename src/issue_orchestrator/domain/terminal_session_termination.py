@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 
 from .executor import ExecutorInteractiveSessionCancellation
 from .process_group import (
@@ -26,8 +27,66 @@ from .process_group import (
 )
 
 
+TERMINAL_SESSION_CANCELLATION_FILENAME = "terminal-session-cancellation.json"
+
+
 class TerminalSessionContainmentError(RuntimeError):
     """The exact persisted terminal process could not be safely contained."""
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalSessionOwnerCancellation:
+    """Durable endpoint identity owned by a terminal-group member."""
+
+    record_path: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record_path, Path) or not self.record_path.is_absolute():
+            raise ValueError(
+                "TerminalSessionOwnerCancellation.record_path must be absolute"
+            )
+
+    @classmethod
+    def for_run_dir(cls, run_dir: Path) -> TerminalSessionOwnerCancellation:
+        if not isinstance(run_dir, Path) or not run_dir.is_absolute():
+            raise ValueError(
+                "TerminalSessionOwnerCancellation.run_dir must be absolute"
+            )
+        return cls(run_dir / TERMINAL_SESSION_CANCELLATION_FILENAME)
+
+
+@dataclass(frozen=True, slots=True)
+class UnregisteredTerminalSessionOwnership:
+    """Durable endpoint identities available before PID registry commit."""
+
+    terminal_cancellation: TerminalSessionOwnerCancellation
+    executor_cancellation: ExecutorInteractiveSessionCancellation
+
+    def __post_init__(self) -> None:
+        if type(self.terminal_cancellation) is not TerminalSessionOwnerCancellation:
+            raise ValueError(
+                "terminal_cancellation must be TerminalSessionOwnerCancellation"
+            )
+        if (
+            type(self.executor_cancellation)
+            is not ExecutorInteractiveSessionCancellation
+        ):
+            raise ValueError(
+                "executor_cancellation must be "
+                "ExecutorInteractiveSessionCancellation"
+            )
+        if (
+            self.terminal_cancellation.record_path.parent
+            != self.executor_cancellation.record_path.parent
+        ):
+            raise ValueError("unregistered cancellation records must share a run dir")
+
+    @classmethod
+    def for_run_dir(cls, run_dir: Path) -> UnregisteredTerminalSessionOwnership:
+        return cls(
+            TerminalSessionOwnerCancellation.for_run_dir(run_dir),
+            ExecutorInteractiveSessionCancellation.for_run_dir(run_dir),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +95,7 @@ class TerminalSessionProcess:
 
     process_id: int
     birth_identity: ProcessBirthIdentity
+    terminal_cancellation: TerminalSessionOwnerCancellation
     executor_cancellation: ExecutorInteractiveSessionCancellation
 
     def __post_init__(self) -> None:
@@ -47,6 +107,11 @@ class TerminalSessionProcess:
             raise ValueError(
                 "TerminalSessionProcess.birth_identity must be ProcessBirthIdentity"
             )
+        if type(self.terminal_cancellation) is not TerminalSessionOwnerCancellation:
+            raise ValueError(
+                "TerminalSessionProcess.terminal_cancellation must be a "
+                "TerminalSessionOwnerCancellation"
+            )
         if (
             type(self.executor_cancellation)
             is not ExecutorInteractiveSessionCancellation
@@ -54,6 +119,13 @@ class TerminalSessionProcess:
             raise ValueError(
                 "TerminalSessionProcess.executor_cancellation must be an "
                 "ExecutorInteractiveSessionCancellation"
+            )
+        if (
+            self.terminal_cancellation.record_path.parent
+            != self.executor_cancellation.record_path.parent
+        ):
+            raise ValueError(
+                "TerminalSessionProcess cancellation records must share a run dir"
             )
 
 
@@ -79,6 +151,28 @@ class TerminalSessionTerminationOutcome(StrEnum):
     STALE_IDENTITY_RETIRED = "stale-identity-retired"
     GRACEFUL = "graceful"
     FORCED = "forced"
+
+
+class TerminalSessionOwnerContainmentOutcome(StrEnum):
+    """Exact state of one terminal-related self-containment owner."""
+
+    ABSENT = "absent"
+    STALE_RETIRED = "stale-retired"
+    CONTAINED = "contained"
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalSessionContainmentReport:
+    """Separate outcomes for the terminal and detached guardian groups."""
+
+    terminal_owner: TerminalSessionOwnerContainmentOutcome
+    guardian_owner: TerminalSessionOwnerContainmentOutcome
+
+    def __post_init__(self) -> None:
+        if type(self.terminal_owner) is not TerminalSessionOwnerContainmentOutcome:
+            raise ValueError("terminal_owner requires an exact containment outcome")
+        if type(self.guardian_owner) is not TerminalSessionOwnerContainmentOutcome:
+            raise ValueError("guardian_owner requires an exact containment outcome")
 
 
 def classify_terminal_session_identity(

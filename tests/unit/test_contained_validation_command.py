@@ -14,24 +14,55 @@ from issue_orchestrator.domain.executor import (
     ExecutorBoundedDeadline,
     ExecutorProcessTerminationPolicy,
 )
+from issue_orchestrator.domain.process_group import (
+    OwnedProcessGroupLeader,
+    ProcessGroupSupervision,
+    ProcessGroupTermination,
+    ProcessGroupWait,
+)
 from issue_orchestrator.domain.validation_execution import (
     ContainedValidationCommand,
     ValidationCommandDeadlineExceeded,
     ValidationCommandDeadlinePending,
     ValidationCommandDeadlineTracker,
+    ValidationCommandCleanupFailed,
     ValidationCommandExited,
+    ValidationCommandOutput,
     ValidationCommandTimedOut,
     ValidationCommandTimeoutPhase,
     ValidationExecutionDeadline,
 )
 from issue_orchestrator.execution.contained_validation_command import (
     PosixContainedValidationCommandRunner,
+    PosixValidationPipeCaptureFactory,
 )
 from issue_orchestrator.execution.process_group_supervisor import (
     PosixProcessGroupSupervisor,
 )
 from issue_orchestrator.execution.process_group_terminator import (
     PosixProcessGroupTerminator,
+)
+from issue_orchestrator.domain.posix_process import PosixProcessProgram
+from issue_orchestrator.execution.posix_pipe import OsPosixPipeFactory
+from issue_orchestrator.execution.posix_process import (
+    MaskedPosixSpawnPrimitive,
+    RetainedPosixProcessLauncher,
+)
+from issue_orchestrator.execution.validation_launch_pipes import (
+    PosixValidationLaunchPipesFactory,
+)
+from issue_orchestrator.execution.validation_pipe_resources import (
+    default_validation_pipe_selector,
+)
+from issue_orchestrator.ports.process_group_supervisor import (
+    ProcessGroupInterruption,
+    ProcessGroupSupervisor,
+)
+from issue_orchestrator.ports.posix_pipe import PosixPipeReader
+from issue_orchestrator.ports.validation_pipe_capture import (
+    ValidationPipeCapture,
+    ValidationPipeCaptureFactory,
+    ValidationPipeCaptureResult,
 )
 from issue_orchestrator.infra.validation_executor_handshake import (
     VALIDATION_EXECUTOR_HANDSHAKE_ENVIRONMENT,
@@ -40,24 +71,152 @@ from tests.process_tree_fixture import (
     CooperativeTermResistantProcessTreeProgram,
     ProcessTreeMember,
 )
+from tests.process_completion_fixture import build_test_process_group_observer
 
 
 def _runner() -> PosixContainedValidationCommandRunner:
+    return _runner_with(
+        _production_supervisor(),
+        PosixValidationPipeCaptureFactory(default_validation_pipe_selector),
+    )
+
+
+def _runner_with_capture(
+    capture_factory: ValidationPipeCaptureFactory,
+) -> PosixContainedValidationCommandRunner:
+    return _runner_with(_production_supervisor(), capture_factory)
+
+
+def _runner_with(
+    supervisor: ProcessGroupSupervisor,
+    capture_factory: ValidationPipeCaptureFactory,
+) -> PosixContainedValidationCommandRunner:
     return PosixContainedValidationCommandRunner(
-        PosixProcessGroupSupervisor(
-            PosixProcessGroupTerminator(
-                ExecutorProcessTerminationPolicy(
-                    graceful_shutdown_seconds=0.05,
-                    forceful_shutdown_seconds=1.0,
+        RetainedPosixProcessLauncher(
+            PosixProcessProgram(
+                (
+                    str(Path(sys.executable)),
+                    "-m",
+                    "issue_orchestrator.entrypoints.posix_process_child",
                 )
-            )
+            ),
+            MaskedPosixSpawnPrimitive(),
+            supervisor,
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=0.05,
+                forceful_shutdown_seconds=1.0,
+            ),
         ),
+        supervisor,
         ContainedCommandOutputPolicy(
             poll_interval_seconds=0.01,
             shutdown_timeout_seconds=1.0,
             final_drain_byte_limit=1_048_576,
         ),
+        capture_factory,
+        PosixValidationLaunchPipesFactory(OsPosixPipeFactory()),
     )
+
+
+def _production_supervisor() -> PosixProcessGroupSupervisor:
+    return PosixProcessGroupSupervisor(
+        PosixProcessGroupTerminator(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=0.05,
+                forceful_shutdown_seconds=1.0,
+            ),
+            build_test_process_group_observer(),
+        )
+    )
+
+
+def _exception_messages(error: BaseException) -> tuple[str, ...]:
+    if isinstance(error, BaseExceptionGroup):
+        return tuple(
+            message
+            for nested in error.exceptions
+            for message in _exception_messages(nested)
+        )
+    return (str(error),)
+
+
+class _FailingCapture:
+    def __init__(
+        self,
+        streams: tuple[PosixPipeReader, PosixPipeReader, PosixPipeReader],
+        failure: BaseException,
+    ) -> None:
+        self._streams = streams
+        self._failure = failure
+
+    def wait_for_request(self, timeout_seconds: float) -> bool:
+        del timeout_seconds
+        return False
+
+    @property
+    def deadline_status(self) -> ValidationCommandDeadlinePending:
+        return ValidationCommandDeadlinePending()
+
+    def finalize(self) -> ValidationPipeCaptureResult:
+        for stream in self._streams:
+            stream.close()
+        return ValidationPipeCaptureResult(
+            ValidationCommandOutput("", ""),
+            self._failure,
+        )
+
+
+class _FailingCaptureFactory:
+    def __init__(self, failure: BaseException) -> None:
+        self._failure = failure
+
+    def create(
+        self,
+        stdout: PosixPipeReader,
+        stderr: PosixPipeReader,
+        handshake_reader: PosixPipeReader,
+        policy: ContainedCommandOutputPolicy,
+        deadline: ValidationExecutionDeadline,
+        started_at_monotonic: float,
+    ) -> ValidationPipeCapture:
+        del policy, deadline, started_at_monotonic
+        return _FailingCapture(
+            (stdout, stderr, handshake_reader),
+            self._failure,
+        )
+
+
+class _SetupFailingCaptureFactory:
+    def create(
+        self,
+        stdout: PosixPipeReader,
+        stderr: PosixPipeReader,
+        handshake_reader: PosixPipeReader,
+        policy: ContainedCommandOutputPolicy,
+        deadline: ValidationExecutionDeadline,
+        started_at_monotonic: float,
+    ) -> ValidationPipeCapture:
+        del policy, deadline, started_at_monotonic
+        for stream in (stdout, stderr, handshake_reader):
+            stream.close()
+        raise RuntimeError("injected validation capture setup failure")
+
+
+class _SupervisionFailingOwner(ProcessGroupSupervisor):
+    def __init__(self, delegate: ProcessGroupSupervisor) -> None:
+        self._delegate = delegate
+
+    def supervise(
+        self,
+        leader: OwnedProcessGroupLeader,
+        wait: ProcessGroupWait,
+        interruption: ProcessGroupInterruption,
+    ) -> ProcessGroupSupervision:
+        del leader, wait, interruption
+        raise RuntimeError("injected validation supervision failure")
+
+    def abort(self, leader: OwnedProcessGroupLeader) -> ProcessGroupTermination:
+        return self._delegate.abort(leader)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process containment")
@@ -221,8 +380,8 @@ def test_nested_executor_remains_bounded_by_outer_deadline(tmp_path: Path) -> No
             working_directory=tmp_path.resolve(),
             environment=os.environ,
             deadline=ValidationExecutionDeadline(
-                ExecutorBoundedDeadline(0.1, 0.2),
-                outer_timeout_seconds=1,
+                ExecutorBoundedDeadline(1.0, 2.0),
+                outer_timeout_seconds=3,
             ),
         )
     )
@@ -230,3 +389,106 @@ def test_nested_executor_remains_bounded_by_outer_deadline(tmp_path: Path) -> No
     assert type(result.cleanup) is ValidationCommandTimedOut
     assert result.cleanup.phase is ValidationCommandTimeoutPhase.OUTER
     assert result.timed_out is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process containment")
+@pytest.mark.timeout(10)
+def test_natural_completion_returns_typed_capture_finalization_failure(
+    tmp_path: Path,
+) -> None:
+    result = _runner_with_capture(
+        _FailingCaptureFactory(RuntimeError("injected finalization failure"))
+    ).run(
+        ContainedValidationCommand(
+            command=f"exec {shlex.quote(sys.executable)} -c pass",
+            working_directory=tmp_path.resolve(),
+            environment=os.environ,
+            deadline=ValidationExecutionDeadline.for_active_timeout(5),
+        )
+    )
+
+    assert type(result.child) is ValidationCommandExited
+    assert result.child.exit_code == 0
+    assert type(result.cleanup) is ValidationCommandCleanupFailed
+    assert _exception_messages(result.cleanup.error) == (
+        "injected finalization failure",
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process containment")
+@pytest.mark.timeout(10)
+def test_supervision_recovery_aggregates_typed_capture_finalization_failure(
+    tmp_path: Path,
+) -> None:
+    result = _runner_with(
+        _SupervisionFailingOwner(_production_supervisor()),
+        _FailingCaptureFactory(RuntimeError("injected finalization failure")),
+    ).run(
+        ContainedValidationCommand(
+            command=f"exec {shlex.quote(sys.executable)} -c 'import time; time.sleep(300)'",
+            working_directory=tmp_path.resolve(),
+            environment=os.environ,
+            deadline=ValidationExecutionDeadline.for_active_timeout(5),
+        )
+    )
+
+    assert type(result.child) is ValidationCommandExited
+    assert type(result.cleanup) is ValidationCommandCleanupFailed
+    assert _exception_messages(result.cleanup.error) == (
+        "injected validation supervision failure",
+        "injected finalization failure",
+    )
+    ProcessTreeMember(result.child.process_id).assert_contained()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process containment")
+@pytest.mark.timeout(10)
+def test_capture_setup_failure_contains_and_reaps_started_child(
+    tmp_path: Path,
+) -> None:
+    result = _runner_with_capture(_SetupFailingCaptureFactory()).run(
+        ContainedValidationCommand(
+            command=f"exec {shlex.quote(sys.executable)} -c 'import time; time.sleep(300)'",
+            working_directory=tmp_path.resolve(),
+            environment=os.environ,
+            deadline=ValidationExecutionDeadline.for_active_timeout(5),
+        )
+    )
+
+    assert type(result.child) is ValidationCommandExited
+    assert type(result.cleanup) is ValidationCommandCleanupFailed
+    assert _exception_messages(result.cleanup.error) == (
+        "injected validation capture setup failure",
+    )
+    ProcessTreeMember(result.child.process_id).assert_contained()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX descriptor inheritance")
+@pytest.mark.timeout(10)
+def test_non_finite_executor_acknowledgement_fails_and_contains_child(
+    tmp_path: Path,
+) -> None:
+    descriptor_variable = VALIDATION_EXECUTOR_HANDSHAKE_ENVIRONMENT.descriptor_variable
+    program = (
+        "import os,struct,time; "
+        f"fd=int(os.environ.pop({descriptor_variable!r})); "
+        "os.write(fd,struct.pack('!Bd',1,float('nan'))); "
+        "os.close(fd); "
+        "time.sleep(300)"
+    )
+    result = _runner().run(
+        ContainedValidationCommand(
+            command=f"exec {shlex.quote(sys.executable)} -c {shlex.quote(program)}",
+            working_directory=tmp_path.resolve(),
+            environment=os.environ,
+            deadline=ValidationExecutionDeadline.for_active_timeout(5),
+        )
+    )
+
+    assert type(result.child) is ValidationCommandExited
+    assert type(result.cleanup) is ValidationCommandCleanupFailed
+    assert any(
+        "positive finite float" in message
+        for message in _exception_messages(result.cleanup.error)
+    )
+    ProcessTreeMember(result.child.process_id).assert_contained()

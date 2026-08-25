@@ -331,7 +331,7 @@ class ExecutorEventStore:
                 fairness_group=work.fairness_group.value,
                 grant=AdmissionGrantRecord.from_domain(grant),
                 error_type=type(error).__name__,
-                error_message=str(error),
+                error_message=_exception_message(error),
             )
         )
 
@@ -523,6 +523,11 @@ class ExecutorEventStore:
 
 def _event_metadata(record: _EventRecord) -> ExecutorEventMetadata:
     return ExecutorEventMetadata(record.recorded_at_unix, record.process_id)
+
+
+def _exception_message(error: BaseException) -> str:
+    message = str(error)
+    return message if message else repr(error)
 
 
 def _host_load(record: HostLoadRecord) -> ExecutorHostLoad:

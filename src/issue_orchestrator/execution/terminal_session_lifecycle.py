@@ -6,9 +6,18 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from typing import NoReturn
+from typing import NoReturn, Protocol, runtime_checkable
 
 from ..domain.process_group import OwnedProcessGroupLeader
+from ..domain.retained_thread import (
+    RetainedThreadActivation,
+    RetainedThreadFinalized,
+    RetainedThreadFinalizedAfterFailure,
+    RetainedThreadShutdownPolicy,
+    RetainedThreadSpec,
+    RetainedThreadState,
+    RetainedThreadStillRunning,
+)
 from ..domain.terminal_session_lifecycle import (
     TerminalSessionWatcherCompleted,
     TerminalSessionWatcherFailed,
@@ -17,6 +26,8 @@ from ..domain.terminal_session_lifecycle import (
     TerminalSessionWatcherTimedOut,
 )
 from ..ports.process_group_supervisor import ProcessGroupSupervisor
+from ..ports.retained_thread import RetainedThreadFactory, RetainedThreadLease
+from ..ports.terminal_session_owner import TerminalSessionLaunchLease
 from .agent_runner import AgentResult, AgentSession
 
 
@@ -35,6 +46,11 @@ def _require_process_group_supervisor(value: object) -> None:
         )
 
 
+def _require_retained_thread_factory(value: object, owner: str) -> None:
+    if not isinstance(value, RetainedThreadFactory):
+        raise ValueError(f"{owner} must implement RetainedThreadFactory")
+
+
 class PendingTerminalSession:
     """Own a spawned PTY leader until durable registry publication succeeds."""
 
@@ -42,12 +58,14 @@ class PendingTerminalSession:
         self,
         session: AgentSession,
         process_group_supervisor: ProcessGroupSupervisor,
+        launch_lease: TerminalSessionLaunchLease,
     ) -> None:
         if type(session) is not AgentSession:
             raise ValueError("PendingTerminalSession.session must be AgentSession")
         _require_process_group_supervisor(process_group_supervisor)
         self._session = session
         self._process_group_supervisor = process_group_supervisor
+        self._launch_lease = launch_lease
 
     @property
     def session(self) -> AgentSession:
@@ -59,19 +77,30 @@ class PendingTerminalSession:
         """Return the exact process-group leader this owner can reap."""
         return self._session.pid
 
+    def require_owner_ready(self) -> None:
+        """Prove self-containment before durable session publication."""
+        self._launch_lease.require_ready()
+
     def abort(self, preceding_error: BaseException) -> NoReturn:
         """Attempt containment, reaping, and descriptor closure before failing."""
         cleanup_errors: list[BaseException] = []
+        group_contained = False
         try:
             self._process_group_supervisor.abort(
                 OwnedProcessGroupLeader(self.process_id)
             )
+            group_contained = True
         except BaseException as cleanup_error:
             cleanup_errors.append(cleanup_error)
-        try:
-            self._session.finalize_after_owned_process_group_reap()
-        except BaseException as cleanup_error:
-            cleanup_errors.append(cleanup_error)
+        if group_contained:
+            try:
+                self._launch_lease.retire_after_containment()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
+                self._session.finalize_after_owned_process_group_reap()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
         if cleanup_errors:
             raise BaseExceptionGroup(
                 "terminal session startup failed and cleanup was incomplete",
@@ -102,37 +131,47 @@ class _WatcherFailed:
 
     error: BaseException
 
+
 _WatcherState = _WatcherRunning | _WatcherCompleted | _WatcherFailed
 
 
 class TerminalSessionWatcher:
     """Own the only thread allowed to wait on and finalize one live PTY."""
 
-    def __init__(self, session_name: str, session: AgentSession) -> None:
+    def __init__(
+        self,
+        session_name: str,
+        session: AgentSession,
+        thread_factory: RetainedThreadFactory,
+    ) -> None:
         if type(session_name) is not str or not session_name:
             raise ValueError("TerminalSessionWatcher.session_name must not be empty")
         if type(session) is not AgentSession:
             raise ValueError("TerminalSessionWatcher.session must be AgentSession")
+        _require_retained_thread_factory(
+            thread_factory,
+            "TerminalSessionWatcher.thread_factory",
+        )
         self._session_name = session_name
         self._session = session
         self._state_lock = threading.Lock()
         self._state: _WatcherState = _WatcherRunning()
-        self._thread = threading.Thread(
-            target=self._watch,
-            name=f"terminal-session-watcher:{session_name}",
-            daemon=True,
+        self._thread: RetainedThreadLease = thread_factory.prepare(
+            RetainedThreadSpec(
+                name=f"terminal-session-watcher:{session_name}",
+                daemon=True,
+            ),
+            self._watch,
         )
 
-    @classmethod
-    def start(
-        cls,
-        session_name: str,
-        session: AgentSession,
-    ) -> TerminalSessionWatcher:
-        """Start and return the single lifecycle owner for one PTY."""
-        watcher = cls(session_name, session)
-        watcher._thread.start()
-        return watcher
+    @property
+    def activation(self) -> RetainedThreadState:
+        """Return whether the thread may own PTY wait/finalization."""
+        return self._thread.state
+
+    def activate(self) -> RetainedThreadActivation:
+        """Start this already-retained owner, preserving post-start failures."""
+        return self._thread.activate()
 
     def await_completion(
         self,
@@ -144,13 +183,31 @@ class TerminalSessionWatcher:
                 "TerminalSessionWatcher.await_completion.policy must be "
                 "TerminalSessionWatcherPolicy"
             )
-        self._thread.join(timeout=policy.shutdown_timeout_seconds)
-        if self._thread.is_alive():
+        if self.activation not in (
+            RetainedThreadState.ACTIVATING,
+            RetainedThreadState.ACTIVATED,
+        ):
+            raise RuntimeError("cannot await a terminal watcher before activation")
+        finalization = self._thread.finalize(
+            RetainedThreadShutdownPolicy(
+                initial_timeout_seconds=policy.shutdown_timeout_seconds,
+                recovery_timeout_seconds=policy.shutdown_timeout_seconds,
+            )
+        )
+        if type(finalization) is RetainedThreadStillRunning:
             return TerminalSessionWatcherTimedOut(
                 self._session_name,
                 self._session.pid,
-                policy.shutdown_timeout_seconds,
+                policy.shutdown_timeout_seconds * 2,
             )
+        if type(finalization) is RetainedThreadFinalizedAfterFailure:
+            return TerminalSessionWatcherFailed(
+                self._session_name,
+                self._session.pid,
+                finalization.error,
+            )
+        if type(finalization) is not RetainedThreadFinalized:
+            raise AssertionError("retained thread finalization is a closed union")
         with self._state_lock:
             state = self._state
         if type(state) is _WatcherCompleted:
@@ -194,3 +251,32 @@ class TerminalSessionWatcher:
             result.timed_out,
             result.duration_seconds,
         )
+
+
+@runtime_checkable
+class TerminalSessionWatcherFactory(Protocol):
+    """Typed construction boundary for the PTY completion owner."""
+
+    def create(
+        self,
+        session_name: str,
+        session: AgentSession,
+    ) -> TerminalSessionWatcher: ...
+
+
+class ThreadTerminalSessionWatcherFactory:
+    """Production adapter that starts one watcher thread per live PTY."""
+
+    def __init__(self, thread_factory: RetainedThreadFactory) -> None:
+        _require_retained_thread_factory(
+            thread_factory,
+            "ThreadTerminalSessionWatcherFactory.thread_factory",
+        )
+        self._thread_factory = thread_factory
+
+    def create(
+        self,
+        session_name: str,
+        session: AgentSession,
+    ) -> TerminalSessionWatcher:
+        return TerminalSessionWatcher(session_name, session, self._thread_factory)

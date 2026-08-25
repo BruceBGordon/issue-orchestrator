@@ -23,7 +23,7 @@ from ...domain.executor_monitoring import (
 from ...ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ._contracts import ResourceObservationRecord, WorkHistoryRecord
 from ._types import ExecutorWorkIdentity, RecordedExecutorObservation
-from ..atomic_record_store import ExecutorAtomicRecordStore
+from ..atomic_record_store import AtomicRecordStore
 
 
 class ExecutorWorkHistoryStore:
@@ -34,7 +34,7 @@ class ExecutorWorkHistoryStore:
         history_dir: Path,
         retention_policy: ExecutorHistoryRetentionPolicy,
         retention_lock: ExecutorHistoryRetentionLock,
-        atomic_records: ExecutorAtomicRecordStore,
+        atomic_records: AtomicRecordStore,
     ) -> None:
         if type(retention_policy) is not ExecutorHistoryRetentionPolicy:
             raise ValueError(
@@ -172,7 +172,7 @@ class ExecutorWorkHistoryStore:
             key=lambda path: (path.stat().st_mtime_ns, path.name),
         )
         for path in oldest_first[:excess]:
-            path.unlink()
+            self._atomic_records.delete(path)
 
     def _observations_unlocked(
         self,

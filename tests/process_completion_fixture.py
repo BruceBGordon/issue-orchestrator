@@ -26,6 +26,9 @@ from issue_orchestrator.adapters.kernel_process_identity import (
 from issue_orchestrator.execution.executor_guardian_cancellation import (
     ExecutorSessionGuardianCanceller,
 )
+from issue_orchestrator.execution.atomic_record_store import (
+    OsAtomicRecordStoreFactory,
+)
 from tests.process_tree_fixture import (
     PROCESS_CONTAINMENT_WATCHDOG_SECONDS,
     ProcessTreeMember,
@@ -34,6 +37,15 @@ from tests.process_tree_fixture import (
 
 _Output = TypeVar("_Output", str, bytes)
 _Result = TypeVar("_Result")
+
+
+def build_test_process_group_observer() -> PsProcessGroupObserver:
+    """Construct the real host observer used by process-containment proofs."""
+    return PsProcessGroupObserver(
+        Path("/bin/ps"),
+        PsProcessObservationPolicy(command_timeout_seconds=2.0),
+        build_kernel_process_identity_observer(),
+    )
 
 
 class ProcessCompletionTimeout(AssertionError):
@@ -114,11 +126,7 @@ class ExecutorGuardianCancellationContainment:
     def contain_after_timeout(self) -> None:
         ExecutorSessionGuardianCanceller(
             PROCESS_CONTAINMENT_WATCHDOG_SECONDS,
-            PsProcessGroupObserver(
-                Path("/bin/ps"),
-                PsProcessObservationPolicy(command_timeout_seconds=2.0),
-                build_kernel_process_identity_observer(),
-            ),
+            OsAtomicRecordStoreFactory(),
         ).contain_if_active(
             ExecutorInteractiveSessionCancellation(self.cancellation_record_path)
         )

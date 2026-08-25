@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+import math
 from pathlib import Path
 from types import MappingProxyType
 
@@ -266,8 +267,8 @@ class ValidationCommandDeadlineTracker:
 
 
 def _require_monotonic_time(value: float, field_name: str) -> None:
-    if type(value) is not float or value <= 0:
-        raise ValueError(f"{field_name} must be a positive monotonic float")
+    if type(value) is not float or not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{field_name} must be a positive finite monotonic float")
 
 
 @dataclass(frozen=True, slots=True)

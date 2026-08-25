@@ -6,14 +6,30 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.control.executor_admission import (
+    ExecutorAdmissionGrant,
+    ExecutorLearnedDemand,
+    QueuedExecutorWork,
+)
 from issue_orchestrator.domain.executor import (
     ExecutorAggressiveness,
+    ExecutorConcurrencyRange,
+    ExecutorFairnessGroup,
     ExecutorPolicy,
     ExecutorPolicyChange,
     ExecutorPolicySource,
+    ExecutorWorkKey,
 )
-from issue_orchestrator.domain.executor_monitoring import ExecutorRecentEventsQuery
+from issue_orchestrator.domain.executor_monitoring import (
+    ExecutorCommandLifecycleFailed,
+    ExecutorRecentEventsQuery,
+    ExecutorRequestId,
+)
 from issue_orchestrator.execution.host_executor._journal import ExecutorEventStore
+from issue_orchestrator.execution.host_executor._types import (
+    ExecutorRepositoryIdentity,
+    ExecutorWorkIdentity,
+)
 
 
 def _policy_change(percent: int) -> ExecutorPolicyChange:
@@ -63,3 +79,33 @@ def test_torn_rotated_event_is_a_hard_failure(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="invalid executor event"):
         store.recent_events(ExecutorRecentEventsQuery(10))
+
+
+def test_empty_lifecycle_exception_message_remains_durable(tmp_path: Path) -> None:
+    store = ExecutorEventStore(tmp_path)
+    work = QueuedExecutorWork(
+        request_id=ExecutorRequestId("empty-error-message"),
+        sequence=1,
+        work_key=ExecutorWorkKey("io:empty-error-message"),
+        fairness_group=ExecutorFairnessGroup("validation-empty-error"),
+        concurrency_range=ExecutorConcurrencyRange(1, 1),
+        learned_demand=ExecutorLearnedDemand(1.0),
+        aggressiveness=ExecutorAggressiveness(100),
+        exclusive_resources=(),
+    )
+    identity = ExecutorWorkIdentity(
+        ExecutorRepositoryIdentity((tmp_path / ".git").resolve(), "journal-test"),
+        work.work_key,
+    )
+
+    store.command_lifecycle_failed(
+        identity,
+        work,
+        ExecutorAdmissionGrant(1, 1),
+        RuntimeError(),
+    )
+
+    [event] = store.recent_events(ExecutorRecentEventsQuery(10)).events
+    assert type(event) is ExecutorCommandLifecycleFailed
+    assert event.error_type == "RuntimeError"
+    assert event.error_message == "RuntimeError()"

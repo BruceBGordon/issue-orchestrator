@@ -31,7 +31,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol, cast, runtime_checkable
 
 from issue_orchestrator.domain.executor import (
     ExecutorFairnessGroup,
@@ -249,6 +249,21 @@ class ValidateProfileConfiguration:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidateProfileInitialization:
+    """Typed profiler context available before target discovery completes."""
+
+    make_bin: str
+    repo_root: str
+    jobs: int
+    dry_run: bool
+    profiled_commit_sha: str
+    source_worktree_dirty: bool
+    host: ProfileHost
+    aggressiveness: ProfileAggressiveness
+    artifact_directory: str
+
+
+@dataclass(frozen=True, slots=True)
 class ProfileMeasurementRequest:
     """Complete non-null input to one disposable profiling session."""
 
@@ -282,9 +297,11 @@ class ValidateProfileSummary:
 class ProfileStage(StrEnum):
     """Ordered profiler stage whose failure terminates later measurement."""
 
+    TARGET_DISCOVERY = "target-discovery"
     COLD_AGGREGATE = "cold-aggregate"
     TARGET = "target"
     LEARNED_AGGREGATE = "learned-aggregate"
+    SUMMARY = "summary"
     PROFILE_SESSION_CLEANUP = "profile-session-cleanup"
 
 
@@ -292,6 +309,7 @@ class ProfileCleanupOperation(StrEnum):
     """Cleanup boundary whose failure remains part of stage evidence."""
 
     WORKTREE_REMOVE = "worktree-remove"
+    WORKTREE_REGISTRATION_QUERY = "worktree-registration-query"
     TEMPORARY_ROOT_REMOVE = "temporary-root-remove"
     PROFILE_SESSION_ROOT_REMOVE = "profile-session-root-remove"
 
@@ -365,6 +383,140 @@ class IsolatedWorktreeRun:
             )
 
 
+class ProfileAggregateProgressKind(StrEnum):
+    """Last durable aggregate boundary reached before observation failed."""
+
+    COMMAND_COMPLETED = "command-completed"
+    AFTER_STATUS_CAPTURED = "after-status-captured"
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileAggregateCommandCompleted:
+    """Aggregate command and cleanup evidence retained before post-observation."""
+
+    executor_before: ProfileExecutorStatus
+    isolated_run: IsolatedWorktreeRun
+    progress: ProfileAggregateProgressKind = field(
+        default=ProfileAggregateProgressKind.COMMAND_COMPLETED,
+        init=False,
+    )
+
+    def __post_init__(self) -> None:
+        if type(self.executor_before) is not ProfileExecutorStatus:
+            raise ValueError(
+                "ProfileAggregateCommandCompleted.executor_before must be "
+                "ProfileExecutorStatus"
+            )
+        if type(self.isolated_run) is not IsolatedWorktreeRun:
+            raise ValueError(
+                "ProfileAggregateCommandCompleted.isolated_run must be "
+                "IsolatedWorktreeRun"
+            )
+
+    def with_executor_after(
+        self,
+        executor_after: ProfileExecutorStatus,
+    ) -> ProfileAggregateAfterStatusCaptured:
+        """Advance only after the post-command status is fully captured."""
+        return ProfileAggregateAfterStatusCaptured(
+            self.executor_before,
+            self.isolated_run,
+            executor_after,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileAggregateAfterStatusCaptured:
+    """Command evidence plus both executor snapshots, awaiting event capture."""
+
+    executor_before: ProfileExecutorStatus
+    isolated_run: IsolatedWorktreeRun
+    executor_after: ProfileExecutorStatus
+    progress: ProfileAggregateProgressKind = field(
+        default=ProfileAggregateProgressKind.AFTER_STATUS_CAPTURED,
+        init=False,
+    )
+
+    def __post_init__(self) -> None:
+        if type(self.executor_before) is not ProfileExecutorStatus:
+            raise ValueError(
+                "ProfileAggregateAfterStatusCaptured.executor_before must be "
+                "ProfileExecutorStatus"
+            )
+        if type(self.isolated_run) is not IsolatedWorktreeRun:
+            raise ValueError(
+                "ProfileAggregateAfterStatusCaptured.isolated_run must be "
+                "IsolatedWorktreeRun"
+            )
+        if type(self.executor_after) is not ProfileExecutorStatus:
+            raise ValueError(
+                "ProfileAggregateAfterStatusCaptured.executor_after must be "
+                "ProfileExecutorStatus"
+            )
+
+    def with_executor_events(
+        self,
+        executor_events: ProfileExecutorEventCapture,
+    ) -> ProfileAggregateRun:
+        """Complete the aggregate after its exact events are captured."""
+        if type(executor_events) is not ProfileExecutorEventCapture:
+            raise ValueError(
+                "with_executor_events requires ProfileExecutorEventCapture"
+            )
+        return ProfileAggregateRun(
+            self.isolated_run.command_result,
+            self.executor_before,
+            self.executor_after,
+            executor_events,
+            self.isolated_run.cleanup_failures,
+        )
+
+
+ProfileIncompleteAggregateRun = (
+    ProfileAggregateCommandCompleted | ProfileAggregateAfterStatusCaptured
+)
+
+
+class ProfileAggregateObservationOperation(StrEnum):
+    """Post-command observation that failed after work evidence existed."""
+
+    EXECUTOR_AFTER_STATUS = "executor-after-status"
+    EXECUTOR_EVENTS = "executor-events"
+
+
+class ProfileAggregateObservationError(RuntimeError):
+    """Typed control signal retaining post-command aggregate progress."""
+
+    def __init__(
+        self,
+        operation: ProfileAggregateObservationOperation,
+        progress: ProfileIncompleteAggregateRun,
+        primary_error: BaseException,
+    ) -> None:
+        if type(operation) is not ProfileAggregateObservationOperation:
+            raise ValueError(
+                "ProfileAggregateObservationError.operation must be typed"
+            )
+        if type(progress) not in (
+            ProfileAggregateCommandCompleted,
+            ProfileAggregateAfterStatusCaptured,
+        ):
+            raise ValueError(
+                "ProfileAggregateObservationError.progress must be typed"
+            )
+        if not isinstance(primary_error, BaseException):
+            raise ValueError(
+                "ProfileAggregateObservationError.primary_error is required"
+            )
+        self.operation = operation
+        self.progress = progress
+        self.primary_error = primary_error
+        super().__init__(
+            f"{operation.value} raised {type(primary_error).__name__}: "
+            f"{_exception_message(primary_error)} after {progress.progress.value}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ProfileFailure:
     """Typed failed result retained without manufacturing comparisons."""
@@ -414,6 +566,72 @@ class ProfileStageFailed(RuntimeError):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ProfileUnexpectedFailure:
+    """Unexpected stage failure retained without manufacturing command evidence."""
+
+    stage: ProfileStage
+    operation_name: str
+    error_type: str
+    error_message: str
+    cleanup_failures: tuple[ProfileCleanupFailure, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.stage) is not ProfileStage:
+            raise ValueError("ProfileUnexpectedFailure.stage must be ProfileStage")
+        if type(self.operation_name) is not str or not self.operation_name:
+            raise ValueError(
+                "ProfileUnexpectedFailure.operation_name must not be empty"
+            )
+        if type(self.error_type) is not str or not self.error_type:
+            raise ValueError("ProfileUnexpectedFailure.error_type must not be empty")
+        if type(self.error_message) is not str or not self.error_message:
+            raise ValueError(
+                "ProfileUnexpectedFailure.error_message must not be empty"
+            )
+        if type(self.cleanup_failures) is not tuple or any(
+            type(failure)
+            not in (ProfileCleanupCommandFailure, ProfileCleanupFilesystemFailure)
+            for failure in self.cleanup_failures
+        ):
+            raise ValueError(
+                "ProfileUnexpectedFailure.cleanup_failures must contain typed "
+                "failures"
+            )
+
+
+class IsolatedProfileWorktreeError(RuntimeError):
+    """Unexpected worktree operation failure plus unconditional cleanup evidence."""
+
+    def __init__(
+        self,
+        operation_name: str,
+        worktree: Path,
+        primary_error: BaseException,
+        cleanup_failures: tuple[ProfileCleanupFailure, ...],
+    ) -> None:
+        if type(operation_name) is not str or not operation_name:
+            raise ValueError("IsolatedProfileWorktreeError.operation_name is required")
+        if type(cleanup_failures) is not tuple:
+            raise ValueError(
+                "IsolatedProfileWorktreeError.cleanup_failures must be a tuple"
+            )
+        if not isinstance(worktree, Path) or not worktree.is_absolute():
+            raise ValueError(
+                "IsolatedProfileWorktreeError.worktree must be an absolute Path"
+            )
+        self.operation_name = operation_name
+        self.worktree = worktree
+        self.primary_error = primary_error
+        self.cleanup_failures = cleanup_failures
+        super().__init__(
+            f"{operation_name} raised {type(primary_error).__name__}: "
+            f"{_exception_message(primary_error)}; cleanup_failures="
+            f"{len(cleanup_failures)}"
+        )
+
+
+@runtime_checkable
 class ProfileDirectoryRemover(Protocol):
     """Remove one profiler-owned directory or raise its filesystem error."""
 
@@ -425,6 +643,363 @@ class ShutilProfileDirectoryRemover:
 
     def remove(self, directory: Path) -> None:
         shutil.rmtree(directory)
+
+
+def _exception_message(error: BaseException) -> str:
+    message = str(error)
+    return message if message else repr(error)
+
+
+def _filesystem_cleanup_failure(
+    operation: ProfileCleanupOperation,
+    error: BaseException,
+) -> ProfileCleanupFilesystemFailure:
+    return ProfileCleanupFilesystemFailure(
+        operation,
+        type(error).__name__,
+        _exception_message(error),
+    )
+
+
+class ProfileWorktreeRegistration(StrEnum):
+    """Exact Git registration state for one isolated worktree path."""
+
+    ABSENT = "absent"
+    REGISTERED = "registered"
+
+
+class _ProfileWorktreeRegistrationState(StrEnum):
+    """Knowledge retained by the worktree owner across add publication."""
+
+    NOT_ATTEMPTED = "not-attempted"
+    INDETERMINATE = "indeterminate"
+    CONFIRMED = "confirmed"
+
+
+@runtime_checkable
+class ProfileWorktreeRegistrationObserver(Protocol):
+    """Observe whether Git still registers one exact canonical worktree path."""
+
+    def observe(
+        self,
+        repo_root: Path,
+        worktree: Path,
+    ) -> ProfileWorktreeRegistration: ...
+
+
+class GitProfileWorktreeRegistrationObserver:
+    """Read Git's porcelain registry without inferring from filesystem state."""
+
+    def observe(
+        self,
+        repo_root: Path,
+        worktree: Path,
+    ) -> ProfileWorktreeRegistration:
+        completed = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(repo_root),
+                "worktree",
+                "list",
+                "--porcelain",
+                "-z",
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or "git returned no diagnostic"
+            raise RuntimeError(f"cannot query Git worktree registration: {detail}")
+        expected = worktree.resolve()
+        registered_paths = tuple(
+            Path(field.removeprefix("worktree ")).resolve()
+            for field in completed.stdout.split("\0")
+            if field.startswith("worktree ")
+        )
+        if expected in registered_paths:
+            return ProfileWorktreeRegistration.REGISTERED
+        return ProfileWorktreeRegistration.ABSENT
+
+
+@runtime_checkable
+class ProfileWorktreeCommandRunner(Protocol):
+    """Execute logged Git registration changes for an isolated worktree."""
+
+    def add(
+        self,
+        *,
+        repo_root: Path,
+        worktree: Path,
+        profiled_commit_sha: str,
+        operation_name: str,
+        dry_run: bool,
+        artifacts: ProfileArtifactStore,
+    ) -> CommandResult: ...
+
+    def remove(
+        self,
+        *,
+        repo_root: Path,
+        worktree: Path,
+        operation_name: str,
+        dry_run: bool,
+        artifacts: ProfileArtifactStore,
+    ) -> CommandResult: ...
+
+
+class LoggedProfileWorktreeCommandRunner:
+    """Production adapter retaining every Git mutation in profiler artifacts."""
+
+    def add(
+        self,
+        *,
+        repo_root: Path,
+        worktree: Path,
+        profiled_commit_sha: str,
+        operation_name: str,
+        dry_run: bool,
+        artifacts: ProfileArtifactStore,
+    ) -> CommandResult:
+        return run_command(
+            name=f"{operation_name}:worktree-add",
+            command=(
+                "git",
+                "-C",
+                str(repo_root),
+                "worktree",
+                "add",
+                "--detach",
+                str(worktree),
+                profiled_commit_sha,
+            ),
+            dry_run=dry_run,
+            cwd=None,
+            worktree_path=None,
+            artifacts=artifacts,
+        )
+
+    def remove(
+        self,
+        *,
+        repo_root: Path,
+        worktree: Path,
+        operation_name: str,
+        dry_run: bool,
+        artifacts: ProfileArtifactStore,
+    ) -> CommandResult:
+        return run_command(
+            name=f"{operation_name}:worktree-remove",
+            command=(
+                "git",
+                "-C",
+                str(repo_root),
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree),
+            ),
+            dry_run=dry_run,
+            cwd=None,
+            worktree_path=None,
+            artifacts=artifacts,
+        )
+
+
+@dataclass(slots=True)
+class IsolatedProfileWorktree:
+    """Deep owner for one registered Git worktree and its temporary root."""
+
+    repo_root: Path
+    operation_name: str
+    profiled_commit_sha: str
+    dry_run: bool
+    artifacts: ProfileArtifactStore
+    temporary_root: Path
+    directory_remover: ProfileDirectoryRemover
+    registration_observer: ProfileWorktreeRegistrationObserver
+    command_runner: ProfileWorktreeCommandRunner
+    _registration_state: _ProfileWorktreeRegistrationState = field(
+        default=_ProfileWorktreeRegistrationState.NOT_ATTEMPTED,
+        init=False,
+    )
+    _closed: bool = field(default=False, init=False)
+    _retained_cleanup_failures: tuple[ProfileCleanupFailure, ...] = field(
+        default=(),
+        init=False,
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.repo_root, Path) or not self.repo_root.is_absolute():
+            raise ValueError("IsolatedProfileWorktree.repo_root must be absolute")
+        if type(self.operation_name) is not str or not self.operation_name:
+            raise ValueError(
+                "IsolatedProfileWorktree.operation_name must not be empty"
+            )
+        if (
+            type(self.profiled_commit_sha) is not str
+            or len(self.profiled_commit_sha) != 40
+        ):
+            raise ValueError(
+                "IsolatedProfileWorktree.profiled_commit_sha must be a full SHA"
+            )
+        if type(self.dry_run) is not bool:
+            raise ValueError("IsolatedProfileWorktree.dry_run must be boolean")
+        if type(self.artifacts) is not ProfileArtifactStore:
+            raise ValueError(
+                "IsolatedProfileWorktree.artifacts must be ProfileArtifactStore"
+            )
+        if (
+            not isinstance(self.temporary_root, Path)
+            or not self.temporary_root.is_absolute()
+        ):
+            raise ValueError(
+                "IsolatedProfileWorktree.temporary_root must be absolute"
+            )
+        if not isinstance(self.directory_remover, ProfileDirectoryRemover):
+            raise ValueError(
+                "IsolatedProfileWorktree.directory_remover must implement "
+                "ProfileDirectoryRemover"
+            )
+        if not isinstance(
+            self.registration_observer,
+            ProfileWorktreeRegistrationObserver,
+        ):
+            raise ValueError(
+                "IsolatedProfileWorktree.registration_observer must implement "
+                "ProfileWorktreeRegistrationObserver"
+            )
+        if not isinstance(self.command_runner, ProfileWorktreeCommandRunner):
+            raise ValueError(
+                "IsolatedProfileWorktree.command_runner must implement "
+                "ProfileWorktreeCommandRunner"
+            )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        repo_root: Path,
+        operation_name: str,
+        profiled_commit_sha: str,
+        dry_run: bool,
+        artifacts: ProfileArtifactStore,
+        directory_remover: ProfileDirectoryRemover,
+        registration_observer: ProfileWorktreeRegistrationObserver,
+        command_runner: ProfileWorktreeCommandRunner,
+        temporary_prefix: str,
+    ) -> IsolatedProfileWorktree:
+        """Allocate the temporary root before any Git registration exists."""
+        if type(temporary_prefix) is not str or not temporary_prefix:
+            raise ValueError("isolated worktree temporary prefix must not be empty")
+        temporary_root = Path(tempfile.mkdtemp(prefix=temporary_prefix)).resolve()
+        return cls(
+            repo_root.resolve(),
+            operation_name,
+            profiled_commit_sha,
+            dry_run,
+            artifacts,
+            temporary_root,
+            directory_remover,
+            registration_observer,
+            command_runner,
+        )
+
+    @property
+    def worktree(self) -> Path:
+        """Return the sole worktree path owned by this lifecycle."""
+        return self.temporary_root / "wt"
+
+    def add(self) -> CommandResult:
+        """Attempt registration once and retain whether Git accepted it."""
+        if self._registration_state is not _ProfileWorktreeRegistrationState.NOT_ATTEMPTED:
+            raise RuntimeError("isolated profile worktree add was attempted twice")
+        if self._closed:
+            raise RuntimeError("isolated profile worktree is already closed")
+        self._registration_state = _ProfileWorktreeRegistrationState.INDETERMINATE
+        result = self.command_runner.add(
+            repo_root=self.repo_root,
+            worktree=self.worktree,
+            profiled_commit_sha=self.profiled_commit_sha,
+            operation_name=self.operation_name,
+            dry_run=self.dry_run,
+            artifacts=self.artifacts,
+        )
+        if result.exit_code == 0:
+            self._registration_state = _ProfileWorktreeRegistrationState.CONFIRMED
+        return result
+
+    def close(self) -> tuple[ProfileCleanupFailure, ...]:
+        """Attempt Git and filesystem cleanup independently and retain all failures."""
+        if self._closed:
+            return self._retained_cleanup_failures
+        failures: list[ProfileCleanupFailure] = []
+        if self._requires_git_removal(failures):
+            self._remove_registered_worktree(failures)
+        try:
+            self.directory_remover.remove(self.temporary_root)
+        except BaseException as error:
+            failures.append(
+                _filesystem_cleanup_failure(
+                    ProfileCleanupOperation.TEMPORARY_ROOT_REMOVE,
+                    error,
+                )
+            )
+        self._retained_cleanup_failures = tuple(failures)
+        self._closed = True
+        return self._retained_cleanup_failures
+
+    def _requires_git_removal(
+        self,
+        failures: list[ProfileCleanupFailure],
+    ) -> bool:
+        if self._registration_state is _ProfileWorktreeRegistrationState.NOT_ATTEMPTED:
+            return False
+        if self._registration_state is _ProfileWorktreeRegistrationState.CONFIRMED:
+            return True
+        try:
+            observation = self.registration_observer.observe(
+                self.repo_root,
+                self.worktree,
+            )
+        except BaseException as error:
+            failures.append(
+                _filesystem_cleanup_failure(
+                    ProfileCleanupOperation.WORKTREE_REGISTRATION_QUERY,
+                    error,
+                )
+            )
+            return True
+        return observation is ProfileWorktreeRegistration.REGISTERED
+
+    def _remove_registered_worktree(
+        self,
+        failures: list[ProfileCleanupFailure],
+    ) -> None:
+        try:
+            removal = self.command_runner.remove(
+                repo_root=self.repo_root,
+                worktree=self.worktree,
+                operation_name=self.operation_name,
+                dry_run=self.dry_run,
+                artifacts=self.artifacts,
+            )
+        except BaseException as error:
+            failures.append(
+                _filesystem_cleanup_failure(
+                    ProfileCleanupOperation.WORKTREE_REMOVE,
+                    error,
+                )
+            )
+            return
+        if removal.exit_code != 0:
+            failures.append(
+                ProfileCleanupCommandFailure(
+                    ProfileCleanupOperation.WORKTREE_REMOVE,
+                    removal,
+                )
+            )
 
 
 class ProfileSessionCleanupError(RuntimeError):
@@ -444,7 +1019,7 @@ class ProfileSessionCleanupError(RuntimeError):
 class ValidateProfileReport:
     """Versioned JSON report written by the profiler."""
 
-    schema_version: Literal[6]
+    schema_version: Literal[7]
     outcome: Literal["complete"]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
@@ -457,7 +1032,7 @@ class ValidateProfileReport:
 class ColdAggregateFailureReport:
     """Partial report when the first aggregate fails."""
 
-    schema_version: Literal[6]
+    schema_version: Literal[7]
     outcome: Literal["failed"]
     config: ValidateProfileConfiguration
     failed_aggregate: ProfileAggregateRun
@@ -468,7 +1043,7 @@ class ColdAggregateFailureReport:
 class TargetFailureReport:
     """Partial report when one isolated target fails."""
 
-    schema_version: Literal[6]
+    schema_version: Literal[7]
     outcome: Literal["failed"]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
@@ -480,7 +1055,7 @@ class TargetFailureReport:
 class LearnedAggregateFailureReport:
     """Partial report when the final aggregate fails."""
 
-    schema_version: Literal[6]
+    schema_version: Literal[7]
     outcome: Literal["failed"]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
@@ -493,7 +1068,7 @@ class LearnedAggregateFailureReport:
 class ProfileSessionCleanupFailureReport:
     """Complete measurements retained when final session cleanup fails."""
 
-    schema_version: Literal[6]
+    schema_version: Literal[7]
     outcome: Literal["failed"]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
@@ -503,12 +1078,83 @@ class ProfileSessionCleanupFailureReport:
     failure: ProfileFailure
 
 
+@dataclass(frozen=True, slots=True)
+class UnexpectedProfileFailureReport:
+    """Partial measurements retained when profiler code raises unexpectedly."""
+
+    schema_version: Literal[7]
+    outcome: Literal["failed"]
+    config: ValidateProfileConfiguration
+    completed_aggregate_runs: tuple[ProfileAggregateRun, ...]
+    incomplete_aggregate_runs: tuple[ProfileIncompleteAggregateRun, ...]
+    completed_target_runs: tuple[CommandResult, ...]
+    failure: ProfileUnexpectedFailure
+
+    def __post_init__(self) -> None:
+        if type(self.completed_aggregate_runs) is not tuple or any(
+            type(run) is not ProfileAggregateRun
+            for run in self.completed_aggregate_runs
+        ):
+            raise ValueError(
+                "UnexpectedProfileFailureReport.completed_aggregate_runs must "
+                "contain ProfileAggregateRun values"
+            )
+        if type(self.incomplete_aggregate_runs) is not tuple or any(
+            type(run)
+            not in (
+                ProfileAggregateCommandCompleted,
+                ProfileAggregateAfterStatusCaptured,
+            )
+            for run in self.incomplete_aggregate_runs
+        ):
+            raise ValueError(
+                "UnexpectedProfileFailureReport.incomplete_aggregate_runs must "
+                "contain typed partial aggregate values"
+            )
+        if type(self.completed_target_runs) is not tuple or any(
+            type(run) is not CommandResult for run in self.completed_target_runs
+        ):
+            raise ValueError(
+                "UnexpectedProfileFailureReport.completed_target_runs must contain "
+                "CommandResult values"
+            )
+        if type(self.failure) is not ProfileUnexpectedFailure:
+            raise ValueError(
+                "UnexpectedProfileFailureReport.failure must be "
+                "ProfileUnexpectedFailure"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileDiscoveryFailureReport:
+    """Typed startup evidence when pinned target discovery fails."""
+
+    schema_version: Literal[7]
+    outcome: Literal["failed"]
+    initialization: ValidateProfileInitialization
+    failure: ProfileUnexpectedFailure
+
+    def __post_init__(self) -> None:
+        if type(self.initialization) is not ValidateProfileInitialization:
+            raise ValueError(
+                "ProfileDiscoveryFailureReport.initialization must be "
+                "ValidateProfileInitialization"
+            )
+        if type(self.failure) is not ProfileUnexpectedFailure:
+            raise ValueError(
+                "ProfileDiscoveryFailureReport.failure must be "
+                "ProfileUnexpectedFailure"
+            )
+
+
 ValidateProfileArtifact = (
     ValidateProfileReport
     | ColdAggregateFailureReport
     | TargetFailureReport
     | LearnedAggregateFailureReport
     | ProfileSessionCleanupFailureReport
+    | UnexpectedProfileFailureReport
+    | ProfileDiscoveryFailureReport
 )
 
 
@@ -650,54 +1296,45 @@ def discover_validate_targets_at_commit(
     repo_root: Path,
     make_bin: str,
     profiled_commit_sha: str,
+    artifacts: ProfileArtifactStore,
 ) -> tuple[str, ...]:
     """Discover lanes from the immutable tree used by every measurement."""
-    temporary_root = Path(tempfile.mkdtemp(prefix="io-validate-profile-discovery-"))
-    worktree = temporary_root / "wt"
-    added = False
+    worktree_owner = IsolatedProfileWorktree.create(
+        repo_root=repo_root,
+        operation_name="target-discovery",
+        profiled_commit_sha=profiled_commit_sha,
+        dry_run=False,
+        artifacts=artifacts,
+        directory_remover=ShutilProfileDirectoryRemover(),
+        registration_observer=GitProfileWorktreeRegistrationObserver(),
+        command_runner=LoggedProfileWorktreeCommandRunner(),
+        temporary_prefix="io-validate-profile-discovery-",
+    )
     try:
-        completed = subprocess.run(
-            (
-                "git",
-                "-C",
-                str(repo_root),
-                "worktree",
-                "add",
-                "--detach",
-                str(worktree),
-                profiled_commit_sha,
-            ),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if completed.returncode != 0:
+        add_result = worktree_owner.add()
+        if add_result.exit_code != 0:
             raise RuntimeError(
-                f"cannot create pinned discovery worktree: {completed.stderr.strip()}"
+                "cannot create pinned discovery worktree: "
+                f"exit={add_result.exit_code} log={add_result.output_log_path}"
             )
-        added = True
-        return discover_validate_targets(worktree, make_bin)
-    finally:
-        if added:
-            removed = subprocess.run(
-                (
-                    "git",
-                    "-C",
-                    str(repo_root),
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(worktree),
-                ),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if removed.returncode != 0:
-                raise RuntimeError(
-                    f"cannot remove pinned discovery worktree: {removed.stderr.strip()}"
-                )
-        shutil.rmtree(temporary_root)
+        targets = discover_validate_targets(worktree_owner.worktree, make_bin)
+    except BaseException as error:
+        cleanup_failures = worktree_owner.close()
+        raise IsolatedProfileWorktreeError(
+            "target-discovery",
+            worktree_owner.worktree,
+            error,
+            cleanup_failures,
+        ) from error
+    cleanup_failures = worktree_owner.close()
+    if cleanup_failures:
+        raise IsolatedProfileWorktreeError(
+            "target-discovery",
+            worktree_owner.worktree,
+            RuntimeError("pinned discovery worktree cleanup failed"),
+            cleanup_failures,
+        )
+    return targets
 
 
 def parse_target_override(raw: str | None) -> tuple[str, ...] | None:
@@ -806,6 +1443,8 @@ def write_profile_artifact(
         TargetFailureReport,
         LearnedAggregateFailureReport,
         ProfileSessionCleanupFailureReport,
+        UnexpectedProfileFailureReport,
+        ProfileDiscoveryFailureReport,
     )
     if type(artifact) not in supported:
         raise ValueError("write_profile_artifact requires a profile report variant")
@@ -823,12 +1462,11 @@ def remove_profile_session_root(
     """Return typed terminal cleanup evidence instead of raising it."""
     try:
         directory_remover.remove(profile_root)
-    except OSError as exc:
+    except BaseException as error:
         return (
-            ProfileCleanupFilesystemFailure(
+            _filesystem_cleanup_failure(
                 ProfileCleanupOperation.PROFILE_SESSION_ROOT_REMOVE,
-                type(exc).__name__,
-                str(exc),
+                error,
             ),
         )
     return ()
@@ -845,6 +1483,19 @@ def _extend_profile_failure(
     )
 
 
+def _extend_unexpected_profile_failure(
+    failure: ProfileUnexpectedFailure,
+    cleanup_failures: tuple[ProfileCleanupFailure, ...],
+) -> ProfileUnexpectedFailure:
+    return ProfileUnexpectedFailure(
+        failure.stage,
+        failure.operation_name,
+        failure.error_type,
+        failure.error_message,
+        (*failure.cleanup_failures, *cleanup_failures),
+    )
+
+
 def _retain_profile_session_cleanup(
     artifact: ValidateProfileArtifact,
     cleanup_failures: tuple[ProfileCleanupFailure, ...],
@@ -853,7 +1504,7 @@ def _retain_profile_session_cleanup(
         return artifact
     if type(artifact) is ValidateProfileReport:
         return ProfileSessionCleanupFailureReport(
-            schema_version=6,
+            schema_version=7,
             outcome="failed",
             config=artifact.config,
             cold_validate_pr_raw_run=artifact.cold_validate_pr_raw_run,
@@ -868,7 +1519,7 @@ def _retain_profile_session_cleanup(
         )
     if type(artifact) is ColdAggregateFailureReport:
         return ColdAggregateFailureReport(
-            schema_version=6,
+            schema_version=7,
             outcome="failed",
             config=artifact.config,
             failed_aggregate=artifact.failed_aggregate,
@@ -876,7 +1527,7 @@ def _retain_profile_session_cleanup(
         )
     if type(artifact) is TargetFailureReport:
         return TargetFailureReport(
-            schema_version=6,
+            schema_version=7,
             outcome="failed",
             config=artifact.config,
             cold_validate_pr_raw_run=artifact.cold_validate_pr_raw_run,
@@ -885,13 +1536,30 @@ def _retain_profile_session_cleanup(
         )
     if type(artifact) is LearnedAggregateFailureReport:
         return LearnedAggregateFailureReport(
-            schema_version=6,
+            schema_version=7,
             outcome="failed",
             config=artifact.config,
             cold_validate_pr_raw_run=artifact.cold_validate_pr_raw_run,
             target_runs=artifact.target_runs,
             failed_aggregate=artifact.failed_aggregate,
             failure=_extend_profile_failure(artifact.failure, cleanup_failures),
+        )
+    if type(artifact) is UnexpectedProfileFailureReport:
+        return UnexpectedProfileFailureReport(
+            schema_version=7,
+            outcome="failed",
+            config=artifact.config,
+            completed_aggregate_runs=artifact.completed_aggregate_runs,
+            incomplete_aggregate_runs=artifact.incomplete_aggregate_runs,
+            completed_target_runs=artifact.completed_target_runs,
+            failure=_extend_unexpected_profile_failure(
+                artifact.failure,
+                cleanup_failures,
+            ),
+        )
+    if type(artifact) is ProfileDiscoveryFailureReport:
+        raise ValueError(
+            "target-discovery artifacts do not own a profile session root"
         )
     if type(artifact) is ProfileSessionCleanupFailureReport:
         raise ValueError("profile session cleanup can only be finalized once")
@@ -901,12 +1569,17 @@ def _retain_profile_session_cleanup(
 def _profile_artifact_exit_code(artifact: ValidateProfileArtifact) -> int:
     if type(artifact) is ValidateProfileReport:
         return 0
-    if type(artifact) in (
-        ColdAggregateFailureReport,
-        TargetFailureReport,
-        LearnedAggregateFailureReport,
-        ProfileSessionCleanupFailureReport,
-    ):
+    if type(artifact) is UnexpectedProfileFailureReport:
+        return 1
+    if type(artifact) is ProfileDiscoveryFailureReport:
+        return 1
+    if type(artifact) is ColdAggregateFailureReport:
+        return artifact.failure.exit_code
+    if type(artifact) is TargetFailureReport:
+        return artifact.failure.exit_code
+    if type(artifact) is LearnedAggregateFailureReport:
+        return artifact.failure.exit_code
+    if type(artifact) is ProfileSessionCleanupFailureReport:
         return artifact.failure.exit_code
     raise AssertionError("ValidateProfileArtifact is a closed union")
 
@@ -1004,116 +1677,103 @@ def run_in_isolated_worktree(
     fairness_group: ExecutorFairnessGroup,
 ) -> IsolatedWorktreeRun:
     """Provision, measure, and remove one isolated detached worktree."""
-    temporary_root = Path(tempfile.mkdtemp(prefix="io-validate-profile-"))
-    worktree = temporary_root / "wt"
-    add_command = (
-        "git",
-        "-C",
-        str(repo_root),
-        "worktree",
-        "add",
-        "--detach",
-        str(worktree),
-        profiled_commit_sha,
-    )
-    add_result = run_command(
-        name=f"{name}:worktree-add",
-        command=add_command,
+    worktree_owner = IsolatedProfileWorktree.create(
+        repo_root=repo_root,
+        operation_name=name,
+        profiled_commit_sha=profiled_commit_sha,
         dry_run=dry_run,
-        cwd=None,
-        worktree_path=None,
         artifacts=artifacts,
+        directory_remover=ShutilProfileDirectoryRemover(),
+        registration_observer=GitProfileWorktreeRegistrationObserver(),
+        command_runner=LoggedProfileWorktreeCommandRunner(),
+        temporary_prefix="io-validate-profile-",
     )
-    add_succeeded = add_result.exit_code == 0
-    if not add_succeeded:
-        command_result = CommandResult(
-            name=name,
-            command=add_command,
-            wall_seconds=add_result.wall_seconds,
-            exit_code=add_result.exit_code,
-            worktree_path=str(worktree),
-            output_log_path=add_result.output_log_path,
-        )
-    else:
-        setup_result = prepare_worktree(
+    try:
+        command_result = _measure_in_isolated_worktree(
+            worktree_owner=worktree_owner,
             make_bin=make_bin,
             name=name,
-            worktree=worktree,
+            make_target=make_target,
             dry_run=dry_run,
-            artifacts=artifacts,
+            jobs=jobs,
+            executor_pool_dir=executor_pool_dir,
+            executor_aggressiveness_percent=executor_aggressiveness_percent,
+            fairness_group=fairness_group,
         )
-        if setup_result.exit_code != 0:
-            command_result = CommandResult(
-                name=name,
-                command=setup_result.command,
-                wall_seconds=setup_result.wall_seconds,
-                exit_code=setup_result.exit_code,
-                worktree_path=str(worktree),
-                output_log_path=setup_result.output_log_path,
-            )
-        else:
-            make_arguments = [make_bin]
-            if jobs is not None:
-                make_arguments.extend(
-                    (
-                        f"-j{jobs}",
-                        "--output-sync=target",
-                        f"VALIDATE_LANE_JOBS={jobs}",
-                    )
-                )
-            make_arguments.append(make_target)
-            environment = os.environ.copy()
-            environment[EXECUTOR_POOL_DIR_ENV] = str(executor_pool_dir)
-            environment[EXECUTOR_AGGRESSIVENESS_ENV] = str(
-                executor_aggressiveness_percent
-            )
-            environment[EXECUTOR_GROUP_ENV] = fairness_group.value
-            command_result = run_command(
-                name=name,
-                command=tuple(make_arguments),
-                dry_run=dry_run,
-                cwd=worktree,
-                worktree_path=str(worktree),
-                artifacts=artifacts,
-                environment=environment,
-            )
+    except BaseException as error:
+        cleanup_failures = worktree_owner.close()
+        raise IsolatedProfileWorktreeError(
+            name,
+            worktree_owner.worktree,
+            error,
+            cleanup_failures,
+        ) from error
+    return IsolatedWorktreeRun(command_result, worktree_owner.close())
 
-    cleanup_failures: list[ProfileCleanupFailure] = []
-    if add_succeeded:
-        removal = run_command(
-            name=f"{name}:worktree-remove",
-            command=(
-                "git",
-                "-C",
-                str(repo_root),
-                "worktree",
-                "remove",
-                "--force",
-                str(worktree),
-            ),
-            dry_run=dry_run,
-            cwd=None,
-            worktree_path=None,
-            artifacts=artifacts,
+
+def _measure_in_isolated_worktree(
+    *,
+    worktree_owner: IsolatedProfileWorktree,
+    make_bin: str,
+    name: str,
+    make_target: str,
+    dry_run: bool,
+    jobs: int | None,
+    executor_pool_dir: Path,
+    executor_aggressiveness_percent: int,
+    fairness_group: ExecutorFairnessGroup,
+) -> CommandResult:
+    add_result = worktree_owner.add()
+    if add_result.exit_code != 0:
+        return CommandResult(
+            name=name,
+            command=add_result.command,
+            wall_seconds=add_result.wall_seconds,
+            exit_code=add_result.exit_code,
+            worktree_path=str(worktree_owner.worktree),
+            output_log_path=add_result.output_log_path,
         )
-        if removal.exit_code != 0:
-            cleanup_failures.append(
-                ProfileCleanupCommandFailure(
-                    ProfileCleanupOperation.WORKTREE_REMOVE,
-                    removal,
-                )
-            )
-    try:
-        shutil.rmtree(temporary_root)
-    except OSError as exc:
-        cleanup_failures.append(
-            ProfileCleanupFilesystemFailure(
-                ProfileCleanupOperation.TEMPORARY_ROOT_REMOVE,
-                type(exc).__name__,
-                str(exc),
+    setup_result = prepare_worktree(
+        make_bin=make_bin,
+        name=name,
+        worktree=worktree_owner.worktree,
+        dry_run=dry_run,
+        artifacts=worktree_owner.artifacts,
+    )
+    if setup_result.exit_code != 0:
+        return CommandResult(
+            name=name,
+            command=setup_result.command,
+            wall_seconds=setup_result.wall_seconds,
+            exit_code=setup_result.exit_code,
+            worktree_path=str(worktree_owner.worktree),
+            output_log_path=setup_result.output_log_path,
+        )
+    make_arguments = [make_bin]
+    if jobs is not None:
+        make_arguments.extend(
+            (
+                f"-j{jobs}",
+                "--output-sync=target",
+                f"VALIDATE_LANE_JOBS={jobs}",
             )
         )
-    return IsolatedWorktreeRun(command_result, tuple(cleanup_failures))
+    make_arguments.append(make_target)
+    environment = os.environ.copy()
+    environment[EXECUTOR_POOL_DIR_ENV] = str(executor_pool_dir)
+    environment[EXECUTOR_AGGRESSIVENESS_ENV] = str(
+        executor_aggressiveness_percent
+    )
+    environment[EXECUTOR_GROUP_ENV] = fairness_group.value
+    return run_command(
+        name=name,
+        command=tuple(make_arguments),
+        dry_run=dry_run,
+        cwd=worktree_owner.worktree,
+        worktree_path=str(worktree_owner.worktree),
+        artifacts=worktree_owner.artifacts,
+        environment=environment,
+    )
 
 
 def resolve_output_path(arguments: ProfileArguments, repo_root: Path) -> Path:
@@ -1337,19 +1997,29 @@ def run_profile_aggregate(
         profiled_commit_sha=profiled_commit_sha,
         fairness_group=fairness_group,
     )
-    after = capture_executor_status(executor_pool_dir, aggressiveness)
-    events = capture_executor_events(
-        executor_pool_dir,
-        aggressiveness,
-        fairness_group=fairness_group,
-    )
-    return ProfileAggregateRun(
-        isolated_run.command_result,
-        before,
-        after,
-        events,
-        isolated_run.cleanup_failures,
-    )
+    command_completed = ProfileAggregateCommandCompleted(before, isolated_run)
+    try:
+        after = capture_executor_status(executor_pool_dir, aggressiveness)
+    except BaseException as error:
+        raise ProfileAggregateObservationError(
+            ProfileAggregateObservationOperation.EXECUTOR_AFTER_STATUS,
+            command_completed,
+            error,
+        ) from error
+    after_status_captured = command_completed.with_executor_after(after)
+    try:
+        events = capture_executor_events(
+            executor_pool_dir,
+            aggressiveness,
+            fairness_group=fairness_group,
+        )
+    except BaseException as error:
+        raise ProfileAggregateObservationError(
+            ProfileAggregateObservationOperation.EXECUTOR_EVENTS,
+            after_status_captured,
+            error,
+        ) from error
+    return after_status_captured.with_executor_events(events)
 
 
 def profile_fairness_group(
@@ -1366,20 +2036,104 @@ def profile_fairness_group(
     )
 
 
+def profile_unexpected_failure(
+    *,
+    stage: ProfileStage,
+    operation_name: str,
+    error: BaseException,
+) -> ProfileUnexpectedFailure:
+    """Convert one exception and nested worktree cleanup into typed evidence."""
+    if type(error) is IsolatedProfileWorktreeError:
+        primary_error = error.primary_error
+        cleanup_failures = error.cleanup_failures
+        operation_name = error.operation_name
+    elif type(error) is ProfileAggregateObservationError:
+        primary_error = error.primary_error
+        cleanup_failures = error.progress.isolated_run.cleanup_failures
+        operation_name = f"{operation_name}:{error.operation.value}"
+    else:
+        primary_error = error
+        cleanup_failures = ()
+    return ProfileUnexpectedFailure(
+        stage=stage,
+        operation_name=operation_name,
+        error_type=type(primary_error).__name__,
+        error_message=_exception_message(primary_error),
+        cleanup_failures=cleanup_failures,
+    )
+
+
+def unexpected_profile_failure_report(
+    *,
+    request: ProfileMeasurementRequest,
+    stage: ProfileStage,
+    operation_name: str,
+    error: BaseException,
+    completed_aggregate_runs: tuple[ProfileAggregateRun, ...],
+    incomplete_aggregate_runs: tuple[ProfileIncompleteAggregateRun, ...],
+    completed_target_runs: tuple[CommandResult, ...],
+) -> UnexpectedProfileFailureReport:
+    """Convert an unexpected measurement exception into durable evidence."""
+    failure = profile_unexpected_failure(
+        stage=stage,
+        operation_name=operation_name,
+        error=error,
+    )
+    print(
+        "[profile] unexpected failure: "
+        f"stage={stage.value} operation={failure.operation_name} "
+        f"error={failure.error_type}: {failure.error_message} "
+        f"cleanup_failures={len(failure.cleanup_failures)}",
+        file=sys.stderr,
+    )
+    return UnexpectedProfileFailureReport(
+        schema_version=7,
+        outcome="failed",
+        config=request.configuration,
+        completed_aggregate_runs=completed_aggregate_runs,
+        incomplete_aggregate_runs=incomplete_aggregate_runs,
+        completed_target_runs=completed_target_runs,
+        failure=failure,
+    )
+
+
+def incomplete_aggregate_evidence(
+    error: BaseException,
+) -> tuple[ProfileIncompleteAggregateRun, ...]:
+    """Project only typed post-command progress from an aggregate failure."""
+    if type(error) is ProfileAggregateObservationError:
+        return (error.progress,)
+    return ()
+
+
 def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifact:
     """Run every measurement and return the complete or first-failure artifact."""
-    cold_aggregate = run_profile_aggregate(
-        repo_root=request.repo_root,
-        make_bin=request.make_bin,
-        name=f"cold-aggregate:{AGGREGATE_TARGET}",
-        dry_run=request.dry_run,
-        jobs=request.jobs,
-        executor_pool_dir=request.executor_pool_dir,
-        aggressiveness=request.aggressiveness,
-        artifacts=request.artifacts,
-        profiled_commit_sha=request.profiled_commit_sha,
-        fairness_group=profile_fairness_group(request.profiled_commit_sha, "cold"),
-    )
+    try:
+        cold_aggregate = run_profile_aggregate(
+            repo_root=request.repo_root,
+            make_bin=request.make_bin,
+            name=f"cold-aggregate:{AGGREGATE_TARGET}",
+            dry_run=request.dry_run,
+            jobs=request.jobs,
+            executor_pool_dir=request.executor_pool_dir,
+            aggressiveness=request.aggressiveness,
+            artifacts=request.artifacts,
+            profiled_commit_sha=request.profiled_commit_sha,
+            fairness_group=profile_fairness_group(
+                request.profiled_commit_sha,
+                "cold",
+            ),
+        )
+    except BaseException as error:
+        return unexpected_profile_failure_report(
+            request=request,
+            stage=ProfileStage.COLD_AGGREGATE,
+            operation_name=f"cold-aggregate:{AGGREGATE_TARGET}",
+            error=error,
+            completed_aggregate_runs=(),
+            incomplete_aggregate_runs=incomplete_aggregate_evidence(error),
+            completed_target_runs=(),
+        )
     try:
         require_stage_success(
             ProfileStage.COLD_AGGREGATE,
@@ -1389,7 +2143,7 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
     except ProfileStageFailed as failed:
         print(f"[profile] {failed}", file=sys.stderr)
         return ColdAggregateFailureReport(
-            schema_version=6,
+            schema_version=7,
             outcome="failed",
             config=request.configuration,
             failed_aggregate=cold_aggregate,
@@ -1398,22 +2152,33 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
 
     completed_targets: list[CommandResult] = []
     for target in request.targets:
-        target_run = run_in_isolated_worktree(
-            repo_root=request.repo_root,
-            make_bin=request.make_bin,
-            name=f"target:{target}",
-            make_target=target,
-            dry_run=request.dry_run,
-            jobs=None,
-            executor_pool_dir=request.executor_pool_dir,
-            executor_aggressiveness_percent=request.aggressiveness.percent,
-            artifacts=request.artifacts,
-            profiled_commit_sha=request.profiled_commit_sha,
-            fairness_group=profile_fairness_group(
-                request.profiled_commit_sha,
-                f"target:{target}",
-            ),
-        )
+        try:
+            target_run = run_in_isolated_worktree(
+                repo_root=request.repo_root,
+                make_bin=request.make_bin,
+                name=f"target:{target}",
+                make_target=target,
+                dry_run=request.dry_run,
+                jobs=None,
+                executor_pool_dir=request.executor_pool_dir,
+                executor_aggressiveness_percent=request.aggressiveness.percent,
+                artifacts=request.artifacts,
+                profiled_commit_sha=request.profiled_commit_sha,
+                fairness_group=profile_fairness_group(
+                    request.profiled_commit_sha,
+                    f"target:{target}",
+                ),
+            )
+        except BaseException as error:
+            return unexpected_profile_failure_report(
+                request=request,
+                stage=ProfileStage.TARGET,
+                operation_name=f"target:{target}",
+                error=error,
+                completed_aggregate_runs=(cold_aggregate,),
+                incomplete_aggregate_runs=(),
+                completed_target_runs=tuple(completed_targets),
+            )
         try:
             require_stage_success(
                 ProfileStage.TARGET,
@@ -1423,7 +2188,7 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
         except ProfileStageFailed as failed:
             print(f"[profile] {failed}", file=sys.stderr)
             return TargetFailureReport(
-                schema_version=6,
+                schema_version=7,
                 outcome="failed",
                 config=request.configuration,
                 cold_validate_pr_raw_run=cold_aggregate,
@@ -1433,18 +2198,32 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
         completed_targets.append(target_run.command_result)
     target_results = tuple(completed_targets)
 
-    learned_aggregate = run_profile_aggregate(
-        repo_root=request.repo_root,
-        make_bin=request.make_bin,
-        name=f"learned-aggregate:{AGGREGATE_TARGET}",
-        dry_run=request.dry_run,
-        jobs=request.jobs,
-        executor_pool_dir=request.executor_pool_dir,
-        aggressiveness=request.aggressiveness,
-        artifacts=request.artifacts,
-        profiled_commit_sha=request.profiled_commit_sha,
-        fairness_group=profile_fairness_group(request.profiled_commit_sha, "learned"),
-    )
+    try:
+        learned_aggregate = run_profile_aggregate(
+            repo_root=request.repo_root,
+            make_bin=request.make_bin,
+            name=f"learned-aggregate:{AGGREGATE_TARGET}",
+            dry_run=request.dry_run,
+            jobs=request.jobs,
+            executor_pool_dir=request.executor_pool_dir,
+            aggressiveness=request.aggressiveness,
+            artifacts=request.artifacts,
+            profiled_commit_sha=request.profiled_commit_sha,
+            fairness_group=profile_fairness_group(
+                request.profiled_commit_sha,
+                "learned",
+            ),
+        )
+    except BaseException as error:
+        return unexpected_profile_failure_report(
+            request=request,
+            stage=ProfileStage.LEARNED_AGGREGATE,
+            operation_name=f"learned-aggregate:{AGGREGATE_TARGET}",
+            error=error,
+            completed_aggregate_runs=(cold_aggregate,),
+            incomplete_aggregate_runs=incomplete_aggregate_evidence(error),
+            completed_target_runs=target_results,
+        )
     try:
         require_stage_success(
             ProfileStage.LEARNED_AGGREGATE,
@@ -1454,7 +2233,7 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
     except ProfileStageFailed as failed:
         print(f"[profile] {failed}", file=sys.stderr)
         return LearnedAggregateFailureReport(
-            schema_version=6,
+            schema_version=7,
             outcome="failed",
             config=request.configuration,
             cold_validate_pr_raw_run=cold_aggregate,
@@ -1463,14 +2242,25 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
             failure=failed.failure,
         )
 
-    summary = summarize(
-        target_results=target_results,
-        cold_validate_pr_raw_result=cold_aggregate.command_result,
-        learned_validate_pr_raw_result=learned_aggregate.command_result,
-        jobs=request.jobs,
-    )
+    try:
+        summary = summarize(
+            target_results=target_results,
+            cold_validate_pr_raw_result=cold_aggregate.command_result,
+            learned_validate_pr_raw_result=learned_aggregate.command_result,
+            jobs=request.jobs,
+        )
+    except BaseException as error:
+        return unexpected_profile_failure_report(
+            request=request,
+            stage=ProfileStage.SUMMARY,
+            operation_name="profile-summary",
+            error=error,
+            completed_aggregate_runs=(cold_aggregate, learned_aggregate),
+            incomplete_aggregate_runs=(),
+            completed_target_runs=target_results,
+        )
     return ValidateProfileReport(
-        schema_version=6,
+        schema_version=7,
         outcome="complete",
         config=request.configuration,
         cold_validate_pr_raw_run=cold_aggregate,
@@ -1493,12 +2283,47 @@ def main() -> int:
     artifacts.initialize()
     host = profile_host()
     aggressiveness = resolve_aggressiveness(arguments)
-
-    targets = arguments.targets or discover_validate_targets_at_commit(
-        repo_root,
-        arguments.make_bin,
-        profiled_commit_sha,
+    initialization = ValidateProfileInitialization(
+        make_bin=arguments.make_bin,
+        repo_root=str(repo_root),
+        jobs=arguments.jobs,
+        dry_run=arguments.dry_run,
+        profiled_commit_sha=profiled_commit_sha,
+        source_worktree_dirty=dirty,
+        host=host,
+        aggressiveness=aggressiveness,
+        artifact_directory=str(artifacts.root),
     )
+    if arguments.targets is not None:
+        targets = arguments.targets
+    else:
+        try:
+            targets = discover_validate_targets_at_commit(
+                repo_root,
+                arguments.make_bin,
+                profiled_commit_sha,
+                artifacts,
+            )
+        except BaseException as error:
+            failure = profile_unexpected_failure(
+                stage=ProfileStage.TARGET_DISCOVERY,
+                operation_name="target-discovery",
+                error=error,
+            )
+            print(
+                "[profile] target discovery failed: "
+                f"error={failure.error_type}: {failure.error_message} "
+                f"cleanup_failures={len(failure.cleanup_failures)}",
+                file=sys.stderr,
+            )
+            artifact = ProfileDiscoveryFailureReport(
+                schema_version=7,
+                outcome="failed",
+                initialization=initialization,
+                failure=failure,
+            )
+            write_profile_artifact(output_path, artifact)
+            return _profile_artifact_exit_code(artifact)
     configuration = ValidateProfileConfiguration(
         make_bin=arguments.make_bin,
         repo_root=str(repo_root),

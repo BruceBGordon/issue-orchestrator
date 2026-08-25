@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import os
+import selectors
 import signal
 import subprocess
+import sys
 import threading
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -23,6 +26,10 @@ from ...domain.executor_guardian import (
     ExecutorGuardianTerminationPolicy,
 )
 from ...domain.executor import ExecutorCommandLifecycle
+from ...domain.process_group_sentinel import (
+    ProcessGroupSentinelPolicy,
+    ProcessGroupSentinelProgram,
+)
 from ...domain.process_group import (
     OwnedProcessGroupLeader,
     ProcessGroupCompleted,
@@ -31,20 +38,36 @@ from ...domain.process_group import (
     ProcessGroupUnboundedWait,
 )
 from ...ports.executor_command_guardian import ExecutorGuardianRequest
+from ...ports.atomic_record_store import AtomicRecordStoreFactory
 from ...ports.process_group_supervisor import ProcessGroupSupervisor
 from ..process_group_supervisor import NeverInterruptProcessGroup
+from ..independent_cleanup import (
+    CleanupAction,
+    CleanupFailed,
+    CleanupFailure,
+    CleanupOutcome,
+    CleanupSucceeded,
+    IndependentCleanupPlan,
+)
 from ..executor_guardian_cancellation import (
+    ExecutorGuardianCancellationControls,
     ExecutorGuardianCancellationLease,
+    NoExecutorGuardianCancellationControls,
     prepare_executor_guardian_cancellation,
 )
+from ..process_cancellation_endpoint import ProcessCancellationOwnerControls
 from ._guardian_contracts import (
     GUARDIAN_TERMINAL_ADAPTER,
     GUARDIAN_START_SIGNAL,
+    GuardianCancellationControlRecord,
+    GuardianDetachedCancellationControlRecord,
+    GuardianInteractiveCancellationControlRecord,
     GuardianInvocationRecord,
 )
 
 
 _MAX_RESULT_BYTES = 65536
+_OWNER_READY_SIGNAL = b"R"
 
 
 def _require_process_group_supervisor(value: object) -> None:
@@ -212,6 +235,9 @@ class PosixExecutorCommandGuardian:
     def __init__(
         self,
         program: ExecutorGuardianProgram,
+        sentinel_program: ProcessGroupSentinelProgram,
+        sentinel_policy: ProcessGroupSentinelPolicy,
+        record_stores: AtomicRecordStoreFactory,
         process_group_supervisor: ProcessGroupSupervisor,
         termination_policy: ExecutorGuardianTerminationPolicy,
     ) -> None:
@@ -226,6 +252,19 @@ class PosixExecutorCommandGuardian:
                 "ExecutorGuardianTerminationPolicy"
             )
         self._program = program
+        if type(sentinel_program) is not ProcessGroupSentinelProgram:
+            raise ValueError(
+                "PosixExecutorCommandGuardian.sentinel_program must be a "
+                "ProcessGroupSentinelProgram"
+            )
+        if type(sentinel_policy) is not ProcessGroupSentinelPolicy:
+            raise ValueError(
+                "PosixExecutorCommandGuardian.sentinel_policy must be a "
+                "ProcessGroupSentinelPolicy"
+            )
+        self._sentinel_program = sentinel_program
+        self._sentinel_policy = sentinel_policy
+        self._record_stores = record_stores
         self._process_group_supervisor = process_group_supervisor
         self._termination_policy = termination_policy
 
@@ -237,35 +276,56 @@ class PosixExecutorCommandGuardian:
         terminal_foreground = _controlling_terminal(request.lifecycle)
         result_read_fd, result_write_fd = os.pipe()
         start_read_fd, start_write_fd = os.pipe()
+        owner_ready_read_fd, owner_ready_write_fd = os.pipe()
         cancellation_lease = self._prepare_cancellation(
             request,
-            (result_read_fd, result_write_fd, start_read_fd, start_write_fd),
+            (
+                result_read_fd,
+                result_write_fd,
+                start_read_fd,
+                start_write_fd,
+                owner_ready_read_fd,
+                owner_ready_write_fd,
+            ),
         )
+        cancellation_controls = cancellation_lease.controls()
         guardian: subprocess.Popen[bytes] | None = None
         group_contained = False
         result_write_open = True
         start_read_open = True
         start_write_open = True
+        owner_ready_read_open = True
+        owner_ready_write_open = True
         try:
+            lease_file_descriptors = request.lease.inherited_file_descriptors()
             invocation = GuardianInvocationRecord.create(
                 arguments=request.arguments,
                 result_file_descriptor=result_write_fd,
                 start_file_descriptor=start_read_fd,
+                owner_ready_file_descriptor=owner_ready_write_fd,
                 lifecycle=request.lifecycle,
                 budget=request.budget,
+                cancellation=self._guardian_cancellation_record(
+                    cancellation_controls
+                ),
                 termination_policy=self._termination_policy,
+                sentinel_program=self._sentinel_program,
+                sentinel_policy=self._sentinel_policy,
+                lease_file_descriptors=lease_file_descriptors,
             )
             guardian_arguments = (
                 *self._program.arguments,
                 "--request-json",
                 invocation.model_dump_json(),
             )
-            lease_file_descriptors = request.lease.inherited_file_descriptors()
             inherited_descriptors = (
                 *lease_file_descriptors,
                 result_write_fd,
                 start_read_fd,
-                *cancellation_lease.inherited_file_descriptors(),
+                owner_ready_write_fd,
+                *self._guardian_cancellation_descriptors(
+                    cancellation_controls
+                ),
             )
             with _installed_parent_interruption(request.lifecycle) as interruption:
                 try:
@@ -281,13 +341,21 @@ class PosixExecutorCommandGuardian:
                 # The guardian now owns inherited copies. Close the outer
                 # executor's references before publishing or starting work so
                 # a stopped outer process cannot retain machine capacity.
-                request.lease.transfer_to_guardian()
                 os.close(result_write_fd)
                 result_write_open = False
                 os.close(start_read_fd)
                 start_read_open = False
-                cancellation_lease.publish(guardian.pid)
-                cancellation_lease.transfer_to_guardian()
+                os.close(owner_ready_write_fd)
+                owner_ready_write_open = False
+                self._await_guardian_owner_ready(
+                    owner_ready_read_fd,
+                    guardian,
+                )
+                os.close(owner_ready_read_fd)
+                owner_ready_read_open = False
+                request.lease.transfer_to_guardian()
+                cancellation_lease.activate()
+                cancellation_lease.transfer_to_owner()
                 if interruption.requested:
                     return ExecutorGuardianCommandCompleted(-signal.SIGTERM)
                 terminal_foreground.grant(guardian.pid)
@@ -313,36 +381,166 @@ class PosixExecutorCommandGuardian:
                     result_read_fd,
                 )
         finally:
-            try:
-                if guardian is not None and not group_contained:
+            primary_error = sys.exception()
+            containment_cleanup: CleanupOutcome = CleanupSucceeded()
+            safe_to_retire_cancellation = guardian is None or group_contained
+            if guardian is not None and not group_contained:
+                try:
                     self._process_group_supervisor.abort(
                         OwnedProcessGroupLeader(guardian.pid)
                     )
-            finally:
-                try:
-                    cancellation_lease.retire()
-                finally:
-                    terminal_foreground.restore()
-                    if result_write_open:
-                        os.close(result_write_fd)
-                    if start_read_open:
-                        os.close(start_read_fd)
-                    if start_write_open:
-                        os.close(start_write_fd)
-                    os.close(result_read_fd)
+                    safe_to_retire_cancellation = True
+                except BaseException as cleanup_error:
+                    cleanup_error.add_note(
+                        "guardian group abort failed; cancellation identity retained"
+                    )
+                    containment_cleanup = CleanupFailed(
+                        (CleanupFailure("guardian-group-abort", cleanup_error),)
+                    )
+            cleanup_actions: list[CleanupAction] = []
+            if safe_to_retire_cancellation:
+                cleanup_actions.append(
+                    CleanupAction(
+                        "cancellation-endpoint-retirement",
+                        cancellation_lease.retire,
+                    )
+                )
+            cleanup_actions.append(
+                CleanupAction("terminal-foreground-restore", terminal_foreground.restore)
+            )
+            if result_write_open:
+                cleanup_actions.append(
+                    CleanupAction(
+                        "result-writer-close",
+                        lambda: os.close(result_write_fd),
+                    )
+                )
+            if start_read_open:
+                cleanup_actions.append(
+                    CleanupAction(
+                        "start-reader-close",
+                        lambda: os.close(start_read_fd),
+                    )
+                )
+            if start_write_open:
+                cleanup_actions.append(
+                    CleanupAction(
+                        "start-writer-close",
+                        lambda: os.close(start_write_fd),
+                    )
+                )
+            if owner_ready_read_open:
+                cleanup_actions.append(
+                    CleanupAction(
+                        "owner-readiness-reader-close",
+                        lambda: os.close(owner_ready_read_fd),
+                    )
+                )
+            if owner_ready_write_open:
+                cleanup_actions.append(
+                    CleanupAction(
+                        "owner-readiness-writer-close",
+                        lambda: os.close(owner_ready_write_fd),
+                    )
+                )
+            cleanup_actions.append(
+                CleanupAction(
+                    "result-reader-close",
+                    lambda: os.close(result_read_fd),
+                )
+            )
+            resource_cleanup = IndependentCleanupPlan(
+                tuple(cleanup_actions)
+            ).run()
+            cleanup_errors = self._cleanup_errors(
+                containment_cleanup,
+                resource_cleanup,
+            )
+            if cleanup_errors:
+                if primary_error is not None:
+                    raise BaseExceptionGroup(
+                        "guardian execution and cleanup failed",
+                        (primary_error, *cleanup_errors),
+                    )
+                raise BaseExceptionGroup(
+                    "guardian cleanup failed",
+                    cleanup_errors,
+                )
 
     @staticmethod
+    def _cleanup_errors(
+        *outcomes: CleanupOutcome,
+    ) -> tuple[BaseException, ...]:
+        errors: list[BaseException] = []
+        for outcome in outcomes:
+            if type(outcome) is CleanupSucceeded:
+                continue
+            if type(outcome) is not CleanupFailed:
+                raise AssertionError("cleanup outcome is a closed union")
+            errors.extend(failure.error for failure in outcome.failures)
+        return tuple(errors)
+
     def _prepare_cancellation(
+        self,
         request: ExecutorGuardianRequest,
-        open_pipe_descriptors: tuple[int, int, int, int],
+        open_pipe_descriptors: tuple[int, ...],
     ) -> ExecutorGuardianCancellationLease:
         """Acquire cancellation ownership or roll back all pre-spawn pipes."""
         try:
-            return prepare_executor_guardian_cancellation(request.cancellation)
+            return prepare_executor_guardian_cancellation(
+                request.cancellation,
+                self._record_stores,
+            )
         except BaseException:
             for descriptor in open_pipe_descriptors:
                 os.close(descriptor)
             raise
+
+    def _await_guardian_owner_ready(
+        self,
+        ready_read_file_descriptor: int,
+        guardian: subprocess.Popen[bytes],
+    ) -> None:
+        deadline = time.monotonic() + self._sentinel_policy.startup_timeout_seconds
+        with selectors.DefaultSelector() as selector:
+            selector.register(ready_read_file_descriptor, selectors.EVENT_READ)
+            remaining = deadline - time.monotonic()
+            ready = selector.select(max(0.0, remaining))
+        if not ready or time.monotonic() >= deadline:
+            raise ExecutorGuardianLaunchError(
+                "guardian owner did not become ready before its absolute deadline"
+            )
+        if os.read(ready_read_file_descriptor, 1) != _OWNER_READY_SIGNAL:
+            guardian.poll()
+            raise ExecutorGuardianLaunchError(
+                "guardian exited before publishing exact owner readiness"
+            )
+
+    @staticmethod
+    def _guardian_cancellation_record(
+        controls: ExecutorGuardianCancellationControls,
+    ) -> GuardianCancellationControlRecord:
+        if type(controls) is NoExecutorGuardianCancellationControls:
+            return GuardianDetachedCancellationControlRecord()
+        if type(controls) is ProcessCancellationOwnerControls:
+            return GuardianInteractiveCancellationControlRecord(
+                listener_file_descriptor=controls.listener_file_descriptor,
+                owner_lock_file_descriptor=controls.owner_lock_file_descriptor,
+            )
+        raise AssertionError("guardian cancellation controls are a closed union")
+
+    @staticmethod
+    def _guardian_cancellation_descriptors(
+        controls: ExecutorGuardianCancellationControls,
+    ) -> tuple[int, ...]:
+        if type(controls) is NoExecutorGuardianCancellationControls:
+            return ()
+        if type(controls) is ProcessCancellationOwnerControls:
+            return (
+                controls.listener_file_descriptor,
+                controls.owner_lock_file_descriptor,
+            )
+        raise AssertionError("guardian cancellation controls are a closed union")
 
     @staticmethod
     def _spawn_guardian(

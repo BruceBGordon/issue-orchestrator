@@ -16,7 +16,23 @@ from ..domain.validation_resource_sampling import (
     ValidationResourceSamplerShutdown,
     ValidationResourceSamplerShutdownFailed,
     ValidationResourceSamplerStopped,
+    ValidationResourceSamplerStart,
+    ValidationResourceSamplerStarted,
+    ValidationResourceSamplerStartIndeterminate,
+    ValidationResourceSamplerStartRejected,
     ValidationResourceSamplingPolicy,
+)
+from ..domain.retained_thread import (
+    RetainedThreadActivated,
+    RetainedThreadActivationIndeterminate,
+    RetainedThreadActivationInterrupted,
+    RetainedThreadActivationRejected,
+    RetainedThreadFinalized,
+    RetainedThreadFinalizedAfterFailure,
+    RetainedThreadShutdownPolicy,
+    RetainedThreadSpec,
+    RetainedThreadState,
+    RetainedThreadStillRunning,
 )
 from ..infra.validation_timings import (
     ValidateTimingRecorder,
@@ -25,6 +41,7 @@ from ..infra.validation_timings import (
     ValidationSwapUsage,
 )
 from ..ports.validation_resource_probe import ValidationResourceProbe
+from ..ports.retained_thread import RetainedThreadFactory, RetainedThreadLease
 
 
 _MEMORY_FREE_RE = re.compile(r"System-wide memory free percentage:\s*(?P<percent>\d+)%")
@@ -149,6 +166,49 @@ _ValidationResourceSamplerThread = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidationResourceSamplerFinalizationEvidence:
+    """Typed facts retained from the thread owner's finalization attempt."""
+
+    remains_live: bool
+    failures: tuple[BaseException, ...]
+
+
+def _sampler_finalization_evidence(
+    finalization: (
+        RetainedThreadFinalized
+        | RetainedThreadFinalizedAfterFailure
+        | RetainedThreadStillRunning
+    ),
+) -> _ValidationResourceSamplerFinalizationEvidence:
+    if type(finalization) is RetainedThreadFinalized:
+        return _ValidationResourceSamplerFinalizationEvidence(False, ())
+    if type(finalization) is RetainedThreadFinalizedAfterFailure:
+        return _ValidationResourceSamplerFinalizationEvidence(
+            False,
+            (finalization.error,),
+        )
+    if type(finalization) is RetainedThreadStillRunning:
+        return _ValidationResourceSamplerFinalizationEvidence(
+            True,
+            (finalization.error,),
+        )
+    raise AssertionError("retained thread finalization is a closed union")
+
+
+def _combined_sampler_failure(
+    failures: tuple[BaseException, ...],
+) -> BaseException:
+    if not failures:
+        raise ValueError("sampler failure collection must not be empty")
+    if len(failures) == 1:
+        return failures[0]
+    return BaseExceptionGroup(
+        "validation resource sampler failed more than once",
+        failures,
+    )
+
+
 @dataclass(slots=True)
 class SystemValidationResourceProbe:
     """Collect one bounded, portable-or-partial host resource sample."""
@@ -238,8 +298,9 @@ class ValidationResourceSampler:
     recorder: ValidateTimingRecorder
     probe: ValidationResourceProbe
     policy: ValidationResourceSamplingPolicy
+    thread_factory: RetainedThreadFactory
     _stop_event: threading.Event = field(default_factory=threading.Event, init=False)
-    _thread: threading.Thread | None = field(default=None, init=False)
+    _thread: RetainedThreadLease = field(init=False)
     _state_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _pending_samples: list[ValidationResourceSample] = field(
         default_factory=list,
@@ -265,32 +326,49 @@ class ValidationResourceSampler:
             ValidationResourceSamplingPolicy,
             "ValidationResourceSampler.policy",
         )
-
-    def start(self) -> None:
-        if self._thread is not None:
-            raise RuntimeError("validation resource sampler was started twice")
-        self.recorder.append_resource_sample(self.probe.collect())
-        self._thread = threading.Thread(
-            target=self._run,
-            name="validate-resource-sampler",
-            daemon=True,
+        _require_protocol(
+            self.thread_factory,
+            RetainedThreadFactory,
+            "ValidationResourceSampler.thread_factory",
         )
-        self._thread.start()
+        self._thread = self.thread_factory.prepare(
+            RetainedThreadSpec(name="validate-resource-sampler", daemon=True),
+            self._run,
+        )
+
+    def start(self) -> ValidationResourceSamplerStart:
+        if self._thread.state is not RetainedThreadState.CREATED:
+            raise RuntimeError("validation resource sampler was started twice")
+        try:
+            self.recorder.append_resource_sample(self.probe.collect())
+        except BaseException as error:
+            return ValidationResourceSamplerStartRejected(error)
+        activation = self._thread.activate()
+        if type(activation) is RetainedThreadActivated:
+            return ValidationResourceSamplerStarted()
+        if type(activation) is RetainedThreadActivationRejected:
+            return ValidationResourceSamplerStartRejected(activation.error)
+        if type(activation) is RetainedThreadActivationInterrupted:
+            return ValidationResourceSamplerStartIndeterminate(activation.error)
+        if type(activation) is RetainedThreadActivationIndeterminate:
+            return ValidationResourceSamplerStartIndeterminate(activation.error)
+        raise AssertionError("retained thread activation is a closed union")
 
     def stop(self) -> ValidationResourceSamplerShutdown:
         self._stop_event.set()
-        thread = self._thread
-        if thread is None:
+        if self._thread.state not in (
+            RetainedThreadState.ACTIVATING,
+            RetainedThreadState.ACTIVATED,
+        ):
             raise RuntimeError("validation resource sampler was stopped before start")
-        thread.join(timeout=self.policy.shutdown_timeout_seconds)
-        failures: list[BaseException] = []
-        if thread.is_alive():
-            failures.append(
-                TimeoutError(
-                    "validation resource sampler did not stop within "
-                    f"{self.policy.shutdown_timeout_seconds:.3f}s"
-                )
+        finalization = self._thread.finalize(
+            RetainedThreadShutdownPolicy(
+                initial_timeout_seconds=self.policy.shutdown_timeout_seconds,
+                recovery_timeout_seconds=self.policy.shutdown_timeout_seconds,
             )
+        )
+        finalization_evidence = _sampler_finalization_evidence(finalization)
+        failures = list(finalization_evidence.failures)
         with self._state_lock:
             samples = tuple(self._pending_samples)
             self._pending_samples.clear()
@@ -308,15 +386,8 @@ class ValidationResourceSampler:
                 failures.append(error)
         if not failures:
             return ValidationResourceSamplerStopped()
-        failure = (
-            failures[0]
-            if len(failures) == 1
-            else BaseExceptionGroup(
-                "validation resource sampler failed more than once",
-                failures,
-            )
-        )
-        if thread.is_alive():
+        failure = _combined_sampler_failure(tuple(failures))
+        if finalization_evidence.remains_live:
             return ValidationResourceSamplerShutdownFailed(failure)
         return ValidationResourceSamplerFailed(failure)
 

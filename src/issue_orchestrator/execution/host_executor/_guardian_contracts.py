@@ -19,6 +19,10 @@ from ...domain.executor_guardian import (
     ExecutorGuardianTerminationPolicy,
     ExecutorGuardianUnboundedBudget,
 )
+from ...domain.process_group_sentinel import (
+    ProcessGroupSentinelPolicy,
+    ProcessGroupSentinelProgram,
+)
 from ._contracts import ExecutorStrictRecord
 
 
@@ -47,6 +51,27 @@ GuardianBudgetRecord = Annotated[
 ]
 
 
+class GuardianDetachedCancellationControlRecord(ExecutorStrictRecord):
+    """Explicit absence of a cancellation listener for detached work."""
+
+    kind: Literal["detached"] = "detached"
+
+
+class GuardianInteractiveCancellationControlRecord(ExecutorStrictRecord):
+    """Exact self-cancellation listener inherited by an interactive guardian."""
+
+    kind: Literal["interactive"] = "interactive"
+    listener_file_descriptor: int = Field(ge=0)
+    owner_lock_file_descriptor: int = Field(ge=0)
+
+
+GuardianCancellationControlRecord = Annotated[
+    GuardianDetachedCancellationControlRecord
+    | GuardianInteractiveCancellationControlRecord,
+    Field(discriminator="kind"),
+]
+
+
 def guardian_budget_record(budget: ExecutorGuardianBudget) -> GuardianBudgetRecord:
     if type(budget) is ExecutorGuardianUnboundedBudget:
         return GuardianUnboundedBudgetRecord()
@@ -59,13 +84,18 @@ def guardian_budget_record(budget: ExecutorGuardianBudget) -> GuardianBudgetReco
 
 
 class GuardianInvocationRecord(ExecutorStrictRecord):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[3] = 3
     arguments: tuple[str, ...]
     result_file_descriptor: int = Field(ge=0)
     start_file_descriptor: int = Field(ge=0)
+    owner_ready_file_descriptor: int = Field(ge=0)
     lifecycle: ExecutorCommandLifecycle
     budget: GuardianBudgetRecord
+    cancellation: GuardianCancellationControlRecord
     graceful_shutdown_seconds: float = Field(gt=0)
+    sentinel_program: tuple[str, ...]
+    sentinel_startup_timeout_seconds: float = Field(gt=0)
+    lease_file_descriptors: tuple[int, ...]
 
     @classmethod
     def create(
@@ -74,17 +104,29 @@ class GuardianInvocationRecord(ExecutorStrictRecord):
         arguments: tuple[str, ...],
         result_file_descriptor: int,
         start_file_descriptor: int,
+        owner_ready_file_descriptor: int,
         lifecycle: ExecutorCommandLifecycle,
         budget: ExecutorGuardianBudget,
+        cancellation: GuardianCancellationControlRecord,
         termination_policy: ExecutorGuardianTerminationPolicy,
+        sentinel_program: ProcessGroupSentinelProgram,
+        sentinel_policy: ProcessGroupSentinelPolicy,
+        lease_file_descriptors: tuple[int, ...],
     ) -> GuardianInvocationRecord:
         return cls(
             arguments=arguments,
             result_file_descriptor=result_file_descriptor,
             start_file_descriptor=start_file_descriptor,
+            owner_ready_file_descriptor=owner_ready_file_descriptor,
             lifecycle=lifecycle,
             budget=guardian_budget_record(budget),
+            cancellation=cancellation,
             graceful_shutdown_seconds=(termination_policy.graceful_shutdown_seconds),
+            sentinel_program=sentinel_program.arguments,
+            sentinel_startup_timeout_seconds=(
+                sentinel_policy.startup_timeout_seconds
+            ),
+            lease_file_descriptors=lease_file_descriptors,
         )
 
     def domain_budget(self) -> ExecutorGuardianBudget:
@@ -92,6 +134,15 @@ class GuardianInvocationRecord(ExecutorStrictRecord):
 
     def termination_policy(self) -> ExecutorGuardianTerminationPolicy:
         return ExecutorGuardianTerminationPolicy(self.graceful_shutdown_seconds)
+
+    def process_group_sentinel_program(self) -> ProcessGroupSentinelProgram:
+        return ProcessGroupSentinelProgram(self.sentinel_program)
+
+    def process_group_sentinel_policy(self) -> ProcessGroupSentinelPolicy:
+        return ProcessGroupSentinelPolicy(
+            graceful_shutdown_seconds=self.graceful_shutdown_seconds,
+            startup_timeout_seconds=self.sentinel_startup_timeout_seconds,
+        )
 
 
 class GuardianCompletedRecord(ExecutorStrictRecord):

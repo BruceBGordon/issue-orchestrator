@@ -360,9 +360,18 @@ class ValidateTimingRecorder:
         canonical_line = line.rstrip("\r\n")
         config_match = _CONFIG_RE.fullmatch(canonical_line)
         if config_match:
-            self.configuration = ValidationConfiguration.parse(
-                config_match.group("fields")
-            )
+            try:
+                configuration = ValidationConfiguration.parse(
+                    config_match.group("fields")
+                )
+            except ValueError:
+                self._record_protocol_failure(
+                    ValidationTimingProtocolFailureKind.MALFORMED_MARKER,
+                    canonical_line,
+                    None,
+                )
+                return
+            self.configuration = configuration
             return
 
         start_match = _START_RE.fullmatch(canonical_line)
@@ -402,15 +411,24 @@ class ValidateTimingRecorder:
                 target,
             )
             return
-        timing = ValidationTargetTiming(
-            context=self.context,
-            configuration=self.configuration,
-            target=target,
-            status=int(end_match.group("status")),
-            elapsed_seconds=int(end_match.group("elapsed")),
-            started_at=started_at,
-            ended_at=end_match.group("at"),
-        )
+        try:
+            timing = ValidationTargetTiming(
+                context=self.context,
+                configuration=self.configuration,
+                target=target,
+                status=int(end_match.group("status")),
+                elapsed_seconds=int(end_match.group("elapsed")),
+                started_at=started_at,
+                ended_at=end_match.group("at"),
+            )
+        except ValueError:
+            self._invalid_targets.add(target)
+            self._record_protocol_failure(
+                ValidationTimingProtocolFailureKind.MALFORMED_MARKER,
+                canonical_line,
+                target,
+            )
+            return
         _append_jsonl(self.output_path, timing)
 
     def _record_protocol_failure(

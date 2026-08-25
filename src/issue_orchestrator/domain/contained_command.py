@@ -96,6 +96,26 @@ class ContainedCommandStarted:
 
 
 @dataclass(frozen=True, slots=True)
+class ContainedCommandOutputPipeClosed:
+    """Every descriptor still owned by the output pipe was closed."""
+
+
+@dataclass(frozen=True, slots=True)
+class ContainedCommandOutputPipeCloseFailed:
+    """Independent descriptor cleanup completed with exact failure evidence."""
+
+    error: BaseException
+
+    def __post_init__(self) -> None:
+        _require_exception(type(self).__name__, "error", self.error)
+
+
+ContainedCommandOutputPipeClose = (
+    ContainedCommandOutputPipeClosed | ContainedCommandOutputPipeCloseFailed
+)
+
+
+@dataclass(frozen=True, slots=True)
 class ContainedCommandExited:
     """Known reaped status of the command's process-group leader."""
 

@@ -35,10 +35,17 @@ from issue_orchestrator.domain.process_group import (
     ProcessGroupTermination,
     ProcessGroupWait,
 )
+from issue_orchestrator.domain.process_group_sentinel import (
+    ProcessGroupSentinelPolicy,
+    ProcessGroupSentinelProgram,
+)
 from issue_orchestrator.execution.host_executor.guardian_launcher import (
     ExecutorGuardianProgram,
     ExecutorGuardianProtocolError,
     PosixExecutorCommandGuardian,
+)
+from issue_orchestrator.execution.atomic_record_store import (
+    OsAtomicRecordStoreFactory,
 )
 from issue_orchestrator.execution.process_group_supervisor import (
     PosixProcessGroupSupervisor,
@@ -59,6 +66,7 @@ from tests.process_tree_fixture import (
     ExitingTermResistantProcessTreeProgram,
     ProcessTreeMember,
 )
+from tests.process_completion_fixture import build_test_process_group_observer
 
 
 def _guardian(
@@ -75,8 +83,38 @@ def _guardian(
                 "issue_orchestrator.execution.host_executor.guardian",
             )
         ),
-        PosixProcessGroupSupervisor(PosixProcessGroupTerminator(termination)),
+        _sentinel_program(),
+        ProcessGroupSentinelPolicy(0.1, 1.0),
+        OsAtomicRecordStoreFactory(),
+        PosixProcessGroupSupervisor(
+            PosixProcessGroupTerminator(
+                termination,
+                build_test_process_group_observer(),
+            )
+        ),
         ExecutorGuardianTerminationPolicy(termination.graceful_shutdown_seconds),
+    )
+
+
+def _sentinel_program() -> ProcessGroupSentinelProgram:
+    return ProcessGroupSentinelProgram(
+        (
+            str(Path(sys.executable)),
+            "-m",
+            "issue_orchestrator.execution.process_group_sentinel",
+        )
+    )
+
+
+def _fault_guardian_protocol_prelude() -> str:
+    return (
+        "import json, os, sys\n"
+        "raw = sys.argv[sys.argv.index('--request-json') + 1]\n"
+        "request = json.loads(raw)\n"
+        "os.write(request['owner_ready_file_descriptor'], b'R')\n"
+        "os.close(request['owner_ready_file_descriptor'])\n"
+        "os.read(request['start_file_descriptor'], 1)\n"
+        "os.close(request['start_file_descriptor'])\n"
     )
 
 
@@ -185,7 +223,12 @@ def test_completed_terminal_record_wins_over_late_parent_sigterm(
 ) -> None:
     termination = ExecutorProcessTerminationPolicy(0.1, 1.0)
     supervisor = _LateInterruptionAfterCompletionSupervisor(
-        PosixProcessGroupSupervisor(PosixProcessGroupTerminator(termination))
+        PosixProcessGroupSupervisor(
+            PosixProcessGroupTerminator(
+                termination,
+                build_test_process_group_observer(),
+            )
+        )
     )
     guardian = PosixExecutorCommandGuardian(
         ExecutorGuardianProgram(
@@ -195,6 +238,9 @@ def test_completed_terminal_record_wins_over_late_parent_sigterm(
                 "issue_orchestrator.execution.host_executor.guardian",
             )
         ),
+        _sentinel_program(),
+        ProcessGroupSentinelPolicy(0.1, 1.0),
+        OsAtomicRecordStoreFactory(),
         supervisor,
         ExecutorGuardianTerminationPolicy(termination.graceful_shutdown_seconds),
     )
@@ -286,7 +332,7 @@ def test_missing_guardian_result_is_explicit_and_outer_contains_group(
     tmp_path: Path,
 ) -> None:
     descendant_path = (tmp_path / "guardian-crash-descendant.pid").resolve()
-    fault = ExitingTermResistantProcessTreeProgram(
+    fault = _fault_guardian_protocol_prelude() + ExitingTermResistantProcessTreeProgram(
         descendant_path,
         300,
         23,
@@ -311,8 +357,7 @@ def test_missing_guardian_result_is_explicit_and_outer_contains_group(
 
 
 def test_malformed_guardian_result_is_never_treated_as_command_success() -> None:
-    fault = (
-        "import json, os, sys; "
+    fault = _fault_guardian_protocol_prelude() + (
         "raw = sys.argv[sys.argv.index('--request-json') + 1]; "
         "fd = json.loads(raw)['result_file_descriptor']; "
         "os.write(fd, b'{}')"
@@ -334,8 +379,7 @@ def test_malformed_guardian_result_is_never_treated_as_command_success() -> None
 
 
 def test_valid_terminal_record_cannot_fabricate_containment() -> None:
-    fault = (
-        "import json, os, sys; "
+    fault = _fault_guardian_protocol_prelude() + (
         "raw = sys.argv[sys.argv.index('--request-json') + 1]; "
         "fd = json.loads(raw)['result_file_descriptor']; "
         'os.write(fd, b\'{"outcome":"completed","exit_code":0}\')'

@@ -20,7 +20,7 @@ from ...ports.atomic_path_replacement import AtomicPathReplacement
 from ._journal import ExecutorEventStore
 from ._history import ExecutorWorkHistoryStore
 from .host_policy import ExecutorPolicyStore
-from ..atomic_record_store import ExecutorAtomicRecordStore
+from ..atomic_record_store import AtomicRecordStore
 
 
 def _require_history_retention_lock(value: object) -> None:
@@ -55,7 +55,7 @@ class HostExecutorMonitor(ExecutorMonitor):
             raise ValueError("HostExecutorMonitor.host_cpu_slots must be positive")
         _require_history_retention_lock(history_retention_lock)
         _require_atomic_path_replacement(atomic_path_replacement)
-        pool_records = ExecutorAtomicRecordStore(
+        pool_records = AtomicRecordStore(
             pool_dir,
             atomic_path_replacement,
         )
@@ -64,7 +64,7 @@ class HostExecutorMonitor(ExecutorMonitor):
             pool_dir / "work-history",
             history_retention_policy,
             history_retention_lock,
-            ExecutorAtomicRecordStore(
+            AtomicRecordStore(
                 pool_dir / "work-history",
                 atomic_path_replacement,
             ),

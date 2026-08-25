@@ -12,6 +12,7 @@ import sys
 import time
 from types import ModuleType
 from pathlib import Path
+from typing import Protocol, cast
 
 import pytest
 
@@ -32,6 +33,87 @@ from issue_orchestrator.domain.executor_monitoring import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROFILE_SCRIPT = REPO_ROOT / "repo-specific/scripts/validate_profile.py"
+
+
+class _AggregateArtifactView(Protocol):
+    executor_before: object
+    executor_after: object
+    executor_events: object
+
+
+class _CompleteProfileArtifactView(Protocol):
+    config: object
+    cold_validate_pr_raw_run: _AggregateArtifactView
+
+
+class _RegisterThenRaiseWorktreeCommandRunner:
+    """Publish real Git registration, then fail before returning its result."""
+
+    def __init__(self, profile: ModuleType) -> None:
+        self._profile = profile
+
+    def add(
+        self,
+        *,
+        repo_root: Path,
+        worktree: Path,
+        profiled_commit_sha: str,
+        operation_name: str,
+        dry_run: bool,
+        artifacts: object,
+    ) -> object:
+        del operation_name, dry_run, artifacts
+        completed = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(repo_root),
+                "worktree",
+                "add",
+                "--detach",
+                str(worktree),
+                profiled_commit_sha,
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        raise KeyboardInterrupt("injected before add result publication")
+
+    def remove(
+        self,
+        *,
+        repo_root: Path,
+        worktree: Path,
+        operation_name: str,
+        dry_run: bool,
+        artifacts: object,
+    ) -> object:
+        del dry_run, artifacts
+        command = (
+            "git",
+            "-C",
+            str(repo_root),
+            "worktree",
+            "remove",
+            "--force",
+            str(worktree),
+        )
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return self._profile.CommandResult(
+            f"{operation_name}:worktree-remove",
+            command,
+            0.0,
+            completed.returncode,
+            None,
+            str(worktree.parent / "remove.log"),
+        )
 
 
 def _load_profile_module() -> ModuleType:
@@ -196,7 +278,7 @@ def test_profile_jobs_control_outer_make_and_inner_lane_limit(
     assert report["config"]["executor_learning"] == (
         "one fresh pool: cold aggregate, lane training, learned aggregate"
     )
-    assert report["schema_version"] == 6
+    assert report["schema_version"] == 7
     assert report["outcome"] == "complete"
     assert len(report["config"]["profiled_commit_sha"]) == 40
     profiled_commit_sha = report["config"]["profiled_commit_sha"]
@@ -316,7 +398,7 @@ def test_profile_stops_at_first_failure_and_writes_typed_partial_report(
 
     assert completed.returncode == expected_exit, completed.stderr
     report = json.loads(output_path.read_text(encoding="utf-8"))
-    assert report["schema_version"] == 6
+    assert report["schema_version"] == 7
     assert report["outcome"] == "failed"
     assert report["failure"]["stage"] == failure_stage
     assert report["failure"]["command_result"]["exit_code"] == expected_exit
@@ -415,7 +497,7 @@ def test_profile_retains_worktree_cleanup_failure_in_typed_partial_report(
 
     assert completed.returncode == 23, completed.stderr
     report = json.loads(output_path.read_text(encoding="utf-8"))
-    assert report["schema_version"] == 6
+    assert report["schema_version"] == 7
     assert report["outcome"] == "failed"
     assert report["failure"]["stage"] == expected_stage
     assert report["failure"]["command_result"]["exit_code"] == 0
@@ -432,10 +514,329 @@ def test_profile_retains_worktree_cleanup_failure_in_typed_partial_report(
         assert report["completed_target_runs"] == []
 
 
+def test_unexpected_post_add_failure_unregisters_and_removes_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _load_profile_module()
+    repository = _profile_repository(tmp_path)
+    artifacts = profile.ProfileArtifactStore(tmp_path / "unexpected-artifacts")
+    artifacts.initialize()
+
+    def interrupt_after_add(**_arguments: object) -> object:
+        raise KeyboardInterrupt("injected after Git registration")
+
+    monkeypatch.setattr(profile, "prepare_worktree", interrupt_after_add)
+
+    with pytest.raises(profile.IsolatedProfileWorktreeError) as raised:
+        profile.run_in_isolated_worktree(
+            repo_root=repository.resolve(),
+            make_bin=_gnu_make(),
+            name="target:smoke",
+            make_target="smoke",
+            dry_run=False,
+            jobs=None,
+            executor_pool_dir=(tmp_path / "executor-pool").resolve(),
+            executor_aggressiveness_percent=125,
+            artifacts=artifacts,
+            profiled_commit_sha=profile.resolve_profiled_commit(repository),
+            fairness_group=ExecutorFairnessGroup("profile:test:unexpected"),
+        )
+
+    failure = raised.value
+    assert type(failure.primary_error) is KeyboardInterrupt
+    assert failure.cleanup_failures == ()
+    assert not failure.worktree.exists()
+    registration = profile.GitProfileWorktreeRegistrationObserver().observe(
+        repository.resolve(),
+        failure.worktree,
+    )
+    assert registration is profile.ProfileWorktreeRegistration.ABSENT
+
+
+def test_add_result_publication_failure_queries_registration_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    profile = _load_profile_module()
+    repository = _profile_repository(tmp_path).resolve()
+    artifacts = profile.ProfileArtifactStore(tmp_path / "indeterminate-artifacts")
+    artifacts.initialize()
+    owner = profile.IsolatedProfileWorktree.create(
+        repo_root=repository,
+        operation_name="target:smoke",
+        profiled_commit_sha=profile.resolve_profiled_commit(repository),
+        dry_run=False,
+        artifacts=artifacts,
+        directory_remover=profile.ShutilProfileDirectoryRemover(),
+        registration_observer=profile.GitProfileWorktreeRegistrationObserver(),
+        command_runner=_RegisterThenRaiseWorktreeCommandRunner(profile),
+        temporary_prefix="io-profile-indeterminate-test-",
+    )
+
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="before add result publication",
+    ):
+        owner.add()
+
+    worktree = owner.worktree
+    assert owner.close() == ()
+    assert owner.close() == ()
+    assert not worktree.exists()
+    assert (
+        profile.GitProfileWorktreeRegistrationObserver().observe(
+            repository,
+            worktree,
+        )
+        is profile.ProfileWorktreeRegistration.ABSENT
+    )
+
+
+def test_unexpected_stage_failure_writes_typed_partial_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _load_profile_module()
+    artifacts = profile.ProfileArtifactStore(tmp_path / "partial-artifacts")
+    artifacts.initialize()
+    complete = _complete_profile_artifact(profile, tmp_path)
+    worktree = (tmp_path / "unexpected-worktree").resolve()
+    cleanup_failure = profile.ProfileCleanupFilesystemFailure(
+        profile.ProfileCleanupOperation.TEMPORARY_ROOT_REMOVE,
+        "PermissionError",
+        "temporary root is busy",
+    )
+
+    def fail_cold_aggregate(**_arguments: object) -> object:
+        raise profile.IsolatedProfileWorktreeError(
+            "cold-aggregate:validate-pr-raw",
+            worktree,
+            KeyboardInterrupt("injected profiler interruption"),
+            (cleanup_failure,),
+        )
+
+    monkeypatch.setattr(profile, "run_profile_aggregate", fail_cold_aggregate)
+    request = profile.ProfileMeasurementRequest(
+        repo_root=tmp_path.resolve(),
+        make_bin="make",
+        jobs=18,
+        dry_run=False,
+        targets=("unit",),
+        executor_pool_dir=(tmp_path / "executor-pool").resolve(),
+        aggressiveness=profile.ProfileAggressiveness(125, "command-line"),
+        artifacts=artifacts,
+        profiled_commit_sha="0" * 40,
+        configuration=complete.config,
+    )
+
+    artifact = profile.measure_profile(request)
+    output_path = tmp_path / "unexpected-report.json"
+    profile.write_profile_artifact(output_path, artifact)
+
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["schema_version"] == 7
+    assert report["outcome"] == "failed"
+    assert report["completed_aggregate_runs"] == []
+    assert report["incomplete_aggregate_runs"] == []
+    assert report["completed_target_runs"] == []
+    assert report["failure"] == {
+        "stage": "cold-aggregate",
+        "operation_name": "cold-aggregate:validate-pr-raw",
+        "error_type": "KeyboardInterrupt",
+        "error_message": "injected profiler interruption",
+        "cleanup_failures": [
+            {
+                "operation": "temporary-root-remove",
+                "error_type": "PermissionError",
+                "error_message": "temporary root is busy",
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("failure_boundary", "expected_progress", "retains_after_status"),
+    (
+        ("status", "command-completed", False),
+        ("events", "after-status-captured", True),
+    ),
+)
+def test_post_command_observation_failure_retains_partial_aggregate_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_boundary: str,
+    expected_progress: str,
+    retains_after_status: bool,
+) -> None:
+    profile = _load_profile_module()
+    artifacts = profile.ProfileArtifactStore(tmp_path / "partial-aggregate-artifacts")
+    artifacts.initialize()
+    complete = _complete_profile_artifact(profile, tmp_path)
+    executor_status = profile.ProfileExecutorStatus(
+        18,
+        125,
+        "environment",
+        "a" * 64,
+        3,
+        (),
+    )
+    command_result = profile.CommandResult(
+        "cold-aggregate:validate-pr-raw",
+        ("make", "validate-pr-raw"),
+        84.5,
+        0,
+        str(tmp_path / "isolated-worktree"),
+        str(tmp_path / "aggregate.log"),
+    )
+    cleanup_failure = profile.ProfileCleanupFilesystemFailure(
+        profile.ProfileCleanupOperation.TEMPORARY_ROOT_REMOVE,
+        "PermissionError",
+        "aggregate temporary root remained",
+    )
+    isolated_run = profile.IsolatedWorktreeRun(
+        command_result,
+        (cleanup_failure,),
+    )
+    status_capture_count = 0
+
+    def capture_status(
+        _executor_pool_dir: Path,
+        _aggressiveness: object,
+    ) -> object:
+        nonlocal status_capture_count
+        status_capture_count += 1
+        if failure_boundary == "status" and status_capture_count == 2:
+            raise OSError("injected post-command status failure")
+        return executor_status
+
+    def capture_events(
+        _executor_pool_dir: Path,
+        _aggressiveness: object,
+        *,
+        fairness_group: object,
+    ) -> object:
+        del fairness_group
+        if failure_boundary != "events":
+            raise AssertionError("event capture must not follow status failure")
+        raise OSError("injected post-command event failure")
+
+    monkeypatch.setattr(
+        profile,
+        "run_in_isolated_worktree",
+        lambda **_arguments: isolated_run,
+    )
+    monkeypatch.setattr(profile, "capture_executor_status", capture_status)
+    monkeypatch.setattr(profile, "capture_executor_events", capture_events)
+    request = profile.ProfileMeasurementRequest(
+        repo_root=tmp_path.resolve(),
+        make_bin="make",
+        jobs=18,
+        dry_run=False,
+        targets=("unit",),
+        executor_pool_dir=(tmp_path / "executor-pool").resolve(),
+        aggressiveness=profile.ProfileAggressiveness(125, "command-line"),
+        artifacts=artifacts,
+        profiled_commit_sha="0" * 40,
+        configuration=complete.config,
+    )
+
+    artifact = profile.measure_profile(request)
+    output_path = tmp_path / f"partial-{failure_boundary}.json"
+    profile.write_profile_artifact(output_path, artifact)
+
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["completed_aggregate_runs"] == []
+    [partial] = report["incomplete_aggregate_runs"]
+    assert partial["progress"] == expected_progress
+    assert partial["executor_before"]["successful_observation_count"] == 3
+    assert partial["isolated_run"]["command_result"]["wall_seconds"] == 84.5
+    assert partial["isolated_run"]["cleanup_failures"] == [
+        {
+            "operation": "temporary-root-remove",
+            "error_type": "PermissionError",
+            "error_message": "aggregate temporary root remained",
+        }
+    ]
+    assert ("executor_after" in partial) is retains_after_status
+    assert report["failure"]["operation_name"].endswith(
+        "executor-after-status" if failure_boundary == "status" else "executor-events"
+    )
+    assert report["failure"]["error_type"] == "OSError"
+    assert report["failure"]["cleanup_failures"] == partial["isolated_run"][
+        "cleanup_failures"
+    ]
+
+
+def test_main_writes_typed_report_when_target_discovery_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _load_profile_module()
+    output_path = tmp_path / "discovery-failure.json"
+    worktree = (tmp_path / "discovery-worktree").resolve()
+    cleanup_failure = profile.ProfileCleanupFilesystemFailure(
+        profile.ProfileCleanupOperation.WORKTREE_REMOVE,
+        "RuntimeError",
+        "Git cleanup failed",
+    )
+    arguments = profile.ProfileArguments(
+        "make",
+        18,
+        output_path,
+        False,
+        None,
+        tmp_path.resolve(),
+        125,
+    )
+    monkeypatch.setattr(profile, "parse_args", lambda: arguments)
+    monkeypatch.setattr(profile, "resolve_profiled_commit", lambda _root: "0" * 40)
+    monkeypatch.setattr(profile, "source_worktree_is_dirty", lambda _root: False)
+    monkeypatch.setattr(
+        profile,
+        "profile_host",
+        lambda: profile.ProfileHost("host", "Darwin", "1", "arm64", 18, 64),
+    )
+    monkeypatch.setattr(
+        profile,
+        "resolve_aggressiveness",
+        lambda _arguments: profile.ProfileAggressiveness(125, "command-line"),
+    )
+
+    def fail_discovery(*_arguments: object) -> object:
+        raise profile.IsolatedProfileWorktreeError(
+            "target-discovery",
+            worktree,
+            RuntimeError("injected discovery failure"),
+            (cleanup_failure,),
+        )
+
+    monkeypatch.setattr(profile, "discover_validate_targets_at_commit", fail_discovery)
+
+    assert profile.main() == 1
+
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["schema_version"] == 7
+    assert report["outcome"] == "failed"
+    assert report["initialization"]["repo_root"] == str(tmp_path.resolve())
+    assert report["failure"] == {
+        "stage": "target-discovery",
+        "operation_name": "target-discovery",
+        "error_type": "RuntimeError",
+        "error_message": "injected discovery failure",
+        "cleanup_failures": [
+            {
+                "operation": "worktree-remove",
+                "error_type": "RuntimeError",
+                "error_message": "Git cleanup failed",
+            }
+        ],
+    }
+
+
 def _complete_profile_artifact(
     profile: ModuleType,
     tmp_path: Path,
-) -> object:
+) -> _CompleteProfileArtifactView:
     command_result = profile.CommandResult(
         "aggregate",
         ("make", "validate-pr-raw"),
@@ -486,14 +887,17 @@ def _complete_profile_artifact(
         0.0,
         (command_result,),
     )
-    return profile.ValidateProfileReport(
-        6,
-        "complete",
-        configuration,
-        aggregate,
-        (command_result,),
-        aggregate,
-        summary,
+    return cast(
+        _CompleteProfileArtifactView,
+        profile.ValidateProfileReport(
+            7,
+            "complete",
+            configuration,
+            aggregate,
+            (command_result,),
+            aggregate,
+            summary,
+        ),
     )
 
 
@@ -558,7 +962,7 @@ def test_stage_failure_retains_primary_and_session_cleanup_failures(
         (),
     )
     artifact = profile.ColdAggregateFailureReport(
-        6,
+        7,
         "failed",
         complete.config,
         failed_aggregate,
@@ -621,10 +1025,13 @@ def test_discovery_is_pinned_when_head_moves_and_source_tree_is_dirty(
         encoding="utf-8",
     )
 
+    artifacts = profile.ProfileArtifactStore(tmp_path / "discovery-artifacts")
+    artifacts.initialize()
     targets = profile.discover_validate_targets_at_commit(
         repository,
         _gnu_make(),
         pinned_sha,
+        artifacts,
     )
 
     assert targets == ("_validate-static-lane", "smoke", "test-vscode")

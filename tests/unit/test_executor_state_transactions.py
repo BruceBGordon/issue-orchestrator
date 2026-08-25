@@ -23,7 +23,7 @@ from issue_orchestrator.domain.executor import (
 )
 from issue_orchestrator.domain.executor_monitoring import ExecutorRequestId
 from issue_orchestrator.execution.atomic_record_store import (
-    ExecutorAtomicRecordStore,
+    AtomicRecordStore,
     OsAtomicPathReplacement,
 )
 from issue_orchestrator.execution.host_executor._state import (
@@ -54,7 +54,7 @@ def test_failed_enqueue_publication_unlinks_and_unlocks_partial_record(
     state = HostExecutorState(
         pool_dir,
         4,
-        ExecutorAtomicRecordStore(pool_dir, OsAtomicPathReplacement()),
+        AtomicRecordStore(pool_dir, OsAtomicPathReplacement()),
     )
     original_write = HostExecutorState._write_locked  # noqa: SLF001 - fault boundary
     attempt_count = 0
@@ -88,7 +88,7 @@ def test_failed_enqueue_preserves_publication_and_cleanup_failures(
     state = HostExecutorState(
         pool_dir,
         4,
-        ExecutorAtomicRecordStore(pool_dir, OsAtomicPathReplacement()),
+        AtomicRecordStore(pool_dir, OsAtomicPathReplacement()),
     )
     request_path = pool_dir / "requests" / "publish-once.json"
 

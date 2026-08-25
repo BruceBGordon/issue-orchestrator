@@ -107,7 +107,10 @@ def _matching_command_tokens(
     predicate: Callable[[Sequence[str] | None], bool],
 ) -> list[str] | None:
     try:
-        tokens = shlex.split(command)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
     except ValueError as exc:
         raise ValueError(
             "terminal interaction intent requires valid shell quoting"
@@ -129,12 +132,91 @@ def _matching_command_tokens(
 
 def _trim_command_prefix(tokens: Sequence[str]) -> list[str] | None:
     trimmed = list(tokens)
-    while trimmed and (
-        trimmed[0].rsplit("/", 1)[-1] in {"command", "env", "exec"}
-        or _looks_like_env_assignment(trimmed[0])
-    ):
-        trimmed = trimmed[1:]
-    return trimmed or None
+    cursor = 0
+    while True:
+        while cursor < len(trimmed) and _looks_like_env_assignment(trimmed[cursor]):
+            cursor += 1
+        if cursor >= len(trimmed):
+            return None
+        wrapper = trimmed[cursor].rsplit("/", 1)[-1]
+        if wrapper == "env":
+            next_cursor = _after_env_prefix(trimmed, cursor + 1)
+        elif wrapper == "command":
+            next_cursor = _after_command_prefix(trimmed, cursor + 1)
+        elif wrapper == "exec":
+            next_cursor = _after_exec_prefix(trimmed, cursor + 1)
+        else:
+            return trimmed[cursor:]
+        if next_cursor is None:
+            return None
+        cursor = next_cursor
+
+
+def _after_env_prefix(tokens: Sequence[str], cursor: int) -> int | None:
+    options_without_values = frozenset(
+        {"-i", "--ignore-environment", "-0", "--null"}
+    )
+    options_with_values = frozenset(
+        {"-u", "--unset", "-C", "--chdir", "-P", "-S", "--argv0"}
+    )
+    value_prefixes = ("--unset=", "--chdir=", "--argv0=")
+    while cursor < len(tokens):
+        token = tokens[cursor]
+        if token == "--":
+            return cursor + 1
+        if _looks_like_env_assignment(token):
+            cursor += 1
+            continue
+        if token in options_without_values:
+            cursor += 1
+            continue
+        if token in options_with_values:
+            if cursor + 1 >= len(tokens):
+                return None
+            cursor += 2
+            continue
+        if token.startswith(value_prefixes):
+            cursor += 1
+            continue
+        if token.startswith("-"):
+            return None
+        return cursor
+    return None
+
+
+def _after_command_prefix(tokens: Sequence[str], cursor: int) -> int | None:
+    while cursor < len(tokens):
+        token = tokens[cursor]
+        if token == "--":
+            return cursor + 1
+        if token == "-p":
+            cursor += 1
+            continue
+        if token in {"-v", "-V"}:
+            return None
+        if token.startswith("-"):
+            return None
+        return cursor
+    return None
+
+
+def _after_exec_prefix(tokens: Sequence[str], cursor: int) -> int | None:
+    while cursor < len(tokens):
+        token = tokens[cursor]
+        if token == "--":
+            return cursor + 1
+        if token == "-a":
+            if cursor + 1 >= len(tokens):
+                return None
+            cursor += 2
+            continue
+        if token.startswith("-") and set(token[1:]) <= {"c", "l"}:
+            cursor += 1
+            continue
+        if token.startswith("-"):
+            return None
+        return cursor
+    return None
 
 
 def _is_claude_command_tokens(tokens: Sequence[str] | None) -> bool:
