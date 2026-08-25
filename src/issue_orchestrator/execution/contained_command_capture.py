@@ -75,6 +75,27 @@ class _OutputPumpFinalizationFailed:
 _OutputPumpFinalization = _OutputPumpFinalized | _OutputPumpFinalizationFailed
 
 
+@dataclass(frozen=True, slots=True)
+class _OutputPumpDetached:
+    """The pump can no longer call either caller-owned output sink."""
+
+
+@dataclass(frozen=True, slots=True)
+class _OutputPumpDetachmentFailed:
+    """The pump could not be detached from caller-owned sinks."""
+
+    failure: ContainedCommandFailure
+
+    def __post_init__(self) -> None:
+        if type(self.failure) is not ContainedCommandFailure:
+            raise ValueError(
+                "_OutputPumpDetachmentFailed.failure must be a ContainedCommandFailure"
+            )
+
+
+_OutputPumpDetachment = _OutputPumpDetached | _OutputPumpDetachmentFailed
+
+
 @dataclass(slots=True)
 class _CapturedOutputPump(ProcessGroupInterruption):
     """Drain output while exposing the first observer failure as interruption."""
@@ -120,12 +141,11 @@ class _CapturedOutputPump(ProcessGroupInterruption):
             self._thread.join()
         except BaseException as error:
             failure = ContainedCommandFailure(error)
-            try:
-                self.detach_after_cleanup_failure()
-            except BaseException as detach_error:
+            detachment = self.detach_after_cleanup_failure()
+            if type(detachment) is _OutputPumpDetachmentFailed:
                 failure = _combine_failures(
                     failure,
-                    ContainedCommandFailure(detach_error),
+                    detachment.failure,
                     "output pump join and sink detach both failed",
                 )
         try:
@@ -145,10 +165,14 @@ class _CapturedOutputPump(ProcessGroupInterruption):
             return _OutputPumpFinalized()
         return _OutputPumpFinalizationFailed(failure)
 
-    def detach_after_cleanup_failure(self) -> None:
+    def detach_after_cleanup_failure(self) -> _OutputPumpDetachment:
         """Prevent a still-blocked daemon pump from touching caller-owned sinks."""
-        with self._sink_lock:
-            self._accepting_output = False
+        try:
+            with self._sink_lock:
+                self._accepting_output = False
+        except BaseException as error:
+            return _OutputPumpDetachmentFailed(ContainedCommandFailure(error))
+        return _OutputPumpDetached()
 
     @property
     def failure(self) -> ContainedCommandFailure | None:
@@ -428,11 +452,18 @@ class PosixContainedCommandCapture:
         try:
             termination = self._process_group_supervisor.abort(leader)
         except BaseException as cleanup_error:
-            pump.detach_after_cleanup_failure()
+            cleanup_failure = ContainedCommandFailure(cleanup_error)
+            detachment = pump.detach_after_cleanup_failure()
+            if type(detachment) is _OutputPumpDetachmentFailed:
+                cleanup_failure = _combine_failures(
+                    cleanup_failure,
+                    detachment.failure,
+                    "command group abort and output sink detach both failed",
+                )
             return ContainedCommandCleanupFailed(
                 child=ContainedCommandExitUnknown(process.pid),
                 capture=ContainedCommandCaptureInterrupted(failure),
-                cleanup_failure=ContainedCommandFailure(cleanup_error),
+                cleanup_failure=cleanup_failure,
                 metrics=pump.metrics,
             )
         process.returncode = termination.leader_exit_code
