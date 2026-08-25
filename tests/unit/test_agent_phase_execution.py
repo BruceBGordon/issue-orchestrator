@@ -148,7 +148,7 @@ def test_scheduler_renders_one_shell_safe_internal_invocation() -> None:
         shell_command="printf '%s\\n' 'human readable'",
     )
     scheduler = HostAgentPhaseCommandScheduler(
-        python_executable=Path(sys.executable).resolve(),
+        python_executable=Path(sys.executable),
         shell_executable=Path("/bin/sh"),
     )
 
@@ -157,7 +157,7 @@ def test_scheduler_renders_one_shell_safe_internal_invocation() -> None:
 
     assert scheduled.absolute_timeout_minutes == 90
     assert arguments[:3] == [
-        str(Path(sys.executable).resolve()),
+        sys.executable,
         "-m",
         "issue_orchestrator.entrypoints.cli_tools.agent_phase_run",
     ]

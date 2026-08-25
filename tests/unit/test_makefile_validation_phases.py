@@ -524,6 +524,13 @@ def test_validate_pr_uses_cache_aware_verify_script():
     assert all("validate_runner" not in line for line in lines[: verify_index + 1])
 
 
+def test_vscode_directory_change_cannot_escape_the_timing_boundary():
+    lines = _dry_run("test-vscode")
+    command = lines[_find_line(lines, "cd packages/vscode && npm test")]
+
+    assert "(cd packages/vscode && npm test)" in command
+
+
 def test_agent_validation_targets_emit_timing_markers():
     simulated_lines = _dry_run("test-simulated-agent", SIMULATED_PARALLEL="0")
     integration_lines = _dry_run("test-integration-agent", INTEGRATION_AGENT_PARALLEL="0")

@@ -14,7 +14,9 @@ from issue_orchestrator.execution.agent_phase_command_scheduler import (
 def host_agent_phase_command_scheduler() -> HostAgentPhaseCommandScheduler:
     """Return the production renderer with deterministic host executables."""
     return HostAgentPhaseCommandScheduler(
-        python_executable=Path(sys.executable).resolve(),
+        # Preserve the virtual-environment launcher. Resolving this symlink
+        # selects the base interpreter and loses the editable package context.
+        python_executable=Path(sys.executable),
         shell_executable=Path("/bin/sh"),
     )
 

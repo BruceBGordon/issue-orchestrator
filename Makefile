@@ -672,7 +672,7 @@ else
 			echo "Missing packages/vscode/node_modules. Run: make install-vscode-extensions"; \
 			exit 1; \
 		fi && \
-		cd packages/vscode && npm test)
+		(cd packages/vscode && npm test))
 endif
 
 install-vscode-extensions:

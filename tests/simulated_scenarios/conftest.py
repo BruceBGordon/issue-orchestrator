@@ -26,6 +26,7 @@ from issue_orchestrator.ports.working_copy import (
 )
 from issue_orchestrator.ports.worktree_manager import RegisteredWorktree, WorktreeInfo
 from issue_orchestrator.infra.config import Config
+from tests.agent_phase_scheduler_helpers import scheduled_agent_shell_command
 from tests.conftest import (
     MockGitHubAdapter,
     MockEventSink,
@@ -374,6 +375,20 @@ SCRIPTS_DIR = REPO_ROOT / "tests" / "simulated_scenarios" / "fixtures" / "script
 _RUN_DIR_RE = re.compile(r"ISSUE_ORCHESTRATOR_RUN_DIR=(['\"]?)([^'\"\s]+)\1")
 
 
+def _scheduled_run_dir(command: str, working_dir: str) -> Path:
+    """Read the required run directory from the typed scheduled phase."""
+    application_command = scheduled_agent_shell_command(command)
+    match = _RUN_DIR_RE.search(application_command)
+    if match is None:
+        raise AssertionError(
+            "scheduled agent phase is missing ISSUE_ORCHESTRATOR_RUN_DIR"
+        )
+    run_dir = Path(match.group(2))
+    if run_dir.is_absolute():
+        return run_dir
+    return (Path(working_dir) / run_dir).resolve()
+
+
 class ScriptSessionRunner:
     """SessionRunner that executes commands via the unified AgentRunner.
 
@@ -396,16 +411,7 @@ class ScriptSessionRunner:
     ) -> bool:
         python_bin_dir = str(Path(sys.executable).parent)
 
-        # Extract run_dir from command to determine log/output paths.
-        match = _RUN_DIR_RE.search(command)
-        if match:
-            run_dir = Path(match.group(2))
-            if not run_dir.is_absolute():
-                run_dir = (Path(working_dir) / run_dir).resolve()
-        else:
-            run_dir = (
-                Path(working_dir) / ".issue-orchestrator" / "sessions" / "fallback"
-            )
+        run_dir = _scheduled_run_dir(command, working_dir)
 
         spec = AgentSpec(
             command=["bash", "-c", command],
@@ -484,15 +490,7 @@ class FastScriptSessionRunner:
     ) -> bool:
         python_bin_dir = str(Path(sys.executable).parent)
 
-        match = _RUN_DIR_RE.search(command)
-        if match:
-            run_dir = Path(match.group(2))
-            if not run_dir.is_absolute():
-                run_dir = (Path(working_dir) / run_dir).resolve()
-        else:
-            run_dir = (
-                Path(working_dir) / ".issue-orchestrator" / "sessions" / "fallback"
-            )
+        run_dir = _scheduled_run_dir(command, working_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
 
         env = dict(os.environ)
