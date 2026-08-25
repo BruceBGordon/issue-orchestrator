@@ -257,8 +257,17 @@ goal.
 After process-group, restart-watchdog, profiler-cleanup, and crash-safe
 persistence hardening, an exact clean committed gate at `4e35b20` passed in
 **85.09s** retained validation time (**85.41s** measured wall time), with zero
-swaps. This is the final post-hardening confirmation rather than an earlier
-cache-only or pre-review measurement.
+swaps. This is the representative approximately-85-second confirmation rather
+than an earlier cache-only measurement.
+
+After the later command-guardian hardening, a clean committed `make validate-pr`
+at `db7b83d` passed in **92.12s** retained validation time (**92.43s** measured
+wall time). Every lane was admitted within 0.181s. The dominant Claude command
+spent 88.856s wall time while using 36.588 child CPU seconds; local unit work
+took 52.826s. The seven-second delta is therefore consistent with the observed
+remote-provider range, not queue starvation or measurable guardian admission
+overhead. The practical result is an approximately 85-second gate with ordinary
+provider-driven variation into the low 90s, not a hard 85-second ceiling.
 
 Timing rows live in the repository's shared Git directory and can therefore
 survive a machine migration. For calibration, select records by the captured
