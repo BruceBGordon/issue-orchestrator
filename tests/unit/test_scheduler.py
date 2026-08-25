@@ -1410,7 +1410,7 @@ class TestLaunchSessionDependencyCAS:
         evaluator = DependencyEvaluator(issue_checker=checker, events=events)
 
         # Create orchestrator with mocked dependencies
-        config = MagicMock(spec=Config)
+        config = Config()
         config.repo = "test/repo"
         config.repo_root = "/tmp"
         config.worktree_base = "/tmp"  # Top-level worktree_base
@@ -1500,7 +1500,7 @@ class TestLaunchSessionDependencyCAS:
 
         evaluator = DependencyEvaluator(issue_checker=checker, events=events)
 
-        config = MagicMock(spec=Config)
+        config = Config()
         config.repo = "test/repo"
         config.repo_root = "/tmp/repo"
         config.worktree_base = "/tmp"  # Top-level worktree_base

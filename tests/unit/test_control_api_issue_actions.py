@@ -515,18 +515,25 @@ class TestDebugSessionEndpoint:
         assert call_kwargs["session_id"] == 123
         assert call_kwargs["working_dir"] == str(worktree)
         assert call_kwargs["session_name"] == "debug-123"
-        assert "ORCHESTRATOR_ISSUE_NUMBER='123'" in call_kwargs["command"]
-        assert "ORCHESTRATOR_API_PORT='8080'" in call_kwargs["command"]
-        assert "ORCHESTRATOR_SESSION_ID='debug-123'" in call_kwargs["command"]
+        launch = call_kwargs["launch"]
+        assert "ORCHESTRATOR_ISSUE_NUMBER='123'" in launch.shell_command
+        assert "ORCHESTRATOR_API_PORT='8080'" in launch.shell_command
+        assert "ORCHESTRATOR_SESSION_ID='debug-123'" in launch.shell_command
         run_dir = session_output.find_run_dir(worktree, "debug-123")
         assert run_dir is not None
         completion_path = (
             f".issue-orchestrator/sessions/{run_dir.name}/"
             "completion-agent_claude.json"
         )
-        assert f"ISSUE_ORCHESTRATOR_COMPLETION_PATH='{completion_path}'" in call_kwargs["command"]
-        assert f"ISSUE_ORCHESTRATOR_RUN_DIR='{run_dir}'" in call_kwargs["command"]
-        assert f"ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR='{run_dir}'" in call_kwargs["command"]
+        assert (
+            f"ISSUE_ORCHESTRATOR_COMPLETION_PATH='{completion_path}'"
+            in launch.shell_command
+        )
+        assert f"ISSUE_ORCHESTRATOR_RUN_DIR='{run_dir}'" in launch.shell_command
+        assert (
+            f"ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR='{run_dir}'"
+            in launch.shell_command
+        )
         manifest = session_output.read_manifest(run_dir)
         assert manifest is not None
         assert manifest["completion_path"] == completion_path

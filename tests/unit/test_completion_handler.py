@@ -11,12 +11,14 @@ Tests focus on invariant outcomes, state transitions, and business rules
 rather than implementation details.
 """
 
-import pytest
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import MagicMock, Mock
+
+import pytest
 
 from issue_orchestrator.infra.config import (
     Config,
@@ -66,6 +68,14 @@ from issue_orchestrator.contracts.public import SessionCompletedPayload
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from tests.conftest import make_provider_availability
 from tests.unit.session_run_helpers import make_session_run_assets
+
+
+def _set_session_runtime(session: Session, *, minutes: float) -> None:
+    """Set diagnostic and authoritative clocks to the same test runtime."""
+    session.started_at = (
+        datetime.now() - timedelta(minutes=minutes)
+    ).replace(microsecond=0)
+    session.watchdog_started_at_monotonic = time.monotonic() - (minutes * 60)
 
 
 # =============================================================================
@@ -1758,9 +1768,7 @@ class TestLabelActionGeneration:
             tmp_worktree,
             run_assets=run,
         )
-        session.started_at = (datetime.now() - timedelta(minutes=24)).replace(
-            microsecond=0
-        )
+        _set_session_runtime(session, minutes=24)
         session_output.update_manifest(
             run.run_dir, {"outcome": "completed", "ended_at": "2026-03-14T23:55:16Z"}
         )
@@ -1804,9 +1812,7 @@ class TestLabelActionGeneration:
             tmp_worktree,
             run_assets=run,
         )
-        session.started_at = (datetime.now() - timedelta(minutes=12)).replace(
-            microsecond=0
-        )
+        _set_session_runtime(session, minutes=12)
         session_output.update_manifest(
             run.run_dir, {"outcome": "completed", "ended_at": "2026-03-14T23:55:16Z"}
         )
@@ -1842,9 +1848,7 @@ class TestLabelActionGeneration:
             tmp_worktree,
             run_assets=run,
         )
-        session.started_at = (datetime.now() - timedelta(minutes=5)).replace(
-            microsecond=0
-        )
+        _set_session_runtime(session, minutes=5)
         session_output.update_manifest(
             run.run_dir, {"outcome": "timed_out", "ended_at": "2026-03-14T23:55:16Z"}
         )
@@ -1884,9 +1888,7 @@ class TestLabelActionGeneration:
             terminal_id="issue-123",
             run_assets=run,
         )
-        session.started_at = (datetime.now() - timedelta(minutes=91)).replace(
-            microsecond=0
-        )
+        _set_session_runtime(session, minutes=91)
 
         repository_host = SimpleNamespace(
             get_prs_for_branch=lambda _branch: [],
@@ -1926,9 +1928,7 @@ class TestLabelActionGeneration:
             tmp_worktree,
             run_assets=run,
         )
-        session.started_at = (datetime.now() - timedelta(minutes=5)).replace(
-            microsecond=0
-        )
+        _set_session_runtime(session, minutes=5)
         session_output.update_manifest(
             run.run_dir, {"outcome": "timed_out", "ended_at": "2026-03-14T23:55:16Z"}
         )

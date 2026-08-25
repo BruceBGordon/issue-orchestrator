@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import textwrap
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2217,6 +2218,7 @@ class TestAuthDiagnosisOutranksTimeAndTimeout:
             encoding="utf-8",
         )
         session.started_at = datetime.now() - timedelta(seconds=age_seconds)
+        session.watchdog_started_at_monotonic = time.monotonic() - age_seconds
         return session
 
     @pytest.mark.parametrize(
@@ -4033,6 +4035,9 @@ class TestAnAuthBannerPastTheHeadOfTheLog:
         )
         session.started_at = datetime.now() - timedelta(
             minutes=sample_config.session_timeout_minutes + 30
+        )
+        session.watchdog_started_at_monotonic = time.monotonic() - (
+            (sample_config.session_timeout_minutes + 30) * 60
         )
 
         result = observer.observe_session(session)
