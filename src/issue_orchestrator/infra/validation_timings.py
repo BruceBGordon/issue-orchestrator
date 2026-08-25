@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import re
@@ -26,6 +27,8 @@ from ..domain.validation_timing import (
     ValidationRunTimingSummary,
     ValidationSwapUsage,
     ValidationTargetTiming,
+    ValidationTimingProtocolFailure,
+    ValidationTimingProtocolFailureKind,
     ValidationTimingEnvelope,
     ValidationTimingPayload,
     ValidationTimingScalar,
@@ -48,6 +51,7 @@ _END_RE = re.compile(
     r"$"
 )
 _TIMING_MARKER_PREFIX = "[validate-timing] "
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +325,8 @@ class ValidateTimingRecorder:
     host_context: ValidationHostContext = field(init=False)
     configuration: ValidationConfiguration = field(init=False)
     _starts: dict[str, str] = field(default_factory=dict, init=False)
+    _invalid_targets: set[str] = field(default_factory=set, init=False)
+    _protocol_failure_count: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.worktree, Path):
@@ -363,23 +369,39 @@ class ValidateTimingRecorder:
         if start_match:
             target = start_match.group("target")
             if target in self._starts:
-                raise ValueError(
-                    f"validation target {target!r} emitted a duplicate START marker"
+                self._starts.pop(target)
+                self._invalid_targets.add(target)
+                self._record_protocol_failure(
+                    ValidationTimingProtocolFailureKind.DUPLICATE_START,
+                    canonical_line,
+                    target,
                 )
+                return
+            if target in self._invalid_targets:
+                return
             self._starts[target] = start_match.group("at")
             return
 
         end_match = _END_RE.fullmatch(canonical_line)
         if not end_match:
             if canonical_line.startswith(_TIMING_MARKER_PREFIX):
-                raise ValueError(
-                    f"malformed validation timing marker: {canonical_line!r}"
+                self._record_protocol_failure(
+                    ValidationTimingProtocolFailureKind.MALFORMED_MARKER,
+                    canonical_line,
+                    None,
                 )
             return
         target = end_match.group("target")
+        if target in self._invalid_targets:
+            return
         started_at = self._starts.pop(target, None)
         if started_at is None:
-            raise ValueError(f"validation target {target!r} emitted END without START")
+            self._record_protocol_failure(
+                ValidationTimingProtocolFailureKind.END_WITHOUT_START,
+                canonical_line,
+                target,
+            )
+            return
         timing = ValidationTargetTiming(
             context=self.context,
             configuration=self.configuration,
@@ -390,6 +412,29 @@ class ValidateTimingRecorder:
             ended_at=end_match.group("at"),
         )
         _append_jsonl(self.output_path, timing)
+
+    def _record_protocol_failure(
+        self,
+        failure_kind: ValidationTimingProtocolFailureKind,
+        line: str,
+        target: str | None,
+    ) -> None:
+        failure = ValidationTimingProtocolFailure(
+            context=self.context,
+            configuration=self.configuration,
+            failure_kind=failure_kind,
+            line=line,
+            target=target,
+        )
+        self._protocol_failure_count += 1
+        _append_jsonl(self.output_path, failure)
+        logger.warning(
+            "Validation timing protocol failure: run_id=%s kind=%s target=%r line=%r",
+            self.run_id,
+            failure_kind.value,
+            target,
+            line,
+        )
 
     def finalize(
         self,
@@ -414,6 +459,7 @@ class ValidateTimingRecorder:
                 wall_ended_at=wall_ended_at,
                 monotonic_ended_at=monotonic_ended_at,
             ),
+            timing_protocol_failure_count=self._protocol_failure_count,
         )
         _append_jsonl(self.output_path, summary)
 

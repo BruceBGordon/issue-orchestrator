@@ -453,7 +453,13 @@ class ExecutorAdmissionPolicy:
         if leased > snapshot.host_cpu_slots:
             raise ValueError("active executor leases exceed host capacity")
         available = snapshot.host_cpu_slots - leased
-        if self._saturation.requires_attenuation(snapshot.host_cpu_utilization):
+        # Pressure can attenuate additional admissions, but it must never make
+        # an idle executor self-starve.  One minimum-sized command is the probe
+        # that allows the machine to make progress and produce fresh learning.
+        host_is_saturated = self._saturation.requires_attenuation(
+            snapshot.host_cpu_utilization
+        )
+        if leased > 0 and host_is_saturated:
             return ExecutorAdmissionDeferred(
                 ExecutorWaitReason.HOST_PRESSURE,
                 leased,
@@ -509,9 +515,13 @@ class ExecutorAdmissionPolicy:
             self._smallest_grant(peer, snapshot.host_cpu_slots).cpu_slots
             for peer in compatible_peers
         )
-        grant_budget = max(
-            minimum_grant.cpu_slots,
-            available - peer_reservation,
+        grant_budget = (
+            minimum_grant.cpu_slots
+            if host_is_saturated
+            else max(
+                minimum_grant.cpu_slots,
+                available - peer_reservation,
+            )
         )
         grant = self._largest_grant(
             current,

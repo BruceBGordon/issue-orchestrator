@@ -26,6 +26,7 @@ from issue_orchestrator.domain.executor_monitoring import (
 from issue_orchestrator.entrypoints.bootstrap import build_executor_monitor
 from tests.agent_phase_scheduler_helpers import host_agent_phase_command_scheduler
 from tests.simulated_scenarios.conftest import SimulatedExecutorPool
+from tests.unit.session_run_helpers import make_session_run_assets
 
 
 def _run_git(repository: Path, *arguments: str) -> None:
@@ -61,6 +62,10 @@ def test_spawned_agent_phase_uses_worker_local_executor_pool(
         cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
             tmp_path.resolve()
         ),
+        destination=make_session_run_assets(
+            repository,
+            session_name="executor-isolation",
+        ).terminal_destination,
     )
     scheduled = host_agent_phase_command_scheduler().schedule(specification)
     completed = subprocess.run(

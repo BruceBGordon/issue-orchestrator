@@ -20,6 +20,7 @@ import shutil
 import signal
 import time
 from pathlib import Path
+from typing import Protocol, cast
 
 import pexpect
 
@@ -53,6 +54,20 @@ __all__ = [
 _GRACEFUL_KILL_TIMEOUT = 5
 
 
+class _PtyFile(Protocol):
+    def close(self) -> None: ...
+
+
+class _PtyProcessInternals(Protocol):
+    fileobj: _PtyFile
+    fd: int
+    closed: bool
+
+
+class _PexpectSpawnInternals(Protocol):
+    ptyproc: _PtyProcessInternals
+
+
 class AgentSession:
     """Handle to a running agent process.
 
@@ -68,7 +83,12 @@ class AgentSession:
         start_time: float,
         interaction_handler: SessionInteractionHandler | None = None,
     ) -> None:
+        if type(child.pid) is not int or child.pid <= 1:
+            raise ValueError(
+                "AgentSession child must have a process id above 1"
+            )
         self._child = child
+        self._process_id = child.pid
         self._log_writer = log_writer
         self._spec = spec
         self._start_time = start_time
@@ -78,8 +98,8 @@ class AgentSession:
             self._interaction_handler.bind_sender(self.send)
 
     @property
-    def pid(self) -> int | None:
-        return self._child.pid
+    def pid(self) -> int:
+        return self._process_id
 
     def send(self, text: str) -> bool:
         """Send text to the agent's PTY stdin.
@@ -154,6 +174,44 @@ class AgentSession:
         except (ProcessLookupError, OSError):
             pass
 
+    def finalize_after_owned_process_group_reap(self) -> None:
+        """Close PTY and log descriptors after another owner reaped the child.
+
+        This is deliberately separate from :meth:`wait`: calling pexpect's
+        normal close path after ``waitpid`` has already run raises while trying
+        to reap the same child.  The startup lifecycle owner uses this method
+        only after its process-group supervisor has provided typed reaping
+        evidence.
+        """
+        if self._closed:
+            raise RuntimeError("AgentSession is already finalized")
+        self._closed = True
+        close_errors: list[BaseException] = []
+        try:
+            self._child.flush()
+        except BaseException as error:
+            close_errors.append(error)
+        pty_process = cast(_PexpectSpawnInternals, self._child).ptyproc
+        try:
+            pty_process.fileobj.close()
+        except BaseException as error:
+            close_errors.append(error)
+        finally:
+            pty_process.fd = -1
+            pty_process.closed = True
+            self._child.child_fd = -1
+            self._child.closed = True
+        if self._log_writer is not None:
+            try:
+                self._log_writer.close()
+            except BaseException as error:
+                close_errors.append(error)
+        if close_errors:
+            raise BaseExceptionGroup(
+                "could not finalize externally reaped agent session",
+                close_errors,
+            )
+
     def _close(self, *, timed_out: bool) -> AgentResult:
         """Close the PTY, flush the log, return the result."""
         if self._closed:
@@ -168,18 +226,22 @@ class AgentSession:
         self._closed = True
         duration = time.monotonic() - self._start_time
 
-        # Close pexpect child to collect exit status
+        finalization_errors: list[Exception] = []
         try:
             self._child.close(force=True)
-        except Exception:  # noqa: BLE001
-            pass
+        except (OSError, pexpect.ExceptionPexpect) as error:
+            finalization_errors.append(error)
 
-        # Flush remaining log output
         if self._log_writer is not None:
             try:
                 self._log_writer.close()
-            except Exception:  # noqa: BLE001
-                pass
+            except OSError as error:
+                finalization_errors.append(error)
+        if finalization_errors:
+            raise ExceptionGroup(
+                "agent session PTY or recording finalization failed",
+                finalization_errors,
+            )
 
         exit_code = self._child.exitstatus
         stderr = ""

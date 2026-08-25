@@ -7,12 +7,45 @@ from pathlib import Path
 
 import pytest
 
-from issue_orchestrator.adapters.host_cpu_utilization import (
-    SystemHostCpuUtilizationObserver,
-)
+from issue_orchestrator.adapters import host_cpu_utilization
+from issue_orchestrator.adapters.host_cpu_utilization import SystemHostCpuUtilizationObserver
 
 
 _LINUX_COUNTER_MODULUS = 2**64
+
+
+def test_darwin_observation_accepts_independently_wrapped_cumulative_sums(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshots = iter(
+        (
+            host_cpu_utilization._CpuCounterSnapshot(  # noqa: SLF001
+                (80,), (95,), 100
+            ),
+            host_cpu_utilization._CpuCounterSnapshot(  # noqa: SLF001
+                (95,), (10,), 100
+            ),
+        )
+    )
+
+    class _WrappedDarwinCounterSource:
+        def snapshot(self) -> host_cpu_utilization._CpuCounterSnapshot:
+            return next(snapshots)
+
+    monkeypatch.setattr(
+        host_cpu_utilization,
+        "_DarwinCpuCounterSource",
+        _WrappedDarwinCounterSource,
+    )
+    observer = SystemHostCpuUtilizationObserver(
+        platform="darwin",
+        monotonic=_MonotonicSequence((10.0, 12.0)),
+    )
+    observer.reset()
+
+    observation = observer.observe()
+
+    assert observation.busy_percent == pytest.approx(100.0 * 15 / 15)
 
 
 class _MonotonicSequence:

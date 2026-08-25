@@ -12,7 +12,7 @@ from issue_orchestrator.control.actions import (
     ActionResult as PlanActionResult,
     CloseIssueAction,
 )
-from issue_orchestrator.domain.models import Issue
+from issue_orchestrator.domain.models import AgentConfig, Issue
 from issue_orchestrator.domain.session_run import SessionRunAssets
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 
@@ -25,6 +25,16 @@ globals().update(
 class _BoundResumeRun:
     run_assets: SessionRunAssets
     completion_path: str
+
+
+def _debug_agent_config(
+    command: str = "claude --model {model} '{initial_prompt}'",
+) -> AgentConfig:
+    return AgentConfig(
+        prompt_path=Path("issue.md"),
+        command=command,
+        timeout_minutes=45,
+    )
 
 
 def _bind_resume_run(
@@ -435,10 +445,7 @@ class TestDebugSessionEndpoint:
         mock_orch.state.cached_queue_issues = [mock_issue]
 
         # Agent config exists
-        mock_agent_config = MagicMock()
-        mock_agent_config.provider = None
-        mock_agent_config.model = "sonnet"
-        mock_orch.config.agents = {"agent:claude": mock_agent_config}
+        mock_orch.config.agents = {"agent:claude": _debug_agent_config()}
 
         # Session already exists
         mock_orch.deps.runner.session_exists.return_value = True
@@ -472,10 +479,7 @@ class TestDebugSessionEndpoint:
         mock_issue.agent_type = "agent:claude"
         mock_orch.state.cached_queue_issues = [mock_issue]
 
-        # Agent config - get_command returns the base command
-        mock_agent_config = MagicMock()
-        mock_agent_config.get_command.return_value = "claude --model sonnet 'Work on issue'"
-        mock_orch.config.agents = {"agent:claude": mock_agent_config}
+        mock_orch.config.agents = {"agent:claude": _debug_agent_config()}
         mock_orch.config.web_port = 8080
         mock_orch.config.control_api_port = 8080
 
@@ -501,14 +505,6 @@ class TestDebugSessionEndpoint:
         assert data["agent"] == "claude"
         assert "coding-done --resume" in data["hint"]
 
-        # Verify get_command was called with debug context
-        mock_agent_config.get_command.assert_called_once()
-        call_kwargs = mock_agent_config.get_command.call_args.kwargs
-        assert call_kwargs["issue_number"] == 123
-        assert call_kwargs["issue_title"] == "Test Issue"
-        assert call_kwargs["worktree"] == worktree
-        assert "DEBUG SESSION" in call_kwargs["existing_work"]
-
         # Verify session was created with correct args
         mock_orch.deps.runner.create_session.assert_called_once()
         call_kwargs = mock_orch.deps.runner.create_session.call_args.kwargs
@@ -519,6 +515,8 @@ class TestDebugSessionEndpoint:
         assert "ORCHESTRATOR_ISSUE_NUMBER='123'" in launch.shell_command
         assert "ORCHESTRATOR_API_PORT='8080'" in launch.shell_command
         assert "ORCHESTRATOR_SESSION_ID='debug-123'" in launch.shell_command
+        assert "DEBUG SESSION" in launch.shell_command
+        assert "Test Issue" in launch.shell_command
         run_dir = session_output.find_run_dir(worktree, "debug-123")
         assert run_dir is not None
         completion_path = (
@@ -530,6 +528,10 @@ class TestDebugSessionEndpoint:
             in launch.shell_command
         )
         assert f"ISSUE_ORCHESTRATOR_RUN_DIR='{run_dir}'" in launch.shell_command
+        assert launch.destination.run_dir == run_dir
+        assert launch.destination.recording_path == (
+            run_dir / "terminal-recording.jsonl"
+        )
         assert (
             f"ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR='{run_dir}'"
             in launch.shell_command
@@ -537,6 +539,35 @@ class TestDebugSessionEndpoint:
         manifest = session_output.read_manifest(run_dir)
         assert manifest is not None
         assert manifest["completion_path"] == completion_path
+        assert manifest["scheduled_outer_watchdog_timeout_minutes"] == 45
+
+    def test_debug_session_rejects_malformed_configured_command(
+        self, client_with_orchestrator, tmp_path
+    ) -> None:
+        client, mock_orch = client_with_orchestrator
+        worktree = tmp_path / "repo-123"
+        worktree.mkdir()
+        mock_issue = MagicMock(
+            number=123,
+            title="Test Issue",
+            agent_type="agent:claude",
+        )
+        mock_orch.state.cached_queue_issues = [mock_issue]
+        mock_orch.config.agents = {
+            "agent:claude": _debug_agent_config("claude 'unterminated")
+        }
+        mock_orch.deps.runner.session_exists.return_value = False
+
+        with patch(
+            "issue_orchestrator.entrypoints.control_api_issue_routes.get_worktree_path",
+            return_value=worktree,
+        ):
+            response = client.post("/api/issues/123/debug-session")
+
+        assert response.status_code == 400
+        assert "valid shell quoting" in response.json()["error"]
+        mock_orch.deps.session_output.start_run.assert_not_called()
+        mock_orch.deps.runner.create_session.assert_not_called()
 
     def test_debug_session_returns_500_when_session_creation_fails(
         self, client_with_orchestrator, tmp_path
@@ -555,10 +586,7 @@ class TestDebugSessionEndpoint:
         mock_issue.agent_type = "agent:claude"
         mock_orch.state.cached_queue_issues = [mock_issue]
 
-        # Agent config
-        mock_agent_config = MagicMock()
-        mock_agent_config.get_command.return_value = "claude 'Work on issue'"
-        mock_orch.config.agents = {"agent:claude": mock_agent_config}
+        mock_orch.config.agents = {"agent:claude": _debug_agent_config()}
         mock_orch.config.web_port = 8080
         mock_orch.config.control_api_port = 8080
 
@@ -566,6 +594,7 @@ class TestDebugSessionEndpoint:
         mock_orch.deps.runner.session_exists.return_value = False
         # Session creation fails
         mock_orch.deps.runner.create_session.return_value = False
+        mock_orch.deps.session_output = FileSystemSessionOutput()
 
         with patch(
             "issue_orchestrator.entrypoints.control_api_issue_routes.get_worktree_path"
@@ -596,15 +625,13 @@ class TestDebugSessionEndpoint:
         mock_issue.agent_type = "agent:claude"
         mock_orch.state.cached_queue_issues = [mock_issue]
 
-        # Agent config
-        mock_agent_config = MagicMock()
-        mock_agent_config.get_command.return_value = "claude 'Work on issue'"
-        mock_orch.config.agents = {"agent:claude": mock_agent_config}
+        mock_orch.config.agents = {"agent:claude": _debug_agent_config()}
         mock_orch.config.web_port = 8080
         mock_orch.config.control_api_port = 8080
 
         mock_orch.deps.runner.session_exists.return_value = False
         mock_orch.deps.runner.create_session.return_value = True
+        mock_orch.deps.session_output = FileSystemSessionOutput()
 
         with patch(
             "issue_orchestrator.entrypoints.control_api_issue_routes.get_worktree_path"

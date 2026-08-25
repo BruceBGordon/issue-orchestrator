@@ -14,6 +14,10 @@ SCHEDULED_OUTER_WATCHDOG_MANIFEST_FIELD = (
 )
 
 
+class UnrestorableScheduledSessionWatchdogError(ValueError):
+    """A live legacy run has no trustworthy persisted watchdog budget."""
+
+
 @dataclass(frozen=True, slots=True)
 class ScheduledSessionWatchdog:
     """Exact owner-produced outer timeout durable across process restarts."""
@@ -34,7 +38,7 @@ class ScheduledSessionWatchdog:
         """Require the exact scheduled watchdog from one active-run manifest."""
         raw_timeout = manifest.get(SCHEDULED_OUTER_WATCHDOG_MANIFEST_FIELD)
         if type(raw_timeout) is not int or raw_timeout < 1:
-            raise ValueError(
+            raise UnrestorableScheduledSessionWatchdogError(
                 "session run manifest missing required scheduled outer watchdog"
             )
         return cls(raw_timeout)

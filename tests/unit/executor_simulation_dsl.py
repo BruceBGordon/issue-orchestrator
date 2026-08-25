@@ -524,7 +524,7 @@ class ExecutorWorkloadSimulator:
                 active,
                 now_seconds,
             )
-            cooperative_yield_count += self._yield_pressured_work(
+            cooperative_yield_count += self._reschedule_at_safe_boundaries(
                 scenario,
                 now_seconds,
                 queued,
@@ -673,7 +673,7 @@ class ExecutorWorkloadSimulator:
                 )
 
     @classmethod
-    def _yield_pressured_work(
+    def _reschedule_at_safe_boundaries(
         cls,
         scenario: ExecutorSimulationScenario,
         now_seconds: float,
@@ -694,7 +694,14 @@ class ExecutorWorkloadSimulator:
                 cls._host_busy_percent(scenario, active, now_seconds),
                 scenario.dials.decision_interval_seconds,
             )
-            if not scenario.dials.saturation.requires_attenuation(utilization):
+            pressure_requires_attenuation = (
+                scenario.dials.saturation.requires_attenuation(utilization)
+            )
+            grant_can_recover = (
+                running.grant.concurrency
+                < running.queued.work.concurrency_range.maximum_concurrency
+            )
+            if not pressure_requires_attenuation and not grant_can_recover:
                 active_index = active.index(running)
                 next_boundary = running.completes_at_seconds
                 if remaining_boundaries:

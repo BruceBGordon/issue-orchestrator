@@ -34,6 +34,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 import pytest
+from tests.process_completion_fixture import PROCESS_COMPLETION_WATCHDOG
 import uvicorn
 from playwright.sync_api import Locator, Page, expect
 
@@ -416,7 +417,13 @@ def _stage_fixture(fixture: Path, tmp_path: Path) -> Path:
 
 class _UvicornTestServer:
     def __init__(self, host: str, port: int) -> None:
-        self.config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        self.config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="warning",
+            timeout_graceful_shutdown=1,
+        )
         self.server = uvicorn.Server(self.config)
         self.thread: Thread | None = None
 
@@ -436,8 +443,12 @@ class _UvicornTestServer:
 
     def stop(self) -> None:
         self.server.should_exit = True
+        self.server.force_exit = True
         if self.thread:
-            self.thread.join(timeout=5)
+            PROCESS_COMPLETION_WATCHDOG.join_thread(
+                self.thread,
+                operation="timeline fixture web server shutdown",
+            )
 
 
 @pytest.fixture

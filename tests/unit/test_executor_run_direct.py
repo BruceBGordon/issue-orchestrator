@@ -7,6 +7,10 @@ import signal
 import subprocess
 import sys
 
+import pytest
+
+from issue_orchestrator.domain.executor import ExecutorWorkKey
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DIRECT_EXECUTOR = REPO_ROOT / "scripts" / "executor-run-direct"
@@ -71,6 +75,73 @@ def test_direct_executor_uses_largest_accepted_concurrency() -> None:
     assert result.returncode == 0
     assert result.stdout == "12\n"
     assert result.stderr == ""
+
+
+def test_direct_executor_accepts_the_public_unicode_work_key_contract() -> None:
+    result = _run_direct(
+        "--min-concurrency",
+        "1",
+        "--max-concurrency",
+        "1",
+        "--work-key",
+        "agent:backend team · β",
+        "--group",
+        "direct-validation",
+        "--",
+        "true",
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "invalid_work_key",
+    ("", "   ", "line\nbreak", "control\x07character", "x" * 161),
+)
+def test_direct_executor_rejects_every_public_work_key_boundary(
+    invalid_work_key: str,
+) -> None:
+    with pytest.raises(ValueError):
+        ExecutorWorkKey(invalid_work_key)
+
+    result = _run_direct(
+        "--min-concurrency",
+        "1",
+        "--max-concurrency",
+        "1",
+        "--work-key",
+        invalid_work_key,
+        "--group",
+        "direct-validation",
+        "--",
+        "true",
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.startswith("usage: executor-run-direct ")
+
+
+@pytest.mark.parametrize("valid_work_key", ("x" * 160, "agent:backend team · β"))
+def test_direct_and_pooled_work_keys_share_accepted_boundaries(
+    valid_work_key: str,
+) -> None:
+    assert ExecutorWorkKey(valid_work_key).value == valid_work_key
+
+    result = _run_direct(
+        "--min-concurrency",
+        "1",
+        "--max-concurrency",
+        "1",
+        "--work-key",
+        valid_work_key,
+        "--group",
+        "direct-validation",
+        "--",
+        "true",
+    )
+
+    assert result.returncode == 0
 
 
 def test_direct_executor_rejects_exclusive_resource_it_cannot_honor() -> None:

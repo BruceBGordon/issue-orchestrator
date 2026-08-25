@@ -16,11 +16,18 @@ from typing import BinaryIO, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from ..domain.process_group import (
+    ProcessGroupAbsent,
+    ProcessGroupExecutable,
+    ProcessGroupPermissionDenied,
+    ProcessGroupZombiesOnly,
+)
 from ..domain.executor import (
     ExecutorCommandCancellation,
     ExecutorInteractiveSessionCancellation,
     ExecutorNoCommandCancellation,
 )
+from ..ports.process_group_observer import ProcessGroupObserver
 
 
 logger = logging.getLogger(__name__)
@@ -159,7 +166,11 @@ def prepare_executor_guardian_cancellation(
 class ExecutorSessionGuardianCanceller:
     """Resolve and contain a guardian through its run-scoped ownership lock."""
 
-    def __init__(self, forceful_shutdown_seconds: float) -> None:
+    def __init__(
+        self,
+        forceful_shutdown_seconds: float,
+        process_group_observer: ProcessGroupObserver,
+    ) -> None:
         if (
             type(forceful_shutdown_seconds) is not float
             or not math.isfinite(forceful_shutdown_seconds)
@@ -170,6 +181,7 @@ class ExecutorSessionGuardianCanceller:
                 "must be positive"
             )
         self._forceful_shutdown_seconds = forceful_shutdown_seconds
+        self._process_group_observer = process_group_observer
 
     def contain_if_active(
         self,
@@ -273,14 +285,27 @@ class ExecutorSessionGuardianCanceller:
                 f"pgid={process_group_id}"
             ) from exc
         while time.monotonic() < deadline:
-            if not _process_group_exists(process_group_id):
+            if self._group_is_contained(process_group_id):
                 return
             time.sleep(0.01)
-        if _process_group_exists(process_group_id):
+        if not self._group_is_contained(process_group_id):
             raise ExecutorGuardianCancellationError(
                 "executor guardian group remained executable after SIGKILL: "
                 f"pgid={process_group_id}"
             )
+
+    def _group_is_contained(self, process_group_id: int) -> bool:
+        observation = self._process_group_observer.observe_group(process_group_id)
+        if type(observation) in (ProcessGroupAbsent, ProcessGroupZombiesOnly):
+            return True
+        if type(observation) is ProcessGroupExecutable:
+            return False
+        if type(observation) is ProcessGroupPermissionDenied:
+            raise ExecutorGuardianCancellationError(
+                "permission denied while observing executor guardian group: "
+                f"pgid={process_group_id} detail={observation.detail}"
+            )
+        raise AssertionError("process group observation is a closed union")
 
 
 def _lock_path(record_path: Path) -> Path:
@@ -324,15 +349,3 @@ def _atomic_write_record(path: Path, record: _GuardianCancellationRecord) -> Non
         if descriptor_owned:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
-
-
-def _process_group_exists(process_group_id: int) -> bool:
-    try:
-        os.killpg(process_group_id, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # macOS reports EPERM for this caller-owned group when only an
-        # unreaped zombie remains; no executable guardian work survives.
-        return False
-    return True

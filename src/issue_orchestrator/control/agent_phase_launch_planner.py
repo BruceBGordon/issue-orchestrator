@@ -78,6 +78,7 @@ class AgentPhaseLaunchPlanner:
             cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
                 request.run.run_dir.resolve()
             ),
+            destination=request.run.terminal_destination,
         )
         scheduled = self._scheduler.schedule(specification)
         scheduled_watchdog = ScheduledSessionWatchdog(

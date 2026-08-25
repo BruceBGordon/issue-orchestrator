@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 
@@ -27,7 +26,6 @@ from issue_orchestrator.ports.working_copy import (
 )
 from issue_orchestrator.ports.worktree_manager import RegisteredWorktree, WorktreeInfo
 from issue_orchestrator.infra.config import Config
-from tests.agent_phase_scheduler_helpers import scheduled_agent_shell_command
 from tests.conftest import (
     MockGitHubAdapter,
     MockEventSink,
@@ -414,23 +412,6 @@ def _stub_persistent_review_exchange_setup(monkeypatch, request):
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "tests" / "simulated_scenarios" / "fixtures" / "scripts"
 
-_RUN_DIR_RE = re.compile(r"ISSUE_ORCHESTRATOR_RUN_DIR=(['\"]?)([^'\"\s]+)\1")
-
-
-def _scheduled_run_dir(command: str, working_dir: str) -> Path:
-    """Read the required run directory from the typed scheduled phase."""
-    application_command = scheduled_agent_shell_command(command)
-    match = _RUN_DIR_RE.search(application_command)
-    if match is None:
-        raise AssertionError(
-            "scheduled agent phase is missing ISSUE_ORCHESTRATOR_RUN_DIR"
-        )
-    run_dir = Path(match.group(2))
-    if run_dir.is_absolute():
-        return run_dir
-    return (Path(working_dir) / run_dir).resolve()
-
-
 class ScriptSessionRunner:
     """SessionRunner that executes commands via the unified AgentRunner.
 
@@ -453,20 +434,20 @@ class ScriptSessionRunner:
     ) -> bool:
         python_bin_dir = str(Path(sys.executable).parent)
 
-        run_dir = _scheduled_run_dir(launch.shell_command, working_dir)
+        run_dir = launch.destination.run_dir
 
         spec = AgentSpec(
             command=[launch.shell.value, "-c", launch.shell_command],
             working_dir=Path(working_dir),
             timeout_seconds=120,
-            log_path=run_dir / "terminal-recording.jsonl",
+            log_path=launch.destination.recording_path,
             output_dir=run_dir,
             env_overrides={"PATH": f"{python_bin_dir}:{os.environ.get('PATH', '')}"},
         )
         result = self._runner.run(spec)
 
         # Populate _last_output from the canonical terminal recording for get_session_output().
-        log_path = run_dir / "terminal-recording.jsonl"
+        log_path = launch.destination.recording_path
         if log_path.exists():
             self._last_output[session_name] = _decode_terminal_recording(log_path)
         else:
@@ -532,7 +513,7 @@ class FastScriptSessionRunner:
     ) -> bool:
         python_bin_dir = str(Path(sys.executable).parent)
 
-        run_dir = _scheduled_run_dir(launch.shell_command, working_dir)
+        run_dir = launch.destination.run_dir
         run_dir.mkdir(parents=True, exist_ok=True)
 
         env = dict(os.environ)

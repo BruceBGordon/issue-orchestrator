@@ -56,7 +56,10 @@ class HostAgentPhaseCommandScheduler(AgentPhaseCommandScheduler):
             )
         return ScheduledAgentPhase(
             terminal_launch=TerminalLaunch(
-                shell_command=shlex.join(
+                # Replace the PTY shell so its persisted PID remains the exact
+                # executor process-group leader for the full scheduled phase.
+                shell_command="exec "
+                + shlex.join(
                     (
                         str(self._python_executable),
                         "-m",
@@ -79,6 +82,7 @@ class HostAgentPhaseCommandScheduler(AgentPhaseCommandScheduler):
                 ),
                 shell=self._application_shell,
                 interaction_intent=specification.interaction_intent,
+                destination=specification.destination,
             ),
             absolute_timeout_minutes=self._outer_watchdog_policy.timeout_minutes(
                 specification.deadline

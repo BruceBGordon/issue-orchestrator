@@ -21,6 +21,7 @@ from ..domain.executor import (
 )
 from ..domain.executor_guardian import ExecutorGuardianTerminationPolicy
 from ..domain.terminal_launch import TerminalShell
+from ..domain.terminal_session_lifecycle import TerminalSessionWatcherPolicy
 from ..domain.terminal_session_termination import TerminalSessionTerminationPolicy
 from ..execution.agent_phase_command_scheduler import HostAgentPhaseCommandScheduler
 from ..ports.agent_phase_command_scheduler import AgentPhaseCommandScheduler
@@ -31,7 +32,9 @@ from ..ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ..ports.executor_monitor import ExecutorMonitor
 from ..ports.host_cpu_utilization import HostCpuUtilizationObserver
 from ..ports.process_group_supervisor import ProcessGroupSupervisor
+from ..ports.process_group_observer import ProcessGroupObserver
 from ..ports.terminal_session_terminator import TerminalSessionTerminator
+from ..ports.validation_command_runner import ValidationCommandRunner
 
 
 _PROCESS_TERMINATION = ExecutorProcessTerminationPolicy(
@@ -49,6 +52,9 @@ _TERMINAL_SESSION_TERMINATION = TerminalSessionTerminationPolicy(
     # executor supervisor spend both inner TERM/KILL bounds, plus one margin.
     graceful_shutdown_seconds=_TERMINAL_SESSION_GUARDIAN_RELAY_SECONDS,
     forceful_shutdown_seconds=_TERMINAL_SESSION_GUARDIAN_RELAY_SECONDS,
+)
+_TERMINAL_SESSION_WATCHER = TerminalSessionWatcherPolicy(
+    shutdown_timeout_seconds=_TERMINAL_SESSION_GUARDIAN_RELAY_SECONDS,
 )
 _HISTORY_RETENTION = ExecutorHistoryRetentionPolicy(
     maximum_profiles=2048,
@@ -118,9 +124,21 @@ def build_process_group_supervisor() -> ProcessGroupSupervisor:
     )
 
 
-def build_terminal_session_terminator() -> TerminalSessionTerminator:
-    """Compose persisted outer-session and guardian containment policy."""
+def terminal_session_watcher_policy() -> TerminalSessionWatcherPolicy:
+    """Return the composition-root-owned PTY watcher shutdown policy."""
+    return _TERMINAL_SESSION_WATCHER
+
+
+def compose_terminal_session_terminator(
+    process_group_observer: ProcessGroupObserver,
+) -> TerminalSessionTerminator:
+    """Compose containment policy around the root-supplied host observer."""
     _require_posix_process_groups()
+    if not isinstance(process_group_observer, ProcessGroupObserver):
+        raise ValueError(
+            "compose_terminal_session_terminator.process_group_observer must "
+            "implement ProcessGroupObserver"
+        )
     from ..execution.executor_guardian_cancellation import (
         ExecutorSessionGuardianCanceller,
     )
@@ -133,17 +151,45 @@ def build_terminal_session_terminator() -> TerminalSessionTerminator:
         ExecutorSessionGuardianCanceller(
             forceful_shutdown_seconds=(
                 _TERMINAL_SESSION_TERMINATION.forceful_shutdown_seconds
-            )
+            ),
+            process_group_observer=process_group_observer,
         ),
+        process_group_observer,
     )
 
 
 def build_contained_command_capture() -> ContainedCommandCapture:
     """Compose streamed command capture behind one process-lifecycle owner."""
     _require_posix_process_groups()
+    from ..domain.contained_command import ContainedCommandOutputPolicy
     from ..execution.contained_command_capture import PosixContainedCommandCapture
 
-    return PosixContainedCommandCapture(build_process_group_supervisor())
+    return PosixContainedCommandCapture(
+        build_process_group_supervisor(),
+        ContainedCommandOutputPolicy(
+            poll_interval_seconds=0.05,
+            shutdown_timeout_seconds=2.0,
+            final_drain_byte_limit=1_048_576,
+        ),
+    )
+
+
+def build_validation_command_runner() -> ValidationCommandRunner:
+    """Compose validation spawn, capture, timeout, containment, and reaping."""
+    _require_posix_process_groups()
+    from ..domain.contained_command import ContainedCommandOutputPolicy
+    from ..execution.contained_validation_command import (
+        PosixContainedValidationCommandRunner,
+    )
+
+    return PosixContainedValidationCommandRunner(
+        build_process_group_supervisor(),
+        ContainedCommandOutputPolicy(
+            poll_interval_seconds=0.05,
+            shutdown_timeout_seconds=2.0,
+            final_drain_byte_limit=4_194_304,
+        ),
+    )
 
 
 def build_executor_command_guardian() -> ExecutorCommandGuardian:

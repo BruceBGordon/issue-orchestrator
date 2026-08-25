@@ -25,8 +25,13 @@ from ..domain.issue_key import GitHubIssueKey
 from ..domain.session_key import SessionKey, TaskKind
 from ..domain.models import Issue, RETROSPECTIVE_REVIEW_TERMINAL_PREFIX, Session
 from ..domain.session_run import RestoredSessionRun, SessionRunAssets
+from ..domain.session_restoration import UnsupportedSessionRun
+from ..domain.session_watchdog import UnrestorableScheduledSessionWatchdogError
 from ..ports import RepositoryHost, WorkingCopy
 from ..ports.session_runner import DiscoveredSession
+from ..ports.unsupported_session_run_containment import (
+    UnsupportedSessionRunContainment,
+)
 from .tech_lead_session_policy import recover_tech_lead_launch_scope
 
 logger = logging.getLogger(__name__)
@@ -54,6 +59,16 @@ class SessionConfigurationIdentityVerificationError(SessionConfigurationIdentity
     """A surviving session's effective launch configuration cannot be verified."""
 
 
+class UnsupportedSessionRunError(RuntimeError):
+    """A legacy live run must be contained instead of reinterpreted."""
+
+    def __init__(self, run: UnsupportedSessionRun) -> None:
+        if type(run) is not UnsupportedSessionRun:
+            raise ValueError("UnsupportedSessionRunError requires UnsupportedSessionRun")
+        self.run = run
+        super().__init__(run.reason)
+
+
 class SessionRestorer:
     """Handles restoring session tracking after orchestrator restart.
 
@@ -67,11 +82,15 @@ class SessionRestorer:
         config: "Config",
         repository_host: RepositoryHost,
         working_copy: WorkingCopy,
+        unsupported_session_run_containment: UnsupportedSessionRunContainment,
         tech_lead_authority: "TechLeadAuthorityStore | None" = None,
     ):
         self.config = config
         self.repository_host = repository_host
         self.working_copy = working_copy
+        self._unsupported_session_run_containment = (
+            unsupported_session_run_containment
+        )
         # Durable cohort ledger, read when rebuilding a restored health
         # review's owned scope (#6994 round 1 F3). Optional so unrelated tests
         # need not wire it; without it a restored storm review still recovers
@@ -114,6 +133,8 @@ class SessionRestorer:
 
             except SessionConfigurationIdentityError:
                 raise
+            except UnsupportedSessionRunError as error:
+                self._unsupported_session_run_containment.contain(error.run)
             except Exception as e:
                 logger.exception(
                     "Failed to restore session for issue #%d: %s", issue_number, e
@@ -350,6 +371,17 @@ class SessionRestorer:
                 run_dir=run_dir,
                 manifest=manifest,
             )
+        except UnrestorableScheduledSessionWatchdogError as exc:
+            raise UnsupportedSessionRunError(
+                UnsupportedSessionRun(
+                    issue_number=self._issue_number(session_info),
+                    session_name=session_name,
+                    reason=(
+                        "live session uses an unsupported legacy run manifest: "
+                        f"{exc}"
+                    ),
+                )
+            ) from exc
         except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
             message = (
                 f"Discovered active session {session_name} has invalid run assets at "

@@ -104,7 +104,7 @@ from .actions import (
     ResetRetryIssueAction,
 )
 from .provider_impact import ApplyProviderImpactAction, apply_provider_impact
-from .session_manager import SessionManager, SessionRef, SessionType, SessionContext
+from .session_manager import SessionManager, SessionRef, SessionType
 from .tech_lead_applier_handlers import tech_lead_action_handlers
 from .tech_lead_issue_creation import apply_create_tech_lead_issue
 from .history_reconciliation import apply_history_reconciliation
@@ -1004,53 +1004,26 @@ class ActionApplier:
         """
         assert isinstance(action, LaunchSessionAction)
 
-        # Use the callback if provided (preferred path - handles entity lookup)
-        if self.session_launcher is not None:
-            session = self.session_launcher(action.session_type, action.number)
-            if session:
-                # An expedited issue that is now an active session has jumped
-                # the lane: free its cap slot (via the queue owner, never a
-                # direct priority_queue mutation) so the next urgent tech-lead
-                # finding can be expedited (#6870). No-op for non-expedited work.
-                if self.expedite_lane is not None:
-                    self.expedite_lane.release(session.issue.number)
-                return ActionResult.ok(
-                    action,
-                    session_name=session.terminal_id,
-                    issue_number=session.issue.number,
-                )
-            else:
-                return ActionResult.fail(
-                    action,
-                    f"Failed to launch {action.session_type} session for #{action.number}"
-                )
-
-        # Fallback: use command/working_dir from action (for testing or direct calls)
-        if not action.command or not action.working_dir:
+        if self.session_launcher is None:
             return ActionResult.fail(
                 action,
-                "No session_launcher callback and action missing command/working_dir"
+                "No session_launcher callback configured",
             )
-
-        ref = SessionRef(session_type=action.session_type, number=action.number)
-
-        # Check if already running
-        if self.sessions.exists(ref):
-            return ActionResult.skip(action, f"Session {ref.name} already running")
-
-        ctx = SessionContext.for_bash_command(
-            ref=ref,
-            shell_command=action.command,
-            working_dir=Path(action.working_dir),
-            title=action.title,
+        session = self.session_launcher(action.session_type, action.number)
+        if session is None:
+            return ActionResult.fail(
+                action,
+                f"Failed to launch {action.session_type} session for #{action.number}",
+            )
+        # An expedited issue that is now an active session has jumped the lane:
+        # free its cap slot through the queue owner.
+        if self.expedite_lane is not None:
+            self.expedite_lane.release(session.issue.number)
+        return ActionResult.ok(
+            action,
+            session_name=session.terminal_id,
+            issue_number=session.issue.number,
         )
-
-        success = self.sessions.start(ctx)
-
-        if success:
-            return ActionResult.ok(action, session_name=ref.name)
-        else:
-            return ActionResult.fail(action, "Failed to start session")
 
     def _apply_launch_validation_retry(self, action: Action) -> ActionResult:
         """Launch a validation retry session through the orchestrator callback."""

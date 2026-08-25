@@ -453,10 +453,12 @@ def test_pressure_saturation_attenuates_then_recovers_without_restart(
     pool_dir = tmp_path / "pool"
     with PressureRig(pool_dir, host_cpu_slots=4) as rig:
         rig.set_host_cpu_busy_percent(95.0)
+        blocker = rig.admit(PressureWork("BLOCKER", "pressure-existing"))
         deferred = rig.defer(PressureWork("DEFERRED", "pressure-adaptive"))
 
         rig.set_host_cpu_busy_percent(0.0)
         rig.require_started(deferred)
+        rig.release(blocker)
         rig.release(deferred)
 
         timeline = _monitor(pool_dir, 4).recent_events(

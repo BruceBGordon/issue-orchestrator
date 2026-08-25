@@ -337,7 +337,7 @@ class ClaudeCodeAdapter(AiAgentAdapter):
                 result = run_command_in_process_group(
                     [
                         "claude",
-                        "--print", "--model", "haiku",
+                        "--print",
                         "--output-format",
                         "text",
                         "--dangerously-skip-permissions",

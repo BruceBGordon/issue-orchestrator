@@ -7,14 +7,17 @@ import os
 import signal
 import sys
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generator
 
 import pytest
 
 from issue_orchestrator.domain.executor import (
+    ExecutorCommandCancellation,
     ExecutorCommandLifecycle,
     ExecutorDeadlineReason,
+    ExecutorInteractiveSessionCancellation,
     ExecutorNoCommandCancellation,
 )
 from issue_orchestrator.domain.executor_guardian import (
@@ -24,6 +27,13 @@ from issue_orchestrator.domain.executor_guardian import (
     ExecutorGuardianCommandTimedOut,
     ExecutorGuardianTerminationPolicy,
     ExecutorGuardianUnboundedBudget,
+)
+from issue_orchestrator.domain.process_group import (
+    OwnedProcessGroupLeader,
+    ProcessGroupCompleted,
+    ProcessGroupSupervision,
+    ProcessGroupTermination,
+    ProcessGroupWait,
 )
 from issue_orchestrator.execution.host_executor.guardian_launcher import (
     ExecutorGuardianProgram,
@@ -39,6 +49,11 @@ from issue_orchestrator.execution.process_group_terminator import (
 from issue_orchestrator.domain.executor import ExecutorProcessTerminationPolicy
 from issue_orchestrator.ports.executor_command_guardian import (
     ExecutorGuardianRequest,
+    ExecutorGuardianLeaseTransfer,
+)
+from issue_orchestrator.ports.process_group_supervisor import (
+    ProcessGroupInterruption,
+    ProcessGroupSupervisor,
 )
 from tests.process_tree_fixture import (
     ExitingTermResistantProcessTreeProgram,
@@ -65,30 +80,79 @@ def _guardian(
     )
 
 
+@dataclass(slots=True)
+class _TestGuardianLease:
+    descriptor: int
+    _transferred: bool = field(default=False, init=False)
+
+    def inherited_file_descriptors(self) -> tuple[int, ...]:
+        if self._transferred:
+            raise RuntimeError("test lease was already transferred")
+        return (self.descriptor,)
+
+    def transfer_to_guardian(self) -> None:
+        if self._transferred:
+            raise RuntimeError("test lease was already transferred")
+        os.close(self.descriptor)
+        self._transferred = True
+
+    def close_local(self) -> None:
+        if not self._transferred:
+            os.close(self.descriptor)
+            self._transferred = True
+
+
 @contextmanager
-def _lease_descriptor() -> Generator[int, None, None]:
+def _lease_descriptor() -> Generator[_TestGuardianLease, None, None]:
     read_fd, write_fd = os.pipe()
+    lease = _TestGuardianLease(write_fd)
     try:
-        yield write_fd
+        yield lease
     finally:
         os.close(read_fd)
-        os.close(write_fd)
+        lease.close_local()
 
 
 def _request(
-    lease_fd: int,
+    lease: ExecutorGuardianLeaseTransfer,
     arguments: tuple[str, ...],
     *,
     budget: ExecutorGuardianUnboundedBudget | ExecutorGuardianBoundedBudget,
+    lifecycle: ExecutorCommandLifecycle = ExecutorCommandLifecycle.DETACHED,
+    cancellation: ExecutorCommandCancellation = ExecutorNoCommandCancellation(),
 ) -> ExecutorGuardianRequest:
     return ExecutorGuardianRequest(
         arguments=arguments,
         environment=os.environ.copy(),
-        lease_file_descriptors=(lease_fd,),
+        lease=lease,
         budget=budget,
-        lifecycle=ExecutorCommandLifecycle.DETACHED,
-        cancellation=ExecutorNoCommandCancellation(),
+        lifecycle=lifecycle,
+        cancellation=cancellation,
     )
+
+
+class _LateInterruptionAfterCompletionSupervisor:
+    """Inject SIGTERM only after natural guardian completion is established."""
+
+    def __init__(self, delegate: ProcessGroupSupervisor) -> None:
+        if not isinstance(delegate, ProcessGroupSupervisor):
+            raise ValueError("delegate must implement ProcessGroupSupervisor")
+        self._delegate = delegate
+
+    def supervise(
+        self,
+        leader: OwnedProcessGroupLeader,
+        wait: ProcessGroupWait,
+        interruption: ProcessGroupInterruption,
+    ) -> ProcessGroupSupervision:
+        supervision = self._delegate.supervise(leader, wait, interruption)
+        if type(supervision) is not ProcessGroupCompleted:
+            raise AssertionError("test requires natural guardian completion")
+        os.kill(os.getpid(), signal.SIGTERM)
+        return supervision
+
+    def abort(self, leader: OwnedProcessGroupLeader) -> ProcessGroupTermination:
+        return self._delegate.abort(leader)
 
 
 @pytest.mark.parametrize(
@@ -114,6 +178,42 @@ def test_guardian_preserves_exact_command_exit_status(
 
     assert type(terminal) is ExecutorGuardianCommandCompleted
     assert terminal.exit_code == expected_exit_code
+
+
+def test_completed_terminal_record_wins_over_late_parent_sigterm(
+    tmp_path: Path,
+) -> None:
+    termination = ExecutorProcessTerminationPolicy(0.1, 1.0)
+    supervisor = _LateInterruptionAfterCompletionSupervisor(
+        PosixProcessGroupSupervisor(PosixProcessGroupTerminator(termination))
+    )
+    guardian = PosixExecutorCommandGuardian(
+        ExecutorGuardianProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.execution.host_executor.guardian",
+            )
+        ),
+        supervisor,
+        ExecutorGuardianTerminationPolicy(termination.graceful_shutdown_seconds),
+    )
+
+    with _lease_descriptor() as lease_fd:
+        terminal = guardian.run(
+            _request(
+                lease_fd,
+                (sys.executable, "-c", "raise SystemExit(17)"),
+                budget=ExecutorGuardianUnboundedBudget(),
+                lifecycle=ExecutorCommandLifecycle.INTERACTIVE_SESSION,
+                cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
+                    tmp_path.resolve()
+                ),
+            )
+        )
+
+    assert type(terminal) is ExecutorGuardianCommandCompleted
+    assert terminal.exit_code == 17
 
 
 def test_guardian_timeout_wins_over_cooperative_term_exit() -> None:

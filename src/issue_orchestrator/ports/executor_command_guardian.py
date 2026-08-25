@@ -19,60 +19,86 @@ from ..domain.executor import (
 )
 
 
+@runtime_checkable
+class ExecutorGuardianLeaseTransfer(Protocol):
+    """Transfer admitted lock ownership to a successfully spawned guardian."""
+
+    def inherited_file_descriptors(self) -> tuple[int, ...]:
+        """Return the locally owned descriptors the guardian must inherit."""
+        ...
+
+    def transfer_to_guardian(self) -> None:
+        """Close local descriptor ownership without unlocking the guardian copy."""
+        ...
+
+
+def _require_guardian_arguments(owner: str, arguments: tuple[str, ...]) -> None:
+    if type(arguments) is not tuple or not arguments:
+        raise ValueError(f"{owner}.arguments must be a non-empty tuple")
+    if not arguments[0] or any(type(argument) is not str for argument in arguments):
+        raise ValueError(
+            f"{owner}.arguments must contain strings and name an executable"
+        )
+    if any("\0" in argument for argument in arguments):
+        raise ValueError(f"{owner}.arguments must not contain NUL bytes")
+
+
+def _validated_environment(
+    owner: str,
+    environment: Mapping[str, str],
+) -> MappingProxyType[str, str]:
+    exact_environment = dict(environment)
+    if any(
+        type(key) is not str
+        or not key
+        or "=" in key
+        or "\0" in key
+        or type(value) is not str
+        or "\0" in value
+        for key, value in exact_environment.items()
+    ):
+        raise ValueError(
+            f"{owner}.environment must contain valid process environment strings"
+        )
+    return MappingProxyType(exact_environment)
+
+
+def _require_guardian_lease(
+    owner: str,
+    lease: object,
+) -> ExecutorGuardianLeaseTransfer:
+    if not isinstance(lease, ExecutorGuardianLeaseTransfer):
+        raise ValueError(f"{owner}.lease must implement ExecutorGuardianLeaseTransfer")
+    descriptors = lease.inherited_file_descriptors()
+    if type(descriptors) is not tuple or not descriptors:
+        raise ValueError(f"{owner}.lease must own at least one descriptor")
+    if any(type(descriptor) is not int or descriptor <= 2 for descriptor in descriptors):
+        raise ValueError(f"{owner}.lease descriptors must all be above 2")
+    if len(descriptors) != len(set(descriptors)):
+        raise ValueError(f"{owner}.lease descriptors must not contain duplicates")
+    return lease
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutorGuardianRequest:
     """Exact command, environment, locks, and budget transferred to a guardian."""
 
     arguments: tuple[str, ...]
     environment: Mapping[str, str]
-    lease_file_descriptors: tuple[int, ...]
+    lease: ExecutorGuardianLeaseTransfer
     budget: ExecutorGuardianBudget
     lifecycle: ExecutorCommandLifecycle
     cancellation: ExecutorCommandCancellation
 
     def __post_init__(self) -> None:
         owner = type(self).__name__
-        if type(self.arguments) is not tuple or not self.arguments:
-            raise ValueError(f"{owner}.arguments must be a non-empty tuple")
-        if not self.arguments[0] or any(
-            type(argument) is not str for argument in self.arguments
-        ):
-            raise ValueError(
-                f"{owner}.arguments must contain strings and name an executable"
-            )
-        if any("\0" in argument for argument in self.arguments):
-            raise ValueError(f"{owner}.arguments must not contain NUL bytes")
-        environment = dict(self.environment)
-        if any(
-            type(key) is not str
-            or not key
-            or "=" in key
-            or "\0" in key
-            or type(value) is not str
-            or "\0" in value
-            for key, value in environment.items()
-        ):
-            raise ValueError(
-                f"{owner}.environment must contain valid process environment strings"
-            )
-        object.__setattr__(self, "environment", MappingProxyType(environment))
-        if type(self.lease_file_descriptors) is not tuple or not (
-            self.lease_file_descriptors
-        ):
-            raise ValueError(
-                f"{owner}.lease_file_descriptors must be a non-empty tuple"
-            )
-        if any(
-            type(descriptor) is not int or descriptor <= 2
-            for descriptor in self.lease_file_descriptors
-        ):
-            raise ValueError(
-                f"{owner}.lease_file_descriptors must contain descriptors above 2"
-            )
-        if len(self.lease_file_descriptors) != len(set(self.lease_file_descriptors)):
-            raise ValueError(
-                f"{owner}.lease_file_descriptors must not contain duplicates"
-            )
+        _require_guardian_arguments(owner, self.arguments)
+        object.__setattr__(
+            self,
+            "environment",
+            _validated_environment(owner, self.environment),
+        )
+        object.__setattr__(self, "lease", _require_guardian_lease(owner, self.lease))
         if type(self.budget) not in (
             ExecutorGuardianUnboundedBudget,
             ExecutorGuardianBoundedBudget,

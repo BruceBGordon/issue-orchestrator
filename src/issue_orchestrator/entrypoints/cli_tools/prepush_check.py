@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Optional
 
 from ...control.validation import PublishGate
-from ...execution import GitWorkingCopy, LocalCommandRunner
+from ...entrypoints.bootstrap_executor import build_validation_command_runner
+from ...execution import GitWorkingCopy
 from ...infra.runtime_artifacts import filter_runtime_managed_dirty_paths
 from ...infra.validation_timings import (
     SYSTEM_VALIDATION_TIMING_CLOCK,
@@ -157,7 +158,7 @@ def _run_validation_gate(
 
     gate = PublishGate(
         worktree,
-        command_runner=LocalCommandRunner(),
+        command_runner=build_validation_command_runner(),
         working_copy=GitWorkingCopy(),
         command=cmd,
         timeout_seconds=timeout,

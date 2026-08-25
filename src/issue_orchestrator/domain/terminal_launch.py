@@ -7,6 +7,9 @@ import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
+
+from .path_guards import require_absolute_path, require_path_under
 
 
 _SHELL_COMMAND_SEPARATORS = frozenset({"&&", ";", "||"})
@@ -41,12 +44,33 @@ class TerminalInteractionIntent(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalRunDestination:
+    """Run-owned terminal recording destination used for launch and cancellation."""
+
+    run_dir: Path
+    recording_path: Path
+
+    def __post_init__(self) -> None:
+        require_absolute_path(self.run_dir, "TerminalRunDestination.run_dir")
+        require_absolute_path(
+            self.recording_path,
+            "TerminalRunDestination.recording_path",
+        )
+        require_path_under(
+            self.recording_path,
+            self.run_dir,
+            "TerminalRunDestination.recording_path",
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class TerminalLaunch:
     """Executable shell text plus semantics that serialization cannot preserve."""
 
     shell_command: str
     shell: TerminalShell
     interaction_intent: TerminalInteractionIntent
+    destination: TerminalRunDestination
 
     def __post_init__(self) -> None:
         if type(self.shell_command) is not str or not self.shell_command:
@@ -57,14 +81,24 @@ class TerminalLaunch:
             raise ValueError(
                 "TerminalLaunch.interaction_intent must be TerminalInteractionIntent"
             )
+        if type(self.destination) is not TerminalRunDestination:
+            raise ValueError(
+                "TerminalLaunch.destination must be TerminalRunDestination"
+            )
 
     @classmethod
-    def classified(cls, shell_command: str, shell: TerminalShell) -> TerminalLaunch:
+    def classified(
+        cls,
+        shell_command: str,
+        shell: TerminalShell,
+        destination: TerminalRunDestination,
+    ) -> TerminalLaunch:
         """Construct from an unwrapped command at the terminal boundary."""
         return cls(
             shell_command=shell_command,
             shell=shell,
             interaction_intent=TerminalInteractionIntent.classify(shell_command),
+            destination=destination,
         )
 
 

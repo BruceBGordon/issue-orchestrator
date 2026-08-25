@@ -3,6 +3,10 @@
 # ruff: noqa: F403,F405,SLF001
 
 from issue_orchestrator.events.catalog import EVENT_SCHEMA_VERSION
+from issue_orchestrator.entrypoints.bootstrap import build_process_group_supervisor
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    terminal_session_watcher_policy,
+)
 from issue_orchestrator.ports.tech_lead_run_record_store import (
     NO_TECH_LEAD_RUN_HISTORY,
 )
@@ -329,6 +333,8 @@ class TestEmitEventHelper:
         # Create plugin manager and register test plugin
         pm = PluginManager(
             RecordingTerminalSessionTerminator(),
+            build_process_group_supervisor(),
+            terminal_session_watcher_policy(),
             terminal_plugin="subprocess",
         )
         pm.register_plugin(TestPlugin(), name="test_plugin")
@@ -486,6 +492,8 @@ class TestIssueRowsEndpoint:
 
         pm = PluginManager(
             RecordingTerminalSessionTerminator(),
+            build_process_group_supervisor(),
+            terminal_session_watcher_policy(),
             terminal_plugin="subprocess",
         )
         pm.register_plugin(TestPlugin(), name="test_plugin")

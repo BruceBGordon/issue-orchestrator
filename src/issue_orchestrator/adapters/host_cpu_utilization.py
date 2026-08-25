@@ -49,8 +49,11 @@ class _CpuCounterSnapshot:
             raise ValueError("CPU counter modulus must be an integer greater than one")
         if any(value >= self.modulus for value in (*self.busy, *self.total)):
             raise ValueError("CPU counters must be below their wrap modulus")
-        if any(busy > total for busy, total in zip(self.busy, self.total, strict=True)):
-            raise ValueError("busy CPU counters must not exceed total counters")
+        # ``busy`` and ``total`` are independently reduced modulo the native
+        # counter width.  A valid wrap can therefore leave the reduced busy
+        # sum numerically above the reduced total sum.  Interval deltas below
+        # own wrap handling; comparing cumulative residues here rejects valid
+        # host observations.
 
 
 class _CpuCounterSource(Protocol):

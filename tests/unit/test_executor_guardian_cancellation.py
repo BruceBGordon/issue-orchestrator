@@ -16,20 +16,28 @@ from issue_orchestrator.execution.executor_guardian_cancellation import (
     ExecutorSessionGuardianCanceller,
     InteractiveExecutorGuardianCancellationLease,
 )
+from tests.unit.process_group_observer_helpers import RecordingProcessGroupObserver
 
 
 def _cancellation(run_dir: Path) -> ExecutorInteractiveSessionCancellation:
     return ExecutorInteractiveSessionCancellation.for_run_dir(run_dir.resolve())
 
 
+def _canceller(seconds: float) -> ExecutorSessionGuardianCanceller:
+    return ExecutorSessionGuardianCanceller(
+        seconds,
+        RecordingProcessGroupObserver(),
+    )
+
+
 @pytest.mark.parametrize("seconds", (0.0, math.nan, math.inf))
 def test_canceller_requires_a_finite_positive_force_bound(seconds: float) -> None:
     with pytest.raises(ValueError, match="must be positive"):
-        ExecutorSessionGuardianCanceller(seconds)
+        _canceller(seconds)
 
 
 def test_canceller_reports_an_absent_endpoint_explicitly(tmp_path: Path) -> None:
-    outcome = ExecutorSessionGuardianCanceller(1.0).contain_if_active(
+    outcome = _canceller(1.0).contain_if_active(
         _cancellation(tmp_path)
     )
 
@@ -43,7 +51,7 @@ def test_canceller_validates_and_retires_a_stale_record(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    outcome = ExecutorSessionGuardianCanceller(1.0).contain_if_active(cancellation)
+    outcome = _canceller(1.0).contain_if_active(cancellation)
 
     assert outcome is ExecutorGuardianCancellationOutcome.STALE_RETIRED
     assert not cancellation.record_path.exists()
@@ -59,7 +67,7 @@ def test_canceller_fails_fast_on_a_malformed_stale_record(tmp_path: Path) -> Non
         ExecutorGuardianCancellationError,
         match="invalid executor guardian cancellation record",
     ):
-        ExecutorSessionGuardianCanceller(1.0).contain_if_active(cancellation)
+        _canceller(1.0).contain_if_active(cancellation)
 
 
 def test_only_one_guardian_can_own_a_run_cancellation_endpoint(

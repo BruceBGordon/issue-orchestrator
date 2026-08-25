@@ -55,9 +55,7 @@ class PluggySessionRunner:
         )
         result = self._pm.hook.create_session(
             session_id=session_id,
-            command=launch.shell_command,
-            interaction_intent=launch.interaction_intent,
-            shell=launch.shell,
+            launch=launch,
             working_dir=working_dir,
             title=title,
             session_name=session_name,

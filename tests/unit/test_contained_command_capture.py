@@ -3,22 +3,25 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Iterator
+import signal
+from collections.abc import Callable
 from enum import StrEnum
-from io import TextIOBase
 from pathlib import Path
 import shlex
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
-from typing import TextIO, cast
+from typing import BinaryIO, cast
 
 import pytest
 
 from issue_orchestrator.domain.contained_command import (
     ContainedCommandCaptureAborted,
     ContainedCommandCaptureFailed,
+    ContainedCommandCompleted,
+    ContainedCommandOutputPolicy,
     ContainedCommandSupervised,
     ContainedCommandStarted,
 )
@@ -47,6 +50,7 @@ from issue_orchestrator.ports.process_group_supervisor import (
     ProcessGroupInterruption,
     ProcessGroupSupervisor,
 )
+from tests.process_completion_fixture import PROCESS_COMPLETION_WATCHDOG
 from tests.process_tree_fixture import ProcessTreeMember
 
 
@@ -66,6 +70,28 @@ class _RejectUnexpectedLine(ContainedCommandLineObserver):
         raise AssertionError(f"an unstarted output pump observed a line: {line!r}")
 
 
+class _IgnoreLines(ContainedCommandLineObserver):
+    def observe_line(self, line: str) -> None:
+        del line
+
+
+@dataclass(frozen=True, slots=True)
+class _BlockingOutput(ContainedCommandOutput):
+    callback_started: threading.Event
+    release_callback: threading.Event
+
+    def child_started(self, started: ContainedCommandStarted) -> None:
+        del started
+
+    def write_line(self, line: str) -> None:
+        del line
+        self.callback_started.set()
+        PROCESS_COMPLETION_WATCHDOG.wait_for_event(
+            self.release_callback,
+            operation="release blocked contained-command output callback",
+        )
+
+
 class _ThreadFailurePoint(StrEnum):
     CONSTRUCTION = "construction"
     START = "start"
@@ -82,24 +108,33 @@ class _SupervisionFailureTiming(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class _CloseFailingTextStream:
-    delegate: TextIOBase
+class _CloseFailingBinaryStream:
+    delegate: BinaryIO
     failure: OSError
 
     def __post_init__(self) -> None:
-        if not isinstance(self.delegate, TextIOBase):
-            raise ValueError("_CloseFailingTextStream.delegate must be text I/O")
         if type(self.failure) is not OSError:
-            raise ValueError("_CloseFailingTextStream.failure must be an OSError")
+            raise ValueError("_CloseFailingBinaryStream.failure must be an OSError")
 
-    def __iter__(self) -> Iterator[str]:
-        return iter(self.delegate)
+    def fileno(self) -> int:
+        return self.delegate.fileno()
 
     def close(self) -> None:
         try:
             self.delegate.close()
         finally:
             raise self.failure
+
+
+_OUTPUT_POLICY = ContainedCommandOutputPolicy(
+    poll_interval_seconds=0.01,
+    shutdown_timeout_seconds=1.0,
+    final_drain_byte_limit=1_048_576,
+)
+
+
+def _capture(supervisor: ProcessGroupSupervisor) -> PosixContainedCommandCapture:
+    return PosixContainedCommandCapture(supervisor, _OUTPUT_POLICY)
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,7 +210,7 @@ def test_output_pump_setup_failure_contains_and_reaps_started_group(
         monkeypatch.setattr(threading, "Thread", reject_thread_construction)
     else:
         monkeypatch.setattr(threading.Thread, "start", reject_thread_start)
-    capture = PosixContainedCommandCapture(
+    capture = _capture(
         PosixProcessGroupSupervisor(
             PosixProcessGroupTerminator(
                 ExecutorProcessTerminationPolicy(
@@ -222,7 +257,11 @@ def test_output_pump_finalization_failure_is_typed_after_group_containment(
     )
     supervision_failure = RuntimeError("injected command supervision failure")
 
-    def reject_thread_join(_thread: threading.Thread) -> None:
+    def reject_thread_join(
+        _thread: threading.Thread,
+        timeout: float | None = None,
+    ) -> None:
+        del timeout
         raise finalization_failure
 
     original_popen = subprocess.Popen
@@ -237,9 +276,9 @@ def test_output_pump_finalization_failure_is_typed_after_group_containment(
         text: bool,
         bufsize: int,
         start_new_session: bool,
-    ) -> subprocess.Popen[str]:
+    ) -> subprocess.Popen[bytes]:
         process = cast(
-            "subprocess.Popen[str]",
+            "subprocess.Popen[bytes]",
             original_popen(
                 command,
                 shell=shell,
@@ -251,11 +290,11 @@ def test_output_pump_finalization_failure_is_typed_after_group_containment(
                 start_new_session=start_new_session,
             ),
         )
-        if not isinstance(process.stdout, TextIOBase):
-            raise AssertionError("contained command did not expose text stdout")
+        if process.stdout is None:
+            raise AssertionError("contained command did not expose binary stdout")
         process.stdout = cast(
-            TextIO,
-            _CloseFailingTextStream(process.stdout, finalization_failure),
+            BinaryIO,
+            _CloseFailingBinaryStream(process.stdout, finalization_failure),
         )
         return process
 
@@ -284,7 +323,7 @@ def test_output_pump_finalization_failure_is_typed_after_group_containment(
         "import signal; signal.pause()" if recover_from_supervision_failure else "pass"
     )
 
-    result = PosixContainedCommandCapture(capture_supervisor).capture(
+    result = _capture(capture_supervisor).capture(
         ContainedShellCommand(
             command=(
                 f"exec {shlex.quote(sys.executable)} -c {shlex.quote(child_program)}"
@@ -325,7 +364,7 @@ def test_capture_and_supervision_failures_are_both_preserved(
             )
         )
     )
-    capture = PosixContainedCommandCapture(
+    capture = _capture(
         _FailingSupervision(
             process_group_supervisor,
             supervision_failure,
@@ -354,3 +393,82 @@ def test_capture_and_supervision_failures_are_both_preserved(
     )
     process_id = int(process_id_path.read_text(encoding="utf-8"))
     ProcessTreeMember(process_id).assert_contained()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX descriptor ownership")
+@pytest.mark.timeout(10)
+def test_escaped_descendant_holding_stdout_cannot_block_capture_finalization(
+    tmp_path: Path,
+) -> None:
+    escaped_pid_path = (tmp_path / "escaped-stdout-holder.pid").resolve()
+    child_program = "import time; time.sleep(300)"
+    leader_program = (
+        "import pathlib,subprocess,sys; "
+        f"child=subprocess.Popen([sys.executable,'-c',{child_program!r}],"
+        "start_new_session=True); "
+        f"pathlib.Path({str(escaped_pid_path)!r}).write_text(str(child.pid)); "
+        "print('leader-complete',flush=True)"
+    )
+    supervisor = PosixProcessGroupSupervisor(
+        PosixProcessGroupTerminator(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=0.01,
+                forceful_shutdown_seconds=1.0,
+            )
+        )
+    )
+
+    result = _capture(supervisor).capture(
+        ContainedShellCommand(
+            command=(
+                f"exec {shlex.quote(sys.executable)} -c "
+                f"{shlex.quote(leader_program)}"
+            ),
+            working_directory=tmp_path,
+        ),
+        _StartedProcessRecorder(tmp_path / "leader.pid"),
+        _IgnoreLines(),
+    )
+
+    escaped_process_id = int(escaped_pid_path.read_text(encoding="utf-8"))
+    try:
+        assert type(result) is ContainedCommandCompleted
+    finally:
+        os.kill(escaped_process_id, signal.SIGKILL)
+        ProcessTreeMember(escaped_process_id).assert_contained()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process containment")
+@pytest.mark.timeout(10)
+def test_blocking_output_sink_cannot_defeat_pump_shutdown_budget(
+    tmp_path: Path,
+) -> None:
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    output = _BlockingOutput(callback_started, release_callback)
+    supervisor = PosixProcessGroupSupervisor(
+        PosixProcessGroupTerminator(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=0.01,
+                forceful_shutdown_seconds=1.0,
+            )
+        )
+    )
+    started_at = time.monotonic()
+
+    try:
+        result = _capture(supervisor).capture(
+            ContainedShellCommand(
+                command="printf 'one line\\n'",
+                working_directory=tmp_path,
+            ),
+            output,
+            _IgnoreLines(),
+        )
+    finally:
+        release_callback.set()
+
+    assert callback_started.is_set()
+    assert time.monotonic() - started_at < 3.0
+    assert type(result) is ContainedCommandCaptureFailed
+    assert type(result.failure.error) is TimeoutError

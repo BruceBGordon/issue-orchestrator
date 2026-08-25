@@ -15,6 +15,7 @@ from issue_orchestrator.domain.terminal_session_termination import (
     TerminalSessionProcess,
     TerminalSessionTerminationPolicy,
 )
+from issue_orchestrator.domain.process_group import ProcessBirthIdentity
 
 
 def _cancellation(tmp_path: Path) -> ExecutorInteractiveSessionCancellation:
@@ -27,14 +28,18 @@ def test_terminal_session_process_requires_real_group_leader_identity(
     process_id: int,
 ) -> None:
     with pytest.raises(ValueError, match="integer above 1"):
-        TerminalSessionProcess(process_id, _cancellation(tmp_path))
+        TerminalSessionProcess(
+            process_id,
+            ProcessBirthIdentity("darwin-timeval:1700000000:100"),
+            _cancellation(tmp_path),
+        )
 
 
 def test_terminal_session_process_requires_typed_cancellation(tmp_path: Path) -> None:
     invalid = cast(ExecutorInteractiveSessionCancellation, None)
 
     with pytest.raises(ValueError, match="executor_cancellation"):
-        TerminalSessionProcess(42, invalid)
+        TerminalSessionProcess(42, ProcessBirthIdentity("darwin-timeval:1700000000:100"), invalid)
 
 
 @pytest.mark.parametrize("seconds", (0.0, -1.0, math.nan, math.inf))

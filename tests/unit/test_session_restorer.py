@@ -23,7 +23,6 @@ import pytest
 from issue_orchestrator.control.session_restorer import (
     SessionConfigurationIdentityVerificationError,
     SessionConfigurationModeMismatchError,
-    SessionRestorer,
 )
 from issue_orchestrator.domain.models import AgentConfig, Issue, Session
 from issue_orchestrator.domain.repository_launch_selection import (
@@ -33,6 +32,10 @@ from issue_orchestrator.domain.session_key import TaskKind
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.session_runner import DiscoveredSession
 from tests.unit.session_run_helpers import make_session_run_assets
+from tests.unit.session_restoration_helpers import (
+    RecordingUnsupportedSessionRunContainment,
+    make_session_restorer,
+)
 
 
 class MockRepositoryHost:
@@ -151,7 +154,7 @@ class TestRestoreSessionsBasic:
     def test_canonical_terminal_id_prefers_persisted_session_name(self, tmp_path):
         """The persisted registry id wins over user-facing tab text."""
         config = make_config(agents={"agent:web": make_agent_config(tmp_path)})
-        restorer = SessionRestorer(config, MockRepositoryHost(), MockWorkingCopy())
+        restorer = make_session_restorer(config, MockRepositoryHost(), MockWorkingCopy())
         discovered = make_discovered_session(
             100,
             tab_name="Review PR #456",
@@ -164,7 +167,7 @@ class TestRestoreSessionsBasic:
     def test_canonical_terminal_id_extracts_review_pr_from_tab_name(self, tmp_path):
         """Legacy discovered review records still derive review-N from tab text."""
         config = make_config(agents={"agent:web": make_agent_config(tmp_path)})
-        restorer = SessionRestorer(config, MockRepositoryHost(), MockWorkingCopy())
+        restorer = make_session_restorer(config, MockRepositoryHost(), MockWorkingCopy())
         discovered = make_discovered_session(
             100, tab_name="#100 Review PR #456", is_review=True
         )
@@ -178,7 +181,7 @@ class TestRestoreSessionsBasic:
     ):
         """A malformed review discovery record is visible in logs before fallback."""
         config = make_config(agents={"agent:web": make_agent_config(tmp_path)})
-        restorer = SessionRestorer(config, MockRepositoryHost(), MockWorkingCopy())
+        restorer = make_session_restorer(config, MockRepositoryHost(), MockWorkingCopy())
         discovered = make_discovered_session(
             100, tab_name="review title without pr", is_review=True
         )
@@ -194,7 +197,7 @@ class TestRestoreSessionsBasic:
     ):
         """Known-terminal restore carries session_name without inventing tab text."""
         config = make_config(agents={"agent:web": make_agent_config(tmp_path)})
-        restorer = SessionRestorer(config, MockRepositoryHost(), MockWorkingCopy())
+        restorer = make_session_restorer(config, MockRepositoryHost(), MockWorkingCopy())
         restorer.restore_sessions = MagicMock(return_value=[])
         run_assets = make_session_run_assets(tmp_path, session_name="issue-123")
 
@@ -239,7 +242,7 @@ class TestRestoreSessionsBasic:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "123-test-branch"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         # Act
         discovered = [make_discovered_session(123, is_review=False, worktree=worktree)]
@@ -279,7 +282,7 @@ class TestRestoreSessionsBasic:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "123-test-branch"
 
-        [session] = SessionRestorer(
+        [session] = make_session_restorer(
             config,
             repo_host,
             working_copy,
@@ -301,7 +304,7 @@ class TestRestoreSessionsBasic:
         session.watchdog_started_at_monotonic = observed_now - (93 * 60)
         assert session.is_timed_out is True
 
-    def test_restore_rejects_active_run_without_scheduled_watchdog(
+    def test_restore_contains_active_legacy_run_without_scheduled_watchdog(
         self,
         tmp_path: Path,
     ) -> None:
@@ -323,15 +326,20 @@ class TestRestoreSessionsBasic:
             run_dir=str(run_assets.run_dir),
         )
 
-        with pytest.raises(
-            SessionConfigurationIdentityVerificationError,
-            match="missing required scheduled outer watchdog",
-        ):
-            SessionRestorer(
-                config,
-                MockRepositoryHost(),
-                MockWorkingCopy(),
-            ).restore_sessions([discovered], already_tracked=[])
+        containment = RecordingUnsupportedSessionRunContainment()
+        restored = make_session_restorer(
+            config,
+            MockRepositoryHost(),
+            MockWorkingCopy(),
+            containment=containment,
+        ).restore_sessions([discovered], already_tracked=[])
+
+        assert restored == []
+        assert len(containment.runs) == 1
+        unsupported = containment.runs[0]
+        assert unsupported.issue_number == 123
+        assert unsupported.session_name == "issue-123"
+        assert "missing required scheduled outer watchdog" in unsupported.reason
 
     def test_restores_review_session_with_pr_number_from_tab_name(self, tmp_path):
         """A discovered review session extracts PR number from tab name."""
@@ -354,7 +362,7 @@ class TestRestoreSessionsBasic:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "100-feature-branch"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         # Tab name format: "#<issue> Review PR #<pr>"
         discovered = [
@@ -393,7 +401,7 @@ class TestRestoreSessionsBasic:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "123-branch"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         # Create an already-tracked session
         existing_session = MagicMock(spec=Session)
@@ -428,7 +436,7 @@ class TestRestoreSessionsBasic:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "123-branch"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         # Same issue discovered twice
         discovered = [
@@ -456,7 +464,7 @@ class TestOrphanedSessionHandling:
         repo_host = MockRepositoryHost()
         working_copy = MockWorkingCopy()
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         discovered = [make_discovered_session(123)]
         with pytest.raises(
@@ -489,7 +497,7 @@ class TestErrorRecovery:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree_200] = "200-branch"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         discovered = [
             make_discovered_session(100),  # Will fail - no recorded run assets
@@ -522,7 +530,7 @@ class TestErrorRecovery:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "123-branch"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         discovered = [make_discovered_session(123, worktree=worktree)]
         with caplog.at_level(logging.ERROR):
@@ -572,7 +580,7 @@ class TestErrorRecovery:
             SessionConfigurationModeMismatchError,
             match="was launched with 'claude'/'main.yaml'",
         ):
-            SessionRestorer(
+            make_session_restorer(
                 config, MockRepositoryHost(), MockWorkingCopy()
             ).restore_sessions(discovered, already_tracked=[])
 
@@ -626,7 +634,7 @@ class TestErrorRecovery:
             "issue_orchestrator.domain.models.time.monotonic",
             lambda: 100.0,
         )
-        restored = SessionRestorer(config, repo_host, working_copy).restore_sessions(
+        restored = make_session_restorer(config, repo_host, working_copy).restore_sessions(
             discovered, already_tracked=[]
         )
 
@@ -679,7 +687,7 @@ class TestErrorRecovery:
         ]
 
         with pytest.raises(SessionConfigurationModeMismatchError):
-            SessionRestorer(
+            make_session_restorer(
                 config,
                 MockRepositoryHost(),
                 MockWorkingCopy(),
@@ -699,7 +707,7 @@ class TestErrorRecovery:
             SessionConfigurationIdentityVerificationError,
             match="no recorded run_dir",
         ):
-            SessionRestorer(
+            make_session_restorer(
                 config,
                 MockRepositoryHost(),
                 MockWorkingCopy(),
@@ -725,7 +733,7 @@ class TestErrorRecovery:
             SessionConfigurationIdentityVerificationError,
             match="is unreadable",
         ):
-            SessionRestorer(
+            make_session_restorer(
                 config,
                 MockRepositoryHost(),
                 MockWorkingCopy(),
@@ -762,7 +770,7 @@ class TestStateValidation:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "123-branch"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         discovered = [make_discovered_session(123, worktree=worktree)]
         with caplog.at_level(logging.WARNING):
@@ -790,7 +798,7 @@ class TestStateValidation:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "123-branch"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         discovered = [make_discovered_session(123, worktree=worktree)]
         with caplog.at_level(logging.WARNING):
@@ -817,7 +825,7 @@ class TestStateValidation:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "123-branch"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         discovered = [
             make_discovered_session(123, tab_name="#123 My task", worktree=worktree)
@@ -848,7 +856,7 @@ class TestStateValidation:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "123-branch"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         discovered = [make_discovered_session(123, worktree=worktree)]
         restored = restorer.restore_sessions(discovered, already_tracked=[])
@@ -881,7 +889,7 @@ class TestBranchNameResolution:
         working_copy = MockWorkingCopy()
         # No branch configured for worktree - returns None
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         discovered = [make_discovered_session(123, worktree=worktree)]
         with caplog.at_level(logging.WARNING):
@@ -912,7 +920,7 @@ class TestWorktreeFromRunAssets:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "123-feature"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         discovered = [make_discovered_session(123, worktree=worktree)]
         restored = restorer.restore_sessions(discovered, already_tracked=[])
@@ -943,7 +951,7 @@ class TestReviewSessionSpecifics:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "100-branch"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         # Tab name without PR number pattern
         discovered = [
@@ -979,7 +987,7 @@ class TestReviewSessionSpecifics:
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "100-branch"
 
-        restorer = SessionRestorer(config, repo_host, working_copy)
+        restorer = make_session_restorer(config, repo_host, working_copy)
 
         discovered = [make_discovered_session(100, is_review=True, worktree=worktree)]
         restored = restorer.restore_sessions(discovered, already_tracked=[])
@@ -1012,7 +1020,7 @@ class TestRestoredTechLeadScope:
         repo_host.issues[issue.number] = issue
         working_copy = MockWorkingCopy()
         return (
-            SessionRestorer(config, repo_host, working_copy, authority),
+            make_session_restorer(config, repo_host, working_copy, authority),
             config,
         )
 

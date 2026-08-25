@@ -260,8 +260,9 @@ class PosixExecutorCommandGuardian:
                 "--request-json",
                 invocation.model_dump_json(),
             )
+            lease_file_descriptors = request.lease.inherited_file_descriptors()
             inherited_descriptors = (
-                *request.lease_file_descriptors,
+                *lease_file_descriptors,
                 result_write_fd,
                 start_read_fd,
                 *cancellation_lease.inherited_file_descriptors(),
@@ -277,6 +278,10 @@ class PosixExecutorCommandGuardian:
                     raise ExecutorGuardianLaunchError(
                         f"could not start executor guardian: {error!r}"
                     ) from error
+                # The guardian now owns inherited copies. Close the outer
+                # executor's references before publishing or starting work so
+                # a stopped outer process cannot retain machine capacity.
+                request.lease.transfer_to_guardian()
                 os.close(result_write_fd)
                 result_write_open = False
                 os.close(start_read_fd)
@@ -371,10 +376,14 @@ class PosixExecutorCommandGuardian:
     ) -> ExecutorGuardianTerminal:
         """Interpret one fully contained guardian supervision outcome."""
         guardian.returncode = supervision.termination.leader_exit_code
-        if type(supervision) is ProcessGroupInterrupted or interruption.requested:
+        if type(supervision) is ProcessGroupInterrupted:
             return ExecutorGuardianCommandCompleted(-signal.SIGTERM)
         if type(supervision) is not ProcessGroupCompleted:
             raise AssertionError("an unbounded guardian wait cannot time out")
+        # A signal may arrive after the guardian has already completed and
+        # published its terminal record.  Completion evidence is authoritative;
+        # interruption is synthesized only when supervision actually observed
+        # an interrupted group.
         terminal = cls._read_terminal(result_read_fd)
         cls._require_expected_guardian_exit(guardian.returncode, terminal)
         return terminal

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -15,24 +16,44 @@ from issue_orchestrator.execution.host_executor import (
     ExecutorRequestIdentityFactory,
     host_policy,
 )
+from issue_orchestrator.infra.validation_executor_handshake import (
+    validate_executor_handshake_payload,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
 AGGRESSIVENESS_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_AGGRESSIVENESS_PERCENT"
+ACTIVE_TIMEOUT_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_ACTIVE_TIMEOUT_SECONDS"
+ABSOLUTE_TIMEOUT_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_ABSOLUTE_TIMEOUT_SECONDS"
+HANDSHAKE_ENV = "ISSUE_ORCHESTRATOR_VALIDATION_EXECUTOR_HANDSHAKE_FD"
+
+
+def _integer_event_field(line: str, field: str) -> int:
+    match = re.search(rf"(?:^| ){re.escape(field)}=(\d+)(?: |$)", line)
+    if match is None:
+        raise AssertionError(f"event has no integer {field!r} field: {line}")
+    return int(match.group(1))
 
 
 def _run_cli(
     pool_dir: Path,
     *arguments: str,
     environment_aggressiveness: str | None = None,
+    deadline_environment: dict[str, str] | None = None,
+    inherited_descriptors: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment[POOL_DIR_ENV] = str(pool_dir)
     environment.pop("ISSUE_ORCHESTRATOR_EXECUTOR_GROUP", None)
     environment.pop(AGGRESSIVENESS_ENV, None)
+    environment.pop(ACTIVE_TIMEOUT_ENV, None)
+    environment.pop(ABSOLUTE_TIMEOUT_ENV, None)
+    environment.pop(HANDSHAKE_ENV, None)
     if environment_aggressiveness is not None:
         environment[AGGRESSIVENESS_ENV] = environment_aggressiveness
+    if deadline_environment is not None:
+        environment.update(deadline_environment)
     return subprocess.run(
         [
             sys.executable,
@@ -45,6 +66,7 @@ def _run_cli(
         capture_output=True,
         text=True,
         check=False,
+        pass_fds=inherited_descriptors,
     )
 
 
@@ -78,6 +100,63 @@ def test_run_requires_complete_demand_and_fairness_group(tmp_path: Path) -> None
     assert "--group or ISSUE_ORCHESTRATOR_EXECUTOR_GROUP is required" in (
         missing_group.stdout
     )
+
+
+def test_run_rejects_partial_inherited_deadline_contract(tmp_path: Path) -> None:
+    result = _run_cli(
+        tmp_path / "pool",
+        "executor-run",
+        "--work-key",
+        "io:deadline-contract",
+        "--min-concurrency",
+        "1",
+        "--max-concurrency",
+        "1",
+        "--group",
+        "validation-deadline-contract",
+        "--",
+        "true",
+        deadline_environment={ACTIVE_TIMEOUT_ENV: "30"},
+    )
+
+    assert result.returncode == 2
+    assert "requires both environment" in result.stdout
+    assert "variables:" in result.stdout
+
+
+def test_run_acknowledges_validation_before_executor_admission(
+    tmp_path: Path,
+) -> None:
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        result = _run_cli(
+            tmp_path / "pool",
+            "executor-run",
+            "--work-key",
+            "io:validation-handshake",
+            "--min-concurrency",
+            "1",
+            "--max-concurrency",
+            "1",
+            "--group",
+            "validation-handshake",
+            "--",
+            "true",
+            deadline_environment={HANDSHAKE_ENV: str(write_descriptor)},
+            inherited_descriptors=(write_descriptor,),
+        )
+        os.close(write_descriptor)
+        write_descriptor = -1
+
+        assert result.returncode == 0
+        acknowledgements = validate_executor_handshake_payload(
+            os.read(read_descriptor, 64)
+        )
+        assert len(acknowledgements) == 1
+    finally:
+        os.close(read_descriptor)
+        if write_descriptor >= 0:
+            os.close(write_descriptor)
 
 
 def test_events_cli_preserves_human_identity_and_scheduler_rationale(
@@ -121,12 +200,13 @@ def test_events_cli_preserves_human_identity_and_scheduler_rationale(
     assert "host_load_5m=" in enqueued
     assert "host_load_15m=" in enqueued
     assert "exclusive=browser" in enqueued
-    assert "concurrency=3" in admitted
+    admitted_concurrency = _integer_event_field(admitted, "concurrency")
+    assert 1 <= admitted_concurrency <= 3
     assert "reserved_for_queued_peers=0" in admitted
     assert "host_cpu_busy=" in admitted
     assert "sample=" in admitted
     assert "host_load_1m=" in admitted
-    assert "exit=0 concurrency=3" in completed
+    assert f"exit=0 concurrency={admitted_concurrency}" in completed
     assert "successful_samples=1" in completed
     assert "learned_cores_per_worker=" in completed
     assert "host_load_1m=" in completed

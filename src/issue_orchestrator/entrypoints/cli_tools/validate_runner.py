@@ -18,13 +18,10 @@ Exit codes:
 """
 
 import os
-import re
-import subprocess
 import sys
-import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
@@ -32,6 +29,8 @@ from typing import TextIO
 from ...domain.contained_command import (
     ContainedCommandCaptureAborted,
     ContainedCommandCaptureFailed,
+    ContainedCommandCaptureInterrupted,
+    ContainedCommandCaptureSucceeded,
     ContainedCommandCleanupError,
     ContainedCommandCleanupFailed,
     ContainedCommandCleanupNotStarted,
@@ -48,9 +47,14 @@ from ...domain.contained_command import (
 from ...infra.env import get_env
 from ...infra.validation_timings import (
     ValidateTimingRecorder,
-    ValidationDiskObservation,
-    ValidationResourceSample,
-    ValidationSwapUsage,
+)
+from ...domain.validation_resource_sampling import (
+    ValidationResourceSamplingPolicy,
+    validation_resource_sampler_shutdown_failure,
+)
+from ...execution.validation_resource_sampling import (
+    SystemValidationResourceProbe,
+    ValidationResourceSampler,
 )
 from ...ports.contained_command import (
     ContainedCommandCapture,
@@ -59,9 +63,10 @@ from ...ports.contained_command import (
     ContainedShellCommand,
 )
 
-_MEMORY_FREE_RE = re.compile(r"System-wide memory free percentage:\s*(?P<percent>\d+)%")
-_SWAP_RE = re.compile(
-    r"total = (?P<total>[0-9.]+)M\s+used = (?P<used>[0-9.]+)M\s+free = (?P<free>[0-9.]+)M"
+_RESOURCE_SAMPLING_POLICY = ValidationResourceSamplingPolicy(
+    sample_interval_seconds=5.0,
+    probe_timeout_seconds=1.0,
+    shutdown_timeout_seconds=4.0,
 )
 
 
@@ -129,152 +134,6 @@ def load_validation_cmd(worktree: Path) -> str | None:
     return quick_config.get("cmd")
 
 
-def run_command_text(args: list[str], *, cwd: Path) -> str | None:
-    """Best-effort subprocess wrapper for lightweight host probes."""
-    try:
-        result = subprocess.run(
-            args,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip()
-
-
-def parse_memory_free_percent(output: str | None) -> int | None:
-    """Parse `memory_pressure -Q` output."""
-    if not output:
-        return None
-    match = _MEMORY_FREE_RE.search(output)
-    if not match:
-        return None
-    return int(match.group("percent"))
-
-
-def parse_swap_usage(output: str | None) -> ValidationSwapUsage | None:
-    """Parse `sysctl vm.swapusage` output into MiB values."""
-    if not output:
-        return None
-    match = _SWAP_RE.search(output)
-    if not match:
-        return None
-    return ValidationSwapUsage(
-        total_mb=float(match.group("total")),
-        used_mb=float(match.group("used")),
-        free_mb=float(match.group("free")),
-    )
-
-
-def parse_iostat_totals(output: str | None) -> ValidationDiskObservation | None:
-    """Parse `iostat -Id disk0` cumulative transfer/MB totals."""
-    if not output:
-        return None
-    lines = [line for line in output.splitlines() if line.strip()]
-    if len(lines) < 3:
-        return None
-    parts = lines[-1].split()
-    if len(parts) < 3:
-        return None
-    try:
-        xfrs = float(parts[-2])
-        mb = float(parts[-1])
-    except ValueError:
-        return None
-    return ValidationDiskObservation(
-        transfers_total=xfrs,
-        megabytes_total=mb,
-        transfers_delta=None,
-        megabytes_delta=None,
-    )
-
-
-@dataclass
-class ResourceSampler:
-    """Periodic host resource sampler for validate runs."""
-
-    worktree: Path
-    recorder: ValidateTimingRecorder
-    sample_interval_seconds: float = 5.0
-    _stop_event: threading.Event = field(default_factory=threading.Event, init=False)
-    _thread: threading.Thread | None = field(default=None, init=False)
-    _last_disk_totals: ValidationDiskObservation | None = field(
-        default=None,
-        init=False,
-    )
-
-    def start(self) -> None:
-        self.recorder.append_resource_sample(self._collect_sample())
-        self._thread = threading.Thread(
-            target=self._run, name="validate-resource-sampler", daemon=True
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self.sample_interval_seconds + 1.0)
-
-    def _run(self) -> None:
-        while not self._stop_event.wait(self.sample_interval_seconds):
-            self.recorder.append_resource_sample(self._collect_sample())
-
-    def _collect_sample(self) -> ValidationResourceSample:
-        loadavg_1m: float | None = None
-        loadavg_5m: float | None = None
-        loadavg_15m: float | None = None
-        try:
-            load1, load5, load15 = os.getloadavg()
-            loadavg_1m = round(load1, 3)
-            loadavg_5m = round(load5, 3)
-            loadavg_15m = round(load15, 3)
-        except OSError:
-            pass
-
-        # These probes are macOS-specific today. Linux validate runs still record
-        # load averages, and we can add /proc-based probes later if CI analysis
-        # needs the same memory/swap/disk visibility.
-        memory_output = run_command_text(["memory_pressure", "-Q"], cwd=self.worktree)
-        free_percent = parse_memory_free_percent(memory_output)
-
-        swap_output = run_command_text(["sysctl", "vm.swapusage"], cwd=self.worktree)
-        swap_usage = parse_swap_usage(swap_output)
-
-        disk_output = run_command_text(["iostat", "-Id", "disk0"], cwd=self.worktree)
-        disk_totals = parse_iostat_totals(disk_output)
-        if disk_totals is not None:
-            if self._last_disk_totals is not None:
-                disk_totals = ValidationDiskObservation(
-                    transfers_total=disk_totals.transfers_total,
-                    megabytes_total=disk_totals.megabytes_total,
-                    transfers_delta=round(
-                        disk_totals.transfers_total
-                        - self._last_disk_totals.transfers_total,
-                        3,
-                    ),
-                    megabytes_delta=round(
-                        disk_totals.megabytes_total
-                        - self._last_disk_totals.megabytes_total,
-                        3,
-                    ),
-                )
-            self._last_disk_totals = disk_totals
-
-        return ValidationResourceSample(
-            recorded_at=datetime.now(timezone.utc).isoformat(),
-            loadavg_1m=loadavg_1m,
-            loadavg_5m=loadavg_5m,
-            loadavg_15m=loadavg_15m,
-            memory_free_percent=free_percent,
-            swap=swap_usage,
-            disk=disk_totals,
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class _TimedValidationCommandResult:
     """One contained terminal fact paired with monotonic/wall-clock evidence."""
@@ -303,6 +162,11 @@ class _TimedValidationCommandResult:
         if type(self.command_result) is ContainedCommandCompleted:
             return self.command_result.child.exit_code
         return 1
+
+    @property
+    def passed(self) -> bool:
+        """Whether validation completed with the success exit status."""
+        return self.validation_exit_code == 0
 
 
 @dataclass(slots=True)
@@ -444,25 +308,90 @@ def _not_started_capture_failure(
 
 def _finalize_validation_evidence(
     *,
-    sampler: ResourceSampler,
+    sampler: ValidationResourceSampler,
     sampler_started: bool,
     recorder: ValidateTimingRecorder,
     result: _TimedValidationCommandResult,
     wall_started_at: datetime,
     monotonic_started_at: float,
-) -> None:
-    try:
-        if sampler_started:
+) -> _TimedValidationCommandResult:
+    finalized_result = result
+    if sampler_started:
+        shutdown_failure = validation_resource_sampler_shutdown_failure(
             sampler.stop()
-    finally:
-        recorder.finalize(
-            command_result=result.command_result,
-            total_elapsed_seconds=result.duration_seconds,
-            wall_started_at=wall_started_at,
-            monotonic_started_at=monotonic_started_at,
-            wall_ended_at=result.wall_ended_at,
-            monotonic_ended_at=result.monotonic_ended_at,
         )
+        if shutdown_failure is not None:
+            finalized_result = _with_sampler_shutdown_failure(
+                result,
+                ContainedCommandFailure(shutdown_failure),
+            )
+    recorder.finalize(
+        command_result=finalized_result.command_result,
+        total_elapsed_seconds=finalized_result.duration_seconds,
+        wall_started_at=wall_started_at,
+        monotonic_started_at=monotonic_started_at,
+        wall_ended_at=finalized_result.wall_ended_at,
+        monotonic_ended_at=finalized_result.monotonic_ended_at,
+    )
+    return finalized_result
+
+
+def _with_sampler_shutdown_failure(
+    result: _TimedValidationCommandResult,
+    sampler_failure: ContainedCommandFailure,
+) -> _TimedValidationCommandResult:
+    command_result = result.command_result
+    if type(command_result) is ContainedCommandCompleted:
+        failed_result: ContainedCommandResult = ContainedCommandCaptureFailed(
+            child=command_result.child,
+            cleanup=ContainedCommandSupervised(),
+            failure=sampler_failure,
+            metrics=command_result.metrics,
+        )
+    elif type(command_result) is ContainedCommandCaptureFailed:
+        failed_result = ContainedCommandCaptureFailed(
+            child=command_result.child,
+            cleanup=command_result.cleanup,
+            failure=ContainedCommandFailure(
+                BaseExceptionGroup(
+                    "validation capture and resource sampler shutdown both failed",
+                    (command_result.failure.error, sampler_failure.error),
+                )
+            ),
+            metrics=command_result.metrics,
+        )
+    elif type(command_result) is ContainedCommandCleanupFailed:
+        if type(command_result.capture) is ContainedCommandCaptureInterrupted:
+            capture_failure = ContainedCommandFailure(
+                BaseExceptionGroup(
+                    "validation capture and resource sampler shutdown both failed",
+                    (command_result.capture.failure.error, sampler_failure.error),
+                )
+            )
+        elif type(command_result.capture) is ContainedCommandCaptureSucceeded:
+            capture_failure = sampler_failure
+        else:
+            raise AssertionError("contained command capture is a closed union")
+        failed_result = ContainedCommandCleanupFailed(
+            child=command_result.child,
+            capture=ContainedCommandCaptureInterrupted(capture_failure),
+            cleanup_failure=ContainedCommandFailure(
+                BaseExceptionGroup(
+                    "validation process cleanup and resource sampler shutdown "
+                    "both failed",
+                    (command_result.cleanup_failure.error, sampler_failure.error),
+                )
+            ),
+            metrics=command_result.metrics,
+        )
+    else:
+        raise AssertionError("contained command result is a closed union")
+    return _TimedValidationCommandResult(
+        command_result=failed_result,
+        duration_seconds=result.duration_seconds,
+        wall_ended_at=result.wall_ended_at,
+        monotonic_ended_at=result.monotonic_ended_at,
+    )
 
 
 def run_validation(
@@ -487,7 +416,15 @@ def run_validation(
     output_file = output_dir / "validation-output.log"
     is_orchestrated_run = get_env("VALIDATION_OUTPUT_DIR") is not None
     timing_recorder = ValidateTimingRecorder(worktree=worktree, command=command)
-    resource_sampler = ResourceSampler(worktree=worktree, recorder=timing_recorder)
+    resource_probe = SystemValidationResourceProbe(
+        worktree=worktree.resolve(),
+        policy=_RESOURCE_SAMPLING_POLICY,
+    )
+    resource_sampler = ValidationResourceSampler(
+        recorder=timing_recorder,
+        probe=resource_probe,
+        policy=_RESOURCE_SAMPLING_POLICY,
+    )
 
     print(f"Running: {command}")
     print(f"Output will be saved to: {output_file}")
@@ -531,7 +468,7 @@ def run_validation(
         wall_ended_at=wall_end,
         monotonic_ended_at=monotonic_end,
     )
-    _finalize_validation_evidence(
+    result = _finalize_validation_evidence(
         sampler=resource_sampler,
         sampler_started=sampler_started,
         recorder=timing_recorder,
@@ -541,14 +478,15 @@ def run_validation(
     )
     _record_terminal_marker(output_file, result)
 
-    if type(command_result) is ContainedCommandCaptureFailed:
-        raise command_result.failure.error
-    if type(command_result) is ContainedCommandCleanupFailed:
-        cleanup_error = ContainedCommandCleanupError(command_result)
-        raise cleanup_error from command_result.cleanup_failure.error
+    finalized_command_result = result.command_result
+    if type(finalized_command_result) is ContainedCommandCaptureFailed:
+        raise finalized_command_result.failure.error
+    if type(finalized_command_result) is ContainedCommandCleanupFailed:
+        cleanup_error = ContainedCommandCleanupError(finalized_command_result)
+        raise cleanup_error from finalized_command_result.cleanup_failure.error
 
     print()
-    if result.validation_exit_code == 0:
+    if result.passed:
         print(f"Validation PASSED (exit code 0) in {result.duration_seconds:.1f}s")
         print(f"Full output saved to: {output_file}")
     else:

@@ -16,11 +16,16 @@ import pytest
 pytestmark = pytest.mark.xdist_group("pty")
 
 from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
-from issue_orchestrator.entrypoints.bootstrap_executor import (
+from issue_orchestrator.entrypoints.bootstrap import (
+    build_process_group_supervisor,
     build_terminal_session_terminator,
+)
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    terminal_session_watcher_policy,
 )
 from issue_orchestrator.domain.terminal_launch import (
     TerminalInteractionIntent,
+    TerminalLaunch,
     TerminalShell,
 )
 from issue_orchestrator.infra.env import ENV_PREFIX
@@ -128,12 +133,19 @@ def test_subprocess_session_writes_completion_and_log(tmp_path, monkeypatch):
         "coding-done completed --implementation 'subprocess test' --problems 'none'"
     )
 
-    plugin = SubprocessPlugin(build_terminal_session_terminator())
+    plugin = SubprocessPlugin(
+        build_terminal_session_terminator(),
+        build_process_group_supervisor(),
+        terminal_session_watcher_policy(),
+    )
     created = plugin.create_session(
         session_id=42,
-        command=command,
-        interaction_intent=TerminalInteractionIntent.NONE,
-        shell=TerminalShell.BASH,
+        launch=TerminalLaunch(
+            shell_command=command,
+            interaction_intent=TerminalInteractionIntent.NONE,
+            shell=TerminalShell.BASH,
+            destination=run_assets.terminal_destination,
+        ),
         working_dir=str(worktree),
         title="Subprocess integration test",
         session_name=session_name,
@@ -173,12 +185,19 @@ def test_subprocess_send_input_writes_to_log(tmp_path, monkeypatch):
         f"touch {shlex.quote(str(ready_file))}; read -r line; echo \"INPUT:$line\""
     )
 
-    plugin = SubprocessPlugin(build_terminal_session_terminator())
+    plugin = SubprocessPlugin(
+        build_terminal_session_terminator(),
+        build_process_group_supervisor(),
+        terminal_session_watcher_policy(),
+    )
     created = plugin.create_session(
         session_id=7,
-        command=command,
-        interaction_intent=TerminalInteractionIntent.NONE,
-        shell=TerminalShell.BASH,
+        launch=TerminalLaunch(
+            shell_command=command,
+            interaction_intent=TerminalInteractionIntent.NONE,
+            shell=TerminalShell.BASH,
+            destination=run_assets.terminal_destination,
+        ),
         working_dir=str(worktree),
         title="Subprocess input test",
         session_name=session_name,

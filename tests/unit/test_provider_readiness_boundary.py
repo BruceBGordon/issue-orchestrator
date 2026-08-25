@@ -82,6 +82,7 @@ from tests.unit.test_session_controller import (
     StubWorkingCopy,
     decide_with_run_assets,
 )
+from tests.unit.session_restoration_helpers import make_session_restorer
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -4117,7 +4118,6 @@ def _restart(state, session, harness):
     SessionRestorer and the real run-artifact adapter, so nothing here can
     accidentally hand the claim over in memory.
     """
-    from issue_orchestrator.control.session_restorer import SessionRestorer
     from issue_orchestrator.control.session_routing import restore_running_sessions
     from issue_orchestrator.domain.models import OrchestratorState
     from issue_orchestrator.ports.session_runner import DiscoveredSession
@@ -4129,7 +4129,11 @@ def _restart(state, session, harness):
     repo_host.issues[session.issue.number] = session.issue
     working_copy = MockWorkingCopy()
     working_copy.branches[session.worktree_path] = session.branch_name or "branch"
-    restorer = SessionRestorer(harness.launcher.config, repo_host, working_copy)
+    restorer = make_session_restorer(
+        harness.launcher.config,
+        repo_host,
+        working_copy,
+    )
     discovered = [
         DiscoveredSession(
             issue_number=session.issue.number,
@@ -4699,7 +4703,7 @@ def _restore_pair(state, sessions, harness):
     added = restore_running_sessions(
         discovered,
         restarted,
-        SessionRestorer(harness.launcher.config, repo_host, working_copy),
+        make_session_restorer(harness.launcher.config, repo_host, working_copy),
         harness.claims,
         _quarantine(harness),
     )
@@ -6011,7 +6015,6 @@ def test_a_rewritten_manifest_across_real_scans_comments_once(
 
 def _restore_with_raw_discovery(harness, discovered):
     """The real restoration seam, given raw discovery records."""
-    from issue_orchestrator.control.session_restorer import SessionRestorer
     from issue_orchestrator.control.session_routing import restore_running_sessions
     from issue_orchestrator.domain.models import OrchestratorState
     from tests.unit.test_session_restorer import MockRepositoryHost, MockWorkingCopy
@@ -6020,7 +6023,7 @@ def _restore_with_raw_discovery(harness, discovered):
     added = restore_running_sessions(
         discovered,
         restarted,
-        SessionRestorer(
+        make_session_restorer(
             harness.launcher.config, MockRepositoryHost(), MockWorkingCopy()
         ),
         harness.claims,

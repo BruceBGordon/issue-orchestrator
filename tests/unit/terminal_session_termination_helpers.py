@@ -4,22 +4,62 @@ from __future__ import annotations
 
 from issue_orchestrator.domain.terminal_session_termination import (
     TerminalSessionProcess,
+    TerminalSessionStatus,
+    TerminalSessionTerminationOutcome,
+)
+from issue_orchestrator.domain.process_group import (
+    ProcessBirthIdentity,
+    ProcessIdentityObservation,
+    ProcessIdentityPresent,
 )
 
 
 class RecordingTerminalSessionTerminator:
     """Record behavior-port invocations without signalling host processes."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        status: TerminalSessionStatus = TerminalSessionStatus.CONTAINED,
+        termination_outcome: TerminalSessionTerminationOutcome = (
+            TerminalSessionTerminationOutcome.ALREADY_CONTAINED
+        ),
+    ) -> None:
+        if type(status) is not TerminalSessionStatus:
+            raise ValueError("status must be TerminalSessionStatus")
+        if type(termination_outcome) is not TerminalSessionTerminationOutcome:
+            raise ValueError(
+                "termination_outcome must be TerminalSessionTerminationOutcome"
+            )
+        self._status = status
+        self._termination_outcome = termination_outcome
         self._processes: list[TerminalSessionProcess] = []
+        self.identified_process_ids: list[int] = []
 
     @property
     def processes(self) -> tuple[TerminalSessionProcess, ...]:
         return tuple(self._processes)
 
-    def terminate(self, process: TerminalSessionProcess) -> None:
+    def identify(self, process_id: int) -> ProcessIdentityObservation:
+        self.identified_process_ids.append(process_id)
+        return ProcessIdentityPresent(
+            ProcessBirthIdentity("darwin-timeval:1700000000:100"),
+            process_id,
+        )
+
+    def status(self, process: TerminalSessionProcess) -> TerminalSessionStatus:
+        if type(process) is not TerminalSessionProcess:
+            raise ValueError(
+                "RecordingTerminalSessionTerminator requires a TerminalSessionProcess"
+            )
+        return self._status
+
+    def terminate(
+        self,
+        process: TerminalSessionProcess,
+    ) -> TerminalSessionTerminationOutcome:
         if type(process) is not TerminalSessionProcess:
             raise ValueError(
                 "RecordingTerminalSessionTerminator requires a TerminalSessionProcess"
             )
         self._processes.append(process)
+        return self._termination_outcome

@@ -16,6 +16,8 @@ EXECUTOR_COMPLETION_CLIENTS = (
     REPO_ROOT / "tests/unit/test_setpgrp_pty_invariants.py",
     REPO_ROOT / "tests/unit/test_agent_phase_execution.py",
     REPO_ROOT / "tests/unit/executor_pressure_dsl.py",
+    REPO_ROOT / "tests/unit/test_validate_runner.py",
+    REPO_ROOT / "tests/unit/test_contained_command_capture.py",
     REPO_ROOT / "tests/unit/test_process_completion_fixture.py",
 )
 
@@ -27,6 +29,7 @@ class CompletionGuardrailViolationKind(Enum):
     COMMUNICATE = "communicate"
     RESULT = "result"
     WAIT = "wait"
+    JOIN = "join"
     WATCHDOG_OWNER_REBINDING = "watchdog owner rebinding"
 
 
@@ -69,6 +72,7 @@ class ProcessCompletionCallGuardrail:
         "communicate": CompletionGuardrailViolationKind.COMMUNICATE,
         "result": CompletionGuardrailViolationKind.RESULT,
         "wait": CompletionGuardrailViolationKind.WAIT,
+        "join": CompletionGuardrailViolationKind.JOIN,
     }
     _WATCHDOG_MODULE = "tests.process_completion_fixture"
     _WATCHDOG_SYMBOL = "PROCESS_COMPLETION_WATCHDOG"
@@ -242,7 +246,9 @@ process.communicate(timeout=5)
 process.wait()
 event.wait(timeout=5)
 future.result(timeout=5)
+thread.join(timeout=5)
 PROCESS_COMPLETION_WATCHDOG.wait(process, operation='owned')
+PROCESS_COMPLETION_WATCHDOG.join_thread(thread, operation='owned thread')
 """,
         encoding="utf-8",
     )
@@ -255,6 +261,7 @@ PROCESS_COMPLETION_WATCHDOG.wait(process, operation='owned')
         CompletionGuardrailViolationKind.WAIT,
         CompletionGuardrailViolationKind.WAIT,
         CompletionGuardrailViolationKind.RESULT,
+        CompletionGuardrailViolationKind.JOIN,
     )
 
 

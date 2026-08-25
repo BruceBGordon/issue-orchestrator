@@ -158,6 +158,17 @@ monotonic absolute deadline. Recovery can therefore extend observation of a
 broken wrapper by at most one persisted outer budget, but it cannot shorten the
 executor's valid queue or execution budget.
 
+Publish and agent validation commands use the same clock separation without a
+new public configuration surface. A plain command remains bounded by the
+configured active-work timeout. The validation process owner also gives nested
+executors an equal admission allowance and a 30-second outer containment margin.
+The first nested `executor-run` acknowledges a one-way inherited descriptor
+before admission; only that explicit handshake yields the parent clock and starts
+an outer watchdog sized above the nested executor's complete active/absolute
+deadline. The deadline pair and handshake cross the CLI boundary as required
+environment contracts. Partial, malformed, or unwritable state fails before
+enqueue rather than silently becoming unbounded.
+
 ## Crash and data behavior
 
 The queue transaction and resource leases are separate ownership objects. A

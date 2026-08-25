@@ -870,6 +870,7 @@ from pathlib import Path
 from threading import Thread
 
 import pytest
+from tests.process_completion_fixture import PROCESS_COMPLETION_WATCHDOG
 import uvicorn
 
 import issue_orchestrator.entrypoints.web as web_module
@@ -887,7 +888,14 @@ def _find_free_port() -> int:
 
 class _UvicornTestServer:
     def __init__(self, host: str, port: int) -> None:
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="warning",
+            access_log=False,
+            timeout_graceful_shutdown=1,
+        )
         self.server = uvicorn.Server(config)
         self.thread = Thread(target=self.server.run, daemon=True)
         self.host = host
@@ -908,7 +916,11 @@ class _UvicornTestServer:
 
     def stop(self) -> None:
         self.server.should_exit = True
-        self.thread.join(timeout=5)
+        self.server.force_exit = True
+        PROCESS_COMPLETION_WATCHDOG.join_thread(
+            self.thread,
+            operation="inline E2E runs server shutdown",
+        )
 
 
 @pytest.fixture

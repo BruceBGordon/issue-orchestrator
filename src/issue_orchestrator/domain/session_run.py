@@ -9,6 +9,7 @@ from typing import Any
 
 from .path_guards import require_absolute_path, require_path_under
 from .session_watchdog import ScheduledSessionWatchdog
+from .terminal_launch import TerminalRunDestination
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +198,13 @@ class SessionRunAssets:
     @property
     def log_path(self) -> Path:
         return self.terminal_recording.path
+
+    @property
+    def terminal_destination(self) -> TerminalRunDestination:
+        return TerminalRunDestination(
+            run_dir=self.run_dir,
+            recording_path=self.terminal_recording.path,
+        )
 
     @property
     def manifest_path(self) -> Path:

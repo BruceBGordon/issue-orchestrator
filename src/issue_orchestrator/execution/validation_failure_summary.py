@@ -306,7 +306,7 @@ def _load_validation_record(path: Path) -> ValidationRecord | None:
         return None
     try:
         return ValidationRecord.from_dict(data)
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, ValueError):
         return None
 
 

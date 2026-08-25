@@ -12,6 +12,7 @@ from threading import Thread
 from unittest.mock import MagicMock
 
 import pytest
+from tests.process_completion_fixture import PROCESS_COMPLETION_WATCHDOG
 import uvicorn
 from playwright.sync_api import Page
 
@@ -114,7 +115,13 @@ class UvicornTestServer:
     """Manage a uvicorn server in a background thread."""
 
     def __init__(self, host: str, port: int) -> None:
-        self.config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        self.config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="warning",
+            timeout_graceful_shutdown=1,
+        )
         self.server = uvicorn.Server(self.config)
         self.thread: Thread | None = None
 
@@ -132,8 +139,12 @@ class UvicornTestServer:
 
     def stop(self) -> None:
         self.server.should_exit = True
+        self.server.force_exit = True
         if self.thread:
-            self.thread.join(timeout=5)
+            PROCESS_COMPLETION_WATCHDOG.join_thread(
+                self.thread,
+                operation="E2E web server shutdown",
+            )
 
 
 def _seed_issue_408_timeline(store: SqliteTimelineStore, repo_root: Path) -> None:

@@ -325,6 +325,10 @@ class TestActionApplier:
 
     def test_apply_launch_session(self, applier, mock_runner):
         """Test applying LaunchSessionAction."""
+        session = MagicMock()
+        session.terminal_id = "issue-123"
+        session.issue.number = 123
+        applier.session_launcher = MagicMock(return_value=session)
         action = LaunchSessionAction(
             session_type=SessionType.ISSUE,
             number=123,
@@ -335,10 +339,10 @@ class TestActionApplier:
         result = applier.apply(action)
 
         assert result.success
-        assert 123 in mock_runner.sessions
+        applier.session_launcher.assert_called_once_with(SessionType.ISSUE, 123)
+        assert 123 not in mock_runner.sessions
 
-    def test_apply_launch_session_skips_if_exists(self, applier, mock_runner):
-        """Test launch session skips if already running."""
+    def test_apply_launch_session_requires_owner_callback(self, applier, mock_runner):
         mock_runner.sessions[123] = {}  # Pre-create
         action = LaunchSessionAction(
             session_type=SessionType.ISSUE,
@@ -349,7 +353,8 @@ class TestActionApplier:
 
         result = applier.apply(action)
 
-        assert result.result_type == ActionResultType.SKIPPED
+        assert not result.success
+        assert "No session_launcher callback" in result.error
 
     def test_apply_stop_session(self, applier, mock_runner):
         """Test applying StopSessionAction."""

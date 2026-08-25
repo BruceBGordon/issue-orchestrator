@@ -30,9 +30,18 @@ from tests.unit.executor_pressure_dsl import (
 pytestmark = pytest.mark.timeout(180)
 
 
-def test_completion_watchdog_must_dominate_process_containment() -> None:
-    with pytest.raises(ValueError, match="at least the process-containment watchdog"):
-        ProcessCompletionWatchdog(PROCESS_CONTAINMENT_WATCHDOG_SECONDS - 1.0)
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    (
+        PROCESS_CONTAINMENT_WATCHDOG_SECONDS - 1.0,
+        PROCESS_CONTAINMENT_WATCHDOG_SECONDS,
+    ),
+)
+def test_completion_watchdog_must_dominate_process_containment(
+    timeout_seconds: float,
+) -> None:
+    with pytest.raises(ValueError, match="exceed the process-containment watchdog"):
+        ProcessCompletionWatchdog(timeout_seconds)
 
 
 def test_text_invocation_requires_absolute_working_directory(tmp_path: Path) -> None:

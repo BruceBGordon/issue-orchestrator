@@ -17,7 +17,6 @@ from ..domain.executor import (
     ExecutorNoCommandCancellation,
     ExecutorRunSpecification,
     ExecutorWorkKey,
-    ExecutorUnboundedDeadline,
 )
 from ..domain.executor_monitoring import (
     ExecutorAllRepositories,
@@ -36,6 +35,10 @@ from ..domain.executor_monitoring import (
     ExecutorHostLoad,
 )
 from .command_exit_status import forward_command_exit_status
+from ..infra.executor_deadline_environment import EXECUTOR_DEADLINE_ENVIRONMENT
+from ..infra.validation_executor_handshake import (
+    VALIDATION_EXECUTOR_HANDSHAKE_ENVIRONMENT,
+)
 
 EXECUTOR_GROUP_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_GROUP"
 
@@ -53,6 +56,7 @@ def cmd_executor_run(args: argparse.Namespace) -> int:
         console.print("[red]executor-run requires a command after --[/red]")
         return 2
     try:
+        VALIDATION_EXECUTOR_HANDSHAKE_ENVIRONMENT.acknowledge_if_requested(os.environ)
         concurrency_range = _executor_concurrency_range(
             minimum_concurrency=args.min_concurrency,
             maximum_concurrency=args.max_concurrency,
@@ -72,7 +76,7 @@ def cmd_executor_run(args: argparse.Namespace) -> int:
             specification,
             ExecutorCommand(
                 command_arguments,
-                ExecutorUnboundedDeadline(),
+                EXECUTOR_DEADLINE_ENVIRONMENT.decode(os.environ),
                 ExecutorCommandLifecycle.DETACHED,
                 ExecutorNoCommandCancellation(),
             ),

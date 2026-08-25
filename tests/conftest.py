@@ -35,6 +35,9 @@ from issue_orchestrator.ports.repository_host import DependencyIssueSnapshot
 from issue_orchestrator.domain.issue_key import FakeIssueKey, IssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+from issue_orchestrator.execution.unsupported_session_run_containment import (
+    SessionRunnerUnsupportedSessionRunContainment,
+)
 from tests.agent_phase_scheduler_helpers import host_agent_phase_command_scheduler
 
 TEST_ADMIN_TOKEN = "test-admin-token"
@@ -593,9 +596,7 @@ class MockTerminalPlugin:
     def create_session(
         self,
         session_id: int,
-        command: str,
-        interaction_intent: TerminalInteractionIntent,
-        shell: TerminalShell,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
@@ -605,17 +606,19 @@ class MockTerminalPlugin:
             {
                 "session_id": session_id,
                 "session_name": session_name,
-                "command": command,
-                "interaction_intent": interaction_intent,
-                "shell": shell,
+                "launch": launch,
+                "command": launch.shell_command,
+                "interaction_intent": launch.interaction_intent,
+                "shell": launch.shell,
                 "working_dir": working_dir,
                 "title": title,
             }
         )
         self.sessions[session_id] = {
-            "command": command,
-            "interaction_intent": interaction_intent,
-            "shell": shell,
+            "launch": launch,
+            "command": launch.shell_command,
+            "interaction_intent": launch.interaction_intent,
+            "shell": launch.shell,
             "working_dir": working_dir,
             "title": title,
             "session_name": session_name,
@@ -677,9 +680,7 @@ class MockPluginManager:
     ) -> bool:
         return self._plugin.create_session(
             session_id=session_id,
-            command=launch.shell_command,
-            interaction_intent=launch.interaction_intent,
-            shell=launch.shell,
+            launch=launch,
             working_dir=working_dir,
             title=title,
             session_name=session_name,
@@ -753,9 +754,7 @@ class MockSessionRunner:
     ) -> bool:
         return self._plugin.create_session(
             session_id=session_id,
-            command=launch.shell_command,
-            interaction_intent=launch.interaction_intent,
-            shell=launch.shell,
+            launch=launch,
             working_dir=working_dir,
             title=title,
             session_name=session_name,
@@ -899,6 +898,9 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.entrypoints.bootstrap_operator_commands import (
         build_operator_issue_command_factory,
     )
+    from issue_orchestrator.entrypoints.bootstrap_executor import (
+        build_validation_command_runner,
+    )
     from issue_orchestrator.entrypoints.bootstrap_session_launcher import (
         build_session_launcher_factory,
     )
@@ -954,7 +956,11 @@ def build_test_orchestrator_deps(
         events=events,
         session_output=session_output,
         working_copy=working_copy,
-        command_runner=command_runner if config.validation.quick.cmd else None,
+        command_runner=(
+            build_validation_command_runner()
+            if config.validation.quick.cmd
+            else None
+        ),
         validation_cmd=config.validation.quick.cmd,
         validation_timeout_seconds=config.validation.quick.timeout_seconds,
         max_validation_retries=config.retry.max_validation_retries,
@@ -984,6 +990,9 @@ def build_test_orchestrator_deps(
         config=config,
         repository_host=repo_host,
         working_copy=working_copy,
+        unsupported_session_run_containment=(
+            SessionRunnerUnsupportedSessionRunContainment(runner)
+        ),
     )
 
     _label_sync = label_sync or LabelSync(labels=repo_host, events=events, pr_tracker=repo_host)

@@ -526,7 +526,7 @@ class TestClaudeCodeAdapter:
         assert success is False
         assert "timed out after 1s" in message
 
-    def test_ai_gate_uses_fast_smoke_model(
+    def test_ai_gate_uses_account_default_model(
         self, adapter, temp_project, monkeypatch
     ):
         from issue_orchestrator.infra.hooks import hooks as hooks_module
@@ -551,13 +551,12 @@ class TestClaudeCodeAdapter:
 
         adapter.test_ai_gate(temp_project)
 
-        assert captured["command"][:5] == [
+        assert captured["command"][:3] == [
             "claude",
             "--print",
-            "--model",
-            "haiku",
             "--output-format",
         ]
+        assert "--model" not in captured["command"]
 
     def test_ai_gate_reports_claude_auth_remediation(
         self, adapter, temp_project, monkeypatch

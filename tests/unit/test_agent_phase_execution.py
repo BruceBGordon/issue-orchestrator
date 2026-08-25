@@ -86,6 +86,11 @@ from tests.process_completion_fixture import (
     PROCESS_COMPLETION_WATCHDOG,
     TextProcessInvocation,
 )
+from tests.unit.executor_pool_dsl import (
+    ExecutorPoolHeldCommand,
+    ExecutorPoolRig,
+    ExecutorPoolWork,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -275,6 +280,10 @@ def test_phase_specification_converts_active_timeout_to_fixed_absolute_bound(
         cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
             tmp_path.resolve()
         ),
+        destination=make_session_run_assets(
+            tmp_path,
+            session_name="phase-specification",
+        ).terminal_destination,
     )
 
     assert specification.deadline.active_timeout_seconds == 2700.0
@@ -420,6 +429,10 @@ def test_scheduler_renders_one_shell_safe_internal_invocation(tmp_path: Path) ->
         cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
             tmp_path.resolve()
         ),
+        destination=make_session_run_assets(
+            tmp_path,
+            session_name="scheduler-render",
+        ).terminal_destination,
     )
     scheduler = HostAgentPhaseCommandScheduler(
         python_executable=Path(sys.executable),
@@ -440,7 +453,8 @@ def test_scheduler_renders_one_shell_safe_internal_invocation(tmp_path: Path) ->
     assert scheduled.absolute_timeout_minutes * 60 > (
         specification.deadline.absolute_timeout_seconds + 2.0 + 58.0
     )
-    assert arguments[:3] == [
+    assert arguments[:4] == [
+        "exec",
         sys.executable,
         "-m",
         "issue_orchestrator.entrypoints.cli_tools.agent_phase_run",
@@ -483,6 +497,10 @@ def test_scheduler_preserves_interaction_intent_hidden_by_executor_wrapper(
         cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
             tmp_path.resolve()
         ),
+        destination=make_session_run_assets(
+            tmp_path,
+            session_name="scheduler-intent",
+        ).terminal_destination,
     )
 
     scheduled = HostAgentPhaseCommandScheduler(
@@ -516,6 +534,10 @@ def test_scheduled_phase_executes_bash_language_without_shell_drift(
         cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
             tmp_path.resolve()
         ),
+        destination=make_session_run_assets(
+            tmp_path,
+            session_name="bash-language",
+        ).terminal_destination,
     )
     scheduled = HostAgentPhaseCommandScheduler(
         python_executable=Path(sys.executable),
@@ -535,12 +557,13 @@ def test_scheduled_phase_executes_bash_language_without_shell_drift(
         request_nonce="c" * 32,
     )
 
-    assert scheduled_arguments[:3] == [
+    assert scheduled_arguments[:4] == [
+        "exec",
         sys.executable,
         "-m",
         "issue_orchestrator.entrypoints.cli_tools.agent_phase_run",
     ]
-    assert run_agent_phase(scheduled_arguments[3:], executor) == 0
+    assert run_agent_phase(scheduled_arguments[4:], executor) == 0
 
 
 def test_internal_phase_client_runs_a_plain_command_without_orchestrator(
@@ -762,28 +785,39 @@ def test_admission_deadline_fails_before_command_and_is_durable(
         queue_poll_seconds=0.01,
     )
 
-    with pytest.raises(ExecutorDeadlineExceededError) as raised:
-        executor.run(
-            ExecutorRunSpecification(
-                work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
-                fairness_group=ExecutorFairnessGroup("agent:run-2:coding-2"),
-                concurrency_range=ExecutorConcurrencyRange(1, 1),
-                exclusive_resources=(),
-            ),
-            ExecutorCommand(
-                (
-                    sys.executable,
-                    "-c",
-                    f"from pathlib import Path; Path({str(marker)!r}).touch()",
+    blocker = ExecutorPoolWork(
+        work_key="agent-phase:lease-blocker",
+        fairness_group="agent:blocking-run",
+        requested_concurrency=1,
+        host_cpu_slots=1,
+        exclusive_resources=(),
+        command=ExecutorPoolHeldCommand("BLOCKER_STARTED", 0),
+    )
+    with ExecutorPoolRig(pool_dir, working_directory=REPO_ROOT) as rig:
+        held_lease = rig.admit(blocker)
+        with pytest.raises(ExecutorDeadlineExceededError) as raised:
+            executor.run(
+                ExecutorRunSpecification(
+                    work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
+                    fairness_group=ExecutorFairnessGroup("agent:run-2:coding-2"),
+                    concurrency_range=ExecutorConcurrencyRange(1, 1),
+                    exclusive_resources=(),
                 ),
-                ExecutorBoundedDeadline(
-                    active_timeout_seconds=0.01,
-                    absolute_timeout_seconds=0.05,
+                ExecutorCommand(
+                    (
+                        sys.executable,
+                        "-c",
+                        f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                    ),
+                    ExecutorBoundedDeadline(
+                        active_timeout_seconds=0.01,
+                        absolute_timeout_seconds=0.05,
+                    ),
+                    ExecutorCommandLifecycle.DETACHED,
+                    ExecutorNoCommandCancellation(),
                 ),
-                ExecutorCommandLifecycle.DETACHED,
-                ExecutorNoCommandCancellation(),
-            ),
-        )
+            )
+        rig.release(held_lease)
 
     assert raised.value.reason is ExecutorDeadlineReason.ABSOLUTE
     assert not marker.exists()

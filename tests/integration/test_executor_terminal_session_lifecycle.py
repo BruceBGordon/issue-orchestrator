@@ -28,8 +28,12 @@ from issue_orchestrator.domain.executor import (
 )
 from issue_orchestrator.execution.session_runner_adapter import PluggySessionRunner
 from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
-from issue_orchestrator.entrypoints.bootstrap_executor import (
+from issue_orchestrator.entrypoints.bootstrap import (
+    build_process_group_supervisor,
     build_terminal_session_terminator,
+)
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    terminal_session_watcher_policy,
 )
 from issue_orchestrator.infra.hooks.hookspec import PROJECT_NAME, TerminalSpec
 from issue_orchestrator.infra.terminal_recording import TERMINAL_RECORDING_FILENAME
@@ -59,7 +63,11 @@ def _runner() -> PluggySessionRunner:
     manager = pluggy.PluginManager(PROJECT_NAME)
     manager.add_hookspecs(TerminalSpec)
     manager.register(
-        SubprocessPlugin(build_terminal_session_terminator()),
+        SubprocessPlugin(
+            build_terminal_session_terminator(),
+            build_process_group_supervisor(),
+            terminal_session_watcher_policy(),
+        ),
         name="terminal_subprocess",
     )
     return PluggySessionRunner(manager)
@@ -111,14 +119,15 @@ def _executor_launch(
             "export ISSUE_ORCHESTRATOR_TEST_HOST_CPU_BUSY_FILE="
             f"{shlex.quote(str(busy_file))}",
             f"printf '%s\\n' $$ > {shlex.quote(str(outer_pid_path))}",
-            shlex.join(executor_arguments),
+            "exec " + shlex.join(executor_arguments),
         )
     )
     return (
         TerminalLaunch(
-            shell_command,
-            TerminalShell.BASH,
-            TerminalInteractionIntent.NONE,
+            shell_command=shell_command,
+            shell=TerminalShell.BASH,
+            interaction_intent=TerminalInteractionIntent.NONE,
+            destination=run.terminal_destination,
         ),
         run.run_dir,
         outer_pid_path,
@@ -385,6 +394,7 @@ def test_stalled_outer_session_cannot_strand_executor_guardian(
         runner.kill_session(7017, "stalled-outer-stop")
 
         ProcessTreeMember(opaque_process_id).assert_contained()
+        ProcessTreeMember(outer_process_id).assert_contained()
         assert not (run_dir / EXECUTOR_SESSION_CANCELLATION_FILENAME).exists()
         assert not runner.session_exists(7017, "stalled-outer-stop")
         follower = subprocess.run(

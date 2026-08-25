@@ -44,6 +44,12 @@ def test_load_validation_failure_summary_extracts_failed_tests_and_excerpts(tmp_
                 "started_at": "2026-03-22T04:53:14Z",
                 "ended_at": "2026-03-22T04:53:58Z",
                 "timed_out": False,
+                "stdout_path": (
+                    ".issue-orchestrator/sessions/run-1/validation-stdout.log"
+                ),
+                "stderr_path": (
+                    ".issue-orchestrator/sessions/run-1/validation-stderr.log"
+                ),
             }
         ),
         encoding="utf-8",
@@ -138,6 +144,12 @@ def test_load_validation_failure_summary_returns_passed_run_when_opted_in(tmp_pa
                 "started_at": "2026-05-07T12:00:00Z",
                 "ended_at": "2026-05-07T12:04:30Z",
                 "timed_out": False,
+                "stdout_path": (
+                    ".issue-orchestrator/sessions/run-pass/validation-stdout.log"
+                ),
+                "stderr_path": (
+                    ".issue-orchestrator/sessions/run-pass/validation-stderr.log"
+                ),
             }
         ),
         encoding="utf-8",
@@ -185,6 +197,12 @@ def _seed_failed_validation(tmp_path: Path) -> tuple[Path, Path]:
                 "started_at": "2026-04-28T10:00:00Z",
                 "ended_at": "2026-04-28T10:01:30Z",
                 "timed_out": False,
+                "stdout_path": (
+                    ".issue-orchestrator/sessions/run-junit/validation-stdout.log"
+                ),
+                "stderr_path": (
+                    ".issue-orchestrator/sessions/run-junit/validation-stderr.log"
+                ),
             }
         ),
         encoding="utf-8",

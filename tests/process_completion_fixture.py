@@ -7,14 +7,22 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TypeVar
+from typing import TextIO, TypeVar
 
 from issue_orchestrator.domain.executor import ExecutorInteractiveSessionCancellation
+from issue_orchestrator.adapters.ps_process_group_observer import (
+    PsProcessGroupObserver,
+    PsProcessObservationPolicy,
+)
+from issue_orchestrator.adapters.kernel_process_identity import (
+    build_kernel_process_identity_observer,
+)
 from issue_orchestrator.execution.executor_guardian_cancellation import (
     ExecutorSessionGuardianCanceller,
 )
@@ -105,7 +113,12 @@ class ExecutorGuardianCancellationContainment:
 
     def contain_after_timeout(self) -> None:
         ExecutorSessionGuardianCanceller(
-            PROCESS_CONTAINMENT_WATCHDOG_SECONDS
+            PROCESS_CONTAINMENT_WATCHDOG_SECONDS,
+            PsProcessGroupObserver(
+                Path("/bin/ps"),
+                PsProcessObservationPolicy(command_timeout_seconds=2.0),
+                build_kernel_process_identity_observer(),
+            ),
         ).contain_if_active(
             ExecutorInteractiveSessionCancellation(self.cancellation_record_path)
         )
@@ -176,10 +189,10 @@ class ProcessCompletionWatchdog:
     def __post_init__(self) -> None:
         if (
             type(self.timeout_seconds) is not float
-            or self.timeout_seconds < PROCESS_CONTAINMENT_WATCHDOG_SECONDS
+            or self.timeout_seconds <= PROCESS_CONTAINMENT_WATCHDOG_SECONDS
         ):
             raise ValueError(
-                "ProcessCompletionWatchdog.timeout_seconds must be at least the "
+                "ProcessCompletionWatchdog.timeout_seconds must exceed the "
                 "process-containment watchdog"
             )
 
@@ -192,15 +205,22 @@ class ProcessCompletionWatchdog:
             raise ValueError(
                 "ProcessCompletionWatchdog.run_text requires TextProcessInvocation"
             )
+        process = subprocess.Popen(
+            invocation.arguments,
+            cwd=invocation.working_directory,
+            env=dict(invocation.environment),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
         try:
-            return subprocess.run(
+            stdout, stderr = process.communicate(timeout=self.timeout_seconds)
+            return subprocess.CompletedProcess(
                 invocation.arguments,
-                cwd=invocation.working_directory,
-                env=dict(invocation.environment),
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=self.timeout_seconds,
+                process.returncode,
+                stdout,
+                stderr,
             )
         except subprocess.TimeoutExpired as error:
             completion_error = ProcessCompletionTimeout(
@@ -212,8 +232,26 @@ class ProcessCompletionWatchdog:
                 operation=f"contain timed-out {invocation.operation}",
                 steps=(
                     ProcessCleanupStep(
+                        operation="contain outer process group",
+                        action=lambda: _kill_process_group(process.pid),
+                    ),
+                    ProcessCleanupStep(
                         operation="contain descendants after process timeout",
                         action=invocation.timeout_containment.contain_after_timeout,
+                    ),
+                    ProcessCleanupStep(
+                        operation="reap outer process",
+                        action=lambda: process.wait(
+                            timeout=PROCESS_CONTAINMENT_WATCHDOG_SECONDS
+                        ),
+                    ),
+                    ProcessCleanupStep(
+                        operation="close outer stdout",
+                        action=lambda: _close_process_stream(process.stdout),
+                    ),
+                    ProcessCleanupStep(
+                        operation="close outer stderr",
+                        action=lambda: _close_process_stream(process.stderr),
                     ),
                 ),
             ).execute(preceding_error=completion_error)
@@ -264,6 +302,40 @@ class ProcessCompletionWatchdog:
             raise ProcessCompletionTimeout(
                 f"{operation} did not occur within the "
                 f"{self.timeout_seconds:.0f}-second deadlock watchdog"
+            )
+
+    def wait_for_path(self, path: Path, *, operation: str) -> None:
+        """Require one external process to publish a filesystem handshake."""
+        if not path.is_absolute():
+            raise ValueError(
+                "ProcessCompletionWatchdog.wait_for_path requires an absolute Path"
+            )
+        _require_operation(operation)
+        deadline = time.monotonic() + self.timeout_seconds
+        pause = threading.Event()
+        while not path.exists():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProcessCompletionTimeout(
+                    f"{operation} did not occur within the "
+                    f"{self.timeout_seconds:.0f}-second deadlock watchdog; "
+                    f"path={path}"
+                )
+            pause.wait(timeout=min(0.01, remaining))
+
+    def join_thread(self, thread: threading.Thread, *, operation: str) -> None:
+        """Require one thread to complete under this deadlock watchdog."""
+        if not isinstance(thread, threading.Thread):
+            raise ValueError(
+                "ProcessCompletionWatchdog.join_thread requires threading.Thread"
+            )
+        _require_operation(operation)
+        thread.join(timeout=self.timeout_seconds)
+        if thread.is_alive():
+            raise ProcessCompletionTimeout(
+                f"{operation} did not complete within the "
+                f"{self.timeout_seconds:.0f}-second deadlock watchdog; "
+                f"thread={thread.name!r}"
             )
 
     def future_result(
@@ -345,6 +417,18 @@ class GuardianPidFile:
         if guardian_pid <= 1:
             raise AssertionError(f"invalid recorded guardian pid {guardian_pid}")
         return guardian_pid
+
+
+def _kill_process_group(process_group_id: int) -> None:
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+
+
+def _close_process_stream(stream: TextIO | None) -> None:
+    if stream is not None:
+        stream.close()
 
 
 def _require_operation(operation: str) -> None:

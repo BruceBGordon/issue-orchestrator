@@ -839,6 +839,8 @@ _NON_PROVIDER_TEXT_CLASSIFIERS = frozenset(
         "execution/git_push_operations.py::get_preflight_fix_hint",
         "execution/git_working_copy.py::GitWorkingCopy.push_preflight",
         "execution/verification_service.py::DefaultVerificationService.classify_error",
+        # --- local operating-system command output, not a provider CLI ---
+        "adapters/ps_process_group_observer.py::PsProcessGroupObserver._snapshot",
         # --- this orchestrator's own artifacts: labels, reasons, summaries ---
         "control/lexical_masking.py::LiteralMasker._literal_at",
         "control/planner.py::Planner._plan_issues",

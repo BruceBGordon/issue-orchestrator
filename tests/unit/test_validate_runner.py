@@ -27,6 +27,7 @@ from issue_orchestrator.domain.process_group import (
 from issue_orchestrator.execution.contained_command_capture import (
     PosixContainedCommandCapture,
 )
+from issue_orchestrator.domain.contained_command import ContainedCommandOutputPolicy
 from issue_orchestrator.infra.validation_timings import (
     ValidateTimingRecorder,
     ValidationConfiguration,
@@ -49,6 +50,11 @@ from tests.process_tree_fixture import (
     ExitingTermResistantProcessTreeProgram,
     ProcessTreeMember,
 )
+from tests.process_completion_fixture import (
+    NoDescendantProcessContainment,
+    PROCESS_COMPLETION_WATCHDOG,
+    TextProcessInvocation,
+)
 from tests.unit.threading_helpers import run_in_thread
 
 
@@ -60,13 +66,38 @@ def _with_repo_on_pythonpath(env: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def _run_validation_cli(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    capture_output: bool,
+    text: bool,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    """Run the validation CLI through the shared completion/containment owner."""
+    if not capture_output or not text:
+        raise ValueError("validation CLI fixture requires captured text output")
+    return PROCESS_COMPLETION_WATCHDOG.run_text(
+        TextProcessInvocation(
+            operation="validate-runner CLI",
+            arguments=tuple(arguments),
+            working_directory=cwd.resolve(),
+            environment=env,
+            timeout_containment=NoDescendantProcessContainment(),
+        )
+    )
+
+
 class _ContainThenReportCleanupFailureSupervisor(ProcessGroupSupervisor):
     """Port fake that proves evidence survives a failing cleanup report."""
 
-    def __init__(self, delegate: ProcessGroupSupervisor) -> None:
+    def __init__(self, delegate: ProcessGroupSupervisor, readiness_path: Path) -> None:
         if not isinstance(delegate, ProcessGroupSupervisor):
             raise ValueError("cleanup-failure supervisor requires a delegate")
         self._delegate = delegate
+        if not readiness_path.is_absolute():
+            raise ValueError("cleanup-failure readiness path must be absolute")
+        self._readiness_path = readiness_path
 
     def supervise(
         self,
@@ -74,9 +105,11 @@ class _ContainThenReportCleanupFailureSupervisor(ProcessGroupSupervisor):
         wait: ProcessGroupWait,
         interruption: ProcessGroupInterruption,
     ) -> ProcessGroupSupervision:
-        del leader, wait
-        if not interruption.wait_for_request(5.0):
-            raise AssertionError("capture interruption was not requested")
+        del leader, wait, interruption
+        PROCESS_COMPLETION_WATCHDOG.wait_for_path(
+            self._readiness_path,
+            operation="cleanup-failure child readiness",
+        )
         raise RuntimeError("injected supervision failure")
 
     def abort(self, leader: OwnedProcessGroupLeader) -> ProcessGroupTermination:
@@ -100,7 +133,7 @@ class TestValidateRunner:
         output_dir = tmp_path / "session-output"
         output_dir.mkdir()
 
-        result = subprocess.run(
+        result = _run_validation_cli(
             [
                 sys.executable, "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
@@ -122,7 +155,7 @@ class TestValidateRunner:
 
     def test_falls_back_to_diagnostics_dir(self, fake_git_repo: Path):
         """Test that output falls back to .issue-orchestrator/diagnostics/."""
-        result = subprocess.run(
+        result = _run_validation_cli(
             [
                 sys.executable, "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
@@ -146,7 +179,7 @@ class TestValidateRunner:
         output_dir = tmp_path / "session-output"
         output_dir.mkdir()
 
-        result = subprocess.run(
+        result = _run_validation_cli(
             [
                 sys.executable, "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
@@ -171,7 +204,7 @@ class TestValidateRunner:
         output_dir.mkdir()
 
         # Test exit code 0
-        result = subprocess.run(
+        result = _run_validation_cli(
             [
                 sys.executable, "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
@@ -188,7 +221,7 @@ class TestValidateRunner:
         assert result.returncode == 0
 
         # Test exit code 42
-        result = subprocess.run(
+        result = _run_validation_cli(
             [
                 sys.executable, "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
@@ -209,7 +242,7 @@ class TestValidateRunner:
         output_dir = tmp_path / "session-output"
         output_dir.mkdir()
 
-        subprocess.run(
+        _run_validation_cli(
             [
                 sys.executable, "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
@@ -233,7 +266,7 @@ class TestValidateRunner:
         output_dir = tmp_path / "session-output"
         output_dir.mkdir()
 
-        result = subprocess.run(
+        result = _run_validation_cli(
             [
                 sys.executable, "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
@@ -255,7 +288,7 @@ class TestValidateRunner:
         output_dir = tmp_path / "session-output"
         output_dir.mkdir()
 
-        result = subprocess.run(
+        result = _run_validation_cli(
             [
                 sys.executable, "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
@@ -282,7 +315,7 @@ class TestValidateRunner:
         output_dir = tmp_path / "session-output"
         output_dir.mkdir()
 
-        result = subprocess.run(
+        result = _run_validation_cli(
             [
                 sys.executable, "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
@@ -325,7 +358,7 @@ class TestValidateRunner:
             "at=2026-03-14T09:10:25-0600\\n'"
         )
 
-        result = subprocess.run(
+        result = _run_validation_cli(
             [
                 sys.executable, "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
@@ -367,54 +400,75 @@ class TestValidateRunner:
         assert target_record["started_at"] == "2026-03-14T09:10:13-0600"
         assert target_record["ended_at"] == "2026-03-14T09:10:25-0600"
 
-    def test_rejects_malformed_known_timing_marker(self, fake_git_repo: Path):
-        """A known marker prefix must never silently lose calibration evidence."""
+    def test_records_malformed_known_timing_marker_without_raising(
+        self,
+        fake_git_repo: Path,
+    ) -> None:
+        """Profiler corruption is explicit but cannot replace command semantics."""
         recorder = ValidateTimingRecorder(worktree=fake_git_repo, command="make validate")
 
         recorder.process_line("[validate-timing] CONFIG validate_jobs=10 unit_parallel=auto\n")
-        with pytest.raises(ValueError, match="malformed validation timing marker"):
-            recorder.process_line("[validate-timing] CONFIG \n")
+        recorder.process_line("[validate-timing] CONFIG \n")
 
-    @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process cleanup")
-    def test_duplicate_marker_cleans_up_child_sampler_and_finalizes_timing(
+        records = [
+            json.loads(line)
+            for line in (
+                fake_git_repo
+                / ".git"
+                / "issue-orchestrator"
+                / "validate-timings.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert records[-1]["kind"] == "timing_protocol_failure"
+        assert records[-1]["failure_kind"] == "malformed-marker"
+
+    @pytest.mark.parametrize(
+        ("command", "expected_failure_kind"),
+        (
+            (
+                "printf '[validate-timing] START target=duplicate at=one\\n' && "
+                "printf '[validate-timing] START target=duplicate at=two\\n'",
+                "duplicate-start",
+            ),
+            (
+                "printf '[validate-timing] END target=missing status=0 "
+                "elapsed=1s at=now\\n'",
+                "end-without-start",
+            ),
+            (
+                "printf '[validate-timing] malformed\\n'",
+                "malformed-marker",
+            ),
+        ),
+    )
+    def test_profiler_failure_preserves_child_success_and_marks_timing_partial(
         self,
         fake_git_repo: Path,
         tmp_path: Path,
+        command: str,
+        expected_failure_kind: str,
     ) -> None:
         output_dir = tmp_path / "output"
-        child_pid_path = (tmp_path / "validation-child.pid").resolve()
-        cooperative_leader = CooperativeTermResistantProcessTreeProgram(
-            child_pid_path,
-            300,
-            (
-                "[validate-timing] START target=duplicate at=one",
-                "[validate-timing] START target=duplicate at=two",
-            ),
-        ).python_source()
-        command = (
-            f"exec {shlex.quote(sys.executable)} -c "
-            f"{shlex.quote(cooperative_leader)}"
-        )
         sampler_threads_before = {
             thread.ident
             for thread in threading.enumerate()
             if thread.name == "validate-resource-sampler"
         }
 
-        with pytest.raises(ValueError, match="duplicate START marker"):
-            run_validation(
-                command,
-                output_dir,
-                fake_git_repo,
-                clock=ValidationRunnerClock(
-                    lambda: datetime.now(timezone.utc),
-                    time.monotonic,
-                ),
-                contained_command_capture=build_contained_command_capture(),
-            )
+        exit_code = run_validation(
+            command,
+            output_dir,
+            fake_git_repo,
+            clock=ValidationRunnerClock(
+                lambda: datetime.now(timezone.utc),
+                time.monotonic,
+            ),
+            contained_command_capture=build_contained_command_capture(),
+        )
 
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-        ProcessTreeMember(child_pid).assert_contained()
+        assert exit_code == 0
         sampler_threads_after = {
             thread.ident
             for thread in threading.enumerate()
@@ -432,11 +486,17 @@ class TestValidateRunner:
             .read_text(encoding="utf-8")
             .splitlines()
         ]
+        failure = next(
+            record for record in records if record["kind"] == "timing_protocol_failure"
+        )
+        assert failure["failure_kind"] == expected_failure_kind
         summary = next(record for record in records if record["kind"] == "run_summary")
-        assert summary["lifecycle"] == "capture-failed"
-        assert summary["process_group_cleanup"] == "capture-aborted"
-        assert summary["exit_code"] == 1
+        assert summary["lifecycle"] == "completed"
+        assert summary["process_group_cleanup"] == "supervised"
+        assert summary["exit_code"] == 0
         assert summary["child_exit_code"] == 0
+        assert summary["timing_protocol_status"] == "partial"
+        assert summary["timing_protocol_failure_count"] == 1
 
     @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process cleanup")
     def test_cleanup_failure_retains_both_errors_stops_sampler_and_finalizes(
@@ -449,10 +509,7 @@ class TestValidateRunner:
         cooperative_leader = CooperativeTermResistantProcessTreeProgram(
             child_pid_path,
             300,
-            (
-                "[validate-timing] START target=duplicate at=one",
-                "[validate-timing] START target=duplicate at=two",
-            ),
+            ("capture-ready",),
         ).python_source()
         command = (
             f"exec {shlex.quote(sys.executable)} -c "
@@ -464,7 +521,8 @@ class TestValidateRunner:
             if thread.name == "validate-resource-sampler"
         }
         supervisor = _ContainThenReportCleanupFailureSupervisor(
-            build_process_group_supervisor()
+            build_process_group_supervisor(),
+            child_pid_path,
         )
 
         with pytest.raises(
@@ -479,7 +537,14 @@ class TestValidateRunner:
                     lambda: datetime.now(timezone.utc),
                     time.monotonic,
                 ),
-                contained_command_capture=PosixContainedCommandCapture(supervisor),
+                contained_command_capture=PosixContainedCommandCapture(
+                    supervisor,
+                    ContainedCommandOutputPolicy(
+                        poll_interval_seconds=0.01,
+                        shutdown_timeout_seconds=1.0,
+                        final_drain_byte_limit=1_048_576,
+                    ),
+                ),
             )
 
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
@@ -505,18 +570,18 @@ class TestValidateRunner:
         assert summary["lifecycle"] == "capture-failed"
         assert summary["process_group_cleanup"] == "cleanup-failed"
         assert summary["capture_status"] == "failed"
-        assert summary["capture_error_type"] == "ExceptionGroup"
-        assert "duplicate START marker" in summary["capture_error_repr"]
+        assert summary["capture_error_type"] == "RuntimeError"
         assert "injected supervision failure" in summary["capture_error_repr"]
         assert summary["cleanup_error_type"] == "RuntimeError"
         assert "injected cleanup failure" in summary["cleanup_error_repr"]
         assert summary["child_outcome"] == "exit-unknown"
         assert summary["child_exit_code"] is None
         assert isinstance(summary["child_process_id"], int)
+        assert summary["timing_protocol_status"] == "complete"
 
     def test_appends_run_summary_record_to_shared_git_dir(self, fake_git_repo: Path):
         """Each validate run should append a run summary record."""
-        result = subprocess.run(
+        result = _run_validation_cli(
             [
                 sys.executable, "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",
@@ -582,20 +647,28 @@ class TestValidateRunner:
             ),
             contained_command_capture=build_contained_command_capture(),
         )
-        validation_thread.join(timeout=5.0)
-        completed_before_descendant_release = not validation_thread.is_alive()
+        try:
+            PROCESS_COMPLETION_WATCHDOG.join_thread(
+                validation_thread,
+                operation="natural-exit validation",
+            )
+        finally:
+            if validation_thread.is_alive() and descendant_pid_path.exists():
+                os.kill(
+                    int(descendant_pid_path.read_text(encoding="utf-8")),
+                    signal.SIGKILL,
+                )
+                PROCESS_COMPLETION_WATCHDOG.join_thread(
+                    validation_thread,
+                    operation="natural-exit validation cleanup",
+                )
         descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
-        if not completed_before_descendant_release:
-            os.kill(descendant_pid, signal.SIGKILL)
-            validation_thread.join(timeout=5.0)
-
-        assert completed_before_descendant_release
         assert validation_result.unwrap() == 0
         ProcessTreeMember(descendant_pid).assert_contained()
 
     def test_appends_resource_samples_to_shared_git_dir(self, fake_git_repo: Path):
         """Validate runs should persist periodic resource samples."""
-        result = subprocess.run(
+        result = _run_validation_cli(
             [
                 sys.executable, "-m",
                 "issue_orchestrator.entrypoints.cli_tools.validate_runner",

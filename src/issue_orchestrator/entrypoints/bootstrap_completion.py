@@ -22,6 +22,7 @@ from ..ports.coder_prompt import (
     CoderPromptAddendumProvider,
     NO_CODER_PROMPT_ADDENDUM,
 )
+from .bootstrap_executor import build_validation_command_runner
 
 if TYPE_CHECKING:
     from ..control.needs_human_block import SharedNeedsHumanBlock
@@ -203,7 +204,11 @@ def create_completion_components(
         events=events,
         session_output=session_output,
         working_copy=working_copy,
-        command_runner=command_runner if config.validation.quick.cmd else None,
+        command_runner=(
+            build_validation_command_runner()
+            if config.validation.quick.cmd
+            else None
+        ),
         validation_cmd=config.validation.quick.cmd,
         validation_timeout_seconds=config.validation.quick.timeout_seconds,
         validation_junit_xml_paths=_validation_junit_xml_paths(config),

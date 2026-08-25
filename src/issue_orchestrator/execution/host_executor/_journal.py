@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import logging
 import os
 import time
 from pathlib import Path
@@ -63,6 +64,7 @@ from ._host_observation import ExecutorHostLoadObservation
 
 
 _MAX_LOG_BYTES = 10 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 class _EventRecord(ExecutorStrictRecord):
@@ -207,11 +209,24 @@ class ExecutorEventStore:
         lock_path = self._pool_dir / "executor-events.lock"
         with lock_path.open("a+b") as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            self._repair_torn_active_tail()
             self._rotate_if_needed()
-            with self.path.open("a", encoding="utf-8") as log_handle:
-                log_handle.write(event.model_dump_json() + "\n")
-                log_handle.flush()
-                os.fsync(log_handle.fileno())
+            payload = (event.model_dump_json() + "\n").encode("utf-8")
+            descriptor = os.open(
+                self.path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
+            )
+            try:
+                remaining = memoryview(payload)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written < 1:
+                        raise OSError("executor event append made no progress")
+                    remaining = remaining[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
 
     def enqueued(
         self,
@@ -446,17 +461,57 @@ class ExecutorEventStore:
             if not path.exists():
                 continue
             try:
-                lines = path.read_text(encoding="utf-8").splitlines()
+                lines = path.read_bytes().splitlines(keepends=True)
             except OSError as exc:
                 raise RuntimeError(f"cannot read executor event store: {path}") from exc
             for line_number, line in enumerate(lines, start=1):
                 try:
                     records.append(_STORED_EVENT_ADAPTER.validate_json(line))
                 except ValidationError as exc:
+                    is_torn_final_line = (
+                        path == self.path
+                        and line_number == len(lines)
+                        and not line.endswith((b"\n", b"\r"))
+                    )
+                    if is_torn_final_line:
+                        logger.warning(
+                            "Ignoring torn final executor event record: path=%s line=%d",
+                            path,
+                            line_number,
+                        )
+                        continue
                     raise RuntimeError(
                         f"invalid executor event at {path}:{line_number}"
                     ) from exc
         return tuple(records)
+
+    def _repair_torn_active_tail(self) -> None:
+        """Truncate only an invalid unterminated tail before the next append."""
+        if not self.path.exists():
+            return
+        payload = self.path.read_bytes()
+        if not payload or payload.endswith(b"\n"):
+            return
+        boundary = payload.rfind(b"\n") + 1
+        tail = payload[boundary:]
+        try:
+            _STORED_EVENT_ADAPTER.validate_json(tail)
+        except ValidationError:
+            with self.path.open("r+b") as handle:
+                handle.truncate(boundary)
+                handle.flush()
+                os.fsync(handle.fileno())
+            logger.warning(
+                "Truncated torn final executor event record before append: path=%s "
+                "removed_bytes=%d",
+                self.path,
+                len(tail),
+            )
+            return
+        with self.path.open("ab") as handle:
+            handle.write(b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def _rotate_if_needed(self) -> None:
         if not self.path.exists() or self.path.stat().st_size < _MAX_LOG_BYTES:

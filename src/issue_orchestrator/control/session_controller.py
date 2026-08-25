@@ -27,7 +27,7 @@ from typing import Any, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .completion_processor import CompletionProcessor, ProcessingResult
-    from ..ports.command_runner import CommandRunner
+    from ..ports.validation_command_runner import ValidationCommandRunner
     from ..ports.working_copy import WorkingCopy
     from ..domain.models import CompletionRecord
     from ..domain.attempt import AttemptKey
@@ -151,7 +151,7 @@ class SessionController:
         events: EventSink,
         session_output: SessionOutput,
         working_copy: "WorkingCopy",
-        command_runner: Optional["CommandRunner"] = None,
+        command_runner: Optional["ValidationCommandRunner"] = None,
         validation_cmd: Optional[str] = None,
         validation_timeout_seconds: int = 300,
         validation_junit_xml_paths: tuple[str, ...] | list[str] = (),

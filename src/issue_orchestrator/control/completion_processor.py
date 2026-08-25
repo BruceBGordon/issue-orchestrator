@@ -656,7 +656,7 @@ class CompletionProcessor:
             return None
         try:
             return ValidationRecord.from_dict(data)
-        except TypeError:
+        except (TypeError, ValueError):
             return None
 
     def _attach_validation_artifacts(

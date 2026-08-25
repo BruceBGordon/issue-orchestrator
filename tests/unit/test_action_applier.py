@@ -885,8 +885,9 @@ class TestLaunchSessionAction:
         assert not result.success
         assert "No session_launcher callback" in result.error
 
-    def test_launch_session_fallback_with_command(self, applier, mock_sessions, tmp_path):
-        """Test launch session fallback when command provided."""
+    def test_launch_session_command_cannot_bypass_owner_callback(
+        self, applier, mock_sessions, tmp_path
+    ):
         action = LaunchSessionAction(
             session_type=SessionType.ISSUE,
             number=123,
@@ -897,11 +898,13 @@ class TestLaunchSessionAction:
 
         result = applier.apply(action)
 
-        assert result.success
-        mock_sessions.start.assert_called_once()
+        assert not result.success
+        assert "No session_launcher callback" in result.error
+        mock_sessions.start.assert_not_called()
 
-    def test_launch_session_already_running(self, applier, mock_sessions, tmp_path):
-        """Test launch session when already running."""
+    def test_launch_session_does_not_query_runner_without_owner_callback(
+        self, applier, mock_sessions, tmp_path
+    ):
         mock_sessions.exists.return_value = True
 
         action = LaunchSessionAction(
@@ -913,8 +916,9 @@ class TestLaunchSessionAction:
 
         result = applier.apply(action)
 
-        assert result.result_type == ActionResultType.SKIPPED
-        assert "already running" in result.details.get("skip_reason", "")
+        assert not result.success
+        assert "No session_launcher callback" in result.error
+        mock_sessions.exists.assert_not_called()
 
 
 class TestLaunchValidationRetryAction:

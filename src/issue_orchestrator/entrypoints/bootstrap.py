@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
@@ -42,8 +43,10 @@ from .bootstrap_executor import (
     build_contained_command_capture as build_contained_command_capture,
     build_executor_monitor as build_executor_monitor,
     build_process_group_supervisor as build_process_group_supervisor,
-    build_terminal_session_terminator,
+    build_validation_command_runner as build_validation_command_runner,
+    compose_terminal_session_terminator,
     compose_executor,
+    terminal_session_watcher_policy,
 )
 from .bootstrap_pair_registry import build_pair_registry_with_worktree_hook
 from .bootstrap_pending_work import (
@@ -66,9 +69,17 @@ from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import GitRepoError, get_repo_from_git
 from ..adapters.host_cpu_utilization import SystemHostCpuUtilizationObserver
+from ..adapters.ps_process_group_observer import (
+    PsProcessGroupObserver,
+    PsProcessObservationPolicy,
+)
+from ..adapters.kernel_process_identity import (
+    build_kernel_process_identity_observer,
+)
 from ..ports.event_sink import EventSink, NullEventSink
 from ..ports.issue_tracker import IssueTracker
 from ..ports.session_runner import SessionRunner, NullSessionRunner
+from ..ports.terminal_session_terminator import TerminalSessionTerminator
 from ..ports.timeline_reader import NullTimelineReader
 from ..ports.timeline_store import NullTimelineStore, TimelineStore
 from ..infra.pause_journal import PAUSE_JOURNAL_FILENAME, JsonlPauseJournal
@@ -118,6 +129,9 @@ from ..ports.provider_readiness import (
     ProviderReadinessProbe,
 )
 from ..execution.session_output_adapter import FileSystemSessionOutput
+from ..execution.unsupported_session_run_containment import (
+    SessionRunnerUnsupportedSessionRunContainment,
+)
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ..execution.internal_review_prompt import build_coder_prompt_addendum_provider
 from ..execution.thread_background_job_runner import ThreadBackgroundJobRunner
@@ -155,6 +169,16 @@ if TYPE_CHECKING:
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
 
 logger = logging.getLogger(__name__)
+
+
+def build_terminal_session_terminator() -> TerminalSessionTerminator:
+    """Compose the portable process observer and terminal containment owner."""
+    process_group_observer = PsProcessGroupObserver(
+        Path("/bin/ps"),
+        PsProcessObservationPolicy(command_timeout_seconds=2.0),
+        build_kernel_process_identity_observer(),
+    )
+    return compose_terminal_session_terminator(process_group_observer)
 
 
 def build_executor() -> Executor:
@@ -468,6 +492,8 @@ def build_orchestrator(
     # Create the pluggy plugin manager and register SSE plugin
     pm = create_plugin_manager(
         terminal_session_terminator=build_terminal_session_terminator(),
+        process_group_supervisor=build_process_group_supervisor(),
+        watcher_policy=terminal_session_watcher_policy(),
         terminal_plugin=config.terminal_adapter,
         ui_mode=config.ui_mode,
         session_interactions_enabled=config.session_interactions.enabled,
@@ -597,6 +623,9 @@ def build_orchestrator(
         config=config,
         repository_host=github,
         working_copy=working_copy,
+        unsupported_session_run_containment=(
+            SessionRunnerUnsupportedSessionRunContainment(runner)
+        ),
         tech_lead_authority=tech_lead_authority,
     ) if github else None
 
@@ -976,6 +1005,9 @@ def build_orchestrator_for_testing(
         config=config,
         repository_host=github,
         working_copy=working_copy,
+        unsupported_session_run_containment=(
+            SessionRunnerUnsupportedSessionRunContainment(runner)
+        ),
         tech_lead_authority=tech_lead_authority_for_testing,
     )
 
@@ -1066,7 +1098,11 @@ def build_orchestrator_for_testing(
         events=events,
         session_output=session_output,
         working_copy=working_copy,
-        command_runner=command_runner if config.validation.quick.cmd else None,
+        command_runner=(
+            build_validation_command_runner()
+            if config.validation.quick.cmd
+            else None
+        ),
         validation_cmd=config.validation.quick.cmd,
         validation_timeout_seconds=config.validation.quick.timeout_seconds,
         attempt_store=attempt_store,

@@ -13,7 +13,11 @@ from .executor import (
     ExecutorProcessTerminationPolicy,
     ExecutorWorkKey,
 )
-from .terminal_launch import TerminalInteractionIntent, TerminalLaunch
+from .terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalLaunch,
+    TerminalRunDestination,
+)
 from .models import AgentConfig, TaskKind
 from .session_run import SessionRunAssets
 
@@ -140,6 +144,7 @@ class AgentPhaseRunSpecification:
     interaction_intent: TerminalInteractionIntent
     shell_command: str
     cancellation: ExecutorInteractiveSessionCancellation
+    destination: TerminalRunDestination
 
     def __post_init__(self) -> None:
         if type(self.work_key) is not ExecutorWorkKey:
@@ -169,6 +174,11 @@ class AgentPhaseRunSpecification:
                 "AgentPhaseRunSpecification.cancellation must be an "
                 "ExecutorInteractiveSessionCancellation"
             )
+        if type(self.destination) is not TerminalRunDestination:
+            raise ValueError(
+                "AgentPhaseRunSpecification.destination must be "
+                "TerminalRunDestination"
+            )
 
     @classmethod
     def from_timeout_minutes(
@@ -180,6 +190,7 @@ class AgentPhaseRunSpecification:
         interaction_intent: TerminalInteractionIntent,
         shell_command: str,
         cancellation: ExecutorInteractiveSessionCancellation,
+        destination: TerminalRunDestination,
     ) -> AgentPhaseRunSpecification:
         if type(active_timeout_minutes) is not int or active_timeout_minutes < 1:
             raise ValueError("active_timeout_minutes must be a positive integer")
@@ -194,6 +205,7 @@ class AgentPhaseRunSpecification:
             interaction_intent=interaction_intent,
             shell_command=shell_command,
             cancellation=cancellation,
+            destination=destination,
         )
 
 

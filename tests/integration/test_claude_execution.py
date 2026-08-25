@@ -24,6 +24,7 @@ from uuid import uuid4
 from issue_orchestrator.infra.env import ENV_PREFIX
 from issue_orchestrator.domain.terminal_launch import (
     TerminalInteractionIntent,
+    TerminalLaunch,
     TerminalShell,
 )
 from tests.process_group_run import run_in_process_group
@@ -470,8 +471,12 @@ class TestClaudeViaAdapterPath:
     def test_claude_via_subprocess_backend(self, tmp_path, require_claude, monkeypatch):
         """Run Claude via subprocess backend in a real git worktree."""
         from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
-        from issue_orchestrator.entrypoints.bootstrap_executor import (
+        from issue_orchestrator.entrypoints.bootstrap import (
+            build_process_group_supervisor,
             build_terminal_session_terminator,
+        )
+        from issue_orchestrator.entrypoints.bootstrap_executor import (
+            terminal_session_watcher_policy,
         )
 
         source_repo_root = Path(__file__).resolve().parents[2]
@@ -500,12 +505,21 @@ class TestClaudeViaAdapterPath:
                 f"\"{escaped_prompt}\""
             )
 
-            plugin = SubprocessPlugin(build_terminal_session_terminator())
+            plugin = SubprocessPlugin(
+                build_terminal_session_terminator(),
+                build_process_group_supervisor(),
+                terminal_session_watcher_policy(),
+            )
             created = plugin.create_session(
                 session_id=999,
-                command=claude_cmd,
-                interaction_intent=TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE,
-                shell=TerminalShell.BASH,
+                launch=TerminalLaunch(
+                    shell_command=claude_cmd,
+                    interaction_intent=(
+                        TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE
+                    ),
+                    shell=TerminalShell.BASH,
+                    destination=run_assets.terminal_destination,
+                ),
                 working_dir=str(worktree),
                 title="Claude subprocess integration",
                 session_name=session_name,

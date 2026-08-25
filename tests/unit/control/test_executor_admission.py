@@ -506,6 +506,40 @@ def test_measured_host_saturation_attenuates_an_otherwise_fitting_admission() ->
         resources=(),
     )
 
+    active = ActiveExecutorLease(
+        fairness_group=ExecutorFairnessGroup("validation-b"),
+        grant=ExecutorAdmissionGrant(1, 1),
+        exclusive_resources=(),
+    )
+    decision = _policy().decide(
+        current,
+        _snapshot(
+            18,
+            (current,),
+            (active,),
+            (("validation-a", 0), ("validation-b", 1)),
+            host_cpu_utilization=ExecutorHostCpuUtilization(95.0, 0.1),
+        ),
+    )
+
+    assert decision == ExecutorAdmissionDeferred(
+        reason=ExecutorWaitReason.HOST_PRESSURE,
+        leased_cpu_slots=1,
+        available_cpu_slots=17,
+    )
+
+
+def test_measured_host_saturation_never_starves_an_idle_executor() -> None:
+    current = _work(
+        "idle-probe",
+        1,
+        "validation-a",
+        ExecutorConcurrencyRange(1, 4),
+        learned_cores=1.0,
+        aggressiveness_percent=100,
+        resources=(),
+    )
+
     decision = _policy().decide(
         current,
         _snapshot(
@@ -513,12 +547,9 @@ def test_measured_host_saturation_attenuates_an_otherwise_fitting_admission() ->
             (current,),
             (),
             (("validation-a", 0),),
-            host_cpu_utilization=ExecutorHostCpuUtilization(95.0, 0.1),
+            host_cpu_utilization=ExecutorHostCpuUtilization(100.0, 0.1),
         ),
     )
 
-    assert decision == ExecutorAdmissionDeferred(
-        reason=ExecutorWaitReason.HOST_PRESSURE,
-        leased_cpu_slots=0,
-        available_cpu_slots=18,
-    )
+    assert isinstance(decision, ExecutorAdmissionGranted)
+    assert decision.grant.cpu_slots == 1

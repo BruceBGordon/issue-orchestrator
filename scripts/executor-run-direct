@@ -1,85 +1,191 @@
-#!/bin/sh
-# Standalone executor-run contract for repositories that do not use IO.
-set -eu
+#!/usr/bin/env python3
+"""Dependency-free direct adapter for the public executor-run contract."""
 
-usage() {
-    echo "usage: executor-run-direct --min-concurrency N --max-concurrency N --work-key KEY [--group GROUP] -- COMMAND [ARG]..." >&2
-    exit 2
-}
+from __future__ import annotations
 
-minimum_concurrency=""
-maximum_concurrency=""
-executor_group=""
-work_key=""
+import os
+import re
+import sys
+from dataclasses import dataclass
+from typing import NoReturn
 
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --exclusive)
-            echo "executor-run-direct cannot honor exclusive resources; use the pooled executor" >&2
-            exit 2
-            ;;
-        --min-concurrency)
-            [ "$#" -ge 2 ] || usage
-            minimum_concurrency=$2
-            shift 2
-            ;;
-        --max-concurrency)
-            [ "$#" -ge 2 ] || usage
-            maximum_concurrency=$2
-            shift 2
-            ;;
-        --work-key)
-            [ "$#" -ge 2 ] || usage
-            case "$2" in
-                ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._:/-]*) usage ;;
-            esac
-            [ "${#2}" -le 160 ] || usage
-            work_key=$2
-            shift 2
-            ;;
-        --group)
-            [ "$#" -ge 2 ] || usage
-            [ -n "$2" ] || usage
-            executor_group=$2
-            shift 2
-            ;;
-        --)
-            shift
+
+_USAGE = (
+    "usage: executor-run-direct --min-concurrency N --max-concurrency N "
+    "--work-key KEY [--group GROUP] -- COMMAND [ARG]..."
+)
+_GROUP_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
+
+
+class DirectExecutorContractError(ValueError):
+    """The standalone invocation violates the public executor contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class DirectExecutorWorkKey:
+    """Standalone form of the public human-readable work identity."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        if type(self.value) is not str or (
+            not 1 <= len(self.value) <= 160
+            or not self.value.isprintable()
+            or not self.value.strip()
+        ):
+            raise DirectExecutorContractError(
+                "work key must contain 1 through 160 printable Unicode "
+                "characters and must not be whitespace-only"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class DirectExecutorFairnessGroup:
+    """Standalone form of the public cross-command fairness identity."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        if type(self.value) is not str or not _GROUP_PATTERN.fullmatch(self.value):
+            raise DirectExecutorContractError(
+                "group must match [A-Za-z0-9][A-Za-z0-9._:/-]{0,255}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class DirectExecutorConcurrencyRange:
+    """Closed concurrency range declared by one standalone command."""
+
+    minimum: int
+    maximum: int
+
+    def __post_init__(self) -> None:
+        if type(self.minimum) is not int or self.minimum < 1:
+            raise DirectExecutorContractError("minimum concurrency must be positive")
+        if type(self.maximum) is not int or self.maximum < self.minimum:
+            raise DirectExecutorContractError(
+                "maximum concurrency must not be below the minimum"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class DirectExecutorRunSpecification:
+    """Complete standalone request accepted before replacing this process."""
+
+    concurrency: DirectExecutorConcurrencyRange
+    work_key: DirectExecutorWorkKey
+    group: DirectExecutorFairnessGroup
+    command: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.concurrency) is not DirectExecutorConcurrencyRange:
+            raise DirectExecutorContractError("concurrency range is required")
+        if type(self.work_key) is not DirectExecutorWorkKey:
+            raise DirectExecutorContractError("work key is required")
+        if type(self.group) is not DirectExecutorFairnessGroup:
+            raise DirectExecutorContractError("group is required")
+        if type(self.command) is not tuple or not self.command or not self.command[0]:
+            raise DirectExecutorContractError("command is required")
+        if any(type(argument) is not str or "\0" in argument for argument in self.command):
+            raise DirectExecutorContractError(
+                "command arguments must be strings without NUL bytes"
+            )
+
+
+def _usage() -> NoReturn:
+    print(_USAGE, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _option_value(arguments: tuple[str, ...], index: int) -> tuple[str, int]:
+    value_index = index + 1
+    if value_index >= len(arguments):
+        _usage()
+    return arguments[value_index], value_index + 1
+
+
+def _positive_integer(raw_value: str) -> int:
+    try:
+        value = int(raw_value)
+    except ValueError:
+        _usage()
+    if value < 1:
+        _usage()
+    return value
+
+
+def _parse(arguments: tuple[str, ...]) -> DirectExecutorRunSpecification:
+    minimum: int | None = None
+    maximum: int | None = None
+    work_key: str | None = None
+    explicit_group: str | None = None
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            command = arguments[index + 1 :]
             break
-            ;;
-        *)
-            usage
-            ;;
-    esac
-done
+        if argument == "--exclusive":
+            print(
+                "executor-run-direct cannot honor exclusive resources; "
+                "use the pooled executor",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        if argument == "--min-concurrency":
+            raw_value, index = _option_value(arguments, index)
+            minimum = _positive_integer(raw_value)
+            continue
+        if argument == "--max-concurrency":
+            raw_value, index = _option_value(arguments, index)
+            maximum = _positive_integer(raw_value)
+            continue
+        if argument == "--work-key":
+            work_key, index = _option_value(arguments, index)
+            continue
+        if argument == "--group":
+            explicit_group, index = _option_value(arguments, index)
+            continue
+        _usage()
+    else:
+        _usage()
 
-[ -n "$minimum_concurrency" ] && [ -n "$maximum_concurrency" ] || usage
-case "$minimum_concurrency:$maximum_concurrency" in *[!0-9:]*) usage ;; esac
-[ "$minimum_concurrency" -ge 1 ] 2>/dev/null || usage
-[ "$maximum_concurrency" -ge "$minimum_concurrency" ] 2>/dev/null || usage
-# Direct mode has no competing work from which to derive a smaller grant.
-granted_concurrency=$maximum_concurrency
-[ "$#" -gt 0 ] && [ -n "$1" ] || usage
-[ -n "$work_key" ] || usage
+    inherited_group = os.environ.get("ISSUE_ORCHESTRATOR_EXECUTOR_GROUP")
+    if (
+        explicit_group is not None
+        and inherited_group is not None
+        and explicit_group != inherited_group
+    ):
+        print(
+            "executor-run-direct: --group conflicts with "
+            "ISSUE_ORCHESTRATOR_EXECUTOR_GROUP",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    group = explicit_group if explicit_group is not None else inherited_group
+    if minimum is None or maximum is None or work_key is None or group is None:
+        _usage()
+    try:
+        return DirectExecutorRunSpecification(
+            concurrency=DirectExecutorConcurrencyRange(minimum, maximum),
+            work_key=DirectExecutorWorkKey(work_key),
+            group=DirectExecutorFairnessGroup(group),
+            command=command,
+        )
+    except DirectExecutorContractError:
+        _usage()
 
-environment_group=${ISSUE_ORCHESTRATOR_EXECUTOR_GROUP-}
-if [ -n "$executor_group" ] && [ -n "$environment_group" ] && [ "$executor_group" != "$environment_group" ]; then
-    echo "executor-run-direct: --group conflicts with ISSUE_ORCHESTRATOR_EXECUTOR_GROUP" >&2
-    exit 2
-fi
-if [ -z "$executor_group" ]; then
-    executor_group=$environment_group
-fi
-[ -n "$executor_group" ] || usage
-case "$executor_group" in
-    [!A-Za-z0-9]*|*[!A-Za-z0-9._:/-]*) usage ;;
-esac
-[ "${#executor_group}" -le 256 ] || usage
 
-# The framework-neutral grant is authoritative. The xdist variable preserves
-# compatibility for Python repositories that select ``pytest -n auto``.
-export ISSUE_ORCHESTRATOR_EXECUTOR_CONCURRENCY=$granted_concurrency
-export ISSUE_ORCHESTRATOR_EXECUTOR_GROUP=$executor_group
-export PYTEST_XDIST_AUTO_NUM_WORKERS=$granted_concurrency
+def main() -> NoReturn:
+    """Validate the complete request, then replace the adapter with its command."""
+    specification = _parse(tuple(sys.argv[1:]))
+    environment = os.environ.copy()
+    granted_concurrency = str(specification.concurrency.maximum)
+    environment["ISSUE_ORCHESTRATOR_EXECUTOR_CONCURRENCY"] = granted_concurrency
+    environment["ISSUE_ORCHESTRATOR_EXECUTOR_GROUP"] = specification.group.value
+    environment["PYTEST_XDIST_AUTO_NUM_WORKERS"] = granted_concurrency
+    os.execvpe(specification.command[0], specification.command, environment)
 
-exec "$@"
+
+if __name__ == "__main__":
+    main()

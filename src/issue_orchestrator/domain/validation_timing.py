@@ -333,6 +333,55 @@ class ValidationTargetTiming:
         )
 
 
+class ValidationTimingProtocolFailureKind(StrEnum):
+    """Closed set of profiler marker protocol defects."""
+
+    DUPLICATE_START = "duplicate-start"
+    END_WITHOUT_START = "end-without-start"
+    MALFORMED_MARKER = "malformed-marker"
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationTimingProtocolFailure:
+    """One typed profiler failure that cannot override validation semantics."""
+
+    context: ValidationRunTimingContext
+    configuration: ValidationConfiguration
+    failure_kind: ValidationTimingProtocolFailureKind
+    line: str
+    target: str | None
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_exact(owner, "context", self.context, ValidationRunTimingContext)
+        _require_exact(
+            owner,
+            "configuration",
+            self.configuration,
+            ValidationConfiguration,
+        )
+        _require_exact(
+            owner,
+            "failure_kind",
+            self.failure_kind,
+            ValidationTimingProtocolFailureKind,
+        )
+        _require_non_empty(owner, "line", self.line)
+        _require_optional_non_empty(owner, "target", self.target)
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return merge_validation_timing_fields(
+            {"kind": "timing_protocol_failure"},
+            self.context,
+            {
+                "failure_kind": self.failure_kind.value,
+                "line": self.line,
+                "target": self.target,
+            },
+            self.configuration,
+        )
+
+
 class ValidationRunLifecycle(StrEnum):
     """Terminal meaning of one validate-runner timing summary."""
 
@@ -479,6 +528,7 @@ class ValidationRunTimingSummary:
     total_elapsed_seconds: float
     recorded_at: str
     envelope: ValidationTimingEnvelope
+    timing_protocol_failure_count: int
 
     def __post_init__(self) -> None:
         owner = type(self).__name__
@@ -506,6 +556,12 @@ class ValidationRunTimingSummary:
         )
         _require_non_empty(owner, "recorded_at", self.recorded_at)
         _require_exact(owner, "envelope", self.envelope, ValidationTimingEnvelope)
+        _require_integer(
+            owner,
+            "timing_protocol_failure_count",
+            self.timing_protocol_failure_count,
+            minimum=0,
+        )
 
     def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
         return merge_validation_timing_fields(
@@ -515,6 +571,14 @@ class ValidationRunTimingSummary:
             {
                 "total_elapsed_seconds": self.total_elapsed_seconds,
                 "recorded_at": self.recorded_at,
+                "timing_protocol_status": (
+                    "complete"
+                    if self.timing_protocol_failure_count == 0
+                    else "partial"
+                ),
+                "timing_protocol_failure_count": (
+                    self.timing_protocol_failure_count
+                ),
             },
             self.envelope,
             self.configuration,

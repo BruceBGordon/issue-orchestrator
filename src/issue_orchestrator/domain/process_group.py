@@ -20,6 +20,173 @@ class OwnedProcessGroupLeader:
 
 
 @dataclass(frozen=True, slots=True)
+class ProcessBirthIdentity:
+    """Collision-resistant kernel token used to reject recycled PIDs."""
+
+    kernel_token: str
+
+    def __post_init__(self) -> None:
+        if type(self.kernel_token) is not str or not self.kernel_token:
+            raise ValueError(
+                "ProcessBirthIdentity.kernel_token must be a non-empty string"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessIdentityAbsent:
+    """No process currently owns the requested PID."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessIdentityPresent:
+    """One current process identity and its current process-group membership."""
+
+    birth_identity: ProcessBirthIdentity
+    process_group_id: int
+
+    def __post_init__(self) -> None:
+        if type(self.birth_identity) is not ProcessBirthIdentity:
+            raise ValueError(
+                "ProcessIdentityPresent.birth_identity must be ProcessBirthIdentity"
+            )
+        if type(self.process_group_id) is not int or self.process_group_id <= 1:
+            raise ValueError(
+                "ProcessIdentityPresent.process_group_id must be above 1"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessIdentityPermissionDenied:
+    """The OS refused a process identity observation."""
+
+    detail: str
+
+    def __post_init__(self) -> None:
+        if type(self.detail) is not str or not self.detail:
+            raise ValueError(
+                "ProcessIdentityPermissionDenied.detail must not be empty"
+            )
+
+
+ProcessIdentityObservation = (
+    ProcessIdentityAbsent
+    | ProcessIdentityPresent
+    | ProcessIdentityPermissionDenied
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessGroupAbsent:
+    """No process currently belongs to the requested process group."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessGroupZombiesOnly:
+    """The process group has members, but none can execute user code."""
+
+    member_count: int
+
+    def __post_init__(self) -> None:
+        if type(self.member_count) is not int or self.member_count < 1:
+            raise ValueError("ProcessGroupZombiesOnly.member_count must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessGroupExecutable:
+    """At least one process-group member can still execute user code."""
+
+    member_count: int
+
+    def __post_init__(self) -> None:
+        if type(self.member_count) is not int or self.member_count < 1:
+            raise ValueError("ProcessGroupExecutable.member_count must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessGroupPermissionDenied:
+    """The OS refused a process-group membership observation."""
+
+    detail: str
+
+    def __post_init__(self) -> None:
+        if type(self.detail) is not str or not self.detail:
+            raise ValueError(
+                "ProcessGroupPermissionDenied.detail must not be empty"
+            )
+
+
+ProcessGroupObservation = (
+    ProcessGroupAbsent
+    | ProcessGroupZombiesOnly
+    | ProcessGroupExecutable
+    | ProcessGroupPermissionDenied
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessSessionLeaderAbsent:
+    """The recorded leader is absent; its numeric group must not be signalled."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessSessionLeaderPermissionDenied:
+    """The OS refused the leader identity required for a safe decision."""
+
+    detail: str
+
+    def __post_init__(self) -> None:
+        if type(self.detail) is not str or not self.detail:
+            raise ValueError(
+                "ProcessSessionLeaderPermissionDenied.detail must not be empty"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessSessionLeaderStale:
+    """The PID now names a process with a different exact birth identity."""
+
+    observed_identity: ProcessIdentityPresent
+
+    def __post_init__(self) -> None:
+        if type(self.observed_identity) is not ProcessIdentityPresent:
+            raise ValueError(
+                "ProcessSessionLeaderStale.observed_identity must be "
+                "ProcessIdentityPresent"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessSessionLeaderPresent:
+    """One owner-level leader identity plus its group-membership observation."""
+
+    identity: ProcessIdentityPresent
+    group: ProcessGroupObservation
+
+    def __post_init__(self) -> None:
+        if type(self.identity) is not ProcessIdentityPresent:
+            raise ValueError(
+                "ProcessSessionLeaderPresent.identity must be ProcessIdentityPresent"
+            )
+        if type(self.group) not in (
+            ProcessGroupAbsent,
+            ProcessGroupZombiesOnly,
+            ProcessGroupExecutable,
+            ProcessGroupPermissionDenied,
+        ):
+            raise ValueError(
+                "ProcessSessionLeaderPresent.group must be a closed observation"
+            )
+
+
+ProcessSessionObservation = (
+    ProcessSessionLeaderAbsent
+    | ProcessSessionLeaderPermissionDenied
+    | ProcessSessionLeaderStale
+    | ProcessSessionLeaderPresent
+)
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessGroupTermination:
     """The reaped leader result after its whole process group was contained."""
 

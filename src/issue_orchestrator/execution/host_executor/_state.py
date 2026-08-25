@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import BinaryIO, Generator, TypeVar
 
@@ -72,6 +73,12 @@ class OwnedQueuedRequest:
         self.release()
 
 
+class _HostExecutorLeaseOwnership(Enum):
+    LOCAL = "local"
+    GUARDIAN = "guardian"
+    RELEASED = "released"
+
+
 class HostExecutorLease:
     """Live CPU/resource locks transferred to the admitted command guardian."""
 
@@ -86,21 +93,44 @@ class HostExecutorLease:
         self.grant = grant
         self.path = path
         self._handles = handles
-        self._released = False
+        self._ownership = _HostExecutorLeaseOwnership.LOCAL
 
-    def guardian_file_descriptors(self) -> tuple[int, ...]:
-        if self._released:
-            raise RuntimeError("cannot transfer a released host executor lease")
+    def inherited_file_descriptors(self) -> tuple[int, ...]:
+        if self._ownership is not _HostExecutorLeaseOwnership.LOCAL:
+            raise RuntimeError("only a locally owned executor lease can be inherited")
         return tuple(handle.fileno() for handle in self._handles)
 
+    def transfer_to_guardian(self) -> None:
+        """Make the spawned guardian the sole descriptor owner without unlocking."""
+        if self._ownership is not _HostExecutorLeaseOwnership.LOCAL:
+            raise RuntimeError("host executor lease can be transferred only once")
+        close_errors: list[BaseException] = []
+        for handle in reversed(self._handles):
+            try:
+                # flock ownership follows the inherited open-file description.
+                # Explicit LOCK_UN here would also unlock the guardian's copy.
+                handle.close()
+            except BaseException as error:
+                error.add_note("failed to close local executor lease descriptor")
+                close_errors.append(error)
+        self._handles.clear()
+        self._ownership = _HostExecutorLeaseOwnership.GUARDIAN
+        if close_errors:
+            raise BaseExceptionGroup(
+                "executor lease transfer descriptor failures",
+                close_errors,
+            )
+
     def release(self) -> None:
-        if self._released:
+        if self._ownership is _HostExecutorLeaseOwnership.RELEASED:
             raise RuntimeError("host executor lease was released twice")
         try:
             self.path.unlink(missing_ok=True)
         finally:
-            _release_handles(self._handles)
-            self._released = True
+            if self._ownership is _HostExecutorLeaseOwnership.LOCAL:
+                _release_handles(self._handles)
+                self._handles.clear()
+            self._ownership = _HostExecutorLeaseOwnership.RELEASED
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,9 +187,37 @@ class HostExecutorState:
         with self._queue_guard():
             self._reset_inactive_group_service_before_enqueue()
             path.parent.mkdir(parents=True, exist_ok=True)
-            handle = path.open("x+b")
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            self._write_locked(handle, QueuedWorkRecord.from_domain(work))
+            handle: BinaryIO | None = None
+            try:
+                handle = path.open("x+b")
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                self._write_locked(handle, QueuedWorkRecord.from_domain(work))
+            except BaseException as publication_error:
+                # A failed publication must not leave a locked, partial request
+                # that poisons every peer until this process happens to exit.
+                cleanup_errors: list[BaseException] = []
+                try:
+                    path.unlink(missing_ok=True)
+                except BaseException as cleanup_error:
+                    cleanup_error.add_note("failed to unlink partial queue record")
+                    cleanup_errors.append(cleanup_error)
+                if handle is not None:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    except BaseException as cleanup_error:
+                        cleanup_error.add_note("failed to unlock partial queue record")
+                        cleanup_errors.append(cleanup_error)
+                    try:
+                        handle.close()
+                    except BaseException as cleanup_error:
+                        cleanup_error.add_note("failed to close partial queue record")
+                        cleanup_errors.append(cleanup_error)
+                if cleanup_errors:
+                    raise BaseExceptionGroup(
+                        "host executor queue publication and cleanup failures",
+                        (publication_error, *cleanup_errors),
+                    )
+                raise
         return OwnedQueuedRequest(work, path, handle)
 
     def _reset_inactive_group_service_before_enqueue(self) -> None:

@@ -146,7 +146,7 @@ def test_sparse_arrivals_model_ten_lane_microbursts_over_thirty_minutes() -> Non
     assert result.maximum_charged_cpu_slots <= 18
     assert result.maximum_requested_cpu_cores < 18
     assert result.maximum_queue_seconds == 0
-    assert result.cooperative_yield_count == 0
+    assert result.cooperative_yield_count > 0
     assert all(
         transition.reason is not ExecutorWaitReason.HOST_PRESSURE
         for transition in result.wait_transitions
@@ -181,7 +181,13 @@ def test_external_saturation_attenuates_then_recovers_in_virtual_seconds() -> No
     )
     assert pressure_waits
     assert all(wait.host_cpu_busy_percent == 100.0 for wait in pressure_waits)
-    assert min(admission.admitted_at_seconds for admission in result.admissions) == 30.0
+    first_admission, *recovered_admissions = result.admissions
+    assert first_admission.admitted_at_seconds == 0.0
+    assert first_admission.grant.concurrency == 1
+    assert all(
+        admission.admitted_at_seconds >= 30.0
+        for admission in recovered_admissions
+    )
     assert result.completed_validation_count == 1
     assert result.maximum_charged_cpu_slots <= 18
 
@@ -247,7 +253,7 @@ def test_sparse_repetitions_learn_a_light_opaque_work_key() -> None:
 def test_application_safe_boundaries_reduce_mid_command_external_overload() -> None:
     cpu_lane = SimulatedLaneProfile(
         work_key=ExecutorWorkKey("io:cpu-heavy"),
-        concurrency_range=ExecutorConcurrencyRange(18, 18),
+        concurrency_range=ExecutorConcurrencyRange(1, 18),
         learned_cores_per_concurrency=1.0,
         actual_cores_per_concurrency=1.0,
         serial_seconds=0.0,

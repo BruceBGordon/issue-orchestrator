@@ -176,6 +176,21 @@ Framework-neutral clients can read
 pool declare a range of `1` through `1`; their CPU demand is still observed and
 learned. Repositories never estimate or declare admission capacity.
 
+No new YAML setting is required for queue-aware validation deadlines. The
+existing validation timeout remains the active command budget, so a command
+that does not use `executor-run` still times out at that exact value. Issue
+Orchestrator gives nested executor admission a separate equal allowance, making
+its absolute deadline twice the configured timeout, and gives the outer
+process-containment observer another 30-second margin. The nested CLI explicitly
+acknowledges its inherited deadline before admission; no repository flag or
+command-name detection is involved. That acknowledgement starts the outer
+watchdog, so queue wait receives the nested executor's full absolute deadline
+plus its containment margin. Queue wait therefore does not consume expected test
+time, while a broken queue and a stuck wrapper remain bounded. The
+validation-start event records all three clocks. If containment is required, the
+human timeout log records the exact expired phase so a post-run diagnosis can
+distinguish queueing, command execution, and outer containment.
+
 The executor derives its internal CPU-slot capacity from the machine. Every
 repository and worktree for the same OS user shares the pool automatically.
 The percentage below is the only host-pressure control exposed to users.

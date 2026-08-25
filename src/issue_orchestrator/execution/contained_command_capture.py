@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import codecs
+import os
+import selectors
 import subprocess
 import threading
 from dataclasses import dataclass, field
-from typing import TextIO, cast
+from typing import BinaryIO, cast
 
 from ..domain.contained_command import (
     ContainedCommandCaptureAborted,
@@ -19,6 +22,7 @@ from ..domain.contained_command import (
     ContainedCommandFailure,
     ContainedCommandMetrics,
     ContainedCommandNotStarted,
+    ContainedCommandOutputPolicy,
     ContainedCommandResult,
     ContainedCommandStarted,
     ContainedCommandSupervised,
@@ -96,14 +100,51 @@ class _OutputPumpDetachmentFailed:
 _OutputPumpDetachment = _OutputPumpDetached | _OutputPumpDetachmentFailed
 
 
+@dataclass(frozen=True, slots=True)
+class _OutputReadPending:
+    """No bytes were ready; the pump should continue polling."""
+
+
+@dataclass(frozen=True, slots=True)
+class _OutputReadFinished:
+    """EOF or the bounded final drain ended output consumption."""
+
+
+@dataclass(frozen=True, slots=True)
+class _OutputReadChunk:
+    """One byte chunk plus the remaining post-containment drain budget."""
+
+    data: bytes
+    remaining_final_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.data) is not bytes or not self.data:
+            raise ValueError("_OutputReadChunk.data must not be empty")
+        if (
+            type(self.remaining_final_bytes) is not int
+            or self.remaining_final_bytes < 0
+        ):
+            raise ValueError(
+                "_OutputReadChunk.remaining_final_bytes must be non-negative"
+            )
+
+
+_OutputRead = _OutputReadPending | _OutputReadFinished | _OutputReadChunk
+
+
 @dataclass(slots=True)
 class _CapturedOutputPump(ProcessGroupInterruption):
     """Drain output while exposing the first observer failure as interruption."""
 
-    stdout: TextIO
+    stdout: BinaryIO
     output: ContainedCommandOutput
     line_observer: ContainedCommandLineObserver
+    policy: ContainedCommandOutputPolicy
     _interruption: threading.Event = field(default_factory=threading.Event, init=False)
+    _stop_requested: threading.Event = field(
+        default_factory=threading.Event,
+        init=False,
+    )
     _sink_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _thread: threading.Thread = field(init=False)
     _failure: ContainedCommandFailure | None = field(default=None, init=False)
@@ -121,6 +162,10 @@ class _CapturedOutputPump(ProcessGroupInterruption):
                 "_CapturedOutputPump.line_observer must implement "
                 "ContainedCommandLineObserver"
             )
+        if type(self.policy) is not ContainedCommandOutputPolicy:
+            raise ValueError(
+                "_CapturedOutputPump.policy must be ContainedCommandOutputPolicy"
+            )
         self._thread = threading.Thread(
             target=self._drain,
             name="contained-command-output",
@@ -137,8 +182,14 @@ class _CapturedOutputPump(ProcessGroupInterruption):
 
     def finalize_after_containment(self) -> _OutputPumpFinalization:
         failure: ContainedCommandFailure | None = None
+        self._stop_requested.set()
         try:
-            self._thread.join()
+            self._thread.join(timeout=self.policy.shutdown_timeout_seconds)
+            if self._thread.is_alive():
+                raise TimeoutError(
+                    "contained command output pump did not stop after group "
+                    f"containment within {self.policy.shutdown_timeout_seconds}s"
+                )
         except BaseException as error:
             failure = ContainedCommandFailure(error)
             detachment = self.detach_after_cleanup_failure()
@@ -176,51 +227,138 @@ class _CapturedOutputPump(ProcessGroupInterruption):
 
     @property
     def failure(self) -> ContainedCommandFailure | None:
-        return self._failure
+        with self._sink_lock:
+            return self._failure
 
     @property
     def metrics(self) -> ContainedCommandMetrics:
-        return ContainedCommandMetrics(
-            line_count=self._line_count,
-            byte_count=self._byte_count,
-        )
+        with self._sink_lock:
+            return ContainedCommandMetrics(
+                line_count=self._line_count,
+                byte_count=self._byte_count,
+            )
 
     def _drain(self) -> None:
+        selector = selectors.DefaultSelector()
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
-            for line in self.stdout:
-                self._line_count += 1
-                self._byte_count += len(line.encode("utf-8", errors="replace"))
-                self._consume_line(line)
+            selector.register(self.stdout.fileno(), selectors.EVENT_READ)
+            pending_text = self._drain_chunks(selector, decoder)
+            pending_text += decoder.decode(b"", final=True)
+            if pending_text:
+                self._emit_line(pending_text)
         except BaseException as error:
             self._record_failure(error)
+        finally:
+            selector.close()
+
+    def _drain_chunks(
+        self,
+        selector: selectors.BaseSelector,
+        decoder: codecs.IncrementalDecoder,
+    ) -> str:
+        pending_text = ""
+        remaining_final_bytes = self.policy.final_drain_byte_limit
+        while True:
+            output_read = self._read_next_chunk(selector, remaining_final_bytes)
+            if type(output_read) is _OutputReadPending:
+                continue
+            if type(output_read) is _OutputReadFinished:
+                return pending_text
+            if type(output_read) is not _OutputReadChunk:
+                raise AssertionError("output read is a closed union")
+            self._record_byte_count(len(output_read.data))
+            pending_text = self._consume_decoded_text(
+                pending_text + decoder.decode(output_read.data)
+            )
+            remaining_final_bytes = output_read.remaining_final_bytes
+
+    def _read_next_chunk(
+        self,
+        selector: selectors.BaseSelector,
+        remaining_final_bytes: int,
+    ) -> _OutputRead:
+        stopping = self._stop_requested.is_set()
+        if stopping and remaining_final_bytes == 0:
+            return _OutputReadFinished()
+        selected = selector.select(
+            timeout=0.0 if stopping else self.policy.poll_interval_seconds
+        )
+        if not selected:
+            return _OutputReadFinished() if stopping else _OutputReadPending()
+        read_size = min(65_536, remaining_final_bytes) if stopping else 65_536
+        chunk = os.read(self.stdout.fileno(), read_size)
+        if not chunk:
+            return _OutputReadFinished()
+        return _OutputReadChunk(
+            chunk,
+            remaining_final_bytes - len(chunk) if stopping else remaining_final_bytes,
+        )
+
+    def _record_byte_count(self, byte_count: int) -> None:
+        with self._sink_lock:
+            if self._accepting_output:
+                self._byte_count += byte_count
+
+    def _consume_decoded_text(self, text: str) -> str:
+        while True:
+            newline = text.find("\n")
+            if newline < 0:
+                return text
+            self._emit_line(text[: newline + 1])
+            text = text[newline + 1 :]
+
+    def _emit_line(self, line: str) -> None:
+        self._consume_line(line)
 
     def _consume_line(self, line: str) -> None:
+        # Never hold the detachment lock across arbitrary caller code.  A sink
+        # may block forever; containment still has to return at its declared
+        # shutdown bound and atomically prevent any later callback from
+        # starting.
         with self._sink_lock:
             if not self._accepting_output:
                 return
-            try:
-                self.output.write_line(line)
-                if self._failure is None:
-                    self.line_observer.observe_line(line)
-            except BaseException as error:
-                self._record_failure(error)
+            output = self.output
+            line_observer = self.line_observer
+            self._line_count += 1
+        try:
+            output.write_line(line)
+            with self._sink_lock:
+                if not self._accepting_output or self._failure is not None:
+                    return
+            line_observer.observe_line(line)
+        except BaseException as error:
+            self._record_failure(error)
 
     def _record_failure(self, error: BaseException) -> None:
-        if self._failure is None:
+        with self._sink_lock:
+            if not self._accepting_output or self._failure is not None:
+                return
             self._failure = ContainedCommandFailure(error)
-            self._interruption.set()
+        self._interruption.set()
 
 
 class PosixContainedCommandCapture:
     """Own Popen, the output pump, group containment, and terminal classification."""
 
-    def __init__(self, process_group_supervisor: ProcessGroupSupervisor) -> None:
+    def __init__(
+        self,
+        process_group_supervisor: ProcessGroupSupervisor,
+        output_policy: ContainedCommandOutputPolicy,
+    ) -> None:
         if not isinstance(process_group_supervisor, ProcessGroupSupervisor):
             raise ValueError(
                 "PosixContainedCommandCapture.process_group_supervisor must "
                 "implement ProcessGroupSupervisor"
             )
         self._process_group_supervisor = process_group_supervisor
+        if type(output_policy) is not ContainedCommandOutputPolicy:
+            raise ValueError(
+                "PosixContainedCommandCapture.output_policy must be "
+                "ContainedCommandOutputPolicy"
+            )
+        self._output_policy = output_policy
 
     def capture(
         self,
@@ -257,15 +395,15 @@ class PosixContainedCommandCapture:
             )
 
     @staticmethod
-    def _spawn(command: ContainedShellCommand) -> subprocess.Popen[str]:
+    def _spawn(command: ContainedShellCommand) -> subprocess.Popen[bytes]:
         return subprocess.Popen(
             command.command,
             shell=True,
             cwd=command.working_directory,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            text=False,
+            bufsize=0,
             start_new_session=True,
         )
 
@@ -280,7 +418,7 @@ class PosixContainedCommandCapture:
 
     def _capture_started_process(
         self,
-        process: subprocess.Popen[str],
+        process: subprocess.Popen[bytes],
         output: ContainedCommandOutput,
         line_observer: ContainedCommandLineObserver,
     ) -> ContainedCommandResult:
@@ -305,9 +443,10 @@ class PosixContainedCommandCapture:
 
         try:
             pump = _CapturedOutputPump(
-                cast(TextIO, process.stdout),
+                cast(BinaryIO, process.stdout),
                 output,
                 line_observer,
+                self._output_policy,
             )
             pump.start()
         except BaseException as error:
@@ -390,7 +529,7 @@ class PosixContainedCommandCapture:
 
     def _abort_without_pump(
         self,
-        process: subprocess.Popen[str],
+        process: subprocess.Popen[bytes],
         leader: OwnedProcessGroupLeader,
         capture_failure: ContainedCommandFailure,
     ) -> ContainedCommandResult:
@@ -423,7 +562,7 @@ class PosixContainedCommandCapture:
 
     @staticmethod
     def _close_unpumped_stdout(
-        process: subprocess.Popen[str],
+        process: subprocess.Popen[bytes],
     ) -> ContainedCommandFailure | None:
         stdout = process.stdout
         if stdout is None:
@@ -436,7 +575,7 @@ class PosixContainedCommandCapture:
 
     def _recover_after_supervision_failure(
         self,
-        process: subprocess.Popen[str],
+        process: subprocess.Popen[bytes],
         leader: OwnedProcessGroupLeader,
         pump: _CapturedOutputPump,
         supervision_failure: ContainedCommandFailure,

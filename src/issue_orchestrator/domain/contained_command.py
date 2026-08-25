@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -13,6 +14,39 @@ def _require_exact(owner: str, field: str, value: object, expected: type) -> Non
 def _require_exception(owner: str, field: str, value: object) -> None:
     if not isinstance(value, BaseException):
         raise ValueError(f"{owner}.{field} must be an exception")
+
+
+@dataclass(frozen=True, slots=True)
+class ContainedCommandOutputPolicy:
+    """Bound output-pump responsiveness after a command group is contained."""
+
+    poll_interval_seconds: float
+    shutdown_timeout_seconds: float
+    final_drain_byte_limit: int
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("poll_interval_seconds", self.poll_interval_seconds),
+            ("shutdown_timeout_seconds", self.shutdown_timeout_seconds),
+        ):
+            if type(value) is not float or not math.isfinite(value) or value <= 0:
+                raise ValueError(
+                    f"ContainedCommandOutputPolicy.{field_name} must be "
+                    "finite and positive"
+                )
+        if self.shutdown_timeout_seconds <= self.poll_interval_seconds:
+            raise ValueError(
+                "ContainedCommandOutputPolicy.shutdown_timeout_seconds must "
+                "exceed poll_interval_seconds"
+            )
+        if (
+            type(self.final_drain_byte_limit) is not int
+            or self.final_drain_byte_limit < 1
+        ):
+            raise ValueError(
+                "ContainedCommandOutputPolicy.final_drain_byte_limit must be "
+                "a positive integer"
+            )
 
 
 @dataclass(frozen=True, slots=True)

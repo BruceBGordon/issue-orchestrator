@@ -435,7 +435,7 @@ class HostExecutor(Executor):
                         ExecutorGuardianRequest(
                             arguments=command.arguments,
                             environment=child_env,
-                            lease_file_descriptors=(lease.guardian_file_descriptors()),
+                            lease=lease,
                             budget=guardian_budget,
                             lifecycle=command.lifecycle,
                             cancellation=command.cancellation,

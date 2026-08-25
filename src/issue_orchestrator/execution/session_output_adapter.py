@@ -505,7 +505,7 @@ class FileSystemSessionOutput(RunDirectoryArtifacts):
             return None
         try:
             return ValidationRecord.from_dict(data)
-        except (KeyError, TypeError) as e:
+        except (KeyError, TypeError, ValueError) as e:
             logger.warning(
                 "Failed to parse validation record at %s: %s", record_path, e
             )
