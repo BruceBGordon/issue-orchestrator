@@ -14,6 +14,7 @@ from types import TracebackType
 from typing import TextIO, cast
 
 from issue_orchestrator.domain.executor import ExecutorConcurrencyRange
+from tests.process_tree_fixture import TermResistantChildProgram
 
 
 POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
@@ -57,21 +58,28 @@ class CloseFdsTreePressureCommand:
                 )
 
     def arguments(self, label: str) -> tuple[str, ...]:
+        descendant_source = TermResistantChildProgram(30).python_source()
         source = (
             "import os, pathlib, signal, subprocess, sys\n"
-            f"pathlib.Path({str(self.guardian_pid_path)!r}).write_text("
-            "str(os.getppid()))\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n"
             "descendant = subprocess.Popen(\n"
-            "    [sys.executable, '-c', "
-            "'import signal, time; signal.signal(signal.SIGTERM, "
-            "signal.SIG_IGN); time.sleep(30)'],\n"
+            f"    [sys.executable, '-c', {descendant_source!r}],\n"
             "    close_fds=True,\n"
             "    stdin=subprocess.DEVNULL,\n"
-            "    stdout=subprocess.DEVNULL,\n"
+            "    stdout=subprocess.PIPE,\n"
             "    stderr=subprocess.DEVNULL,\n"
+            "    text=True,\n"
             ")\n"
+            "if descendant.stdout is None:\n"
+            "    raise RuntimeError('descendant readiness pipe was not created')\n"
+            "reported_pid = int(descendant.stdout.readline())\n"
+            "if reported_pid != descendant.pid:\n"
+            "    raise RuntimeError('descendant readiness identity mismatch')\n"
+            f"pathlib.Path({str(self.guardian_pid_path)!r}).write_text("
+            "str(os.getppid()))\n"
             f"pathlib.Path({str(self.descendant_pid_path)!r}).write_text("
-            "str(descendant.pid))\n"
+            "str(reported_pid))\n"
+            "signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})\n"
             f"print({label!r}, flush=True)\n"
             "sys.stdin.readline()\n"
         )
@@ -105,11 +113,11 @@ class HungPressureCommand:
     def arguments(self, label: str) -> tuple[str, ...]:
         source = (
             "import os, pathlib, signal\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
             f"pathlib.Path({str(self.guardian_pid_path)!r}).write_text("
             "str(os.getppid()))\n"
             f"pathlib.Path({str(self.command_pid_path)!r}).write_text("
             "str(os.getpid()))\n"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
             f"print({label!r}, flush=True)\n"
             "signal.pause()\n"
         )

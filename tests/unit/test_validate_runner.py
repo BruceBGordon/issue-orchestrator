@@ -44,6 +44,10 @@ from issue_orchestrator.ports.process_group_supervisor import (
     ProcessGroupInterruption,
     ProcessGroupSupervisor,
 )
+from tests.process_tree_fixture import (
+    CooperativeTermResistantProcessTreeProgram,
+    ExitingTermResistantProcessTreeProgram,
+)
 from tests.unit.threading_helpers import run_in_thread
 
 
@@ -377,22 +381,15 @@ class TestValidateRunner:
         tmp_path: Path,
     ) -> None:
         output_dir = tmp_path / "output"
-        child_pid_path = tmp_path / "validation-child.pid"
-        resistant_child = (
-            "import signal, time; "
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
-        )
-        cooperative_leader = (
-            "import signal, subprocess, sys; "
-            f"descendant = subprocess.Popen([sys.executable, '-c', {resistant_child!r}], "
-            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-            "stderr=subprocess.DEVNULL); "
-            f"open({str(child_pid_path)!r}, 'w').write(str(descendant.pid)); "
-            "signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0)); "
-            "print('[validate-timing] START target=duplicate at=one', flush=True); "
-            "print('[validate-timing] START target=duplicate at=two', flush=True); "
-            "signal.pause()"
-        )
+        child_pid_path = (tmp_path / "validation-child.pid").resolve()
+        cooperative_leader = CooperativeTermResistantProcessTreeProgram(
+            child_pid_path,
+            30,
+            (
+                "[validate-timing] START target=duplicate at=one",
+                "[validate-timing] START target=duplicate at=two",
+            ),
+        ).python_source()
         command = (
             f"exec {shlex.quote(sys.executable)} -c "
             f"{shlex.quote(cooperative_leader)}"
@@ -448,22 +445,15 @@ class TestValidateRunner:
         tmp_path: Path,
     ) -> None:
         output_dir = tmp_path / "output"
-        child_pid_path = tmp_path / "cleanup-failure-child.pid"
-        resistant_child = (
-            "import signal, time; "
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
-        )
-        cooperative_leader = (
-            "import signal, subprocess, sys; "
-            f"child = subprocess.Popen([sys.executable, '-c', {resistant_child!r}], "
-            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-            "stderr=subprocess.DEVNULL); "
-            f"open({str(child_pid_path)!r}, 'w').write(str(child.pid)); "
-            "signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0)); "
-            "print('[validate-timing] START target=duplicate at=one', flush=True); "
-            "print('[validate-timing] START target=duplicate at=two', flush=True); "
-            "signal.pause()"
-        )
+        child_pid_path = (tmp_path / "cleanup-failure-child.pid").resolve()
+        cooperative_leader = CooperativeTermResistantProcessTreeProgram(
+            child_pid_path,
+            30,
+            (
+                "[validate-timing] START target=duplicate at=one",
+                "[validate-timing] START target=duplicate at=two",
+            ),
+        ).python_source()
         command = (
             f"exec {shlex.quote(sys.executable)} -c "
             f"{shlex.quote(cooperative_leader)}"
@@ -572,17 +562,14 @@ class TestValidateRunner:
         fake_git_repo: Path,
         tmp_path: Path,
     ) -> None:
-        descendant_pid_path = tmp_path / "natural-validation-descendant.pid"
-        resistant_child = (
-            "import signal, time; "
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)"
-        )
-        natural_leader = (
-            "import subprocess, sys; "
-            f"child = subprocess.Popen([sys.executable, '-c', {resistant_child!r}], "
-            "stdin=subprocess.DEVNULL); "
-            f"open({str(descendant_pid_path)!r}, 'w').write(str(child.pid))"
-        )
+        descendant_pid_path = (
+            tmp_path / "natural-validation-descendant.pid"
+        ).resolve()
+        natural_leader = ExitingTermResistantProcessTreeProgram(
+            descendant_pid_path,
+            300,
+            0,
+        ).python_source()
         command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(natural_leader)}"
 
         validation_thread, validation_result = run_in_thread(

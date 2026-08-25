@@ -41,6 +41,7 @@ from issue_orchestrator.domain.executor import ExecutorProcessTerminationPolicy
 from issue_orchestrator.ports.executor_command_guardian import (
     ExecutorGuardianRequest,
 )
+from tests.process_tree_fixture import ExitingTermResistantProcessTreeProgram
 
 
 def _guardian(
@@ -193,15 +194,12 @@ def _pid_has_exited(pid: int) -> bool:
 def test_missing_guardian_result_is_explicit_and_outer_contains_group(
     tmp_path: Path,
 ) -> None:
-    descendant_path = tmp_path / "guardian-crash-descendant.pid"
-    fault = (
-        "import pathlib, signal, subprocess, sys; "
-        "child = subprocess.Popen([sys.executable, '-c', "
-        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "time.sleep(30)']); "
-        f"pathlib.Path({str(descendant_path)!r}).write_text(str(child.pid)); "
-        "raise SystemExit(23)"
-    )
+    descendant_path = (tmp_path / "guardian-crash-descendant.pid").resolve()
+    fault = ExitingTermResistantProcessTreeProgram(
+        descendant_path,
+        30,
+        23,
+    ).python_source()
     with _lease_descriptor() as lease_fd:
         with pytest.raises(
             ExecutorGuardianProtocolError,

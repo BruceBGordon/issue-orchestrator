@@ -73,6 +73,10 @@ from issue_orchestrator.domain.models import AgentConfig, TaskKind
 from issue_orchestrator.domain.session_run import SessionRunAssets
 from issue_orchestrator.domain.session_watchdog import ScheduledSessionWatchdog
 from issue_orchestrator.ports.host_cpu_utilization import HostCpuUtilizationObserver
+from tests.process_tree_fixture import (
+    CooperativeTermResistantProcessTreeProgram,
+    ExitingTermResistantProcessTreeProgram,
+)
 from tests.unit.session_run_helpers import make_session_run_assets
 from tests.unit.executor_guardian_helpers import executor_command_guardian
 
@@ -633,17 +637,12 @@ def test_descendant_is_gone_before_timed_out_phase_releases_lease(
 ) -> None:
     """A cooperative leader cannot release capacity around a resistant child."""
     pool_dir = tmp_path / "pool"
-    descendant_pid_file = tmp_path / "descendant.pid"
-    leader_script = (
-        "import signal, subprocess, sys; "
-        "descendant = subprocess.Popen([sys.executable, '-c', "
-        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "time.sleep(300)'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-        "stderr=subprocess.DEVNULL); "
-        f"open({str(descendant_pid_file)!r}, 'w').write(str(descendant.pid)); "
-        "signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0)); "
-        "signal.pause()"
-    )
+    descendant_pid_file = (tmp_path / "descendant.pid").resolve()
+    leader_script = CooperativeTermResistantProcessTreeProgram(
+        descendant_pid_file,
+        300,
+        (),
+    ).python_source()
 
     executor = _deterministic_host_executor(
         pool_dir,
@@ -688,18 +687,12 @@ def test_natural_phase_completion_contains_descendant_before_lease_release(
 ) -> None:
     """A successful leader cannot leave a detached same-group child behind."""
     pool_dir = tmp_path / "pool"
-    descendant_pid_file = tmp_path / "natural-descendant.pid"
-    resistant_child = (
-        "import signal, time; "
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)"
-    )
-    leader_script = (
-        "import subprocess, sys; "
-        f"child = subprocess.Popen([sys.executable, '-c', {resistant_child!r}], "
-        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-        "stderr=subprocess.DEVNULL); "
-        f"open({str(descendant_pid_file)!r}, 'w').write(str(child.pid))"
-    )
+    descendant_pid_file = (tmp_path / "natural-descendant.pid").resolve()
+    leader_script = ExitingTermResistantProcessTreeProgram(
+        descendant_pid_file,
+        300,
+        0,
+    ).python_source()
     executor = _deterministic_host_executor(
         pool_dir,
         host_cpu_observer=_IdleHostCpuObserver(),

@@ -326,8 +326,8 @@ def test_session_stop_contains_executor_guardian_and_opaque_command(
     opaque_pid_path = tmp_path / "opaque.pid"
     command_source = (
         "import os,pathlib,signal,time; "
-        f"pathlib.Path({str(opaque_pid_path)!r}).write_text(str(os.getpid())); "
         "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"pathlib.Path({str(opaque_pid_path)!r}).write_text(str(os.getpid())); "
         "print('OPAQUE-READY',flush=True); "
         "time.sleep(60)"
     )
@@ -371,8 +371,8 @@ def test_stalled_outer_session_cannot_strand_executor_guardian(
     opaque_pid_path = tmp_path / "opaque.pid"
     command_source = (
         "import os,pathlib,signal,time; "
-        f"pathlib.Path({str(opaque_pid_path)!r}).write_text(str(os.getpid())); "
         "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"pathlib.Path({str(opaque_pid_path)!r}).write_text(str(os.getpid())); "
         "print('OPAQUE-READY',flush=True); "
         "time.sleep(60)"
     )

@@ -7,6 +7,9 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
+
+import pytest
 
 from issue_orchestrator.domain.executor import ExecutorProcessTerminationPolicy
 from issue_orchestrator.domain.process_group import (
@@ -21,27 +24,13 @@ from issue_orchestrator.execution.process_group_supervisor import (
 from issue_orchestrator.execution.process_group_terminator import (
     PosixProcessGroupTerminator,
 )
-
-
-_LEADER_SCRIPT = """
-import signal
-import subprocess
-import sys
-
-descendant = subprocess.Popen(
-    [
-        sys.executable,
-        "-c",
-        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)",
-    ],
-    stdin=subprocess.DEVNULL,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
+from tests.process_tree_fixture import (
+    CooperativeTermResistantProcessTreeProgram,
+    ExitingTermResistantProcessTreeProgram,
 )
-print(descendant.pid, flush=True)
-signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(0))
-signal.pause()
-"""
+
+
+pytestmark = pytest.mark.timeout(30)
 
 
 def _pid_has_exited(pid: int, *, deadline_seconds: float = 5.0) -> bool:
@@ -58,10 +47,18 @@ def _pid_has_exited(pid: int, *, deadline_seconds: float = 5.0) -> bool:
     return False
 
 
-def test_term_resistant_descendant_dies_when_cooperative_leader_exits() -> None:
+def test_term_resistant_descendant_dies_when_cooperative_leader_exits(
+    tmp_path: Path,
+) -> None:
     """A leader's TERM exit must not suppress the whole-group SIGKILL."""
+    descendant_pid_path = (tmp_path / "cooperative-descendant.pid").resolve()
+    leader = CooperativeTermResistantProcessTreeProgram(
+        descendant_pid_path,
+        300,
+        ("TREE-READY",),
+    )
     process = subprocess.Popen(
-        [sys.executable, "-c", _LEADER_SCRIPT],
+        [sys.executable, "-c", leader.python_source()],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -69,7 +66,12 @@ def test_term_resistant_descendant_dies_when_cooperative_leader_exits() -> None:
     )
     if process.stdout is None:
         raise AssertionError("leader readiness pipe was not created")
-    descendant_pid = int(process.stdout.readline().strip())
+    readiness = process.stdout.readline()
+    assert readiness == "TREE-READY\n", (
+        f"leader readiness mismatch: line={readiness!r} "
+        f"returncode={process.poll()!r}"
+    )
+    descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
     terminator = PosixProcessGroupTerminator(
         ExecutorProcessTerminationPolicy(
             graceful_shutdown_seconds=0.1,
@@ -97,28 +99,22 @@ def test_term_resistant_descendant_dies_when_cooperative_leader_exits() -> None:
             process.wait(timeout=1.0)
 
 
-def test_natural_leader_exit_contains_descendant_before_reaping() -> None:
-    resistant_child = (
-        "import signal, time; "
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
-    )
-    natural_leader = (
-        "import subprocess, sys; "
-        f"child = subprocess.Popen([sys.executable, '-c', {resistant_child!r}], "
-        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-        "stderr=subprocess.DEVNULL); "
-        "print(child.pid, flush=True)"
+def test_natural_leader_exit_contains_descendant_before_reaping(
+    tmp_path: Path,
+) -> None:
+    descendant_pid_path = (tmp_path / "natural-descendant.pid").resolve()
+    natural_leader = ExitingTermResistantProcessTreeProgram(
+        descendant_pid_path,
+        30,
+        0,
     )
     process = subprocess.Popen(
-        [sys.executable, "-c", natural_leader],
+        [sys.executable, "-c", natural_leader.python_source()],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
     )
-    if process.stdout is None:
-        raise AssertionError("leader readiness pipe was not created")
-    descendant_pid = int(process.stdout.readline().strip())
     supervisor = PosixProcessGroupSupervisor(
         PosixProcessGroupTerminator(
             ExecutorProcessTerminationPolicy(
@@ -137,9 +133,12 @@ def test_natural_leader_exit_contains_descendant_before_reaping() -> None:
         process.returncode = supervision.termination.leader_exit_code
         assert type(supervision) is ProcessGroupCompleted
         assert process.returncode == 0
+        descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
         assert _pid_has_exited(descendant_pid)
     finally:
-        try:
-            os.kill(descendant_pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if descendant_pid_path.exists():
+            descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
+            try:
+                os.kill(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
