@@ -10,7 +10,7 @@ from ..domain.posix_pipe import (
     PosixPipeClosed,
     PosixPipeCloseFailed,
 )
-from ..ports.posix_pipe import PosixPipe, PosixPipeReader
+from ..ports.posix_pipe import PosixPipe, PosixPipeReader, PosixPipeWriter
 from .independent_cleanup import (
     CleanupAction,
     CleanupFailed,
@@ -48,6 +48,16 @@ def _close_reader(reader: PosixPipeReader | None) -> BaseException | None:
         return None
     try:
         reader.close()
+    except BaseException as error:
+        return error
+    return None
+
+
+def _close_writer(writer: PosixPipeWriter | None) -> BaseException | None:
+    if writer is None:
+        return None
+    try:
+        writer.close()
     except BaseException as error:
         return error
     return None
@@ -104,6 +114,33 @@ class OwnedPosixPipe:
                 _close_reader(reader),
             )
         return reader
+
+    def transfer_writer_after_launch(self) -> PosixPipeWriter:
+        previous_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK,
+            _TRANSFER_SIGNALS,
+        )
+        writer: PosixPipeWriter | None = None
+        try:
+            os.close(self._read_descriptor)
+            self._read_descriptor = -1
+            writer = os.fdopen(self._write_descriptor, "wb", buffering=0)
+            self._write_descriptor = -1
+        except BaseException as transfer_error:
+            raise _combine_errors(
+                "POSIX pipe writer transfer failed",
+                transfer_error,
+                _restore_mask(previous_mask),
+                _close_writer(writer),
+            )
+        restoration_error = _restore_mask(previous_mask)
+        if restoration_error is not None:
+            raise _combine_errors(
+                "POSIX pipe signal restoration failed",
+                restoration_error,
+                _close_writer(writer),
+            )
+        return writer
 
     def close(self) -> PosixPipeClosed | PosixPipeCloseFailed:
         actions = tuple(

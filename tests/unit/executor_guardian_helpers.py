@@ -20,6 +20,11 @@ from issue_orchestrator.execution.host_executor.guardian_launcher import (
 from issue_orchestrator.execution.atomic_record_store import (
     OsAtomicRecordStoreFactory,
 )
+from issue_orchestrator.entrypoints.bootstrap import build_posix_process_launcher
+from issue_orchestrator.execution.guardian_launch_pipes import (
+    PosixGuardianLaunchPipesFactory,
+)
+from issue_orchestrator.execution.posix_pipe import OsPosixPipeFactory
 from issue_orchestrator.execution.process_group_supervisor import (
     PosixProcessGroupSupervisor,
 )
@@ -58,13 +63,13 @@ def executor_command_guardian(
             1.0,
         ),
         OsAtomicRecordStoreFactory(),
+        build_posix_process_launcher(),
+        PosixGuardianLaunchPipesFactory(OsPosixPipeFactory()),
         PosixProcessGroupSupervisor(
             PosixProcessGroupTerminator(
                 termination_policy,
                 build_test_process_group_observer(),
             )
         ),
-        ExecutorGuardianTerminationPolicy(
-            termination_policy.graceful_shutdown_seconds
-        ),
+        ExecutorGuardianTerminationPolicy(termination_policy.graceful_shutdown_seconds),
     )

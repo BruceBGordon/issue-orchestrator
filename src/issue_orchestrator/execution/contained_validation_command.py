@@ -36,26 +36,6 @@ from ..domain.validation_execution import (
     validation_cleanup_from_supervision,
 )
 from ..infra.validation_executor_handshake import ValidationExecutorHandshakeDecoder
-
-
-_ExactValue = TypeVar("_ExactValue")
-
-
-def _require_exact_type(
-    value: object,
-    expected_type: type[_ExactValue],
-    field_name: str,
-) -> _ExactValue:
-    if type(value) is not expected_type:
-        raise ValueError(f"{field_name} must be {expected_type.__name__}")
-    return cast(_ExactValue, value)
-
-
-def _require_positive_float(value: float, field_name: str) -> None:
-    if type(value) is not float or value <= 0:
-        raise ValueError(f"{field_name} must be a positive float")
-
-
 from ..ports.posix_pipe import PosixPipeReader
 from ..ports.posix_process import (
     PosixProcessHandle,
@@ -86,6 +66,24 @@ from .validation_pipe_resources import (
     ValidationPipeRole,
     ValidationPipeSelectorFactory,
 )
+
+
+_ExactValue = TypeVar("_ExactValue")
+
+
+def _require_exact_type(
+    value: object,
+    expected_type: type[_ExactValue],
+    field_name: str,
+) -> _ExactValue:
+    if type(value) is not expected_type:
+        raise ValueError(f"{field_name} must be {expected_type.__name__}")
+    return cast(_ExactValue, value)
+
+
+def _require_positive_float(value: float, field_name: str) -> None:
+    if type(value) is not float or value <= 0:
+        raise ValueError(f"{field_name} must be a positive float")
 
 
 def _combined_error(

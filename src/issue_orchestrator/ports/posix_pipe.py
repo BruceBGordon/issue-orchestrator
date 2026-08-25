@@ -17,6 +17,15 @@ class PosixPipeReader(Protocol):
 
 
 @runtime_checkable
+class PosixPipeWriter(Protocol):
+    """Minimal binary writer transferred from a retained pipe."""
+
+    def fileno(self) -> int: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
 class PosixPipe(Protocol):
     """One pipe whose descriptor ownership cannot be ambiguous."""
 
@@ -28,6 +37,10 @@ class PosixPipe(Protocol):
 
     def transfer_reader_after_launch(self) -> PosixPipeReader:
         """Close the child endpoint and transfer the parent reader."""
+        ...
+
+    def transfer_writer_after_launch(self) -> PosixPipeWriter:
+        """Close the parent reader and transfer the parent writer."""
         ...
 
     def close(self) -> PosixPipeClose:

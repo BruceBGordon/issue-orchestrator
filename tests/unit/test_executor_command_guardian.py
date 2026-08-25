@@ -40,6 +40,7 @@ from issue_orchestrator.domain.process_group_sentinel import (
     ProcessGroupSentinelProgram,
 )
 from issue_orchestrator.execution.host_executor.guardian_launcher import (
+    ExecutorGuardianLaunchError,
     ExecutorGuardianProgram,
     ExecutorGuardianProtocolError,
     PosixExecutorCommandGuardian,
@@ -47,6 +48,11 @@ from issue_orchestrator.execution.host_executor.guardian_launcher import (
 from issue_orchestrator.execution.atomic_record_store import (
     OsAtomicRecordStoreFactory,
 )
+from issue_orchestrator.entrypoints.bootstrap import build_posix_process_launcher
+from issue_orchestrator.execution.guardian_launch_pipes import (
+    PosixGuardianLaunchPipesFactory,
+)
+from issue_orchestrator.execution.posix_pipe import OsPosixPipeFactory
 from issue_orchestrator.execution.process_group_supervisor import (
     PosixProcessGroupSupervisor,
 )
@@ -62,6 +68,13 @@ from issue_orchestrator.ports.process_group_supervisor import (
     ProcessGroupInterruption,
     ProcessGroupSupervisor,
 )
+from issue_orchestrator.ports.posix_process import (
+    PosixProcessLaunch,
+    PosixProcessLauncher,
+    PosixProcessLaunchRecoveryFailed,
+    PosixProcessLaunchStarted,
+)
+from issue_orchestrator.domain.posix_process import PosixProcessLaunchSpec
 from tests.process_tree_fixture import (
     ExitingTermResistantProcessTreeProgram,
     ProcessTreeMember,
@@ -86,6 +99,8 @@ def _guardian(
         _sentinel_program(),
         ProcessGroupSentinelPolicy(0.1, 1.0),
         OsAtomicRecordStoreFactory(),
+        build_posix_process_launcher(),
+        PosixGuardianLaunchPipesFactory(OsPosixPipeFactory()),
         PosixProcessGroupSupervisor(
             PosixProcessGroupTerminator(
                 termination,
@@ -193,6 +208,27 @@ class _LateInterruptionAfterCompletionSupervisor:
         return self._delegate.abort(leader)
 
 
+class _IndeterminateGuardianLauncher:
+    """Report a real started guardian as uncontained after parent finalization."""
+
+    def __init__(self, delegate: PosixProcessLauncher) -> None:
+        if not isinstance(delegate, PosixProcessLauncher):
+            raise ValueError("delegate must implement PosixProcessLauncher")
+        self._delegate = delegate
+        self.started_process_id: int | None = None
+
+    def launch(self, specification: PosixProcessLaunchSpec) -> PosixProcessLaunch:
+        outcome = self._delegate.launch(specification)
+        if type(outcome) is not PosixProcessLaunchStarted:
+            return outcome
+        self.started_process_id = outcome.process.process_id
+        return PosixProcessLaunchRecoveryFailed(
+            outcome.process.process_id,
+            RuntimeError("injected guardian parent finalization failure"),
+            RuntimeError("injected first guardian recovery failure"),
+        )
+
+
 @pytest.mark.parametrize(
     ("command", "expected_exit_code"),
     (
@@ -241,6 +277,8 @@ def test_completed_terminal_record_wins_over_late_parent_sigterm(
         _sentinel_program(),
         ProcessGroupSentinelPolicy(0.1, 1.0),
         OsAtomicRecordStoreFactory(),
+        build_posix_process_launcher(),
+        PosixGuardianLaunchPipesFactory(OsPosixPipeFactory()),
         supervisor,
         ExecutorGuardianTerminationPolicy(termination.graceful_shutdown_seconds),
     )
@@ -328,15 +366,69 @@ def test_guardian_reports_command_start_failure_without_exit_fabrication() -> No
     assert "/definitely/missing/executor-command" in terminal.error_repr
 
 
+def test_indeterminate_guardian_activation_gets_second_containment_attempt() -> None:
+    termination = ExecutorProcessTerminationPolicy(0.1, 1.0)
+    launcher = _IndeterminateGuardianLauncher(build_posix_process_launcher())
+    guardian = PosixExecutorCommandGuardian(
+        ExecutorGuardianProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.execution.host_executor.guardian",
+            )
+        ),
+        _sentinel_program(),
+        ProcessGroupSentinelPolicy(0.1, 1.0),
+        OsAtomicRecordStoreFactory(),
+        launcher,
+        PosixGuardianLaunchPipesFactory(OsPosixPipeFactory()),
+        PosixProcessGroupSupervisor(
+            PosixProcessGroupTerminator(
+                termination,
+                build_test_process_group_observer(),
+            )
+        ),
+        ExecutorGuardianTerminationPolicy(termination.graceful_shutdown_seconds),
+    )
+
+    with _lease_descriptor() as lease_fd:
+        with pytest.raises(
+            ExecutorGuardianLaunchError,
+            match="guardian activation could not prove containment",
+        ):
+            guardian.run(
+                _request(
+                    lease_fd,
+                    (
+                        sys.executable,
+                        "-c",
+                        "raise AssertionError('command start gate must stay closed')",
+                    ),
+                    budget=ExecutorGuardianUnboundedBudget(),
+                )
+            )
+
+    assert launcher.started_process_id is not None
+    try:
+        os.kill(launcher.started_process_id, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        raise AssertionError("second-chance guardian containment left a live process")
+
+
 def test_missing_guardian_result_is_explicit_and_outer_contains_group(
     tmp_path: Path,
 ) -> None:
     descendant_path = (tmp_path / "guardian-crash-descendant.pid").resolve()
-    fault = _fault_guardian_protocol_prelude() + ExitingTermResistantProcessTreeProgram(
-        descendant_path,
-        300,
-        23,
-    ).python_source()
+    fault = (
+        _fault_guardian_protocol_prelude()
+        + ExitingTermResistantProcessTreeProgram(
+            descendant_path,
+            300,
+            23,
+        ).python_source()
+    )
     with _lease_descriptor() as lease_fd:
         with pytest.raises(
             ExecutorGuardianProtocolError,

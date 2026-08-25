@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import shlex
 import sys
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -42,7 +44,11 @@ from issue_orchestrator.execution.process_group_supervisor import (
 from issue_orchestrator.execution.process_group_terminator import (
     PosixProcessGroupTerminator,
 )
-from issue_orchestrator.domain.posix_process import PosixProcessProgram
+from issue_orchestrator.domain.posix_process import (
+    PosixDescriptorMapping,
+    PosixProcessEnvironment,
+    PosixProcessProgram,
+)
 from issue_orchestrator.execution.posix_pipe import OsPosixPipeFactory
 from issue_orchestrator.execution.posix_process import (
     MaskedPosixSpawnPrimitive,
@@ -63,6 +69,13 @@ from issue_orchestrator.ports.validation_pipe_capture import (
     ValidationPipeCapture,
     ValidationPipeCaptureFactory,
     ValidationPipeCaptureResult,
+)
+from issue_orchestrator.ports.validation_launch_pipes import (
+    ValidationLaunchPipes,
+    ValidationLaunchPipesClose,
+    ValidationLaunchPipesClosed,
+    ValidationLaunchPipesFactory,
+    ValidationLaunchReaders,
 )
 from issue_orchestrator.infra.validation_executor_handshake import (
     VALIDATION_EXECUTOR_HANDSHAKE_ENVIRONMENT,
@@ -91,6 +104,18 @@ def _runner_with(
     supervisor: ProcessGroupSupervisor,
     capture_factory: ValidationPipeCaptureFactory,
 ) -> PosixContainedValidationCommandRunner:
+    return _runner_with_launch_pipes(
+        supervisor,
+        capture_factory,
+        PosixValidationLaunchPipesFactory(OsPosixPipeFactory()),
+    )
+
+
+def _runner_with_launch_pipes(
+    supervisor: ProcessGroupSupervisor,
+    capture_factory: ValidationPipeCaptureFactory,
+    launch_pipes_factory: ValidationLaunchPipesFactory,
+) -> PosixContainedValidationCommandRunner:
     return PosixContainedValidationCommandRunner(
         RetainedPosixProcessLauncher(
             PosixProcessProgram(
@@ -114,7 +139,7 @@ def _runner_with(
             final_drain_byte_limit=1_048_576,
         ),
         capture_factory,
-        PosixValidationLaunchPipesFactory(OsPosixPipeFactory()),
+        launch_pipes_factory,
     )
 
 
@@ -200,6 +225,42 @@ class _SetupFailingCaptureFactory:
         for stream in (stdout, stderr, handshake_reader):
             stream.close()
         raise RuntimeError("injected validation capture setup failure")
+
+
+@dataclass(frozen=True, slots=True)
+class _TransferFailingValidationLaunchPipes(ValidationLaunchPipes):
+    delegate: ValidationLaunchPipes
+    failure: RuntimeError
+
+    @property
+    def descriptor_mappings(self) -> tuple[PosixDescriptorMapping, ...]:
+        return self.delegate.descriptor_mappings
+
+    def child_environment(
+        self,
+        base_environment: Mapping[str, str],
+    ) -> PosixProcessEnvironment:
+        return self.delegate.child_environment(base_environment)
+
+    def transfer_readers_after_launch(self) -> ValidationLaunchReaders:
+        outcome = self.delegate.close()
+        if type(outcome) is not ValidationLaunchPipesClosed:
+            raise AssertionError("injected transfer precleanup unexpectedly failed")
+        raise self.failure
+
+    def close(self) -> ValidationLaunchPipesClose:
+        return self.delegate.close()
+
+
+@dataclass(frozen=True, slots=True)
+class _TransferFailingValidationLaunchPipesFactory(ValidationLaunchPipesFactory):
+    failure: RuntimeError
+
+    def create(self) -> ValidationLaunchPipes:
+        return _TransferFailingValidationLaunchPipes(
+            PosixValidationLaunchPipesFactory(OsPosixPipeFactory()).create(),
+            self.failure,
+        )
 
 
 class _SupervisionFailingOwner(ProcessGroupSupervisor):
@@ -460,6 +521,31 @@ def test_capture_setup_failure_contains_and_reaps_started_child(
     assert _exception_messages(result.cleanup.error) == (
         "injected validation capture setup failure",
     )
+    ProcessTreeMember(result.child.process_id).assert_contained()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process containment")
+@pytest.mark.timeout(10)
+def test_post_spawn_reader_transfer_failure_contains_and_reaps_started_child(
+    tmp_path: Path,
+) -> None:
+    transfer_failure = RuntimeError("injected validation reader transfer failure")
+    result = _runner_with_launch_pipes(
+        _production_supervisor(),
+        PosixValidationPipeCaptureFactory(default_validation_pipe_selector),
+        _TransferFailingValidationLaunchPipesFactory(transfer_failure),
+    ).run(
+        ContainedValidationCommand(
+            command=f"exec {shlex.quote(sys.executable)} -c 'import time; time.sleep(300)'",
+            working_directory=tmp_path.resolve(),
+            environment=os.environ,
+            deadline=ValidationExecutionDeadline.for_active_timeout(5),
+        )
+    )
+
+    assert type(result.child) is ValidationCommandExited
+    assert type(result.cleanup) is ValidationCommandCleanupFailed
+    assert result.cleanup.error is transfer_failure
     ProcessTreeMember(result.child.process_id).assert_contained()
 
 

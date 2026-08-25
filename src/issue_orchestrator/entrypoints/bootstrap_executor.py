@@ -347,6 +347,8 @@ def build_executor_command_guardian() -> ExecutorCommandGuardian:
         ExecutorGuardianProgram,
         PosixExecutorCommandGuardian,
     )
+    from ..execution.guardian_launch_pipes import PosixGuardianLaunchPipesFactory
+    from ..execution.posix_pipe import OsPosixPipeFactory
     from ..domain.process_group_sentinel import (
         ProcessGroupSentinelPolicy,
         ProcessGroupSentinelProgram,
@@ -372,6 +374,8 @@ def build_executor_command_guardian() -> ExecutorCommandGuardian:
             startup_timeout_seconds=_TERMINAL_SESSION_OWNER.startup_timeout_seconds,
         ),
         build_atomic_record_store_factory(),
+        build_posix_process_launcher(),
+        PosixGuardianLaunchPipesFactory(OsPosixPipeFactory()),
         build_process_group_supervisor(),
         ExecutorGuardianTerminationPolicy(
             _PROCESS_TERMINATION.graceful_shutdown_seconds

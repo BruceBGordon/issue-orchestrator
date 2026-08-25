@@ -6,7 +6,6 @@ from __future__ import annotations
 import os
 import selectors
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -37,9 +36,32 @@ from ...domain.process_group import (
     ProcessGroupSupervision,
     ProcessGroupUnboundedWait,
 )
+from ...domain.posix_process import (
+    PosixDescriptorMapping,
+    PosixProcessEnvironment,
+    PosixProcessGroupMode,
+    PosixProcessLaunchSpec,
+    PosixProcessProgram,
+    PosixProcessWithoutTerminal,
+)
 from ...ports.executor_command_guardian import ExecutorGuardianRequest
 from ...ports.atomic_record_store import AtomicRecordStoreFactory
 from ...ports.process_group_supervisor import ProcessGroupSupervisor
+from ...ports.guardian_launch_pipes import (
+    GuardianLaunchPipes,
+    GuardianLaunchPipesClosed,
+    GuardianLaunchPipesCloseFailed,
+    GuardianLaunchPipesFactory,
+)
+from ...ports.posix_process import (
+    PosixProcessHandle,
+    PosixProcessLaunch,
+    PosixProcessLauncher,
+    PosixProcessLaunchRecovered,
+    PosixProcessLaunchRecoveryFailed,
+    PosixProcessLaunchRejected,
+    PosixProcessLaunchStarted,
+)
 from ..process_group_supervisor import NeverInterruptProcessGroup
 from ..independent_cleanup import (
     CleanupAction,
@@ -84,6 +106,29 @@ class ExecutorGuardianLaunchError(RuntimeError):
 
 class ExecutorGuardianProtocolError(RuntimeError):
     """Raised when a guardian exits without one exact terminal record."""
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardianActivationStarted:
+    process: PosixProcessHandle
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardianActivationContained:
+    error: BaseException
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardianActivationUncontained:
+    process_id: int
+    error: BaseException
+
+
+_GuardianActivation = (
+    _GuardianActivationStarted
+    | _GuardianActivationContained
+    | _GuardianActivationUncontained
+)
 
 
 class _NoParentInterruption:
@@ -238,6 +283,8 @@ class PosixExecutorCommandGuardian:
         sentinel_program: ProcessGroupSentinelProgram,
         sentinel_policy: ProcessGroupSentinelPolicy,
         record_stores: AtomicRecordStoreFactory,
+        process_launcher: PosixProcessLauncher,
+        launch_pipes_factory: GuardianLaunchPipesFactory,
         process_group_supervisor: ProcessGroupSupervisor,
         termination_policy: ExecutorGuardianTerminationPolicy,
     ) -> None:
@@ -265,6 +312,18 @@ class PosixExecutorCommandGuardian:
         self._sentinel_program = sentinel_program
         self._sentinel_policy = sentinel_policy
         self._record_stores = record_stores
+        if not callable(getattr(process_launcher, "launch", None)):
+            raise ValueError(
+                "PosixExecutorCommandGuardian.process_launcher must implement "
+                "PosixProcessLauncher"
+            )
+        self._process_launcher = process_launcher
+        if not callable(getattr(launch_pipes_factory, "create", None)):
+            raise ValueError(
+                "PosixExecutorCommandGuardian.launch_pipes_factory must implement "
+                "GuardianLaunchPipesFactory"
+            )
+        self._launch_pipes_factory = launch_pipes_factory
         self._process_group_supervisor = process_group_supervisor
         self._termination_policy = termination_policy
 
@@ -274,40 +333,23 @@ class PosixExecutorCommandGuardian:
                 "PosixExecutorCommandGuardian.run requires ExecutorGuardianRequest"
             )
         terminal_foreground = _controlling_terminal(request.lifecycle)
-        result_read_fd, result_write_fd = os.pipe()
-        start_read_fd, start_write_fd = os.pipe()
-        owner_ready_read_fd, owner_ready_write_fd = os.pipe()
-        cancellation_lease = self._prepare_cancellation(
-            request,
-            (
-                result_read_fd,
-                result_write_fd,
-                start_read_fd,
-                start_write_fd,
-                owner_ready_read_fd,
-                owner_ready_write_fd,
-            ),
-        )
+        pipes = self._launch_pipes_factory.create()
+        cancellation_lease = self._prepare_cancellation(request, pipes)
         cancellation_controls = cancellation_lease.controls()
-        guardian: subprocess.Popen[bytes] | None = None
+        guardian: PosixProcessHandle | None = None
+        uncontained_process_id: int | None = None
         group_contained = False
-        result_write_open = True
-        start_read_open = True
-        start_write_open = True
-        owner_ready_read_open = True
-        owner_ready_write_open = True
         try:
             lease_file_descriptors = request.lease.inherited_file_descriptors()
+            child_descriptors = pipes.child_descriptors
             invocation = GuardianInvocationRecord.create(
                 arguments=request.arguments,
-                result_file_descriptor=result_write_fd,
-                start_file_descriptor=start_read_fd,
-                owner_ready_file_descriptor=owner_ready_write_fd,
+                result_file_descriptor=child_descriptors.result_writer,
+                start_file_descriptor=child_descriptors.start_reader,
+                owner_ready_file_descriptor=child_descriptors.owner_ready_writer,
                 lifecycle=request.lifecycle,
                 budget=request.budget,
-                cancellation=self._guardian_cancellation_record(
-                    cancellation_controls
-                ),
+                cancellation=self._guardian_cancellation_record(cancellation_controls),
                 termination_policy=self._termination_policy,
                 sentinel_program=self._sentinel_program,
                 sentinel_policy=self._sentinel_policy,
@@ -320,56 +362,47 @@ class PosixExecutorCommandGuardian:
             )
             inherited_descriptors = (
                 *lease_file_descriptors,
-                result_write_fd,
-                start_read_fd,
-                owner_ready_write_fd,
-                *self._guardian_cancellation_descriptors(
-                    cancellation_controls
-                ),
+                *self._guardian_cancellation_descriptors(cancellation_controls),
             )
             with _installed_parent_interruption(request.lifecycle) as interruption:
-                try:
-                    guardian = self._spawn_guardian(
-                        guardian_arguments,
-                        request,
-                        inherited_descriptors,
-                    )
-                except OSError as error:
-                    raise ExecutorGuardianLaunchError(
-                        f"could not start executor guardian: {error!r}"
-                    ) from error
+                activation = self._activate_guardian(
+                    guardian_arguments,
+                    request,
+                    pipes.descriptor_mappings(inherited_descriptors),
+                )
+                if type(activation) is _GuardianActivationContained:
+                    raise activation.error
+                if type(activation) is _GuardianActivationUncontained:
+                    uncontained_process_id = activation.process_id
+                    raise activation.error
+                if type(activation) is not _GuardianActivationStarted:
+                    raise AssertionError("guardian activation is a closed union")
+                guardian = activation.process
                 # The guardian now owns inherited copies. Close the outer
                 # executor's references before publishing or starting work so
                 # a stopped outer process cannot retain machine capacity.
-                os.close(result_write_fd)
-                result_write_open = False
-                os.close(start_read_fd)
-                start_read_open = False
-                os.close(owner_ready_write_fd)
-                owner_ready_write_open = False
+                endpoints = pipes.transfer_parent_endpoints_after_launch()
                 self._await_guardian_owner_ready(
-                    owner_ready_read_fd,
+                    endpoints.owner_ready_reader.fileno(),
                     guardian,
                 )
-                os.close(owner_ready_read_fd)
-                owner_ready_read_open = False
                 request.lease.transfer_to_guardian()
                 cancellation_lease.activate()
                 cancellation_lease.transfer_to_owner()
                 if interruption.requested:
                     return ExecutorGuardianCommandCompleted(-signal.SIGTERM)
-                terminal_foreground.grant(guardian.pid)
-                if os.write(start_write_fd, GUARDIAN_START_SIGNAL) != len(
-                    GUARDIAN_START_SIGNAL
-                ):
+                terminal_foreground.grant(guardian.process_id)
+                if os.write(
+                    endpoints.start_writer.fileno(),
+                    GUARDIAN_START_SIGNAL,
+                ) != len(GUARDIAN_START_SIGNAL):
                     raise ExecutorGuardianLaunchError(
                         "executor guardian start gate performed a short write"
                     )
-                os.close(start_write_fd)
-                start_write_open = False
+                endpoints.start_writer.close()
 
                 supervision = self._process_group_supervisor.supervise(
-                    OwnedProcessGroupLeader(guardian.pid),
+                    OwnedProcessGroupLeader(guardian.process_id),
                     ProcessGroupUnboundedWait(),
                     interruption,
                 )
@@ -378,94 +411,167 @@ class PosixExecutorCommandGuardian:
                     supervision,
                     interruption,
                     guardian,
-                    result_read_fd,
+                    endpoints.result_reader.fileno(),
                 )
         finally:
             primary_error = sys.exception()
-            containment_cleanup: CleanupOutcome = CleanupSucceeded()
-            safe_to_retire_cancellation = guardian is None or group_contained
-            if guardian is not None and not group_contained:
-                try:
-                    self._process_group_supervisor.abort(
-                        OwnedProcessGroupLeader(guardian.pid)
-                    )
-                    safe_to_retire_cancellation = True
-                except BaseException as cleanup_error:
-                    cleanup_error.add_note(
-                        "guardian group abort failed; cancellation identity retained"
-                    )
-                    containment_cleanup = CleanupFailed(
-                        (CleanupFailure("guardian-group-abort", cleanup_error),)
-                    )
-            cleanup_actions: list[CleanupAction] = []
-            if safe_to_retire_cancellation:
-                cleanup_actions.append(
-                    CleanupAction(
-                        "cancellation-endpoint-retirement",
-                        cancellation_lease.retire,
-                    )
-                )
-            cleanup_actions.append(
-                CleanupAction("terminal-foreground-restore", terminal_foreground.restore)
+            self._finalize_run(
+                guardian,
+                uncontained_process_id,
+                group_contained,
+                cancellation_lease,
+                terminal_foreground,
+                pipes,
+                primary_error,
             )
-            if result_write_open:
-                cleanup_actions.append(
-                    CleanupAction(
-                        "result-writer-close",
-                        lambda: os.close(result_write_fd),
-                    )
+
+    def _activate_guardian(
+        self,
+        guardian_arguments: tuple[str, ...],
+        request: ExecutorGuardianRequest,
+        descriptor_mappings: tuple[PosixDescriptorMapping, ...],
+    ) -> _GuardianActivation:
+        launch = self._spawn_guardian(
+            guardian_arguments,
+            request,
+            descriptor_mappings,
+        )
+        if type(launch) is PosixProcessLaunchStarted:
+            return _GuardianActivationStarted(launch.process)
+        if type(launch) is PosixProcessLaunchRejected:
+            return _GuardianActivationContained(
+                self._launch_error(
+                    f"could not start executor guardian: {launch.error!r}",
+                    launch.error,
                 )
-            if start_read_open:
-                cleanup_actions.append(
-                    CleanupAction(
-                        "start-reader-close",
-                        lambda: os.close(start_read_fd),
-                    )
+            )
+        if type(launch) is PosixProcessLaunchRecovered:
+            return _GuardianActivationContained(
+                self._launch_error(
+                    "executor guardian activation was interrupted and contained",
+                    launch.activation_error,
                 )
-            if start_write_open:
-                cleanup_actions.append(
-                    CleanupAction(
-                        "start-writer-close",
-                        lambda: os.close(start_write_fd),
-                    )
-                )
-            if owner_ready_read_open:
-                cleanup_actions.append(
-                    CleanupAction(
-                        "owner-readiness-reader-close",
-                        lambda: os.close(owner_ready_read_fd),
-                    )
-                )
-            if owner_ready_write_open:
-                cleanup_actions.append(
-                    CleanupAction(
-                        "owner-readiness-writer-close",
-                        lambda: os.close(owner_ready_write_fd),
-                    )
-                )
+            )
+        if type(launch) is PosixProcessLaunchRecoveryFailed:
+            recovery = BaseExceptionGroup(
+                "guardian activation and recovery both failed",
+                (launch.activation_error, launch.recovery_error),
+            )
+            return _GuardianActivationUncontained(
+                launch.process_id,
+                self._launch_error(
+                    "executor guardian activation could not prove containment",
+                    recovery,
+                ),
+            )
+        raise AssertionError("POSIX process launch is a closed union")
+
+    @staticmethod
+    def _launch_error(
+        message: str,
+        cause: BaseException,
+    ) -> ExecutorGuardianLaunchError:
+        error = ExecutorGuardianLaunchError(message)
+        error.__cause__ = cause
+        return error
+
+    def _finalize_run(
+        self,
+        guardian: PosixProcessHandle | None,
+        uncontained_process_id: int | None,
+        group_contained: bool,
+        cancellation_lease: ExecutorGuardianCancellationLease,
+        terminal_foreground: _ControllingTerminal,
+        pipes: GuardianLaunchPipes,
+        primary_error: BaseException | None,
+    ) -> None:
+        containment_cleanup, safe_to_retire = self._contain_after_run(
+            guardian,
+            uncontained_process_id,
+            group_contained,
+        )
+        cleanup_actions: list[CleanupAction] = []
+        if safe_to_retire:
             cleanup_actions.append(
                 CleanupAction(
-                    "result-reader-close",
-                    lambda: os.close(result_read_fd),
+                    "cancellation-endpoint-retirement",
+                    cancellation_lease.retire,
                 )
             )
-            resource_cleanup = IndependentCleanupPlan(
-                tuple(cleanup_actions)
-            ).run()
-            cleanup_errors = self._cleanup_errors(
-                containment_cleanup,
-                resource_cleanup,
+        cleanup_actions.extend(
+            (
+                CleanupAction(
+                    "terminal-foreground-restore",
+                    terminal_foreground.restore,
+                ),
+                CleanupAction(
+                    "guardian-launch-pipes-close",
+                    lambda: self._require_pipes_closed(pipes),
+                ),
             )
-            if cleanup_errors:
-                if primary_error is not None:
-                    raise BaseExceptionGroup(
-                        "guardian execution and cleanup failed",
-                        (primary_error, *cleanup_errors),
+        )
+        resource_cleanup = IndependentCleanupPlan(tuple(cleanup_actions)).run()
+        cleanup_errors = self._cleanup_errors(
+            containment_cleanup,
+            resource_cleanup,
+        )
+        if not cleanup_errors:
+            return
+        if primary_error is not None:
+            raise BaseExceptionGroup(
+                "guardian execution and cleanup failed",
+                (primary_error, *cleanup_errors),
+            )
+        raise BaseExceptionGroup("guardian cleanup failed", cleanup_errors)
+
+    def _contain_after_run(
+        self,
+        guardian: PosixProcessHandle | None,
+        uncontained_process_id: int | None,
+        group_contained: bool,
+    ) -> tuple[CleanupOutcome, bool]:
+        if group_contained:
+            return CleanupSucceeded(), True
+        if guardian is not None:
+            try:
+                termination = self._process_group_supervisor.abort(
+                    OwnedProcessGroupLeader(guardian.process_id)
+                )
+                guardian.record_external_reap(termination.leader_exit_code)
+            except BaseException as cleanup_error:
+                cleanup_error.add_note(
+                    "guardian group abort failed; cancellation identity retained"
+                )
+                return (
+                    CleanupFailed(
+                        (CleanupFailure("guardian-group-abort", cleanup_error),)
+                    ),
+                    False,
+                )
+            return CleanupSucceeded(), True
+        if uncontained_process_id is None:
+            return CleanupSucceeded(), True
+        try:
+            self._process_group_supervisor.abort(
+                OwnedProcessGroupLeader(uncontained_process_id)
+            )
+        except BaseException as cleanup_error:
+            cleanup_error.add_note(
+                "indeterminate guardian group recovery failed; "
+                "cancellation identity retained"
+            )
+            return (
+                CleanupFailed(
+                    (
+                        CleanupFailure(
+                            "indeterminate-guardian-group-abort",
+                            cleanup_error,
+                        ),
                     )
-                raise BaseExceptionGroup(
-                    "guardian cleanup failed",
-                    cleanup_errors,
-                )
+                ),
+                False,
+            )
+        return CleanupSucceeded(), True
 
     @staticmethod
     def _cleanup_errors(
@@ -483,7 +589,7 @@ class PosixExecutorCommandGuardian:
     def _prepare_cancellation(
         self,
         request: ExecutorGuardianRequest,
-        open_pipe_descriptors: tuple[int, ...],
+        pipes: GuardianLaunchPipes,
     ) -> ExecutorGuardianCancellationLease:
         """Acquire cancellation ownership or roll back all pre-spawn pipes."""
         try:
@@ -491,15 +597,37 @@ class PosixExecutorCommandGuardian:
                 request.cancellation,
                 self._record_stores,
             )
-        except BaseException:
-            for descriptor in open_pipe_descriptors:
-                os.close(descriptor)
-            raise
+        except BaseException as cancellation_error:
+            pipe_cleanup_error = self._pipes_close_error(pipes)
+            if pipe_cleanup_error is None:
+                raise
+            raise BaseExceptionGroup(
+                "guardian cancellation and pipe cleanup both failed",
+                (cancellation_error, pipe_cleanup_error),
+            )
+
+    @staticmethod
+    def _pipes_close_error(pipes: GuardianLaunchPipes) -> BaseException | None:
+        try:
+            outcome = pipes.close()
+        except BaseException as error:
+            return error
+        if type(outcome) is GuardianLaunchPipesClosed:
+            return None
+        if type(outcome) is not GuardianLaunchPipesCloseFailed:
+            raise AssertionError("guardian launch pipe close is a closed union")
+        return outcome.error
+
+    @classmethod
+    def _require_pipes_closed(cls, pipes: GuardianLaunchPipes) -> None:
+        error = cls._pipes_close_error(pipes)
+        if error is not None:
+            raise error
 
     def _await_guardian_owner_ready(
         self,
         ready_read_file_descriptor: int,
-        guardian: subprocess.Popen[bytes],
+        guardian: PosixProcessHandle,
     ) -> None:
         deadline = time.monotonic() + self._sentinel_policy.startup_timeout_seconds
         with selectors.DefaultSelector() as selector:
@@ -515,6 +643,29 @@ class PosixExecutorCommandGuardian:
             raise ExecutorGuardianLaunchError(
                 "guardian exited before publishing exact owner readiness"
             )
+
+    def _spawn_guardian(
+        self,
+        guardian_arguments: tuple[str, ...],
+        request: ExecutorGuardianRequest,
+        descriptor_mappings: tuple[PosixDescriptorMapping, ...],
+    ) -> PosixProcessLaunch:
+        if request.lifecycle is ExecutorCommandLifecycle.DETACHED:
+            group_mode = PosixProcessGroupMode.NEW_SESSION
+        elif request.lifecycle is ExecutorCommandLifecycle.INTERACTIVE_SESSION:
+            group_mode = PosixProcessGroupMode.NEW_PROCESS_GROUP
+        else:
+            raise AssertionError("ExecutorCommandLifecycle is a closed enum")
+        return self._process_launcher.launch(
+            PosixProcessLaunchSpec(
+                program=PosixProcessProgram(guardian_arguments),
+                working_directory=Path.cwd().resolve(),
+                environment=PosixProcessEnvironment.from_mapping(request.environment),
+                group_mode=group_mode,
+                descriptor_mappings=descriptor_mappings,
+                terminal=PosixProcessWithoutTerminal(),
+            )
+        )
 
     @staticmethod
     def _guardian_cancellation_record(
@@ -542,38 +693,16 @@ class PosixExecutorCommandGuardian:
             )
         raise AssertionError("guardian cancellation controls are a closed union")
 
-    @staticmethod
-    def _spawn_guardian(
-        guardian_arguments: tuple[str, ...],
-        request: ExecutorGuardianRequest,
-        inherited_descriptors: tuple[int, ...],
-    ) -> subprocess.Popen[bytes]:
-        if request.lifecycle is ExecutorCommandLifecycle.DETACHED:
-            return subprocess.Popen(
-                guardian_arguments,
-                env=dict(request.environment),
-                pass_fds=inherited_descriptors,
-                start_new_session=True,
-            )
-        if request.lifecycle is ExecutorCommandLifecycle.INTERACTIVE_SESSION:
-            return subprocess.Popen(
-                guardian_arguments,
-                env=dict(request.environment),
-                pass_fds=inherited_descriptors,
-                process_group=0,
-            )
-        raise AssertionError("ExecutorCommandLifecycle is a closed enum")
-
     @classmethod
     def _terminal_after_supervision(
         cls,
         supervision: ProcessGroupSupervision,
         interruption: _ParentInterruption,
-        guardian: subprocess.Popen[bytes],
+        guardian: PosixProcessHandle,
         result_read_fd: int,
     ) -> ExecutorGuardianTerminal:
         """Interpret one fully contained guardian supervision outcome."""
-        guardian.returncode = supervision.termination.leader_exit_code
+        guardian.record_external_reap(supervision.termination.leader_exit_code)
         if type(supervision) is ProcessGroupInterrupted:
             return ExecutorGuardianCommandCompleted(-signal.SIGTERM)
         if type(supervision) is not ProcessGroupCompleted:
@@ -583,7 +712,10 @@ class PosixExecutorCommandGuardian:
         # interruption is synthesized only when supervision actually observed
         # an interrupted group.
         terminal = cls._read_terminal(result_read_fd)
-        cls._require_expected_guardian_exit(guardian.returncode, terminal)
+        cls._require_expected_guardian_exit(
+            supervision.termination.leader_exit_code,
+            terminal,
+        )
         return terminal
 
     @staticmethod
