@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Profile validate bottlenecks using isolated cold runs.
+"""Profile cold and learned PR-validation on one exact committed revision.
 
-Each run executes in a detached HEAD worktree rooted at the current committed
-revision. Uncommitted local changes are intentionally excluded for reproducible
-baselines.
+Each measured command executes in a detached HEAD worktree. One fresh host
+executor pool is shared by the whole profile: the first aggregate is genuinely
+cold, per-lane runs populate learning, and the final aggregate measures the
+learned state whose exact fingerprint and sample inventory are recorded.
+Uncommitted changes are intentionally excluded. Package-manager, compiler, OS,
+and other external caches are intentionally preserved: this measures a normal
+prepared developer machine, not an artificially empty machine.
 
-Each isolated worktree is provisioned via `make worktree-setup` before running
-the measured target, so runtime behavior matches real worktree usage.
+Every worktree is provisioned with ``make worktree-setup`` before measurement.
+The reported job count controls both the aggregate GNU make graph and its inner
+validation-lane fan-out.
 """
 
 from __future__ import annotations
@@ -22,91 +27,265 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal, cast
+
+from issue_orchestrator.domain.executor import ExecutorPolicySource
+from issue_orchestrator.domain.executor_monitoring import ExecutorStatus
+from issue_orchestrator.entrypoints.bootstrap import (
+    build_executor,
+    build_executor_monitor,
+)
+from issue_orchestrator.infra.validation_timings import build_host_context
 
 
-DEFAULT_VALIDATE_TARGETS = [
-    "typecheck",
-    "lint-arch",
-    "lint-complexity",
-    "test-unit",
-    "test-simulated",
-    "test-integration",
-    "test-web",
-]
+EXECUTOR_POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
+EXECUTOR_AGGRESSIVENESS_ENV = (
+    "ISSUE_ORCHESTRATOR_EXECUTOR_AGGRESSIVENESS_PERCENT"
+)
+AGGREGATE_TARGET = "validate-pr-raw"
+AGGREGATE_LANE_VARIABLE = "VALIDATE_PR_LANES"
+PROFILE_METHOD = "cold_then_learned_detached_HEAD_with_warm_external_caches"
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class CommandResult:
+    """One measured command and its exact execution result."""
+
     name: str
-    command: list[str]
+    command: tuple[str, ...]
     wall_seconds: float
     exit_code: int
-    worktree_path: str | None = None
+    worktree_path: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileArguments:
+    """Validated profiler invocation."""
+
+    make_bin: str
+    jobs: int
+    output: Path | None
+    dry_run: bool
+    targets: tuple[str, ...] | None
+    repo_root: Path
+    aggressiveness_percent: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileHost:
+    """Non-null host identity attached to reproducible calibration evidence."""
+
+    name: str
+    system: str
+    release: str
+    machine: str
+    cpu_count: int
+    memory_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileAggressiveness:
+    """Selected calibration dial and the authority used to select it."""
+
+    percent: int
+    selection_source: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileLearnedWork:
+    """Compact public projection of one retained executor profile."""
+
+    repository_label: str
+    work_key: str
+    successful_observation_count: int
+    estimated_cores_per_concurrency: float
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileExecutorStatus:
+    """Effective host policy and retained learning at one profile boundary."""
+
+    host_cpu_slots: int
+    aggressiveness_percent: int
+    policy_source: str
+    learning_fingerprint_sha256: str
+    successful_observation_count: int
+    learned_work: tuple[ProfileLearnedWork, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileAggregateRun:
+    """One aggregate result with exact learning state before and after it."""
+
+    command_result: CommandResult
+    executor_before: ProfileExecutorStatus
+    executor_after: ProfileExecutorStatus
+
+
+@dataclass(frozen=True, slots=True)
+class ValidateProfileConfiguration:
+    """Configuration required to reproduce and interpret one profile."""
+
+    make_bin: str
+    repo_root: str
+    jobs: int
+    dry_run: bool
+    targets: tuple[str, ...]
+    aggregate_target: str
+    method: str
+    profiled_commit_sha: str
+    source_worktree_dirty: bool
+    host: ProfileHost
+    aggressiveness: ProfileAggressiveness
+    executor_learning: str
+    external_caches: str
+
+
+@dataclass(frozen=True, slots=True)
+class ValidateProfileSummary:
+    """Derived bottleneck measurements for one profile."""
+
+    timestamp_utc: str
+    jobs: int
+    cold_validate_pr_raw_seconds: float
+    learned_validate_pr_raw_seconds: float
+    learned_minus_cold_seconds: float
+    fresh_worktree_target_sum_seconds: float
+    fresh_worktree_slowest_target_seconds: float
+    validate_pr_raw_minus_slowest_target_seconds: float
+    top_targets: tuple[CommandResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ValidateProfileReport:
+    """Versioned JSON report written by the profiler."""
+
+    schema_version: Literal[2]
+    config: ValidateProfileConfiguration
+    cold_validate_pr_raw_run: ProfileAggregateRun
+    target_runs: tuple[CommandResult, ...]
+    learned_validate_pr_raw_run: ProfileAggregateRun
+    summary: ValidateProfileSummary
 
 
 def detect_jobs() -> int:
+    """Return the detected CPU count or fail when the OS cannot supply it."""
     cpu_count = os.cpu_count()
     if cpu_count is None or cpu_count <= 0:
-        return 5
+        raise RuntimeError("cannot determine a positive CPU count for profiling")
     return cpu_count
 
 
+def positive_integer(raw: str) -> int:
+    """Parse one canonical positive base-ten integer for argparse."""
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1 or str(parsed) != raw:
+        raise argparse.ArgumentTypeError(
+            "must be a positive base-ten integer without padding"
+        )
+    return parsed
+
+
+def aggressiveness_percent(raw: str) -> int:
+    """Parse the executor's published aggressiveness percentage range."""
+    parsed = positive_integer(raw)
+    if not 25 <= parsed <= 400:
+        raise argparse.ArgumentTypeError("must be between 25 and 400")
+    return parsed
+
+
+def configured_default_jobs() -> int:
+    """Resolve the profiler default without silently replacing invalid input."""
+    configured = os.environ.get("VALIDATE_JOBS")
+    return detect_jobs() if configured is None else positive_integer(configured)
+
+
 def run_command(
+    *,
     name: str,
-    command: list[str],
+    command: tuple[str, ...],
     dry_run: bool,
-    cwd: Path | None = None,
-    worktree_path: str | None = None,
+    cwd: Path | None,
+    worktree_path: str | None,
+    environment: dict[str, str] | None = None,
 ) -> CommandResult:
+    """Execute and measure one exact argv without invoking a shell."""
     cwd_info = f" (cwd={cwd})" if cwd is not None else ""
     print(f"[profile] {name}: {' '.join(command)}{cwd_info}")
     if dry_run:
-        return CommandResult(
-            name=name,
-            command=command,
-            wall_seconds=0.0,
-            exit_code=0,
-            worktree_path=worktree_path,
-        )
+        return CommandResult(name, command, 0.0, 0, worktree_path)
 
-    start = time.monotonic()
-    completed = subprocess.run(command, check=False, cwd=cwd)
-    wall = time.monotonic() - start
+    started = time.monotonic()
+    completed = subprocess.run(
+        command,
+        check=False,
+        cwd=cwd,
+        env=environment,
+    )
     return CommandResult(
         name=name,
         command=command,
-        wall_seconds=wall,
+        wall_seconds=time.monotonic() - started,
         exit_code=completed.returncode,
         worktree_path=worktree_path,
     )
 
 
-def discover_validate_targets(make_bin: str) -> list[str]:
-    """Read _validate-impl prerequisites from make's expanded database."""
-    proc = subprocess.run(
-        [make_bin, "-pn"],
+def discover_validate_targets(repo_root: Path, make_bin: str) -> tuple[str, ...]:
+    """Read the aggregate PR lanes from GNU make's database."""
+    completed = subprocess.run(
+        (make_bin, "-pn"),
+        cwd=repo_root,
         check=False,
         capture_output=True,
         text=True,
     )
-    if proc.returncode != 0:
-        return list(DEFAULT_VALIDATE_TARGETS)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "cannot inspect GNU make validation targets: "
+            f"exit={completed.returncode} stderr={completed.stderr.strip()}"
+        )
 
-    for raw_line in proc.stdout.splitlines():
+    lane_targets: tuple[str, ...] = ()
+    lane_prefix = f"{AGGREGATE_LANE_VARIABLE} :="
+    for raw_line in completed.stdout.splitlines():
         line = raw_line.strip()
-        if not line.startswith("_validate-impl:"):
-            continue
-        _, _, deps_part = line.partition(":")
-        deps = [token for token in deps_part.strip().split(" ") if token]
-        if deps:
-            return deps
-        break
+        if line.startswith(lane_prefix):
+            _, _, value = line.partition(":=")
+            lane_targets = tuple(value.split())
 
-    return list(DEFAULT_VALIDATE_TARGETS)
+    if not lane_targets:
+        raise RuntimeError(
+            f"GNU make did not declare {AGGREGATE_LANE_VARIABLE} targets"
+        )
+    return tuple(
+        dict.fromkeys(("_validate-static-lane", *lane_targets, "test-vscode"))
+    )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_target_override(raw: str | None) -> tuple[str, ...] | None:
+    """Parse an optional explicit target list without inventing empty work."""
+    if raw is None:
+        return None
+    targets = tuple(target.strip() for target in raw.split(",") if target.strip())
+    if not targets:
+        raise argparse.ArgumentTypeError("--targets must contain at least one target")
+    return tuple(dict.fromkeys((*targets, "test-vscode")))
+
+
+def parse_args() -> ProfileArguments:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--aggressiveness",
+        type=aggressiveness_percent,
+        help=(
+            "Executor aggressiveness percentage. If omitted, use the current "
+            "effective machine policy and record its source."
+        ),
+    )
     parser.add_argument(
         "--make-bin",
         default=os.environ.get("GMAKE", "make"),
@@ -114,28 +293,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--jobs",
-        type=int,
-        default=int(os.environ.get("VALIDATE_JOBS", detect_jobs())),
-        help="Parallel job count to use for parallel validate profile run",
+        type=positive_integer,
+        default=configured_default_jobs(),
+        help="Job count for both aggregate make and inner validation lanes",
     )
     parser.add_argument(
         "--output",
         type=Path,
         help=(
             "Write JSON report to this path "
-            "(default: <repo-root>/.issue-orchestrator/diagnostics/validate-profile-<timestamp>.json)"
+            "(default: <repo-root>/.issue-orchestrator/diagnostics/"
+            "validate-profile-<timestamp>.json)"
         ),
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print commands without executing them",
+        help="Print commands and write a zero-duration report without executing",
     )
     parser.add_argument(
         "--targets",
         help=(
-            "Comma-separated target override. "
-            "If omitted, targets are discovered from _validate-impl."
+            "Comma-separated target override. If omitted, targets are discovered "
+            "from the aggregate PR-lane declaration."
         ),
     )
     parser.add_argument(
@@ -144,57 +324,77 @@ def parse_args() -> argparse.Namespace:
         default=Path(__file__).resolve().parents[2],
         help="Repository root (default: inferred from this script location)",
     )
-    return parser.parse_args()
+    namespace = parser.parse_args()
+    return ProfileArguments(
+        make_bin=cast(str, namespace.make_bin),
+        jobs=cast(int, namespace.jobs),
+        output=cast(Path | None, namespace.output),
+        dry_run=cast(bool, namespace.dry_run),
+        targets=parse_target_override(cast(str | None, namespace.targets)),
+        repo_root=cast(Path, namespace.repo_root),
+        aggressiveness_percent=cast(int | None, namespace.aggressiveness),
+    )
 
 
 def default_output_path(repo_root: Path) -> Path:
-    ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
-    return repo_root / ".issue-orchestrator/diagnostics" / f"validate-profile-{ts}.json"
+    timestamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+    return (
+        repo_root
+        / ".issue-orchestrator/diagnostics"
+        / f"validate-profile-{timestamp}.json"
+    )
 
 
-def collect_failures(results: list[CommandResult]) -> list[CommandResult]:
-    failed = [result for result in results if result.exit_code != 0]
+def collect_failures(
+    results: tuple[CommandResult, ...],
+) -> tuple[CommandResult, ...]:
+    failed = tuple(result for result in results if result.exit_code != 0)
     if failed:
         print("[profile] failed command(s):", file=sys.stderr)
         for result in failed:
-            print(
-                f"  - {result.name} (exit={result.exit_code})",
-                file=sys.stderr,
-            )
+            print(f"  - {result.name} (exit={result.exit_code})", file=sys.stderr)
     return failed
 
 
-def emit_summary(
-    target_results: list[CommandResult],
-    validate_raw_result: CommandResult,
+def summarize(
+    *,
+    target_results: tuple[CommandResult, ...],
+    cold_validate_pr_raw_result: CommandResult,
+    learned_validate_pr_raw_result: CommandResult,
     jobs: int,
-) -> dict[str, object]:
-    serial_total = sum(result.wall_seconds for result in target_results)
-    cold_parallel_total = validate_raw_result.wall_seconds
-    max_target = max((result.wall_seconds for result in target_results), default=0.0)
-    bottleneck_gap = cold_parallel_total - max_target
-
-    sorted_targets = sorted(target_results, key=lambda r: r.wall_seconds, reverse=True)
-    top_targets = sorted_targets[:3]
-
-    summary = {
-        "timestamp_utc": datetime.now(tz=UTC).isoformat(),
-        "jobs": jobs,
-        "cold_validate_raw_seconds": cold_parallel_total,
-        "cold_target_sum_seconds": serial_total,
-        "cold_slowest_target_seconds": max_target,
-        "cold_validate_minus_slowest_target_seconds": bottleneck_gap,
-        "top_targets": [asdict(result) for result in top_targets],
-    }
+) -> ValidateProfileSummary:
+    if not target_results:
+        raise ValueError("a validate profile requires at least one target result")
+    target_sum = sum(result.wall_seconds for result in target_results)
+    slowest_target = max(result.wall_seconds for result in target_results)
+    cold_total = cold_validate_pr_raw_result.wall_seconds
+    learned_total = learned_validate_pr_raw_result.wall_seconds
+    bottleneck_gap = learned_total - slowest_target
+    top_targets = tuple(
+        sorted(target_results, key=lambda result: result.wall_seconds, reverse=True)[:3]
+    )
+    summary = ValidateProfileSummary(
+        timestamp_utc=datetime.now(tz=UTC).isoformat(),
+        jobs=jobs,
+        cold_validate_pr_raw_seconds=cold_total,
+        learned_validate_pr_raw_seconds=learned_total,
+        learned_minus_cold_seconds=learned_total - cold_total,
+        fresh_worktree_target_sum_seconds=target_sum,
+        fresh_worktree_slowest_target_seconds=slowest_target,
+        validate_pr_raw_minus_slowest_target_seconds=bottleneck_gap,
+        top_targets=top_targets,
+    )
 
     print()
-    print("Validate Profile Summary")
-    print("------------------------")
+    print("Validate PR Profile Summary")
+    print("---------------------------")
     print(f"jobs: {jobs}")
-    print(f"cold validate-raw: {cold_parallel_total:.2f}s")
-    print(f"cold target sum: {serial_total:.2f}s")
-    print(f"cold slowest target: {max_target:.2f}s")
-    print(f"validate-raw minus slowest target: {bottleneck_gap:.2f}s")
+    print(f"cold validate-pr-raw: {cold_total:.2f}s")
+    print(f"learned validate-pr-raw: {learned_total:.2f}s")
+    print(f"learned minus cold: {learned_total - cold_total:.2f}s")
+    print(f"fresh-worktree target sum: {target_sum:.2f}s")
+    print(f"fresh-worktree slowest target: {slowest_target:.2f}s")
+    print(f"validate-pr-raw minus slowest target: {bottleneck_gap:.2f}s")
     print("top targets:")
     for result in top_targets:
         print(f"  - {result.name}: {result.wall_seconds:.2f}s")
@@ -202,15 +402,16 @@ def emit_summary(
 
 
 def prepare_worktree(
+    *,
     make_bin: str,
     name: str,
     worktree: Path,
     dry_run: bool,
 ) -> CommandResult:
-    """Prepare a fresh worktree exactly like real agent/user setup."""
+    """Prepare a fresh worktree exactly like a real agent or user worktree."""
     return run_command(
         name=f"{name}:worktree-setup",
-        command=[make_bin, "worktree-setup"],
+        command=(make_bin, "worktree-setup"),
         dry_run=dry_run,
         cwd=worktree,
         worktree_path=str(worktree),
@@ -218,30 +419,48 @@ def prepare_worktree(
 
 
 def run_in_isolated_worktree(
+    *,
     repo_root: Path,
     make_bin: str,
     name: str,
     make_target: str,
     dry_run: bool,
-    jobs: int | None = None,
+    jobs: int | None,
+    executor_pool_dir: Path,
+    executor_aggressiveness_percent: int,
 ) -> CommandResult:
-    tmp_dir = Path(tempfile.mkdtemp(prefix="io-validate-profile-"))
-    worktree = tmp_dir / "wt"
+    """Provision, measure, and remove one isolated detached worktree."""
+    temporary_root = Path(tempfile.mkdtemp(prefix="io-validate-profile-"))
+    worktree = temporary_root / "wt"
+    add_succeeded = False
     try:
-        add_cmd = ["git", "-C", str(repo_root), "worktree", "add", "--detach", str(worktree), "HEAD"]
+        add_command = (
+            "git",
+            "-C",
+            str(repo_root),
+            "worktree",
+            "add",
+            "--detach",
+            str(worktree),
+            "HEAD",
+        )
         add_result = run_command(
             name=f"{name}:worktree-add",
-            command=add_cmd,
+            command=add_command,
             dry_run=dry_run,
+            cwd=None,
+            worktree_path=None,
         )
         if add_result.exit_code != 0:
             return CommandResult(
                 name=name,
-                command=add_cmd,
+                command=add_command,
                 wall_seconds=add_result.wall_seconds,
                 exit_code=add_result.exit_code,
                 worktree_path=str(worktree),
             )
+        add_succeeded = True
+
         setup_result = prepare_worktree(
             make_bin=make_bin,
             name=name,
@@ -257,95 +476,307 @@ def run_in_isolated_worktree(
                 worktree_path=str(worktree),
             )
 
-        make_cmd = [make_bin]
+        make_arguments = [make_bin]
         if jobs is not None:
-            make_cmd.append(f"-j{jobs}")
-        # output-sync is useful for parallel aggregate runs; unnecessary for single-target runs.
-        if jobs is not None:
-            make_cmd.append("--output-sync=target")
-        make_cmd.append(make_target)
+            make_arguments.extend(
+                (
+                    f"-j{jobs}",
+                    "--output-sync=target",
+                    f"VALIDATE_LANE_JOBS={jobs}",
+                )
+            )
+        make_arguments.append(make_target)
+        environment = os.environ.copy()
+        environment[EXECUTOR_POOL_DIR_ENV] = str(executor_pool_dir)
+        environment[EXECUTOR_AGGRESSIVENESS_ENV] = str(
+            executor_aggressiveness_percent
+        )
         return run_command(
             name=name,
-            command=make_cmd,
+            command=tuple(make_arguments),
             dry_run=dry_run,
             cwd=worktree,
             worktree_path=str(worktree),
+            environment=environment,
         )
     finally:
-        _ = run_command(
-            name=f"{name}:worktree-remove",
-            command=["git", "-C", str(repo_root), "worktree", "remove", "--force", str(worktree)],
-            dry_run=dry_run,
+        if add_succeeded:
+            removal = run_command(
+                name=f"{name}:worktree-remove",
+                command=(
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(worktree),
+                ),
+                dry_run=dry_run,
+                cwd=None,
+                worktree_path=None,
+            )
+            if removal.exit_code != 0:
+                raise RuntimeError(
+                    f"failed to remove profiler worktree {worktree}: "
+                    f"exit={removal.exit_code}"
+                )
+        shutil.rmtree(temporary_root)
+
+
+def resolve_output_path(arguments: ProfileArguments, repo_root: Path) -> Path:
+    if arguments.output is None:
+        return default_output_path(repo_root)
+    if arguments.output.is_absolute():
+        return arguments.output
+    return repo_root / arguments.output
+
+
+def resolve_profiled_commit(repo_root: Path) -> str:
+    """Resolve the exact committed tree profiled by detached worktrees."""
+    completed = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    commit_sha = completed.stdout.strip()
+    if completed.returncode != 0 or len(commit_sha) != 40:
+        detail = completed.stderr.strip() or commit_sha or "git returned no SHA"
+        raise RuntimeError(f"cannot resolve profiled commit: {detail}")
+    return commit_sha
+
+
+def source_worktree_is_dirty(repo_root: Path) -> bool:
+    """Report whether HEAD intentionally excludes local source changes."""
+    completed = subprocess.run(
+        ("git", "status", "--porcelain"),
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "cannot inspect profiler source worktree: "
+            f"{completed.stderr.strip()}"
         )
-        if not dry_run:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+    return bool(completed.stdout)
+
+
+def profile_host() -> ProfileHost:
+    """Capture required host facts or fail instead of weakening provenance."""
+    host = build_host_context()
+    required = (
+        host.name,
+        host.system,
+        host.release,
+        host.machine,
+        host.cpu_count,
+        host.memory_bytes,
+    )
+    if any(value is None for value in required):
+        raise RuntimeError("validation profiler requires complete host identity")
+    return ProfileHost(
+        name=cast(str, host.name),
+        system=cast(str, host.system),
+        release=cast(str, host.release),
+        machine=cast(str, host.machine),
+        cpu_count=cast(int, host.cpu_count),
+        memory_bytes=cast(int, host.memory_bytes),
+    )
+
+
+def resolve_aggressiveness(arguments: ProfileArguments) -> ProfileAggressiveness:
+    """Select one explicit dial while retaining its original authority."""
+    if arguments.aggressiveness_percent is not None:
+        return ProfileAggressiveness(
+            percent=arguments.aggressiveness_percent,
+            selection_source="command-line",
+        )
+    policy = build_executor().policy()
+    return ProfileAggressiveness(
+        percent=policy.aggressiveness.percent,
+        selection_source=f"machine-{policy.source.value}",
+    )
+
+
+def capture_executor_status(
+    executor_pool_dir: Path,
+    selected_aggressiveness: ProfileAggressiveness,
+) -> ProfileExecutorStatus:
+    """Query the executor through its monitor port under the profiled policy."""
+    previous_pool = os.environ.get(EXECUTOR_POOL_DIR_ENV)
+    previous_aggressiveness = os.environ.get(EXECUTOR_AGGRESSIVENESS_ENV)
+    os.environ[EXECUTOR_POOL_DIR_ENV] = str(executor_pool_dir)
+    os.environ[EXECUTOR_AGGRESSIVENESS_ENV] = str(
+        selected_aggressiveness.percent
+    )
+    try:
+        status = build_executor_monitor().status()
+    finally:
+        if previous_pool is None:
+            del os.environ[EXECUTOR_POOL_DIR_ENV]
+        else:
+            os.environ[EXECUTOR_POOL_DIR_ENV] = previous_pool
+        if previous_aggressiveness is None:
+            del os.environ[EXECUTOR_AGGRESSIVENESS_ENV]
+        else:
+            os.environ[EXECUTOR_AGGRESSIVENESS_ENV] = previous_aggressiveness
+    return project_executor_status(status)
+
+
+def project_executor_status(status: ExecutorStatus) -> ProfileExecutorStatus:
+    """Project the public monitor domain into the versioned report contract."""
+    if status.policy.source is not ExecutorPolicySource.ENVIRONMENT:
+        raise RuntimeError(
+            "profiled executor policy must be the explicit environment value"
+        )
+    return ProfileExecutorStatus(
+        host_cpu_slots=status.host_cpu_slots,
+        aggressiveness_percent=status.policy.aggressiveness.percent,
+        policy_source=status.policy.source.value,
+        learning_fingerprint_sha256=status.learning.fingerprint_sha256,
+        successful_observation_count=(
+            status.learning.successful_observation_count
+        ),
+        learned_work=tuple(
+            ProfileLearnedWork(
+                repository_label=item.repository.label,
+                work_key=item.work_key.value,
+                successful_observation_count=(
+                    item.successful_observation_count
+                ),
+                estimated_cores_per_concurrency=(
+                    item.estimated_cores_per_concurrency
+                ),
+            )
+            for item in status.learning.learned_work
+        ),
+    )
+
+
+def run_profile_aggregate(
+    *,
+    repo_root: Path,
+    make_bin: str,
+    name: str,
+    dry_run: bool,
+    jobs: int,
+    executor_pool_dir: Path,
+    aggressiveness: ProfileAggressiveness,
+) -> ProfileAggregateRun:
+    """Measure one aggregate with learning provenance on both boundaries."""
+    before = capture_executor_status(executor_pool_dir, aggressiveness)
+    command_result = run_in_isolated_worktree(
+        repo_root=repo_root,
+        make_bin=make_bin,
+        name=name,
+        make_target=AGGREGATE_TARGET,
+        dry_run=dry_run,
+        jobs=jobs,
+        executor_pool_dir=executor_pool_dir,
+        executor_aggressiveness_percent=aggressiveness.percent,
+    )
+    after = capture_executor_status(executor_pool_dir, aggressiveness)
+    return ProfileAggregateRun(command_result, before, after)
 
 
 def main() -> int:
-    args = parse_args()
-    make_bin = args.make_bin
-    repo_root = args.repo_root.resolve()
-    if args.output is not None:
-        output_path = args.output if args.output.is_absolute() else repo_root / args.output
-    else:
-        output_path = default_output_path(repo_root)
+    arguments = parse_args()
+    repo_root = arguments.repo_root.resolve()
+    output_path = resolve_output_path(arguments, repo_root)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    profiled_commit_sha = resolve_profiled_commit(repo_root)
+    dirty = source_worktree_is_dirty(repo_root)
+    host = profile_host()
+    aggressiveness = resolve_aggressiveness(arguments)
 
-    if args.targets:
-        target_list = [target.strip() for target in args.targets.split(",") if target.strip()]
-    else:
-        target_list = discover_validate_targets(make_bin)
-    if "test-vscode" not in target_list:
-        target_list.append("test-vscode")
-
-    target_results: list[CommandResult] = []
-    for target in target_list:
-        target_results.append(
+    targets = arguments.targets or discover_validate_targets(
+        repo_root,
+        arguments.make_bin,
+    )
+    profile_root = Path(tempfile.mkdtemp(prefix="io-validate-profile-session-"))
+    executor_pool_dir = profile_root / "executor-pool"
+    try:
+        cold_aggregate = run_profile_aggregate(
+            repo_root=repo_root,
+            make_bin=arguments.make_bin,
+            name=f"cold-aggregate:{AGGREGATE_TARGET}",
+            dry_run=arguments.dry_run,
+            jobs=arguments.jobs,
+            executor_pool_dir=executor_pool_dir,
+            aggressiveness=aggressiveness,
+        )
+        target_results = tuple(
             run_in_isolated_worktree(
                 repo_root=repo_root,
-                make_bin=make_bin,
+                make_bin=arguments.make_bin,
                 name=f"target:{target}",
                 make_target=target,
-                dry_run=args.dry_run,
-            ),
+                dry_run=arguments.dry_run,
+                jobs=None,
+                executor_pool_dir=executor_pool_dir,
+                executor_aggressiveness_percent=aggressiveness.percent,
+            )
+            for target in targets
         )
-
-    validate_raw_result = run_in_isolated_worktree(
-        repo_root=repo_root,
-        make_bin=make_bin,
-        name="parallel:validate-raw",
-        make_target="validate-raw",
-        dry_run=args.dry_run,
-        jobs=args.jobs,
+        learned_aggregate = run_profile_aggregate(
+            repo_root=repo_root,
+            make_bin=arguments.make_bin,
+            name=f"learned-aggregate:{AGGREGATE_TARGET}",
+            dry_run=arguments.dry_run,
+            jobs=arguments.jobs,
+            executor_pool_dir=executor_pool_dir,
+            aggressiveness=aggressiveness,
+        )
+    finally:
+        shutil.rmtree(profile_root)
+    summary = summarize(
+        target_results=target_results,
+        cold_validate_pr_raw_result=cold_aggregate.command_result,
+        learned_validate_pr_raw_result=learned_aggregate.command_result,
+        jobs=arguments.jobs,
     )
-
-    payload = {
-        "config": {
-            "make_bin": make_bin,
-            "repo_root": str(repo_root),
-            "jobs": args.jobs,
-            "dry_run": args.dry_run,
-            "targets": target_list,
-            "method": "isolated_cold_worktree_with_full_worktree_setup",
-            "profiled_ref": "HEAD (detached worktrees; uncommitted changes excluded)",
-        },
-        "target_runs": [asdict(result) for result in target_results],
-        "validate_raw_run": asdict(validate_raw_result),
-        "summary": emit_summary(
-            target_results=target_results,
-            validate_raw_result=validate_raw_result,
-            jobs=args.jobs,
+    report = ValidateProfileReport(
+        schema_version=2,
+        config=ValidateProfileConfiguration(
+            make_bin=arguments.make_bin,
+            repo_root=str(repo_root),
+            jobs=arguments.jobs,
+            dry_run=arguments.dry_run,
+            targets=targets,
+            aggregate_target=AGGREGATE_TARGET,
+            method=PROFILE_METHOD,
+            profiled_commit_sha=profiled_commit_sha,
+            source_worktree_dirty=dirty,
+            host=host,
+            aggressiveness=aggressiveness,
+            executor_learning=(
+                "one fresh pool: cold aggregate, lane training, learned aggregate"
+            ),
+            external_caches="preserved",
         ),
-    }
-
-    output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        cold_validate_pr_raw_run=cold_aggregate,
+        target_runs=target_results,
+        learned_validate_pr_raw_run=learned_aggregate,
+        summary=summary,
+    )
+    output_path.write_text(
+        json.dumps(asdict(report), indent=2) + "\n",
+        encoding="utf-8",
+    )
     print(f"report: {output_path}")
 
-    failures = collect_failures(target_results + [validate_raw_result])
-    if failures:
-        # Return the first failing code for shell compatibility.
-        return failures[0].exit_code
-    return 0
+    failures = collect_failures(
+        (
+            cold_aggregate.command_result,
+            *target_results,
+            learned_aggregate.command_result,
+        )
+    )
+    return failures[0].exit_code if failures else 0
 
 
 if __name__ == "__main__":

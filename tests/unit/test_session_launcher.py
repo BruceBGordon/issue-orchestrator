@@ -45,6 +45,10 @@ from issue_orchestrator.control.session_launch_types import (
     LaunchResult,
 )
 from tests.callback_endpoint_helpers import ready_callback_endpoint
+from tests.agent_phase_scheduler_helpers import (
+    host_agent_phase_command_scheduler,
+    scheduled_agent_shell_command,
+)
 from issue_orchestrator.control.session_launcher import (
     SessionLauncher,
     detect_existing_work,
@@ -643,6 +647,7 @@ def _build_launcher_bundle(
         remove_session_machine=remove_session_machine,
         board_snapshot_provider=board_snapshot_provider,
         agent_callback_endpoint=ready_callback_endpoint(),
+        agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
         claim_manager=claim_manager,
         **launcher_kwargs,
     )
@@ -872,6 +877,32 @@ class TestLaunchIssueSession:
         assert result.session.key.task == TaskKind.CODE
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__coding-1")
+        assert result.session.agent_config.timeout_minutes == 90
+
+    def test_issue_phase_has_human_identity_and_run_fairness_group(
+        self,
+        launcher_bundle,
+        sample_issue,
+    ):
+        result = launcher_bundle.launcher.launch_issue_session(
+            sample_issue,
+            active_sessions=[],
+        )
+
+        assert result.success is True
+        arguments = shlex.split(launcher_bundle.create_session_calls[0]["cmd"])
+        assert arguments[arguments.index("--work-key") + 1] == (
+            "agent-phase:agent:web:code"
+        )
+        group = arguments[arguments.index("--group") + 1]
+        assert group.startswith("agent:")
+        assert group.endswith(":coding-1")
+        assert arguments[arguments.index("--active-timeout-seconds") + 1] == (
+            "2700.0"
+        )
+        assert arguments[arguments.index("--absolute-timeout-seconds") + 1] == (
+            "5400.0"
+        )
 
     def test_internal_review_instructions_reach_initial_coder_command(
         self,
@@ -1521,6 +1552,7 @@ class TestLaunchIssueSession:
             dependency_evaluator=_Evaluator(),
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
         )
 
         result = launcher.launch_issue_session(sample_issue, active_sessions=[])
@@ -1968,6 +2000,7 @@ class TestLaunchValidationRetrySession:
         assert result.session.original_prompt == "Work on issue #123: Fix checkout"
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__coding-2")
+        assert result.session.agent_config.timeout_minutes == 90
         assert mock_worktree_manager.create_calls[0]["branch_name"] == "123-fix-checkout"
         command = launcher_bundle.create_session_calls[0]["cmd"]
         assert "Validation Retry" in command
@@ -2084,6 +2117,7 @@ class TestLaunchReviewSession:
         assert result.session.key.task == TaskKind.REVIEW
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__review-1")
+        assert result.session.agent_config.timeout_minutes == 60
 
     def test_internal_coder_instructions_do_not_change_reviewer_command(
         self,
@@ -2120,7 +2154,7 @@ class TestLaunchReviewSession:
 
         assert result.success is True
         command = launcher_bundle.create_session_calls[0]["cmd"]
-        assert "--verbose" in shlex.split(command)
+        assert "--verbose" in shlex.split(scheduled_agent_shell_command(command))
 
     def test_fails_when_no_review_agent_configured(self, session_launcher):
         """Verify fails when no code review agent configured (line 418)."""
@@ -2333,6 +2367,7 @@ class TestLaunchRetrospectiveReviewSession:
         assert "RETROSPECTIVE REVIEW MODE" in result.session.original_prompt
         assert "issue #365" in result.session.original_prompt
         assert "Prior orchestrator PR: #512" in result.session.original_prompt
+        assert result.session.agent_config.timeout_minutes == 60
 
         create_call = mock_worktree_manager.create_calls[0]
         assert create_call["issue_number"] == 365
@@ -2367,7 +2402,7 @@ class TestLaunchRetrospectiveReviewSession:
 
         assert result.success is True
         command = launcher_bundle.create_session_calls[0]["cmd"]
-        assert "--verbose" in shlex.split(command)
+        assert "--verbose" in shlex.split(scheduled_agent_shell_command(command))
 
     def test_unset_prior_pr_is_resolved_lazily_at_launch(
         self,
@@ -2569,6 +2604,7 @@ class TestLaunchReworkSession:
         assert result.session.key.task == TaskKind.REWORK
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__coding-2")
+        assert result.session.agent_config.timeout_minutes == 90
         started = next(e for e in mock_events.events if str(e.name) == "rework.started")
         assert started.data["agent"] == "agent:web"
         assert started.data["task"] == "rework"
@@ -7293,7 +7329,9 @@ class TestValidationOutputDir:
         launcher_bundle.launcher.launch_issue_session(sample_issue, active_sessions=[])
 
         assert len(launcher_bundle.create_session_calls) == 1
-        command = launcher_bundle.create_session_calls[0]["cmd"]
+        command = scheduled_agent_shell_command(
+            launcher_bundle.create_session_calls[0]["cmd"]
+        )
         assert "ISSUE_ORCHESTRATOR_CONFIG_NAME='main.yaml'" in command
 
 
@@ -7399,6 +7437,7 @@ class TestStackRelaunchGate:
             dependency_evaluator=self._CannedWorkEvaluator(report_fn),
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
         )
 
     @pytest.fixture

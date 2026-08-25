@@ -30,6 +30,14 @@ from issue_orchestrator.execution.agent_runner_types import AgentSpec, RetryPoli
 from tests.fixtures.live_agent_cli import is_claude_authenticated
 
 
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.live,
+    pytest.mark.provider_claude,
+    pytest.mark.xdist_group("pty"),
+]
+
+
 def _decoded_output(path: Path) -> str:
     """Decode the base64-JSONL terminal recording into raw stdout text.
 

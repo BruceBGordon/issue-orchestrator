@@ -20,10 +20,8 @@ cleanly on stdin EOF.
 from __future__ import annotations
 
 import fcntl
-import json
 import logging
 import os
-import select
 import shutil
 import signal
 import struct
@@ -41,7 +39,12 @@ from ..domain.review_exchange_failures import (
 )
 from ..infra.shutdown_signals import child_signal_reset_preexec
 from ..infra.terminal_recording import MirroredTerminalRecordingWriter
-from .persistent_round_io import drain_pty_output_until_quiet
+from .persistent_round_io import (
+    drain_pty_output as _drain_pty_output,
+    drain_pty_output_until_quiet,
+    safe_recording_size as _safe_recording_size,
+    try_read_response as _try_read_response,
+)
 from .persistent_round_interactions import (
     PersistentInteractionState,
     bind_interaction_sender,
@@ -87,7 +90,7 @@ class PersistentRoundError(RuntimeError):
 
 
 class PersistentRoundTimeoutError(TimeoutError):
-    """Raised when a round's response file does not appear within the timeout."""
+    """Raised when a round response does not appear within the timeout."""
 
     def __init__(
         self,
@@ -475,7 +478,6 @@ def send_round(
         now=now,
         sleep=sleep,
     )
-
     # When the mailbox is the channel, nothing is read from or written to
     # ``response_file`` — so there is no stale file to clear and the read is
     # the mailbox poll.
@@ -670,51 +672,6 @@ def _wait_for_round_response(
     )
 
 
-def _safe_recording_size(session: PersistentSession) -> int | None:
-    """Best-effort read of the role recording's current size in bytes.
-
-    Used by ``send_round``'s heartbeat to surface "is the agent
-    producing output at all" — non-zero growth between heartbeats
-    means the agent is alive and emitting; zero growth means it
-    hasn't even started rendering its prompt yet (or the TUI is
-    wedged on a startup dialog with no auto-responder).
-    """
-    log_writer = session.log_writer
-    if log_writer is None:
-        return None
-    recording_path = getattr(log_writer, "recording_path", None)
-    if recording_path is None or not recording_path.exists():
-        return None
-    try:
-        return recording_path.stat().st_size
-    except OSError:
-        return None
-
-
-def _try_read_response(response_file: Path) -> dict[str, Any] | None:
-    """Return the parsed JSON if the file exists and parses, else None.
-
-    A returned ``None`` covers both "file not yet present" and "file
-    present but the writer hasn't finished a complete JSON document yet"
-    — both cases call for continued polling rather than escalation.
-    """
-    if not response_file.exists():
-        return None
-    try:
-        text = response_file.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    if not text.strip():
-        return None
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    return parsed
-
-
 def close_persistent_session(
     session: PersistentSession,
     *,
@@ -759,43 +716,6 @@ def close_persistent_session(
         if session.log_writer is not None:
             session.log_writer.close()
     return session.proc.returncode
-
-
-def _drain_pty_output(session: PersistentSession) -> int:
-    """Read everything currently available on the master fd into the log.
-
-    When no log writer is configured (tests that don't care about
-    output), the chunks are discarded — they've been read off the PTY,
-    which is what matters to free the buffer. Returns the total number
-    of bytes drained on this call so the caller can surface
-    agent-is-alive evidence in heartbeat logs.
-    """
-    drained = 0
-    while True:
-        if session.closed:
-            return drained
-        try:
-            ready, _, _ = select.select([session.master_fd], [], [], 0)
-        except OSError:
-            logger.debug(
-                "[send_round] PTY drain skipped for closed fd=%d pid=%d",
-                session.master_fd,
-                session.proc.pid,
-            )
-            return drained
-        if not ready:
-            return drained
-        try:
-            chunk = os.read(session.master_fd, 4096)
-        except (BlockingIOError, OSError):
-            return drained
-        if not chunk:
-            return drained
-        drained += len(chunk)
-        if session.log_writer is not None:
-            session.log_writer.write(chunk)
-        if session.output_observer is not None:
-            session.output_observer(chunk)
 
 
 def _set_pty_geometry(slave_fd: int, *, rows: int, cols: int) -> None:

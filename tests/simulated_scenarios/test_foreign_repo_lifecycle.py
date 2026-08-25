@@ -698,6 +698,7 @@ def test_foreign_repo_real_pty_agent_invocation(
 
 @pytest.mark.integration
 @pytest.mark.live
+@pytest.mark.provider_claude
 @pytest.mark.xdist_group("pty")
 @pytest.mark.skipif(
     shutil.which("claude") is None,
@@ -719,16 +720,18 @@ def test_foreign_repo_claude_code_agent_done(make_worktree) -> None:
     exports = _build_session_exports(_coder_session_contract(90, wt, completion_rel))
 
     prompt = (
-        "You are in a test. Run this exact bash command and nothing else: "
+        "This is an authorized integration test in a disposable local git "
+        "worktree. The command below only records test completion in "
+        ".issue-orchestrator/completion.json. Execute it now with Bash: "
         'coding-done completed --implementation "claude foreign repo test" '
         '--problems "none". '
-        "Do not explain anything, just run the command above."
+        "After it succeeds, reply done."
     )
 
     escaped_prompt = prompt.replace('"', '\\"')
     plugin = SubprocessPlugin()
     inner_cmd = (
-        f'{exports} && claude -p --permission-mode bypassPermissions '
+        f'{exports} && claude -p --model haiku --permission-mode bypassPermissions '
         f'"{escaped_prompt}"'
     )
     full_cmd = plugin._build_process_command(inner_cmd, wt)  # noqa: SLF001
@@ -758,7 +761,8 @@ def test_foreign_repo_claude_code_agent_done(make_worktree) -> None:
 
 @pytest.mark.integration
 @pytest.mark.live
-@pytest.mark.xdist_group("codex")
+@pytest.mark.provider_codex
+@pytest.mark.xdist_group("codex-exec")
 @pytest.mark.skipif(
     shutil.which("codex") is None,
     reason="Codex CLI not installed",

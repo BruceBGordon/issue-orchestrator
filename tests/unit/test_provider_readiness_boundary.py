@@ -530,6 +530,9 @@ class _LauncherHarness:
             NullManifestDownloader,
         )
         from tests.callback_endpoint_helpers import ready_callback_endpoint
+        from tests.agent_phase_scheduler_helpers import (
+            host_agent_phase_command_scheduler,
+        )
         from tests.unit.test_session_launcher import (
             MockCommandRunner,
             MockEventSink,
@@ -581,6 +584,7 @@ class _LauncherHarness:
             else _manager(self.events),
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
             provider_readiness_probe=probe,
         )
 

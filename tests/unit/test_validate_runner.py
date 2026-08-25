@@ -6,13 +6,24 @@ so agents can find failure details without re-running tests.
 
 import json
 import os
+import shlex
 import subprocess
 import sys
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from issue_orchestrator.infra.validation_timings import ValidateTimingRecorder
+from issue_orchestrator.infra.validation_timings import (
+    ValidateTimingRecorder,
+    ValidationConfiguration,
+    ValidationConfigurationEntry,
+)
+from issue_orchestrator.entrypoints.cli_tools.validate_runner import (
+    ValidationRunnerClock,
+    run_validation,
+)
 
 
 def _with_repo_on_pythonpath(env: dict[str, str]) -> dict[str, str]:
@@ -296,17 +307,69 @@ class TestValidateRunner:
         assert target_record["live_web_jobs"] == "2"
         assert target_record["agent_jobs"] == "1"
         assert target_record["e2e_jobs"] == "1"
+        assert target_record["host_name"]
+        assert target_record["host_system"]
+        assert target_record["host_machine"]
+        assert isinstance(target_record["host_cpu_count"], int)
+        assert target_record["host_memory_bytes"] is None or isinstance(
+            target_record["host_memory_bytes"], int
+        )
         assert target_record["started_at"] == "2026-03-14T09:10:13-0600"
         assert target_record["ended_at"] == "2026-03-14T09:10:25-0600"
 
-    def test_ignores_malformed_timing_config_lines(self, fake_git_repo: Path):
-        """Malformed CONFIG markers should not clear a previously parsed config."""
+    def test_rejects_malformed_known_timing_marker(self, fake_git_repo: Path):
+        """A known marker prefix must never silently lose calibration evidence."""
         recorder = ValidateTimingRecorder(worktree=fake_git_repo, command="make validate")
 
         recorder.process_line("[validate-timing] CONFIG validate_jobs=10 unit_parallel=auto\n")
-        recorder.process_line("[validate-timing] CONFIG \n")
+        with pytest.raises(ValueError, match="malformed validation timing marker"):
+            recorder.process_line("[validate-timing] CONFIG \n")
 
-        assert recorder.config == {"validate_jobs": "10", "unit_parallel": "auto"}
+    @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process cleanup")
+    def test_duplicate_marker_cleans_up_child_sampler_and_finalizes_timing(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        output_dir = tmp_path / "output"
+        child_pid_path = tmp_path / "validation-child.pid"
+        command = (
+            f"printf '%s' \"$$\" > {shlex.quote(str(child_pid_path))}; "
+            "printf '[validate-timing] START target=duplicate at=one\\n'; "
+            "printf '[validate-timing] START target=duplicate at=two\\n'; "
+            "sleep 30"
+        )
+        sampler_threads_before = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name == "validate-resource-sampler"
+        }
+
+        with pytest.raises(ValueError, match="duplicate START marker"):
+            run_validation(command, output_dir, fake_git_repo)
+
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        sampler_threads_after = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name == "validate-resource-sampler"
+        }
+        assert sampler_threads_after == sampler_threads_before
+        records = [
+            json.loads(line)
+            for line in (
+                fake_git_repo
+                / ".git"
+                / "issue-orchestrator"
+                / "validate-timings.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        summary = next(record for record in records if record["kind"] == "run_summary")
+        assert summary["exit_code"] == -15
 
     def test_appends_run_summary_record_to_shared_git_dir(self, fake_git_repo: Path):
         """Each validate run should append a run summary record."""
@@ -337,10 +400,14 @@ class TestValidateRunner:
         assert isinstance(summary_record["monotonic_elapsed_seconds"], float)
         assert isinstance(summary_record["wall_elapsed_seconds"], float)
         assert summary_record["total_elapsed_seconds"] == pytest.approx(
-            summary_record["wall_elapsed_seconds"], abs=0.01
+            summary_record["monotonic_elapsed_seconds"], abs=0.01
         )
         assert isinstance(summary_record["wall_started_at"], str)
         assert isinstance(summary_record["wall_ended_at"], str)
+        assert summary_record["host_name"]
+        assert summary_record["host_memory_bytes"] is None or isinstance(
+            summary_record["host_memory_bytes"], int
+        )
 
     def test_appends_resource_samples_to_shared_git_dir(self, fake_git_repo: Path):
         """Validate runs should persist periodic resource samples."""
@@ -366,6 +433,62 @@ class TestValidateRunner:
         sample = resource_records[0]
         assert sample["worktree"] == str(fake_git_repo)
         assert "recorded_at" in sample
+        assert sample["host_name"]
+        assert isinstance(sample["host_cpu_count"], int)
+
+    def test_wall_clock_rollback_cannot_corrupt_elapsed_duration(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        wall_start = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+        wall_rollback = datetime(2026, 8, 24, 11, tzinfo=timezone.utc)
+        wall_calls = 0
+        monotonic_calls = 0
+
+        def wall_now() -> datetime:
+            nonlocal wall_calls
+            wall_calls += 1
+            return wall_start if wall_calls == 1 else wall_rollback
+
+        def monotonic_now() -> float:
+            nonlocal monotonic_calls
+            monotonic_calls += 1
+            return 100.0 if monotonic_calls == 1 else 105.0
+
+        result = run_validation(
+            "true",
+            tmp_path / "output",
+            fake_git_repo,
+            clock=ValidationRunnerClock(wall_now, monotonic_now),
+        )
+
+        assert result == 0
+        records = [
+            json.loads(line)
+            for line in (
+                fake_git_repo
+                / ".git"
+                / "issue-orchestrator"
+                / "validate-timings.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        summary = next(record for record in records if record["kind"] == "run_summary")
+        assert summary["total_elapsed_seconds"] == 5.0
+        assert summary["monotonic_elapsed_seconds"] == 5.0
+        assert summary["wall_elapsed_seconds"] == -3600.0
+
+    def test_default_run_ids_are_unique_within_the_same_second(
+        self,
+        fake_git_repo: Path,
+    ) -> None:
+        first = ValidateTimingRecorder(fake_git_repo, "first")
+        second = ValidateTimingRecorder(fake_git_repo, "second")
+
+        assert first.run_id != second.run_id
+        assert "-pid" in first.run_id
 
 
 class TestReadHeadSha:

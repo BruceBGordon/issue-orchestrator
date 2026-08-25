@@ -19,7 +19,8 @@ import pytest
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.live,
-    pytest.mark.xdist_group("codex"),
+    pytest.mark.provider_codex,
+    pytest.mark.xdist_group("codex-exec"),
     pytest.mark.usefixtures("isolated_codex_home"),
 ]
 

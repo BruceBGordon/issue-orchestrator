@@ -11,7 +11,6 @@ Storage location: .issue-orchestrator/validation/<suite>/<HEAD_SHA>.json
 
 import json
 import logging
-import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -428,6 +427,7 @@ class PublishGate:
         timeout_seconds: int = 1800,
         attempt_store: AttemptStore | None = None,
         attempt_key: AttemptKey | None = None,
+        timing_clock: timings.ValidationTimingClock = timings.SYSTEM_VALIDATION_TIMING_CLOCK,
     ):
         """Initialize publish gate for a worktree.
 
@@ -449,6 +449,7 @@ class PublishGate:
         self.timeout_seconds = timeout_seconds
         self.attempt_store = attempt_store
         self.attempt_key = attempt_key
+        self.timing_clock = timing_clock
         self.store = ValidationRecordStore(worktree)
         self.cache = ValidationCache(self.store)
         self.runner = ValidationRunner(self.store, command_runner)
@@ -471,27 +472,26 @@ class PublishGate:
     ) -> None:
         """Append an outer publish-gate timing record."""
         record = result.record
-        payload: dict[str, object] = {
-            "kind": "validation_gate_summary",
-            "gate": self.SUITE_NAME,
-            "command": self.command,
-            "timeout_seconds": self.timeout_seconds,
-            "head_sha": head_sha,
-            "cache_lookup": cache_lookup,
-            "cache_hit": result.cache_hit,
-            "allowed": result.allowed,
-            "reason": result.reason,
-            "record_passed": record.passed if record else None,
-            "record_exit_code": record.exit_code if record else None,
-            "record_timed_out": record.timed_out if record else None,
-        }
-        payload.update(
-            timings.build_timing_envelope(
+        summary = timings.PublishGateTimingSummary(
+            gate=self.SUITE_NAME,
+            command=self.command,
+            timeout_seconds=self.timeout_seconds,
+            head_sha=head_sha,
+            cache_lookup=cache_lookup,
+            cache_hit=result.cache_hit,
+            allowed=result.allowed,
+            reason=result.reason,
+            record_passed=record.passed if record else None,
+            record_exit_code=record.exit_code if record else None,
+            record_timed_out=record.timed_out if record else None,
+            envelope=timings.build_timing_envelope(
                 wall_started_at=wall_started_at,
                 monotonic_started_at=monotonic_started_at,
-            )
+                wall_ended_at=self.timing_clock.wall_now(),
+                monotonic_ended_at=self.timing_clock.monotonic_now(),
+            ),
         )
-        timings.append_validation_timing(self.worktree, payload)
+        timings.append_validation_timing(self.worktree, summary)
 
     def _validate_attempt_key_head(self, head_sha: str) -> None:
         if self.attempt_key is None:
@@ -639,8 +639,8 @@ class PublishGate:
         Returns:
             PublishGateResult with allowed status and reason
         """
-        wall_started_at = datetime.now(timezone.utc)
-        monotonic_started_at = time.monotonic()
+        wall_started_at = self.timing_clock.wall_now()
+        monotonic_started_at = self.timing_clock.monotonic_now()
         head_sha: str | None = None
         cache_lookup = "not_checked"
 

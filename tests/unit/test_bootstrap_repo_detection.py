@@ -256,7 +256,10 @@ class TestCheckGithubTokenScopes:
         # Should not raise - only non-empty scopes are checked
         _check_github_token_scopes(config, github_adapter)
 
-    def test_check_scopes_logs_warning_on_exception(self) -> None:
+    def test_check_scopes_logs_warning_on_exception(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         """Logs warning and returns if get_token_scopes fails."""
         config = Config()
         config.github_required_scopes = ["repo"]
@@ -265,12 +268,14 @@ class TestCheckGithubTokenScopes:
         github_adapter = MagicMock()
         github_adapter.get_token_scopes.side_effect = Exception("API error")
 
-        with patch("issue_orchestrator.entrypoints.bootstrap.logger") as mock_logger:
-            # Should not raise, just log warning
+        with caplog.at_level("WARNING"):
             _check_github_token_scopes(config, github_adapter)
-            mock_logger.warning.assert_called()
+        assert "Failed to fetch GitHub token scopes" in caplog.text
 
-    def test_check_scopes_logs_token_info_when_available(self) -> None:
+    def test_check_scopes_logs_token_info_when_available(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         """Logs token scopes when successfully retrieved."""
         config = Config()
         config.github_required_scopes = []
@@ -279,12 +284,14 @@ class TestCheckGithubTokenScopes:
         github_adapter = MagicMock()
         github_adapter.get_token_scopes.return_value = ["repo", "workflow"]
 
-        with patch("issue_orchestrator.entrypoints.bootstrap.logger") as mock_logger:
+        with caplog.at_level("INFO"):
             _check_github_token_scopes(config, github_adapter)
-            mock_logger.info.assert_called()
-            assert "token scopes" in mock_logger.info.call_args[0][0].lower()
+        assert "GitHub token scopes: repo, workflow" in caplog.text
 
-    def test_check_scopes_logs_when_scopes_unavailable(self) -> None:
+    def test_check_scopes_logs_when_scopes_unavailable(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         """Logs info when token scopes are unavailable."""
         config = Config()
         config.github_required_scopes = []
@@ -293,12 +300,14 @@ class TestCheckGithubTokenScopes:
         github_adapter = MagicMock()
         github_adapter.get_token_scopes.return_value = []
 
-        with patch("issue_orchestrator.entrypoints.bootstrap.logger") as mock_logger:
+        with caplog.at_level("INFO"):
             _check_github_token_scopes(config, github_adapter)
-            mock_logger.info.assert_called()
-            assert "unavailable" in mock_logger.info.call_args[0][0].lower()
+        assert "GitHub token scopes unavailable" in caplog.text
 
-    def test_check_scopes_skips_github_app_auth(self) -> None:
+    def test_check_scopes_skips_github_app_auth(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         """GitHub App auth has permissions, not OAuth scopes."""
         config = Config()
         config.github_required_scopes = ["repo"]
@@ -306,11 +315,11 @@ class TestCheckGithubTokenScopes:
         github_adapter = MagicMock()
         github_adapter.auth_kind = "github_app"
 
-        with patch("issue_orchestrator.entrypoints.bootstrap.logger") as mock_logger:
+        with caplog.at_level("INFO"):
             _check_github_token_scopes(config, github_adapter)
 
         github_adapter.get_token_scopes.assert_not_called()
-        mock_logger.info.assert_called()
+        assert "Skipping OAuth scope check" in caplog.text
 
 
 class TestBuildOrchestratorForTesting:

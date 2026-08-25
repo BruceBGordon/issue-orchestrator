@@ -192,17 +192,118 @@ To view: cat /path/to/worktree/.issue-orchestrator/diagnostics/validation-output
 
 **How it works:** The `make validate` target runs validation through a Python wrapper (`validate_runner.py`) that captures all output while also streaming it to the terminal. This ensures agents can find failure details without re-running tests.
 
-**Fallback:** If the Python wrapper fails, use `make validate-raw` for direct execution (no output capture).
+**Explicit diagnostic path:** `make validate-raw` runs directly without output
+capture. It is never selected automatically when the Python wrapper fails.
 
-**Tuning local PR validation parallelism:** `make validate-pr` is phased so
-pytest suites that already use xdist do not also compete with each other at the
-Makefile level. `VALIDATE_JOBS` still controls the static-check phase by
-default. Use `VALIDATE_TEST_JOBS`, `VALIDATE_WEB_JOBS`,
-`VALIDATE_AGENT_JOBS`, or `VALIDATE_E2E_JOBS` when debugging local contention;
-the default `1` for these heavier phases is a deliberate stability/walltime
-tradeoff.
+**Tuning local PR validation parallelism:** `make validate-pr` launches static
+analysis and six test commands concurrently. Each command declares an accepted
+concurrency range under a human-readable IO work key. The measured defaults on
+the 18-core host are static 1–3, unit 8–24, simulated 4–8, local integration
+2–4, Claude 1–2, Codex 2–3, and browser 4–12. Those are accepted ranges, not
+simultaneous reservations. The host executor learns CPU occupancy for each key
+and grants the largest value that fits the active machine-wide leases.
 
-**Environment variable:** The orchestrator sets `ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR` to direct output to the session directory. For direct runs, this is unset and output goes to the diagnostics fallback.
+Every range-based pytest command uses `-n auto`. This is required: xdist reads the
+executor grant from `PYTEST_XDIST_AUTO_NUM_WORKERS`, while a numeric `-n N`
+would bypass the grant. `--dist=loadgroup` preserves serial tests within each
+declared provider interaction group without collapsing the entire provider lane
+to one xdist worker.
+
+For a repeatable experiment, set a numeric `UNIT_PARALLEL`,
+`SIMULATED_PARALLEL`, `INTEGRATION_PARALLEL`, `CLAUDE_PROVIDER_PARALLEL`,
+`CODEX_PROVIDER_PARALLEL`, or `WEB_PARALLEL`. The Make target converts that
+number to a fixed minimum/maximum executor grant while keeping xdist on `auto`.
+Set a value to `0` to disable xdist for that command. `PROVIDER_PARALLEL`
+remains the shared override for both provider commands. `VALIDATE_LANE_JOBS`
+only controls how many commands Make may submit; the executor owns admission.
+
+All repositories and worktrees under the same OS user share the host pool. The
+executor detects its internal CPU-slot capacity; the aggressiveness percentage
+is the one host-pressure dial. Provider and browser lanes also hold named
+exclusive leases so two
+orchestrated issues cannot run the same scarce local integration concurrently.
+Every top-level IO validation gives all its lanes one fairness group. The pool
+accounts admitted CPU slots per live group, so a newly waiting light Porchpin
+validation runs before more lanes from an already-served heavy IO validation.
+An old request that needs several CPU slots drains enough capacity to run
+instead of being starved by a stream of small work.
+See [Client Test Integrations](../user/test-integrations.md#bound-validation-concurrency-across-repositories)
+for the generic repository wrapper.
+
+Each queued command also samples native host CPU busy time over its admission
+interval. A `waiting reason=host-pressure` event means the sample reached the
+internal 95% threshold, so the executor stopped admitting new commands until a
+later sample showed recovery. Use `executor-events` to distinguish this from
+capacity, fairness, exclusive-resource, and lease-race waits. Load average is
+recorded for context but does not drive this decision.
+
+The 2026-08-24 calibration on the 18-core, 64 GB host found the full uncached
+PR gate at 95.86s with 100% aggressiveness, 84.24s at 125%, and 96.76s at 150%.
+Provider round trips vary substantially, but local static and unit work also
+slowed at 150%, placing 125% at the measured knee. Use
+`issue-orchestrator executor-policy --aggressiveness 125` on that host. Older
+timing-history rows may have been migrated from the previous machine; only
+explicitly retained runs known to have executed on this host are calibration
+evidence.
+
+After native CPU-pressure feedback and learned range admission were complete,
+three independent full uncached confirmations passed in **83.23s**,
+**81.45s**, and **83.52s** (82.73s mean). The third includes the final
+adversarial fixes to learning-history retention, low-core grant selection,
+monotonic queue ordering, and profiler accounting. All seven lanes were
+admitted within 0.13s. Their critical paths were provider lanes at 79–82s;
+local lanes completed in 15–47s. Peak recorded lane RSS remained far below the
+available 64 GB and swap stayed unused, so memory did not constrain these runs.
+
+This is a repeatable scheduling result, not a hard wall-clock upper bound on
+remote services. One otherwise-identical confirmation took 128.8s because the
+real interactive Codex smoke alone varied to 122.02s; its executor admission
+took 0.12s and its entire lane consumed only about 20 child CPU seconds. An
+instrumented isolated run split 42.5s into 9.0s of interactive startup, 4.1s of
+safe prompt submission, and 29.4s awaiting the review response. Faster-model
+experiments were not retained: Spark was fast but emitted an invalid protocol
+value in one of three runs, while Luna and Terra were slower in measured
+samples. A larger future optimization could start an idle interactive provider
+and make the first real review specification its first model turn, instead of
+paying for a bootstrap "waiting" turn; that changes the production session
+contract and belongs outside executor tuning.
+
+Removing any remaining lane-arrival-order component requires an explicit
+batch-submission contract; do not simulate one with lane priorities or startup
+sleeps. "Uncached" here bypasses the validation-result cache only. Normal OS
+filesystem, installed dependency, browser, CLI, and external-service caches
+remain part of the real-world measurement.
+
+`make -f repo-specific/Makefile validate-profile` measures detached fresh
+worktrees against committed `HEAD`. Each measured command receives a fresh
+executor-learning pool, while normal external caches remain enabled. Its
+`VALIDATE_JOBS` value controls both aggregate GNU make fan-out and the inner
+validation-lane fan-out; the JSON report records both facts explicitly. The
+headline serial sum includes the aggregate static lane exactly once; nested
+typecheck, architecture, and quality components are not double-counted as
+independent execution lanes.
+
+Use `issue-orchestrator executor-events --limit 100` to inspect the durable
+typed decision trail after a run. It reports human repository/work identities,
+wait reasons, grants, internal CPU-slot arithmetic, native CPU busy samples and
+sample intervals, resource observations, and learned-estimate changes. It
+reads through the executor monitoring port rather than parsing logs or private
+state.
+
+To exercise an IO lane that has no exclusive resource without the host pool,
+use the standalone direct executor with the same command contract:
+
+```bash
+make test-unit EXECUTOR_RUN=./scripts/executor-run-direct
+```
+
+The direct executor grants the declared maximum but performs no cross-process
+coordination or learning. It fails rather than silently ignoring an exclusive
+resource, so it cannot replace the pooled executor for IO's complete PR gate.
+
+**Environment variable:** The orchestrator sets
+`ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR` to direct output to the session
+directory. Direct runs use the repository diagnostics directory by default.
 
 ### Pre-Push Hook Infinite Recursion
 

@@ -30,6 +30,7 @@ from issue_orchestrator.ports.repository_host import DependencyIssueSnapshot
 from issue_orchestrator.domain.issue_key import FakeIssueKey, IssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+from tests.agent_phase_scheduler_helpers import host_agent_phase_command_scheduler
 
 TEST_ADMIN_TOKEN = "test-admin-token"
 TEST_AGENT_CALLBACK_TOKEN = "test-agent-callback-token"
@@ -1159,6 +1160,7 @@ def build_test_orchestrator_deps(
             agent_callback_endpoint=agent_callback_endpoint,
             provider_readiness_probe=readiness_probe,
             needs_human_block=needs_human_block,
+            agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
         ),
         # Same shape again for the completion handler (#6999 A4).
         completion_handler_factory=build_completion_handler_factory(

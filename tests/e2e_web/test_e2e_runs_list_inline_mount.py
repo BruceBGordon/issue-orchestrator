@@ -512,8 +512,9 @@ def test_two_rows_expanded_act_independently(
 
     # ── 4. Click Row A's Ops button — only Row A's timeline refetches ─
     fetched.clear()
-    with page.expect_request(
-        lambda req: f"/api/e2e-run-detail/{run_a_id}" in req.url and "view=ops" in req.url,
+    with page.expect_response(
+        lambda response: f"/api/e2e-run-detail/{run_a_id}" in response.url
+        and "view=ops" in response.url,
         timeout=5_000,
     ):
         btn_a_ops.click()
@@ -686,8 +687,8 @@ def test_create_issues_for_untriaged_uses_row_scoped_agent_and_run_id(
     )
 
     # Intercept the bulk-create endpoint and capture every body the
-    # frontend sent.  ``page.expect_request`` waits for the click to
-    # trigger a real POST.
+    # frontend sent. ``page.expect_response`` waits until the route
+    # handler has captured and fulfilled the POST.
     create_calls: list[dict[str, object]] = []
 
     def _route_create(route):
@@ -761,8 +762,9 @@ def test_create_issues_for_untriaged_uses_row_scoped_agent_and_run_id(
 
     # Click row A's Create-issues button + wait for the POST to fire.
     create_btn_a = row_a.locator(".e2e-untracked-banner button.btn-primary").first
-    with page.expect_request(
-        lambda req: f"/control/e2e/create-issues/{run_a_id}" in req.url and req.method == "POST",
+    with page.expect_response(
+        lambda response: f"/control/e2e/create-issues/{run_a_id}" in response.url
+        and response.request.method == "POST",
         timeout=5_000,
     ):
         create_btn_a.click()

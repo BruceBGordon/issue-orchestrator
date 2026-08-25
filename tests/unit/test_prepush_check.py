@@ -5,6 +5,7 @@ import os
 import pytest
 import tempfile
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from issue_orchestrator.entrypoints.cli_tools.prepush_check import (
@@ -12,6 +13,7 @@ from issue_orchestrator.entrypoints.cli_tools.prepush_check import (
     load_validation_cmd,
     run_prepush_check,
 )
+from issue_orchestrator.infra.validation_timings import ValidationTimingClock
 
 
 def _shared_timing_records(worktree: Path) -> list[dict[str, object]]:
@@ -182,6 +184,42 @@ class TestRunPrepushCheck:
             assert result == 0
         finally:
             os.chdir(orig_cwd)
+
+    def test_public_prepush_path_survives_wall_clock_rollback(
+        self,
+        temp_worktree: Path,
+    ) -> None:
+        wall_values = iter(
+            (
+                datetime(2026, 8, 24, 12, tzinfo=timezone.utc),
+                datetime(2026, 8, 24, 11, tzinfo=timezone.utc),
+            )
+        )
+        monotonic_values = iter((100.0, 101.0, 102.0, 105.0))
+        timing_clock = ValidationTimingClock(
+            wall_now=lambda: next(wall_values),
+            monotonic_now=lambda: next(monotonic_values),
+        )
+
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(temp_worktree)
+            result = run_prepush_check(
+                verbose=False,
+                dirty_only=True,
+                timing_clock=timing_clock,
+            )
+        finally:
+            os.chdir(original_cwd)
+
+        assert result == 0
+        summary = next(
+            record
+            for record in _shared_timing_records(temp_worktree)
+            if record["kind"] == "prepush_gate_summary"
+        )
+        assert summary["monotonic_elapsed_seconds"] == 5.0
+        assert summary["wall_elapsed_seconds"] == -3600.0
 
     def test_records_error_summary_when_config_load_raises(
         self, temp_worktree, monkeypatch

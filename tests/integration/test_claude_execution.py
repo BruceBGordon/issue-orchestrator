@@ -11,6 +11,7 @@ from collections.abc import Mapping
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.live,
+    pytest.mark.provider_claude,
     # Run PTY tests sequentially in one worker to avoid Python 3.14 forkpty warning
     # (forkpty() in multi-threaded processes can deadlock)
     pytest.mark.xdist_group("pty"),
@@ -123,6 +124,8 @@ class TestClaudeExecution:
             [
                 "claude",
                 "--print",  # Output response and exit (non-interactive)
+                "--model",
+                "haiku",
                 f"Reply with exactly this token and nothing else: {expected_token}",
             ],
             timeout=xdist_timeout(60),  # Give Claude time to respond
@@ -141,7 +144,9 @@ class TestClaudeExecution:
         This is the actual pattern used by the orchestrator.
         """
         # Build a command similar to what orchestrator generates
-        inner_command = "claude --print 'Reply with just the word: hello'"
+        inner_command = (
+            "claude --print --model haiku 'Reply with just the word: hello'"
+        )
 
         # Escape single quotes for zsh wrapper (the fix we just made)
         escaped_command = inner_command.replace("'", "'\\''")
@@ -172,6 +177,8 @@ class TestClaudeExecution:
                 [
                     "claude",
                     "--print",
+                    "--model",
+                    "haiku",
                     "--dangerously-skip-permissions",  # Bypass permission prompts
                     f"Read the file at {test_file} and tell me what the title is. Reply with just the title text.",
                 ],
@@ -206,6 +213,8 @@ class TestClaudeExecution:
                 [
                     "claude",
                     "--print",
+                    "--model",
+                    "haiku",
                     "--dangerously-skip-permissions",
                     f"Read {instruction_file} and confirm you can see 'Agent Instructions' in it. Reply YES or NO.",
                 ],
@@ -247,6 +256,8 @@ class TestClaudeWithEnvironmentIsolation:
             [
                 "claude",
                 "--print",
+                "--model",
+                "haiku",
                 "Reply with just the word: working",
             ],
             timeout=xdist_timeout(60),
@@ -280,6 +291,8 @@ class TestClaudeWithEnvironmentIsolation:
             [
                 "claude",
                 "--print",
+                "--model",
+                "haiku",
                 "hello",
             ],
             capture_output=True,
@@ -415,7 +428,7 @@ class TestClaudeViaAdapterPath:
         # Build the claude command - ask Claude to create a file we can verify
         # This proves Claude actually ran and executed tools, not just responded
         claude_cmd = (
-            f"claude --print --dangerously-skip-permissions "
+            f"claude --print --model haiku --dangerously-skip-permissions "
             f"'Create a file at {verify_file} containing exactly the text VERIFIED. "
             f"Use the Write tool. Reply with DONE when complete.'"
         )
@@ -476,7 +489,7 @@ class TestClaudeViaAdapterPath:
             run_assets = make_session_run_assets(worktree, session_name=session_name)
             claude_cmd = (
                 f"export {ENV_PREFIX}RUN_DIR='{run_assets.run_dir}' && "
-                "claude --print --dangerously-skip-permissions "
+                "claude --print --model haiku --dangerously-skip-permissions "
                 f"\"{escaped_prompt}\""
             )
 
@@ -548,7 +561,7 @@ class TestClaudeViaAdapterPath:
             isolate_home=True,  # This breaks Keychain auth!
         )
 
-        claude_cmd = "claude --print 'hello'"
+        claude_cmd = "claude --print --model haiku 'hello'"
         escaped_cmd = claude_cmd.replace("'", "'\\''")
         full_cmd = f'{isolation_prefix}cd "{worktree}" && {escaped_cmd}'
         zsh_wrapped = f"zsh -l -c '{full_cmd}'"
@@ -625,6 +638,7 @@ class TestAgentDoneInvocation:
             [
                 "claude",
                 "-p",
+                "--model", "haiku",
                 "--permission-mode", "bypassPermissions",
                 prompt,
             ],

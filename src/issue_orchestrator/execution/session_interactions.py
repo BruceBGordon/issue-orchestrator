@@ -207,7 +207,10 @@ def _matching_command_tokens(
 
 def _trim_command_prefix(tokens: Sequence[str]) -> list[str] | None:
     trimmed = list(tokens)
-    while trimmed and (trimmed[0] == "exec" or _looks_like_env_assignment(trimmed[0])):
+    while trimmed and (
+        trimmed[0].rsplit("/", 1)[-1] in {"command", "env", "exec"}
+        or _looks_like_env_assignment(trimmed[0])
+    ):
         trimmed = trimmed[1:]
     return trimmed or None
 
@@ -304,7 +307,7 @@ def _is_codex_interactive_command_tokens(tokens: Sequence[str]) -> bool:
 
 
 def _looks_like_env_assignment(token: str) -> bool:
-    if "=" not in token or token.startswith("-") or "/" in token:
+    if "=" not in token or token.startswith("-"):
         return False
     key, _, _ = token.partition("=")
-    return bool(key)
+    return re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) is not None

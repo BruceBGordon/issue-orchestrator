@@ -108,6 +108,18 @@ class ProviderCommandWrapper(Protocol):
     def __call__(self, base_command: str, agent_config: AgentConfig, run_dir: Path, /) -> str: ...
 
 
+class AgentPhaseScheduler(Protocol):
+    def __call__(
+        self,
+        *,
+        shell_command: str,
+        agent_config: AgentConfig,
+        run: SessionRunAssets,
+        agent_label: str,
+        task_kind: TaskKind,
+    ) -> tuple[str, AgentConfig]: ...
+
+
 class SessionEnvBuilder(Protocol):
     def __call__(
         self,
@@ -150,6 +162,7 @@ class ReworkLaunchDependencies:
     clear_reset_retry_scratch_pending_label: GuardLabelClearer
     persist_session_prompt: PromptPersister
     wrap_provider_command: ProviderCommandWrapper
+    schedule_agent_phase: AgentPhaseScheduler
     build_session_env: SessionEnvBuilder
     check_provider_ready: ProviderReadinessChecker
     resolve_stack_decision: StackDecisionResolverFn
@@ -497,7 +510,13 @@ def launch_rework_session(
             run_assets=run,
             worktree_path=worktree_path,
         )
-        command = f"{env_exports} && {base_command}"
+        command, session_agent_config = deps.schedule_agent_phase(
+            shell_command=f"{env_exports} && {base_command}",
+            agent_config=agent_config,
+            run=run,
+            agent_label=rework.agent_type,
+            task_kind=TaskKind.REWORK,
+        )
         logger.info(
             "[launch] Rework session command: issue=%s pr=%s session=%s worktree=%s completion=%s command=%s",
             issue_number,
@@ -541,7 +560,7 @@ def launch_rework_session(
         session = Session(
             key=session_key,
             issue=rework_issue,
-            agent_config=agent_config,
+            agent_config=session_agent_config,
             terminal_id=session_name,
             worktree_path=worktree_path,
             branch_name=branch_name,

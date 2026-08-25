@@ -12,6 +12,12 @@ from rich.console import Console
 from ..infra.logging_config import setup_logging
 from .cli_auth_commands import cmd_auth, cmd_keys
 from .cli_dry_run import run_dry_run as _run_dry_run
+from .cli_executor_commands import (
+    cmd_executor_events,
+    cmd_executor_policy,
+    cmd_executor_run,
+    cmd_executor_status,
+)
 from .cli_hook_commands import cmd_setup_guardrails, cmd_setup_hooks, cmd_verify
 from .cli_parser import CLICommandHandlers, build_parser
 from .cli_queue_commands import cmd_audit
@@ -829,6 +835,10 @@ def main() -> int:
             doctor=cmd_doctor,
             demo=cmd_demo,
             trace=cmd_trace,
+            executor_run=cmd_executor_run,
+            executor_policy=cmd_executor_policy,
+            executor_events=cmd_executor_events,
+            executor_status=cmd_executor_status,
         )
     )
 

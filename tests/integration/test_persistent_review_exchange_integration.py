@@ -847,6 +847,8 @@ def test_synthetic_raw_tui_review_exchange_suppresses_bootstrap_response(
 
 @pytest.mark.skipif(not _CODEX_READY, reason="codex CLI not installed or not logged in")
 @pytest.mark.live_codex
+@pytest.mark.provider_codex
+@pytest.mark.xdist_group("codex-interactive")
 def test_real_interactive_codex_reviewer_round_trips_through_exchange(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -113,6 +113,8 @@ markers = [
     "live: Tests that require network access and external services",
     "live_agent: Tests that run real AI provider CLI sessions under the e2e flake-management lane",
     "live_codex: Live Codex CLI smoke tests collected by e2e or dedicated live lanes",
+    "provider_claude: Tests that consume the host's authenticated Claude CLI/account lane",
+    "provider_codex: Tests that consume the host's authenticated Codex CLI/account lane",
     "xdist_group(name): Group tests to run serially under pytest-xdist --dist=loadgroup",
     "gh_activity_limit: Enforce GH API activity limits per test (test_gh_activity_limit, system_gh_activity_limit)",
     "requires_infra: Tests requiring external infrastructure (GitHub token, running services). Run in CI, excluded from pre-push.",

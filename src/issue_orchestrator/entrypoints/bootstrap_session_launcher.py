@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from ..domain.state_machines.session_machine import SessionStateMachine
     from ..infra.config import Config
     from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
+    from ..ports.agent_phase_command_scheduler import AgentPhaseCommandScheduler
     from ..ports.board_snapshot_provider import BoardSnapshotProvider
     from ..ports.issue import Issue as IssueProtocol
     from ..ports.session_launcher_factory import SessionLauncherFactory
@@ -53,6 +54,7 @@ def build_session_launcher_factory(
     provider_readiness_probe: ProviderReadinessProbe,
     needs_human_block: SharedNeedsHumanBlock,
     coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
+    agent_phase_command_scheduler: "AgentPhaseCommandScheduler",
 ) -> "SessionLauncherFactory":
     """Bind the application dependencies; return the facade-facing factory."""
 
@@ -87,6 +89,7 @@ def build_session_launcher_factory(
             ),
             board_snapshot_provider=board_snapshot_provider,
             agent_callback_endpoint=agent_callback_endpoint,
+            agent_phase_command_scheduler=agent_phase_command_scheduler,
             provider_readiness_probe=provider_readiness_probe,
             needs_human_block=needs_human_block,
             coder_prompt_addendum=coder_prompt_addendum,

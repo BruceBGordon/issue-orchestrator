@@ -1,4 +1,4 @@
-.PHONY: help venv venv-fast semgrep-venv worktree-create worktree-setup install upgrade-deps deps-batch release release-pr prepare-release preview-readme typecheck lint-arch lint-complexity quality-guardrails quality-guardrails-stale sync-deps test test-unit test-unit-cov test-unit-cov-html test-integration test-integration-core test-integration-core-local test-integration-core-live-codex test-integration-agent test-simulated test-simulated-core test-simulated-agent test-e2e test-e2e-heavy test-e2e-onboarding-live test-e2e-one test-e2e-live test-real-claude-dev test-real-claude-review test-real-gh-labels test-real-gh test-real-gh-plus-e2e test-real-gh-plus-e2e-subprocess test-web test-web-headed playwright-install validate validate-raw validate-pr validate-pr-raw validate-quick validate-full verify-hooks-all _validate-impl _validate-static-impl _validate-core-tests-impl _validate-pr-impl _validate-agent-impl _validate-full-impl clean demo issues-validate issues-fix issues-fix-dry-run issues-create
+.PHONY: help venv venv-fast semgrep-venv worktree-create worktree-setup install upgrade-deps deps-batch release release-pr prepare-release preview-readme typecheck lint-arch lint-complexity quality-guardrails quality-guardrails-stale sync-deps test test-unit test-unit-cov test-unit-cov-html test-integration test-integration-core test-integration-core-local test-integration-core-live-codex test-integration-agent test-simulated test-simulated-core test-simulated-agent test-provider-core-claude test-provider-core-codex test-provider-pr-claude test-provider-pr-codex test-e2e test-e2e-heavy test-e2e-onboarding-live test-e2e-one test-e2e-live test-real-claude-dev test-real-claude-review test-real-gh-labels test-real-gh test-real-gh-plus-e2e test-real-gh-plus-e2e-subprocess test-web test-web-headed playwright-install validate validate-raw validate-pr validate-pr-raw validate-quick validate-full verify-hooks-all _validate-impl _validate-static-lane _validate-static-impl _validate-core-tests-impl _validate-pr-impl _validate-agent-impl _validate-full-impl clean demo issues-validate issues-fix issues-fix-dry-run issues-create
 
 # GNU make detection - required for parallel validation with grouped output
 # On macOS: brew install make (provides gmake)
@@ -316,15 +316,15 @@ PYTEST_TIMINGS ?= --durations=$(PYTEST_DURATIONS) --durations-min=$(PYTEST_DURAT
 
 define TIMED_RUN
 	@target="$(1)"; \
-	start=$$(date +%s); \
+	start=$$($(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.validation_marker_clock now) || exit $$?; \
 	start_hr=$$(date '+%Y-%m-%dT%H:%M:%S%z'); \
 	echo "[validate-timing] START target=$$target at=$$start_hr"; \
 	set +e; \
 	{ $(2); }; \
 	status=$$?; \
-	end=$$(date +%s); \
+	end=$$($(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.validation_marker_clock now) || exit $$?; \
 	end_hr=$$(date '+%Y-%m-%dT%H:%M:%S%z'); \
-	elapsed=$$((end-start)); \
+	elapsed=$$($(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.validation_marker_clock elapsed "$$start" "$$end") || exit $$?; \
 	echo "[validate-timing] END target=$$target status=$$status elapsed=$${elapsed}s at=$$end_hr"; \
 	exit $$status
 endef
@@ -363,20 +363,67 @@ lint-complexity:
 		echo "Checking code complexity (C901) and branch count (PLR0912)..." && \
 		$(RUFF) check src packages/agent_runner/src --output-format=concise)
 
-# Parallel test execution with pytest-xdist (-n auto uses all CPU cores)
-# Use PARALLEL=0 to disable: make test-unit PARALLEL=0
+# Parallel test execution with pytest-xdist. Validation commands opt into the
+# issue-orchestrator machine-wide executor pool, which bounds the sum of xdist
+# workers across independent repositories and worktrees.
+# A repository declares an accepted concurrency range for each opaque work key.
+# The executor learns the key's CPU occupancy, chooses a grant, and exports it
+# through PYTEST_XDIST_AUTO_NUM_WORKERS. Numeric PARALLEL overrides collapse a
+# range to one repeatable value; PARALLEL=0 disables xdist without bypassing
+# machine-wide admission.
+EXECUTOR_RUN ?= $(PYTHON) -m issue_orchestrator.entrypoints.cli executor-run
+
+executor_min = $(if $(filter 0,$(strip $(1))),1,$(if $(filter auto logical,$(strip $(1))),$(strip $(2)),$(strip $(1))))
+executor_max = $(if $(filter 0,$(strip $(1))),1,$(if $(filter auto logical,$(strip $(1))),$(strip $(2)),$(strip $(1))))
+pytest_parallel_args = $(if $(filter 0,$(strip $(1))),,-n auto --dist=loadgroup)
+
+define RUN_IN_EXECUTOR_POOL
+ISSUE_ORCHESTRATOR_EXECUTOR_GROUP="$${ISSUE_ORCHESTRATOR_EXECUTOR_GROUP:-io-standalone-$(1)-$$PPID}" \
+$(EXECUTOR_RUN) --work-key io:$(1) --min-concurrency $(2) --max-concurrency $(3) $(foreach resource,$(4),--exclusive $(resource)) -- $(5)
+endef
+
 PARALLEL ?= auto
 UNIT_PARALLEL ?= $(PARALLEL)
+UNIT_MIN_CONCURRENCY ?= 8
+UNIT_MAX_CONCURRENCY ?= 24
 SIMULATED_PARALLEL ?= $(PARALLEL)
+SIMULATED_MIN_CONCURRENCY ?= 4
+SIMULATED_MAX_CONCURRENCY ?= 8
+SIMULATED_AGENT_PARALLEL ?= $(PARALLEL)
+SIMULATED_AGENT_MIN_CONCURRENCY ?= 1
+SIMULATED_AGENT_MAX_CONCURRENCY ?= 2
 INTEGRATION_PARALLEL ?= $(PARALLEL)
+INTEGRATION_MIN_CONCURRENCY ?= 2
+INTEGRATION_MAX_CONCURRENCY ?= 4
+# PROVIDER_PARALLEL remains a compatibility override for both provider lanes.
+# Their accepted ranges differ, and each learned profile is repository-local.
+PROVIDER_PARALLEL ?= $(PARALLEL)
+CLAUDE_PROVIDER_PARALLEL ?= $(PROVIDER_PARALLEL)
+CLAUDE_PROVIDER_MIN_CONCURRENCY ?= 1
+CLAUDE_PROVIDER_MAX_CONCURRENCY ?= 2
+CODEX_PROVIDER_PARALLEL ?= $(PROVIDER_PARALLEL)
+CODEX_PROVIDER_MIN_CONCURRENCY ?= 2
+CODEX_PROVIDER_MAX_CONCURRENCY ?= 3
+WEB_PARALLEL ?= $(PARALLEL)
+WEB_MIN_CONCURRENCY ?= 4
+WEB_MAX_CONCURRENCY ?= 12
 # Live provider-backed integration tests share authenticated local CLIs and
 # provider account state. Run them serially unless explicitly overridden.
 INTEGRATION_AGENT_PARALLEL ?= 0
-INTEGRATION_AGENT_FILES := tests/integration/test_claude_execution.py tests/integration/test_codex_execution.py tests/integration/test_live_agent_chain.py
+INTEGRATION_CLAUDE_AGENT_FILES := tests/integration/test_claude_execution.py tests/integration/test_live_agent_chain.py
+INTEGRATION_CODEX_AGENT_FILES := tests/integration/test_codex_execution.py
+INTEGRATION_AGENT_FILES := tests/integration/test_claude_execution.py tests/integration/test_live_agent_chain.py tests/integration/test_codex_execution.py
 # Keep this list in sync with the -k exclusion in test-simulated-core.
 # New agent-backed tests added to test_foreign_repo_lifecycle.py must be listed here
 # so they move to test-simulated-agent instead of staying in the fast local slice.
-SIMULATED_AGENT_FILES := tests/simulated_scenarios/test_foreign_repo_lifecycle.py::test_foreign_repo_claude_code_agent_done tests/simulated_scenarios/test_foreign_repo_lifecycle.py::test_foreign_repo_codex_agent_done
+SIMULATED_CLAUDE_AGENT_TEST := tests/simulated_scenarios/test_foreign_repo_lifecycle.py::test_foreign_repo_claude_code_agent_done
+SIMULATED_CODEX_AGENT_TEST := tests/simulated_scenarios/test_foreign_repo_lifecycle.py::test_foreign_repo_codex_agent_done
+SIMULATED_PROVIDER_PATH := tests/simulated_scenarios/test_foreign_repo_lifecycle.py
+SIMULATED_AGENT_FILES := $(SIMULATED_CLAUDE_AGENT_TEST) $(SIMULATED_CODEX_AGENT_TEST)
+PROVIDER_CORE_CLAUDE_PATHS := tests/integration/test_ai_gate_hooks.py tests/integration/test_sandbox_os_boundary.py
+PROVIDER_CORE_CODEX_PATHS := tests/integration/test_sandbox_os_boundary.py tests/integration/test_persistent_review_exchange_integration.py
+PROVIDER_PR_CLAUDE_PATHS := $(PROVIDER_CORE_CLAUDE_PATHS) $(SIMULATED_PROVIDER_PATH) $(INTEGRATION_CLAUDE_AGENT_FILES)
+PROVIDER_PR_CODEX_PATHS := $(PROVIDER_CORE_CODEX_PATHS) $(SIMULATED_PROVIDER_PATH) $(INTEGRATION_CODEX_AGENT_FILES)
 
 # Python interpreter for dependency checks
 PYTHON ?= .venv/bin/python
@@ -405,45 +452,45 @@ sync-deps:
 test-unit: sync-deps
 ifeq ($(UNIT_PARALLEL),0)
 	$(call TIMED_RUN,test-unit,\
-		$(PYTEST) tests/unit packages/agent_runner/tests -x -q --tb=short $(PYTEST_TIMINGS))
+		$(call RUN_IN_EXECUTOR_POOL,unit,1,1,,\
+			$(PYTEST) tests/unit packages/agent_runner/tests -x -q --tb=short $(PYTEST_TIMINGS)))
 else
 	$(call TIMED_RUN,test-unit,\
-		$(PYTEST) tests/unit packages/agent_runner/tests -x -q --tb=short -n $(UNIT_PARALLEL) --dist=loadgroup $(PYTEST_TIMINGS))
+		$(call RUN_IN_EXECUTOR_POOL,unit,$(call executor_min,$(UNIT_PARALLEL),$(UNIT_MIN_CONCURRENCY)),$(call executor_max,$(UNIT_PARALLEL),$(UNIT_MAX_CONCURRENCY)),,\
+			$(PYTEST) tests/unit packages/agent_runner/tests -x -q --tb=short $(call pytest_parallel_args,$(UNIT_PARALLEL)) $(PYTEST_TIMINGS)))
 endif
 
 test-simulated: sync-deps
 ifeq ($(SIMULATED_PARALLEL),0)
-	$(PYTEST) tests/simulated_scenarios -x -q --tb=short $(PYTEST_TIMINGS)
+	$(call RUN_IN_EXECUTOR_POOL,simulated,1,1,,\
+		$(PYTEST) tests/simulated_scenarios -x -q --tb=short $(PYTEST_TIMINGS))
 else
-	$(PYTEST) tests/simulated_scenarios -x -q --tb=short -n $(SIMULATED_PARALLEL) --dist=loadgroup $(PYTEST_TIMINGS)
+	$(call RUN_IN_EXECUTOR_POOL,simulated,$(call executor_min,$(SIMULATED_PARALLEL),$(SIMULATED_MIN_CONCURRENCY)),$(call executor_max,$(SIMULATED_PARALLEL),$(SIMULATED_MAX_CONCURRENCY)),,\
+		$(PYTEST) tests/simulated_scenarios -x -q --tb=short $(call pytest_parallel_args,$(SIMULATED_PARALLEL)) $(PYTEST_TIMINGS))
 endif
 
 test-simulated-core: sync-deps
 ifeq ($(SIMULATED_PARALLEL),0)
 	$(call TIMED_RUN,test-simulated-core,\
-		$(PYTEST) tests/simulated_scenarios -x -q --tb=short \
-			--ignore=tests/simulated_scenarios/test_foreign_repo_lifecycle.py \
-			$(PYTEST_TIMINGS) && \
-		$(PYTEST) tests/simulated_scenarios/test_foreign_repo_lifecycle.py -x -q --tb=short \
-			-k "not test_foreign_repo_claude_code_agent_done and not test_foreign_repo_codex_agent_done" \
-			$(PYTEST_TIMINGS))
+		$(call RUN_IN_EXECUTOR_POOL,simulated-core,1,1,,\
+			$(PYTEST) tests/simulated_scenarios -x -q --tb=short \
+				-m "not provider_claude and not provider_codex" $(PYTEST_TIMINGS)))
 else
 	$(call TIMED_RUN,test-simulated-core,\
-		$(PYTEST) tests/simulated_scenarios -x -q --tb=short -n $(SIMULATED_PARALLEL) --dist=loadgroup \
-			--ignore=tests/simulated_scenarios/test_foreign_repo_lifecycle.py \
-			$(PYTEST_TIMINGS) && \
-		$(PYTEST) tests/simulated_scenarios/test_foreign_repo_lifecycle.py -x -q --tb=short -n $(SIMULATED_PARALLEL) --dist=loadgroup \
-			-k "not test_foreign_repo_claude_code_agent_done and not test_foreign_repo_codex_agent_done" \
-			$(PYTEST_TIMINGS))
+		$(call RUN_IN_EXECUTOR_POOL,simulated-core,$(call executor_min,$(SIMULATED_PARALLEL),$(SIMULATED_MIN_CONCURRENCY)),$(call executor_max,$(SIMULATED_PARALLEL),$(SIMULATED_MAX_CONCURRENCY)),,\
+			$(PYTEST) tests/simulated_scenarios -x -q --tb=short $(call pytest_parallel_args,$(SIMULATED_PARALLEL)) \
+				-m "not provider_claude and not provider_codex" $(PYTEST_TIMINGS)))
 endif
 
 test-simulated-agent: sync-deps
-ifeq ($(SIMULATED_PARALLEL),0)
+ifeq ($(SIMULATED_AGENT_PARALLEL),0)
 	$(call TIMED_RUN,test-simulated-agent,\
-		$(PYTEST) $(SIMULATED_AGENT_FILES) -x -q --tb=short $(PYTEST_TIMINGS))
+		$(call RUN_IN_EXECUTOR_POOL,simulated-agent,1,1,claude codex,\
+			$(PYTEST) $(SIMULATED_AGENT_FILES) -x -q --tb=short $(PYTEST_TIMINGS)))
 else
 	$(call TIMED_RUN,test-simulated-agent,\
-		$(PYTEST) $(SIMULATED_AGENT_FILES) -x -q --tb=short -n $(SIMULATED_PARALLEL) --dist=loadgroup $(PYTEST_TIMINGS))
+		$(call RUN_IN_EXECUTOR_POOL,simulated-agent,$(call executor_min,$(SIMULATED_AGENT_PARALLEL),$(SIMULATED_AGENT_MIN_CONCURRENCY)),$(call executor_max,$(SIMULATED_AGENT_PARALLEL),$(SIMULATED_AGENT_MAX_CONCURRENCY)),claude codex,\
+			$(PYTEST) $(SIMULATED_AGENT_FILES) -x -q --tb=short $(call pytest_parallel_args,$(SIMULATED_AGENT_PARALLEL)) $(PYTEST_TIMINGS)))
 endif
 
 test-unit-cov:
@@ -463,27 +510,30 @@ test-integration-core: test-integration-core-local test-integration-core-live-co
 test-integration-core-local: sync-deps
 ifeq ($(INTEGRATION_PARALLEL),0)
 	$(call TIMED_RUN,test-integration-core,\
-		$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex" \
+		$(call RUN_IN_EXECUTOR_POOL,integration-core,1,1,,\
+			$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex and not provider_claude and not provider_codex" \
 			--ignore=tests/integration/test_claude_execution.py \
 			--ignore=tests/integration/test_codex_execution.py \
 			--ignore=tests/integration/test_live_agent_chain.py \
-			$(PYTEST_TIMINGS))
+			$(PYTEST_TIMINGS)))
 else
 	$(call TIMED_RUN,test-integration-core,\
-		$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex" -n $(INTEGRATION_PARALLEL) --dist=loadgroup \
+		$(call RUN_IN_EXECUTOR_POOL,integration-core,$(call executor_min,$(INTEGRATION_PARALLEL),$(INTEGRATION_MIN_CONCURRENCY)),$(call executor_max,$(INTEGRATION_PARALLEL),$(INTEGRATION_MAX_CONCURRENCY)),,\
+			$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex and not provider_claude and not provider_codex" $(call pytest_parallel_args,$(INTEGRATION_PARALLEL)) \
 			--ignore=tests/integration/test_claude_execution.py \
 			--ignore=tests/integration/test_codex_execution.py \
 			--ignore=tests/integration/test_live_agent_chain.py \
-			$(PYTEST_TIMINGS))
+			$(PYTEST_TIMINGS)))
 endif
 
 test-integration-core-live-codex: sync-deps
 	$(call TIMED_RUN,test-integration-core-live-codex,\
-		$(PYTEST) tests/integration -x -q --tb=short -m "live_codex and not requires_infra" \
+		$(call RUN_IN_EXECUTOR_POOL,integration-live-codex,1,1,codex,\
+			$(PYTEST) tests/integration -x -q --tb=short -m "live_codex and not requires_infra" \
 			--ignore=tests/integration/test_claude_execution.py \
 			--ignore=tests/integration/test_codex_execution.py \
 			--ignore=tests/integration/test_live_agent_chain.py \
-			$(PYTEST_TIMINGS))
+			$(PYTEST_TIMINGS)))
 
 # Backward-compatible alias for existing callers.
 test-integration-no-infra: test-integration-core
@@ -491,11 +541,33 @@ test-integration-no-infra: test-integration-core
 test-integration-agent: sync-deps
 ifeq ($(INTEGRATION_AGENT_PARALLEL),0)
 	$(call TIMED_RUN,test-integration-agent,\
-		$(PYTEST) $(INTEGRATION_AGENT_FILES) -x -q --tb=short $(PYTEST_TIMINGS))
+		$(call RUN_IN_EXECUTOR_POOL,integration-agent,1,1,claude codex,\
+			$(PYTEST) $(INTEGRATION_AGENT_FILES) -x -q --tb=short $(PYTEST_TIMINGS)))
 else
 	$(call TIMED_RUN,test-integration-agent,\
-		$(PYTEST) $(INTEGRATION_AGENT_FILES) -x -q --tb=short -n $(INTEGRATION_AGENT_PARALLEL) --dist=loadgroup $(PYTEST_TIMINGS))
+		$(call RUN_IN_EXECUTOR_POOL,integration-agent,$(INTEGRATION_AGENT_PARALLEL),$(INTEGRATION_AGENT_PARALLEL),claude codex,\
+			$(PYTEST) $(INTEGRATION_AGENT_FILES) -x -q --tb=short $(call pytest_parallel_args,$(INTEGRATION_AGENT_PARALLEL)) $(PYTEST_TIMINGS)))
 endif
+
+test-provider-core-claude: sync-deps
+	$(call TIMED_RUN,test-provider-core-claude,\
+		$(call RUN_IN_EXECUTOR_POOL,provider-claude,$(call executor_min,$(CLAUDE_PROVIDER_PARALLEL),$(CLAUDE_PROVIDER_MIN_CONCURRENCY)),$(call executor_max,$(CLAUDE_PROVIDER_PARALLEL),$(CLAUDE_PROVIDER_MAX_CONCURRENCY)),claude,\
+			$(PYTEST) $(PROVIDER_CORE_CLAUDE_PATHS) -x -q --tb=short $(call pytest_parallel_args,$(CLAUDE_PROVIDER_PARALLEL)) -m "provider_claude and not requires_infra" $(PYTEST_TIMINGS)))
+
+test-provider-core-codex: sync-deps
+	$(call TIMED_RUN,test-provider-core-codex,\
+		$(call RUN_IN_EXECUTOR_POOL,provider-codex,$(call executor_min,$(CODEX_PROVIDER_PARALLEL),$(CODEX_PROVIDER_MIN_CONCURRENCY)),$(call executor_max,$(CODEX_PROVIDER_PARALLEL),$(CODEX_PROVIDER_MAX_CONCURRENCY)),codex,\
+			$(PYTEST) $(PROVIDER_CORE_CODEX_PATHS) -x -q --tb=short $(call pytest_parallel_args,$(CODEX_PROVIDER_PARALLEL)) -m "provider_codex and not requires_infra" $(PYTEST_TIMINGS)))
+
+test-provider-pr-claude: sync-deps
+	$(call TIMED_RUN,test-provider-pr-claude,\
+		$(call RUN_IN_EXECUTOR_POOL,provider-claude,$(call executor_min,$(CLAUDE_PROVIDER_PARALLEL),$(CLAUDE_PROVIDER_MIN_CONCURRENCY)),$(call executor_max,$(CLAUDE_PROVIDER_PARALLEL),$(CLAUDE_PROVIDER_MAX_CONCURRENCY)),claude,\
+			$(PYTEST) $(PROVIDER_PR_CLAUDE_PATHS) -x -q --tb=short $(call pytest_parallel_args,$(CLAUDE_PROVIDER_PARALLEL)) -m "provider_claude and not requires_infra" $(PYTEST_TIMINGS)))
+
+test-provider-pr-codex: sync-deps
+	$(call TIMED_RUN,test-provider-pr-codex,\
+		$(call RUN_IN_EXECUTOR_POOL,provider-codex,$(call executor_min,$(CODEX_PROVIDER_PARALLEL),$(CODEX_PROVIDER_MIN_CONCURRENCY)),$(call executor_max,$(CODEX_PROVIDER_PARALLEL),$(CODEX_PROVIDER_MAX_CONCURRENCY)),codex,\
+			$(PYTEST) $(PROVIDER_PR_CODEX_PATHS) -x -q --tb=short $(call pytest_parallel_args,$(CODEX_PROVIDER_PARALLEL)) -m "provider_codex and not requires_infra" $(PYTEST_TIMINGS)))
 
 # Full integration tests including infrastructure-dependent ones (run in CI)
 test-integration-full: sync-deps
@@ -583,7 +655,8 @@ test:
 # Playwright browser smoke tests for Flow-first web UI
 test-web:
 	$(call TIMED_RUN,test-web,\
-		$(PYTEST) tests/e2e_web -v --tb=short $(PYTEST_TIMINGS))
+		$(call RUN_IN_EXECUTOR_POOL,web,$(call executor_min,$(WEB_PARALLEL),$(WEB_MIN_CONCURRENCY)),$(call executor_max,$(WEB_PARALLEL),$(WEB_MAX_CONCURRENCY)),browser,\
+			$(PYTEST) tests/e2e_web -v --tb=short $(call pytest_parallel_args,$(WEB_PARALLEL)) $(PYTEST_TIMINGS)))
 
 test-web-headed:
 	$(PYTEST) tests/e2e_web -v --tb=short --headed $(PYTEST_TIMINGS)
@@ -622,25 +695,21 @@ validate:
 validate-pr:
 	@./scripts/verify-pr.sh
 
-# Raw validation - direct execution without output capture wrapper
-# Use this as a fallback if the Python wrapper fails
-VALIDATE_JOBS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 5)
-VALIDATE_STATIC_JOBS ?= $(VALIDATE_JOBS)
-VALIDATE_TEST_JOBS ?= 1
-VALIDATE_WEB_JOBS ?= 1
-# Run the browser smoke lane beside the single live-Codex core check after
-# local xdist-heavy core tests pass.
-VALIDATE_LIVE_WEB_JOBS ?= 2
-VALIDATE_AGENT_JOBS ?= 1
+# Raw validation - explicit direct execution without output capture
+VALIDATE_STATIC_MIN_CONCURRENCY ?= 1
+VALIDATE_STATIC_MAX_CONCURRENCY ?= 3
+VALIDATE_LANE_JOBS ?= 7
 VALIDATE_E2E_JOBS ?= 1
+VALIDATE_CORE_LANES := test-provider-core-claude test-provider-core-codex test-web test-unit test-simulated-core test-integration-core-local
+VALIDATE_PR_LANES := test-provider-pr-claude test-provider-pr-codex test-web test-unit test-simulated-core test-integration-core-local
 
 define VALIDATE_CONFIG
-	@echo "[validate-timing] CONFIG validate_jobs=$(VALIDATE_JOBS) unit_parallel=$(UNIT_PARALLEL) simulated_parallel=$(SIMULATED_PARALLEL) integration_parallel=$(INTEGRATION_PARALLEL) integration_agent_parallel=$(INTEGRATION_AGENT_PARALLEL) static_jobs=$(VALIDATE_STATIC_JOBS) test_jobs=$(VALIDATE_TEST_JOBS) web_jobs=$(VALIDATE_WEB_JOBS) live_web_jobs=$(VALIDATE_LIVE_WEB_JOBS) agent_jobs=$(VALIDATE_AGENT_JOBS) e2e_jobs=$(VALIDATE_E2E_JOBS)"
+	@echo "[validate-timing] CONFIG lane_jobs=$(VALIDATE_LANE_JOBS) static_range=$(VALIDATE_STATIC_MIN_CONCURRENCY)-$(VALIDATE_STATIC_MAX_CONCURRENCY) unit_range=$(call executor_min,$(UNIT_PARALLEL),$(UNIT_MIN_CONCURRENCY))-$(call executor_max,$(UNIT_PARALLEL),$(UNIT_MAX_CONCURRENCY)) simulated_range=$(call executor_min,$(SIMULATED_PARALLEL),$(SIMULATED_MIN_CONCURRENCY))-$(call executor_max,$(SIMULATED_PARALLEL),$(SIMULATED_MAX_CONCURRENCY)) integration_range=$(call executor_min,$(INTEGRATION_PARALLEL),$(INTEGRATION_MIN_CONCURRENCY))-$(call executor_max,$(INTEGRATION_PARALLEL),$(INTEGRATION_MAX_CONCURRENCY)) claude_range=$(call executor_min,$(CLAUDE_PROVIDER_PARALLEL),$(CLAUDE_PROVIDER_MIN_CONCURRENCY))-$(call executor_max,$(CLAUDE_PROVIDER_PARALLEL),$(CLAUDE_PROVIDER_MAX_CONCURRENCY)) codex_range=$(call executor_min,$(CODEX_PROVIDER_PARALLEL),$(CODEX_PROVIDER_MIN_CONCURRENCY))-$(call executor_max,$(CODEX_PROVIDER_PARALLEL),$(CODEX_PROVIDER_MAX_CONCURRENCY)) web_range=$(call executor_min,$(WEB_PARALLEL),$(WEB_MIN_CONCURRENCY))-$(call executor_max,$(WEB_PARALLEL),$(WEB_MAX_CONCURRENCY)) e2e_jobs=$(VALIDATE_E2E_JOBS)"
 endef
 
 validate-raw:
 	$(VALIDATE_CONFIG)
-	@$(GMAKE) --output-sync=target _validate-impl
+	@ISSUE_ORCHESTRATOR_EXECUTOR_GROUP="$${ISSUE_ORCHESTRATOR_EXECUTOR_GROUP:-io-validate-$$PPID}" $(GMAKE) --output-sync=target _validate-impl
 	@$(GMAKE) --output-sync=target test-vscode
 	@echo "✓ All validations passed!"
 
@@ -651,39 +720,41 @@ validate-raw:
 # intentionally need to force the full uncached suite at the current HEAD.
 validate-pr-raw:
 	$(VALIDATE_CONFIG)
-	@$(GMAKE) --output-sync=target _validate-pr-impl
+	@ISSUE_ORCHESTRATOR_EXECUTOR_GROUP="$${ISSUE_ORCHESTRATOR_EXECUTOR_GROUP:-io-validate-pr-$$PPID}" $(GMAKE) --output-sync=target _validate-pr-impl
 	@$(GMAKE) --output-sync=target test-vscode
 	@echo "✓ Required PR validations passed!"
 
 # Internal phased validation targets. Invoke through validate-raw,
 # validate-pr-raw, or validate-full so timing metadata is emitted.
-# Keep pytest suite fan-out low by default:
-# each suite may already use xdist internally, so running many suites together
-# can oversubscribe local CPUs and starve browser/subprocess tests.
+# Each lane declares its xdist weight to the machine-wide executor pool. That
+# lets independent repos/worktrees wait for shared host capacity instead of
+# each pytest invocation independently expanding to every CPU.
 _validate-impl:
+	$(call TIMED_RUN,validate-core-lanes-phase,\
+		$(GMAKE) -j$(VALIDATE_LANE_JOBS) --output-sync=target _validate-static-lane $(VALIDATE_CORE_LANES))
+
+_validate-static-lane:
+	$(call RUN_IN_EXECUTOR_POOL,static-v2,$(VALIDATE_STATIC_MIN_CONCURRENCY),$(VALIDATE_STATIC_MAX_CONCURRENCY),,\
+		$(GMAKE) --output-sync=target _validate-static-granted)
+
+_validate-static-granted:
 	$(call TIMED_RUN,validate-static-phase,\
-		$(GMAKE) -j$(VALIDATE_STATIC_JOBS) --output-sync=target _validate-static-impl)
-	$(call TIMED_RUN,validate-core-tests-phase,\
-		$(GMAKE) -j$(VALIDATE_TEST_JOBS) --output-sync=target _validate-core-tests-impl)
-	$(call TIMED_RUN,validate-live-web-phase,\
-		$(GMAKE) -j$(VALIDATE_LIVE_WEB_JOBS) --output-sync=target test-integration-core-live-codex test-web)
+		$(GMAKE) -j$${ISSUE_ORCHESTRATOR_EXECUTOR_CONCURRENCY:?executor grant missing} --output-sync=target _validate-static-impl)
 
 _validate-static-impl: typecheck lint-arch lint-complexity
 
 _validate-core-tests-impl: test-unit test-simulated-core test-integration-core-local
 
 _validate-pr-impl:
-	$(call TIMED_RUN,validate-main-phase,\
-		$(GMAKE) --output-sync=target _validate-impl)
-	$(call TIMED_RUN,validate-agent-phase,\
-		$(GMAKE) -j$(VALIDATE_AGENT_JOBS) --output-sync=target _validate-agent-impl)
+	$(call TIMED_RUN,validate-pr-lanes-phase,\
+		$(GMAKE) -j$(VALIDATE_LANE_JOBS) --output-sync=target _validate-static-lane $(VALIDATE_PR_LANES))
 
 _validate-agent-impl: test-simulated-agent test-integration-agent
 
 # Full validation including e2e tests
 validate-full:
 	$(VALIDATE_CONFIG)
-	@$(GMAKE) --output-sync=target _validate-full-impl
+	@ISSUE_ORCHESTRATOR_EXECUTOR_GROUP="$${ISSUE_ORCHESTRATOR_EXECUTOR_GROUP:-io-validate-full-$$PPID}" $(GMAKE) --output-sync=target _validate-full-impl
 	@$(GMAKE) --output-sync=target test-vscode
 	@echo "✓ All validations passed (including e2e)!"
 

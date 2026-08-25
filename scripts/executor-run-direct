@@ -1,0 +1,85 @@
+#!/bin/sh
+# Standalone executor-run contract for repositories that do not use IO.
+set -eu
+
+usage() {
+    echo "usage: executor-run-direct --min-concurrency N --max-concurrency N --work-key KEY [--group GROUP] -- COMMAND [ARG]..." >&2
+    exit 2
+}
+
+minimum_concurrency=""
+maximum_concurrency=""
+executor_group=""
+work_key=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --exclusive)
+            echo "executor-run-direct cannot honor exclusive resources; use the pooled executor" >&2
+            exit 2
+            ;;
+        --min-concurrency)
+            [ "$#" -ge 2 ] || usage
+            minimum_concurrency=$2
+            shift 2
+            ;;
+        --max-concurrency)
+            [ "$#" -ge 2 ] || usage
+            maximum_concurrency=$2
+            shift 2
+            ;;
+        --work-key)
+            [ "$#" -ge 2 ] || usage
+            case "$2" in
+                ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._:/-]*) usage ;;
+            esac
+            [ "${#2}" -le 160 ] || usage
+            work_key=$2
+            shift 2
+            ;;
+        --group)
+            [ "$#" -ge 2 ] || usage
+            [ -n "$2" ] || usage
+            executor_group=$2
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+[ -n "$minimum_concurrency" ] && [ -n "$maximum_concurrency" ] || usage
+case "$minimum_concurrency:$maximum_concurrency" in *[!0-9:]*) usage ;; esac
+[ "$minimum_concurrency" -ge 1 ] 2>/dev/null || usage
+[ "$maximum_concurrency" -ge "$minimum_concurrency" ] 2>/dev/null || usage
+# Direct mode has no competing work from which to derive a smaller grant.
+granted_concurrency=$maximum_concurrency
+[ "$#" -gt 0 ] && [ -n "$1" ] || usage
+[ -n "$work_key" ] || usage
+
+environment_group=${ISSUE_ORCHESTRATOR_EXECUTOR_GROUP-}
+if [ -n "$executor_group" ] && [ -n "$environment_group" ] && [ "$executor_group" != "$environment_group" ]; then
+    echo "executor-run-direct: --group conflicts with ISSUE_ORCHESTRATOR_EXECUTOR_GROUP" >&2
+    exit 2
+fi
+if [ -z "$executor_group" ]; then
+    executor_group=$environment_group
+fi
+[ -n "$executor_group" ] || usage
+case "$executor_group" in
+    [!A-Za-z0-9]*|*[!A-Za-z0-9._:/-]*) usage ;;
+esac
+[ "${#executor_group}" -le 256 ] || usage
+
+# The framework-neutral grant is authoritative. The xdist variable preserves
+# compatibility for Python repositories that select ``pytest -n auto``.
+export ISSUE_ORCHESTRATOR_EXECUTOR_CONCURRENCY=$granted_concurrency
+export ISSUE_ORCHESTRATOR_EXECUTOR_GROUP=$executor_group
+export PYTEST_XDIST_AUTO_NUM_WORKERS=$granted_concurrency
+
+exec "$@"

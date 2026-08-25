@@ -23,6 +23,7 @@ from issue_orchestrator.control.validation import (
     VALIDATION_SCHEMA_VERSION,
 )
 from issue_orchestrator.control.isolation import GRADLE_USER_HOME_ENV
+from issue_orchestrator.infra.validation_timings import ValidationTimingClock
 
 
 def _shared_timing_records(worktree: Path) -> list[dict[str, object]]:
@@ -648,6 +649,36 @@ class TestPublishGate:
         assert summary["cache_lookup"] == "disabled"
         assert summary["allowed"] is True
         assert summary["record_exit_code"] is None
+
+    def test_gate_summary_survives_wall_clock_rollback(self, temp_worktree):
+        wall_values = iter(
+            (
+                datetime(2026, 8, 24, 12, tzinfo=timezone.utc),
+                datetime(2026, 8, 24, 11, tzinfo=timezone.utc),
+            )
+        )
+        monotonic_values = iter((100.0, 105.0))
+        gate = PublishGate(
+            temp_worktree,
+            command_runner=LocalCommandRunner(),
+            working_copy=GitWorkingCopy(),
+            command=None,
+            timing_clock=ValidationTimingClock(
+                wall_now=lambda: next(wall_values),
+                monotonic_now=lambda: next(monotonic_values),
+            ),
+        )
+
+        result = gate.check()
+
+        assert result.allowed is True
+        summary = next(
+            record
+            for record in _shared_timing_records(temp_worktree)
+            if record["kind"] == "validation_gate_summary"
+        )
+        assert summary["monotonic_elapsed_seconds"] == 5.0
+        assert summary["wall_elapsed_seconds"] == -3600.0
 
     def test_gate_appends_summary_when_head_sha_missing(self, temp_worktree):
         """Publish gate summaries should pin HEAD lookup failures."""

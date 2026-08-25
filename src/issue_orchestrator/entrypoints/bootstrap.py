@@ -15,9 +15,13 @@ Principle: "No Nulls in Orchestrator"
            - Tests explicitly pass fakes/nulls
 """
 
+from __future__ import annotations
+
 import logging
 import os
+import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
@@ -34,10 +38,20 @@ from .bootstrap_environment import (
     export_orchestrator_python as export_orchestrator_python,
 )
 from .bootstrap_claims import ClaimComponents, assemble_claim_components, lease_config_from
+from .bootstrap_dependencies import Dependencies as Dependencies
+from .bootstrap_executor_platform import (
+    raise_missing_posix_executor_dependency,
+    require_posix_executor,
+)
 from .bootstrap_pair_registry import build_pair_registry_with_worktree_hook
 from .bootstrap_pending_work import (
     build_pending_work_wiring,
     require_repository_host,
+)
+from .bootstrap_repository_identity import resolve_repo
+from .bootstrap_validation import (
+    check_github_token_scopes as _check_github_token_scopes,
+    validate_required_dependencies,
 )
 from .bootstrap_session_launcher import build_session_launcher_factory
 from .bootstrap_operator_commands import build_operator_issue_command_factory
@@ -48,7 +62,7 @@ from .bootstrap_completion import (
 )
 from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
-from ..adapters.github.repo import get_repo_from_git, GitRepoError
+from ..adapters.github.repo import GitRepoError, get_repo_from_git
 from ..ports.event_sink import EventSink, NullEventSink
 from ..ports.issue_tracker import IssueTracker
 from ..ports.session_runner import SessionRunner, NullSessionRunner
@@ -75,6 +89,9 @@ from ..execution import (
     DefaultTimelineWriter,
 )
 from ..execution.gh_guard import install_gh_guard
+from ..execution.agent_phase_command_scheduler import (
+    HostAgentPhaseCommandScheduler,
+)
 from ..events import EventHub, SequencedEventSink
 from ..control import (
     Planner,
@@ -127,36 +144,98 @@ from ..ports.run_ledger_store import SingleInstanceRunLedgerStore
 from ..domain.lease_config import LeaseConfig
 
 if TYPE_CHECKING:
+    from ..control.executor_admission import ExecutorWorkDemandEstimator
     from ..ports.label_set import LabelSet
     from ..control.label_manager import LabelManager
     from ..infra.orchestrator import Orchestrator
-    from ..ports.attempt_store import AttemptStore
-    from ..control.pr_scanner import PRScanner
-    from ..control.session_restorer import SessionRestorer
     from ..control.completion_processor import CompletionProcessor
     from ..control.publish_recovery import PublishRecoveryService
-    from ..control.session_controller import SessionController
-    from ..adapters.github.fresh_issue_reader import GitHubFreshIssueReader
     from ..ports.fresh_issue_reader import FreshIssueReader
-    from ..ports.e2e_issue_tracker import E2EIssueTracker
     from ..ports.attempt_store import AttemptStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+    from ..ports.executor import Executor
+    from ..ports.executor_monitor import ExecutorMonitor
 
 logger = logging.getLogger(__name__)
+_AGENT_PHASE_COMMAND_SCHEDULER = HostAgentPhaseCommandScheduler(
+    python_executable=Path(sys.executable),
+    shell_executable=Path("/bin/sh"),
+)
 
 
-def _resolve_repo(config: Config) -> str | None:
-    """Resolve repo name from config or auto-detect from git remote."""
-    repo = config.repo
-    if not repo:
-        try:
-            repo = get_repo_from_git()
-            logger.info("Auto-detected repository from git remote: %s", repo)
-            config.repo = repo
-        except GitRepoError as e:
-            logger.warning("Could not auto-detect repository: %s", e)
-            repo = None
-    return repo
+def build_executor() -> Executor:
+    """Compose the machine-wide command executor behind its public port."""
+    require_posix_executor()
+    from ..control.executor_admission import (
+        ExecutorAdmissionPolicy,
+        ExecutorSaturationPolicy,
+    )
+
+    try:
+        from ..execution.host_executor import (
+            HostExecutor,
+            ExecutorRequestIdentityFactory,
+            default_executor_pool_dir,
+            detected_executor_cpu_count,
+        )
+        from ..adapters.host_cpu_utilization import (
+            SystemHostCpuUtilizationObserver,
+        )
+    except ModuleNotFoundError as exc:
+        raise_missing_posix_executor_dependency(exc)
+        raise AssertionError("unreachable after missing executor dependency")
+    return HostExecutor(
+        pool_dir=default_executor_pool_dir(),
+        host_cpu_slots=detected_executor_cpu_count(),
+        admission_policy=ExecutorAdmissionPolicy(
+            ExecutorSaturationPolicy(maximum_busy_percent=95)
+        ),
+        demand_estimator=_build_executor_demand_estimator(),
+        host_cpu_observer=SystemHostCpuUtilizationObserver(),
+        request_identity_factory=ExecutorRequestIdentityFactory(
+            wall_time_nanoseconds=time.time_ns,
+            monotonic_nanoseconds=time.monotonic_ns,
+            process_id=os.getpid,
+            request_nonce=lambda: uuid4().hex,
+        ),
+        queue_settle_seconds=0.1,
+        queue_poll_seconds=0.05,
+    )
+
+
+def build_executor_monitor() -> ExecutorMonitor:
+    """Compose the read-only executor activity monitor."""
+    require_posix_executor()
+    try:
+        from ..execution.host_executor import (
+            HostExecutorMonitor,
+            default_executor_pool_dir,
+            detected_executor_cpu_count,
+        )
+    except ModuleNotFoundError as exc:
+        raise_missing_posix_executor_dependency(exc)
+        raise AssertionError("unreachable after missing executor dependency")
+    return HostExecutorMonitor(
+        default_executor_pool_dir(),
+        detected_executor_cpu_count(),
+        _build_executor_demand_estimator(),
+    )
+
+
+def _build_executor_demand_estimator() -> ExecutorWorkDemandEstimator:
+    """Construct the one learning policy shared by executor and monitor."""
+    from ..control.executor_admission import (
+        ExecutorLearningPolicy,
+        ExecutorWorkDemandEstimator,
+    )
+
+    return ExecutorWorkDemandEstimator(
+        ExecutorLearningPolicy(
+            cold_start_cores_per_concurrency=1.0,
+            minimum_cores_per_concurrency=0.05,
+            recent_observation_weight=0.3,
+        )
+    )
 
 
 def _create_github_auth(repo: str, config: Config) -> GitHubAuth:
@@ -420,62 +499,6 @@ def _build_publish_recovery(
     )
 
 
-def _validate_required_deps(
-    github: GitHubAdapter | None,
-    event_hub: EventHub | None,
-    planner: Planner | None,
-    session_manager: SessionManager | None,
-    label_sync: LabelSync | None,
-    action_applier: ActionApplier | None,
-    fact_gatherer: FactGatherer | None,
-    pr_scanner: "PRScanner | None",
-    session_restorer: "SessionRestorer | None",
-    completion_processor: "CompletionProcessor | None",
-    session_controller_instance: "SessionController | None",
-    fresh_issue_reader: "GitHubFreshIssueReader | None",
-    e2e_issue_tracker: "E2EIssueTracker | None",
-) -> None:
-    """Validate all required dependencies are present."""
-    # GitHub requires special error message
-    require_repository_host(github)
-    # Check all other required deps with a data-driven approach
-    deps_to_check = [
-        (event_hub, "EventHub"),
-        (planner, "Planner"),
-        (session_manager, "SessionManager"),
-        (label_sync, "LabelSync"),
-        (action_applier, "ActionApplier"),
-        (fact_gatherer, "FactGatherer"),
-        (pr_scanner, "PRScanner"),
-        (session_restorer, "SessionRestorer"),
-        (completion_processor, "CompletionProcessor"),
-        (session_controller_instance, "SessionController"),
-        (fresh_issue_reader, "FreshIssueReader"),
-        (e2e_issue_tracker, "E2EIssueTracker"),
-    ]
-    for dep, name in deps_to_check:
-        if dep is None:
-            raise ValueError(f"{name} is required")
-
-
-class Dependencies:
-    """Container for all injected dependencies.
-
-    This keeps the orchestrator constructor signature clean by bundling
-    all dependencies into a single object.
-    """
-
-    def __init__(
-        self,
-        events: EventSink,
-        runner: SessionRunner,
-        github: GitHubAdapter | None = None,
-    ):
-        self.events = events
-        self.runner = runner
-        self.github = github
-
-
 def build_orchestrator(
     config: Config,
     enable_ipc: bool = True,
@@ -548,7 +571,7 @@ def build_orchestrator(
     timeline_sink = TimelineEventSink(timeline_writer)
 
     # Resolve repo and create GitHub adapter
-    repo = _resolve_repo(config)
+    repo = resolve_repo(config, get_repo_from_git, GitRepoError)
     github_auth = _create_github_auth(repo, config) if repo else None
     github = _create_github_adapter(repo, config, github_auth) if repo and github_auth else None
 
@@ -636,16 +659,12 @@ def build_orchestrator(
     fact_gatherer = tech_lead.fact_gatherer
 
     # Create PR scanner and session restorer
-    pr_scanner = (
-        PRScanner(
-            config=config,
-            repository=github,
-            events=events,
-            issue_branches_fn=lambda: extract_issue_branches(working_copy, config.repo_root),
-        )
-        if github
-        else None
-    )
+    pr_scanner = PRScanner(
+        config=config,
+        repository=github,
+        events=events,
+        issue_branches_fn=lambda: extract_issue_branches(working_copy, config.repo_root),
+    ) if github else None
     session_restorer = SessionRestorer(
         config=config,
         repository_host=github,
@@ -685,16 +704,13 @@ def build_orchestrator(
     # port into it (#6924).
     agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
 
-
     # Built here, before the completion pipeline, because that pipeline needs
     # the shared-block owner: the agent's typed needs_human outcome routes
     # through it (#6999 F2 round 4).
     repository_host = require_repository_host(github)
     pending_work = build_pending_work_wiring(
-        repo_root=config.repo_root,
-        repository_host=repository_host,
-        action_applier=cast("ActionApplier", action_applier),
-        label_writer=repository_host,
+        repo_root=config.repo_root, repository_host=repository_host,
+        action_applier=cast("ActionApplier", action_applier), label_writer=repository_host,
         label_manager=label_manager, events=events)
 
     completion_processor, session_controller_instance, completion_handler_factory = create_completion_components(
@@ -722,7 +738,7 @@ def build_orchestrator(
     )
 
     # Validate all dependencies are present
-    _validate_required_deps(
+    validate_required_dependencies(
         github, event_hub, planner, session_manager, label_sync,
         action_applier, fact_gatherer, pr_scanner, session_restorer,
         completion_processor, session_controller_instance, fresh_issue_reader,
@@ -822,6 +838,7 @@ def build_orchestrator(
         provider_readiness_probe=provider_readiness_probe,
         needs_human_block=pending_work.needs_human_block,
         coder_prompt_addendum=coder_prompt_addendum,
+        agent_phase_command_scheduler=_AGENT_PHASE_COMMAND_SCHEDULER,
     )
     deps = OrchestratorDeps(
         events=events,
@@ -880,32 +897,6 @@ def build_orchestrator(
     return orchestrator
 
 
-def _check_github_token_scopes(config: Config, github: GitHubAdapter) -> None:
-    if getattr(github, "auth_kind", None) == "github_app":
-        logger.info("Skipping OAuth scope check for GitHub App installation auth")
-        return
-    required = {scope.strip() for scope in (config.github_required_scopes or []) if scope.strip()}
-    allowed = {scope.strip() for scope in (config.github_allowed_scopes or []) if scope.strip()}
-    try:
-        scopes = set(github.get_token_scopes())
-    except Exception as exc:
-        logger.warning("Failed to fetch GitHub token scopes: %s", exc)
-        return
-
-    if required and not required.issubset(scopes):
-        missing = sorted(required - scopes)
-        raise ValueError(f"GitHub token missing required scopes: {missing}")
-
-    if allowed and not scopes.issubset(allowed):
-        extra = sorted(scopes - allowed)
-        raise ValueError(f"GitHub token has disallowed scopes: {extra}")
-
-    if scopes:
-        logger.info("GitHub token scopes: %s", ", ".join(sorted(scopes)))
-    else:
-        logger.info("GitHub token scopes unavailable (fine-grained token or missing header)")
-
-
 def build_orchestrator_for_testing(
     config: Config,
     github: GitHubAdapter,  # Required - no more hiding None
@@ -958,6 +949,7 @@ def build_orchestrator_for_testing(
 
     # Create label manager (shared instance for all control-layer components)
     from ..control.label_manager import LabelManager as _LabelManager
+
     label_manager = _LabelManager(config)
 
     default_label_sync = None
@@ -1250,6 +1242,7 @@ def build_orchestrator_for_testing(
         provider_readiness_probe=provider_readiness_probe,
         needs_human_block=pending_work.needs_human_block,
         coder_prompt_addendum=coder_prompt_addendum,
+        agent_phase_command_scheduler=_AGENT_PHASE_COMMAND_SCHEDULER,
     )
     completion_handler_factory = build_completion_handler_factory(
         config,
