@@ -23,6 +23,7 @@ from issue_orchestrator.execution.timeline_store import SqliteTimelineStore
 import issue_orchestrator.entrypoints.web as web_module
 from issue_orchestrator.entrypoints.web import app
 from issue_orchestrator.ports.timeline_store import TimelineRecord
+from tests.fixtures.timeline_run_artifacts import write_available_timeline_run_manifest
 from tests.fixtures.web_contract_mocks import MockOrchestratorForWeb
 
 
@@ -125,12 +126,13 @@ class UvicornTestServer:
 
 def _seed_issue_408_timeline(store: SqliteTimelineStore, repo_root: Path) -> None:
     """Populate the smoke-test issue with a realistic coding/review lifecycle."""
-    run_dir = repo_root / ".issue-orchestrator" / "sessions" / "flow-run-1"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "terminal-recording.jsonl").write_text(
-        '{"event_type":"resize","offset_ms":0,"rows":24,"cols":80}\n',
-        encoding="utf-8",
+    run_dir = (
+        repo_root
+        / ".issue-orchestrator"
+        / "sessions"
+        / "flow-run-1__coding-408"
     )
+    _write_available_timeline_run(run_dir, issue_number=408)
     base = {
         "issue_number": 408,
         "timeline_schema_version": 4,
@@ -211,12 +213,13 @@ def _seed_issue_408_timeline(store: SqliteTimelineStore, repo_root: Path) -> Non
 
 def _seed_issue_409_timeline(store: SqliteTimelineStore, repo_root: Path) -> None:
     """Populate the running issue with an in-flight coding snapshot."""
-    run_dir = repo_root / ".issue-orchestrator" / "sessions" / "flow-run-2"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "terminal-recording.jsonl").write_text(
-        '{"event_type":"resize","offset_ms":0,"rows":24,"cols":80}\n',
-        encoding="utf-8",
+    run_dir = (
+        repo_root
+        / ".issue-orchestrator"
+        / "sessions"
+        / "flow-run-2__coding-409"
     )
+    _write_available_timeline_run(run_dir, issue_number=409)
     base = {
         "issue_number": 409,
         "timeline_schema_version": 4,
@@ -246,6 +249,21 @@ def _seed_issue_409_timeline(store: SqliteTimelineStore, repo_root: Path) -> Non
     )
 
 
+def _write_available_timeline_run(run_dir: Path, *, issue_number: int) -> None:
+    """Create a truthful available-run fixture for dashboard Timeline rows."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    recording = run_dir / "terminal-recording.jsonl"
+    recording.write_text(
+        '{"event_type":"resize","offset_ms":0,"rows":24,"cols":80}\n',
+        encoding="utf-8",
+    )
+    write_available_timeline_run_manifest(
+        run_dir=run_dir,
+        terminal_recording=recording,
+        issue_number=issue_number,
+    )
+
+
 def _seed_issue_410_timeline(store: SqliteTimelineStore, repo_root: Path) -> None:
     """Populate an issue whose cycle records a ``validation.passed`` event.
 
@@ -257,12 +275,13 @@ def _seed_issue_410_timeline(store: SqliteTimelineStore, repo_root: Path) -> Non
     ``openValidationFailure`` and opens the validation dialog (issue
     #6310 AC-2 end-to-end coverage).
     """
-    run_dir = repo_root / ".issue-orchestrator" / "sessions" / "flow-run-410"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "terminal-recording.jsonl").write_text(
-        '{"event_type":"resize","offset_ms":0,"rows":24,"cols":80}\n',
-        encoding="utf-8",
+    run_dir = (
+        repo_root
+        / ".issue-orchestrator"
+        / "sessions"
+        / "flow-run-410__coding-410"
     )
+    _write_available_timeline_run(run_dir, issue_number=410)
     base = {
         "issue_number": 410,
         "timeline_schema_version": 4,

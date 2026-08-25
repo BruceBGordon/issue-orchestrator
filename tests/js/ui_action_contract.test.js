@@ -169,3 +169,23 @@ test('buildSessionPromptRequest rejects an invalid issue number', () => {
         /Invalid issue number/,
     );
 });
+
+test('exact-run artifact requests keep URL issue and run_dir as one capability', () => {
+    const runDir = '/runs/owned-by-123';
+    const requests = [
+        uiActionContract.buildTerminalRecordingRequest(999, runDir),
+        uiActionContract.buildSessionPromptRequest(999, runDir),
+        uiActionContract.buildReviewArtifactRequest(
+            999,
+            runDir,
+            `${runDir}/review-exchange/turns/review-report.md`,
+            'review_report',
+        ),
+    ];
+
+    for (const request of requests) {
+        assert.match(request.endpoint, /\/999\?/);
+        assert.match(request.endpoint, /run_dir=%2Fruns%2Fowned-by-123/);
+        assert.doesNotMatch(request.endpoint, /\/123\?/);
+    }
+});

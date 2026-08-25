@@ -36,8 +36,10 @@ from ..infra.repo_identity import get_repo_head_sha
 from ..ports import EventSink,  make_trace_event
 from ..domain.session_run import SessionRunAssets
 from ..ports.session_output import SessionOutput
+from ..ports.command_runner import CommandRunner
 from ..ports.worktree_manager import WorktreeManager, WorktreeInfo, WorktreeReuseOptions
-from .worktree import Worktree, WorktreePreparationError
+from .isolation import build_runtime_tool_env
+from .worktree import Worktree, WorktreePreparationError, WorktreeSetupError
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +71,48 @@ class ScratchWorktreeIdentity:
     branch_name: str
 
 
+def prepare_worktree_environment(
+    *,
+    config: Config,
+    command_runner: CommandRunner,
+    worktree_path: Path,
+) -> None:
+    """Run the repository's configured worktree setup commands.
+
+    Owned here because ``WorktreeContext.create`` is the single place the
+    control layer acquires a worktree. Running setup from individual launchers
+    meant only coding sessions and validation retries got it: review, rework,
+    retrospective-review and tech-lead worktrees launched without their
+    environment, and previously survived only because the adapter symlinked the
+    repo's venv into every worktree.
+
+    Commands are expected to be idempotent -- they run on reuse as well as
+    creation.
+    """
+    if not config.setup_worktree:
+        return
+    started = time.time()
+    for command in config.setup_worktree:
+        logger.info("[launch] Running setup: %s", command)
+        result = command_runner.run(
+            command,
+            shell=True,
+            cwd=worktree_path,
+            env=build_runtime_tool_env(worktree_path),
+        )
+        if result.timed_out:
+            raise RuntimeError(f"setup command timed out: {command}")
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or "no stderr captured"
+            raise RuntimeError(
+                f"setup command failed: {command} "
+                f"(exit_code={result.returncode}): {stderr}"
+            )
+    logger.info("[launch] Setup completed in %.1fs", time.time() - started)
+
+
 @dataclass
+
 class WorktreeContext:
     """Encapsulates worktree state and operations for a session.
 
@@ -101,6 +144,7 @@ class WorktreeContext:
         *,
         worktree_manager: WorktreeManager,
         config: Config,
+        command_runner: CommandRunner,
         events: EventSink,
         session_output: SessionOutput,
         issue_number: int,
@@ -120,6 +164,8 @@ class WorktreeContext:
         Args:
             worktree_manager: For creating the worktree
             config: Configuration with repo settings
+            command_runner: Runs the repository's configured worktree setup
+                commands, so every launch path provisions its environment
             events: For emitting trace events
             issue_number: Issue number
             issue_title: Issue title (for worktree naming)
@@ -236,6 +282,42 @@ class WorktreeContext:
             )
         worktree_path = worktree_info.path
         actual_branch = worktree_info.branch_name
+
+        # Provision the environment before anything runs in this worktree.
+        # Every launch path -- coding, review, rework, retrospective, tech-lead
+        # scratch -- reaches a worktree through here, so doing it at acquisition
+        # is what makes "every worktree has its environment" true by
+        # construction rather than by each launcher remembering.
+        try:
+            prepare_worktree_environment(
+                config=config,
+                command_runner=command_runner,
+                worktree_path=worktree_path,
+            )
+        except RuntimeError as exc:
+            logger.error(
+                "[issue-%d] Worktree setup failed: path=%s error=%s",
+                issue_number,
+                worktree_path,
+                exc,
+            )
+            return cls(
+                worktree_path=worktree_path,
+                branch_name=actual_branch,
+                session_name=session_name,
+                phase_name=phase_name,
+                issue_number=issue_number,
+                worktree_info=worktree_info,
+                run=None,  # type: ignore[arg-type]
+                claude_project_dir=Path(),
+                error=WorktreeSetupError(
+                    path=worktree_path,
+                    issue_number=issue_number,
+                    message=f"Setup commands failed: {exc}",
+                ),
+                _config=config,
+                _session_output=session_output,
+            )
 
         # Emit event if work was discarded during worktree reset
         if worktree_info.uncommitted_discarded > 0 or worktree_info.commits_discarded > 0:

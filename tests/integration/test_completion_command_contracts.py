@@ -34,7 +34,10 @@ from issue_orchestrator.ports.tech_lead_authority import InMemoryTechLeadAuthori
 from issue_orchestrator.ports.open_issue_corpus_store import (
     InMemoryOpenIssueCorpusStore,
 )
-from issue_orchestrator.observation.observation import SessionObservation, SessionObservationResult
+from issue_orchestrator.observation.observation import (
+    SessionObservation,
+    SessionObservationResult,
+)
 from issue_orchestrator.entrypoints.cli_tools.setup_wizard import (
     create_starter_prompt,
     create_tech_lead_review_prompt,
@@ -45,13 +48,17 @@ from issue_orchestrator.entrypoints.setup_wizard_prompts import (
     build_tech_lead_review_prompt_text,
 )
 from issue_orchestrator.control.label_manager import LabelManager
-from issue_orchestrator.resources import get_coding_done_instructions, get_reviewer_done_instructions
+from issue_orchestrator.resources import (
+    get_coding_done_instructions,
+    get_reviewer_done_instructions,
+)
 from tests.git_push_authorization import authorized_local_fixture_git_env
 from tests.conftest import make_provider_availability
 from tests.unit.session_run_helpers import make_session_run_assets
 
 from .conftest import xdist_timeout
 from tests.callback_endpoint_helpers import ready_callback_endpoint
+
 
 @pytest.fixture(scope="module")
 def lm() -> LabelManager:
@@ -116,7 +123,9 @@ def _extract_completion_commands(text: str) -> list[str]:
     return deduped
 
 
-def _run_completion_command(command: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+def _run_completion_command(
+    command: str, cwd: Path
+) -> subprocess.CompletedProcess[str]:
     argv = shlex.split(command)
     if "--help" not in argv and "--dry-run" not in argv:
         argv.append("--dry-run")
@@ -135,13 +144,35 @@ def _run_completion_command(command: str, cwd: Path) -> subprocess.CompletedProc
 
 
 def _init_git_repo(path: Path) -> None:
-    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True, text=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True, capture_output=True, text=True)
-    subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "init"], cwd=path, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     (path / "README.md").write_text("test\n")
     (path / ".gitignore").write_text(".agent-done-marker\n.issue-orchestrator/\n")
-    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True, text=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "add", "."], cwd=path, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 _REVIEWER_STATUSES = {"approved", "changes_requested"}
@@ -152,7 +183,9 @@ def _bin_for_status(status: str) -> str:
     return "reviewer-done" if status in _REVIEWER_STATUSES else "coding-done"
 
 
-def _run_completion_raw(argv: list[str], cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run_completion_raw(
+    argv: list[str], cwd: Path, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     bin_name = _bin_for_status(argv[0])
     cli_bin = Path(sys.executable).parent / bin_name
     assert cli_bin.exists(), f"{bin_name} not found at {cli_bin}"
@@ -214,7 +247,14 @@ class _RecordingPRAdapter:
     def get_prs_for_branch(self, branch: str, state: str = "open") -> list[object]:
         return []
 
-    def create_pr(self, title: str, body: str, head: str, base: str = "main", draft: bool | None = None) -> object:
+    def create_pr(
+        self,
+        title: str,
+        body: str,
+        head: str,
+        base: str = "main",
+        draft: bool | None = None,
+    ) -> object:
         return type("PR", (), {"url": "https://example.test/pr/1"})()
 
     def add_comment(self, issue_or_pr_number: int, body: str) -> str:
@@ -232,8 +272,17 @@ class _NoopGitAdapter:
     def has_tracked_changes(self, worktree: Path, include_staged: bool = True) -> bool:
         return False
 
-    def push(self, worktree: Path, remote: str = "origin", force_with_lease: bool = True, set_upstream: bool = True, skip_hooks: bool = False):
-        return type("PushResult", (), {"success": True, "message": "ok", "branch": "issue-1"})()
+    def push(
+        self,
+        worktree: Path,
+        remote: str = "origin",
+        force_with_lease: bool = True,
+        set_upstream: bool = True,
+        skip_hooks: bool = False,
+    ):
+        return type(
+            "PushResult", (), {"success": True, "message": "ok", "branch": "issue-1"}
+        )()
 
     def get_branch_status(self, worktree: Path):
         return None
@@ -251,15 +300,23 @@ class _NoopGitAdapter:
         return None
 
     def push_preflight(self, worktree: Path, remote: str = "origin"):
-        return type("PreflightResult", (), {"would_succeed": True, "error": None, "fix_hint": None})()
+        return type(
+            "PreflightResult",
+            (),
+            {"would_succeed": True, "error": None, "fix_hint": None},
+        )()
 
 
-def test_setup_wizard_generated_prompts_have_valid_completion_commands(tmp_path: Path) -> None:
+def test_setup_wizard_generated_prompts_have_valid_completion_commands(
+    tmp_path: Path,
+) -> None:
     work_prompt = tmp_path / "work-agent.md"
     tech_lead_prompt = tmp_path / "tech-lead-agent.md"
 
     create_starter_prompt("agent:backend", work_prompt)
-    create_tech_lead_review_prompt(tech_lead_prompt, "needs-tech-lead-review", "tech-lead-reviewed")
+    create_tech_lead_review_prompt(
+        tech_lead_prompt, "needs-tech-lead-review", "tech-lead-reviewed"
+    )
 
     combined = work_prompt.read_text() + "\n" + tech_lead_prompt.read_text()
     commands = _extract_completion_commands(combined)
@@ -267,7 +324,8 @@ def test_setup_wizard_generated_prompts_have_valid_completion_commands(tmp_path:
 
 
 def test_control_api_prompt_templates_have_valid_completion_commands(
-    tmp_path: Path, lm: LabelManager,
+    tmp_path: Path,
+    lm: LabelManager,
 ) -> None:
     prompts = [
         build_starter_prompt_text("backend"),
@@ -298,12 +356,24 @@ def test_completion_record_schema_contract_for_all_statuses(tmp_path: Path) -> N
 
     cases = [
         (
-            ["completed", "--implementation", "Implemented feature", "--problems", "None"],
+            [
+                "completed",
+                "--implementation",
+                "Implemented feature",
+                "--problems",
+                "None",
+            ],
             CompletionOutcome.COMPLETED.value,
             {"push_branch", "create_pr", "post_comment"},
         ),
         (
-            ["blocked", "--reason", "Dependency unavailable", "--attempted", "Retried twice"],
+            [
+                "blocked",
+                "--reason",
+                "Dependency unavailable",
+                "--attempted",
+                "Retried twice",
+            ],
             CompletionOutcome.BLOCKED.value,
             {"push_branch", "add_blocked_label", "post_comment"},
         ),
@@ -315,7 +385,12 @@ def test_completion_record_schema_contract_for_all_statuses(tmp_path: Path) -> N
         (
             ["approved", "--summary", "Looks good", "--risk", "low"],
             CompletionOutcome.REVIEW_APPROVED.value,
-            {"add_code_reviewed_label", "remove_needs_rework_label", "remove_code_review_label", "post_comment"},
+            {
+                "add_code_reviewed_label",
+                "remove_needs_rework_label",
+                "remove_code_review_label",
+                "post_comment",
+            },
         ),
         (
             ["changes_requested", "--issues", "Missing tests", "--risk", "medium"],
@@ -339,11 +414,15 @@ def test_completion_record_schema_contract_for_all_statuses(tmp_path: Path) -> N
 def test_prompt_role_status_contracts(lm: LabelManager) -> None:
     work_prompt = build_starter_prompt_text("backend")
     review_prompt = build_code_review_prompt_text(lm.code_review, lm.code_reviewed)
-    tech_lead_prompt = build_tech_lead_review_prompt_text("tech-lead-review", "tech-lead-reviewed")
+    tech_lead_prompt = build_tech_lead_review_prompt_text(
+        "tech-lead-review", "tech-lead-reviewed"
+    )
 
     work_statuses = _extract_statuses(_extract_completion_commands(work_prompt))
     review_statuses = _extract_statuses(_extract_completion_commands(review_prompt))
-    tech_lead_statuses = _extract_statuses(_extract_completion_commands(tech_lead_prompt))
+    tech_lead_statuses = _extract_statuses(
+        _extract_completion_commands(tech_lead_prompt)
+    )
 
     assert {"blocked", "needs_human"} <= work_statuses
     assert review_statuses == {"approved", "changes_requested"}
@@ -362,7 +441,8 @@ def test_prompt_role_status_contracts(lm: LabelManager) -> None:
 
 
 def test_completion_record_drives_expected_review_actions(
-    tmp_path: Path, lm: LabelManager,
+    tmp_path: Path,
+    lm: LabelManager,
 ) -> None:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -373,7 +453,9 @@ def test_completion_record_drives_expected_review_actions(
 
     env = {
         **os.environ,
-        "ISSUE_ORCHESTRATOR_COMPLETION_PATH": str(completion_path.relative_to(worktree)),
+        "ISSUE_ORCHESTRATOR_COMPLETION_PATH": str(
+            completion_path.relative_to(worktree)
+        ),
         "ISSUE_ORCHESTRATOR_SESSION_ID": "review-100",
         "ISSUE_ORCHESTRATOR_RUN_DIR": str(run_assets.run_dir),
     }
@@ -417,7 +499,10 @@ def test_completion_record_drives_expected_review_actions(
     assert decision.status.name == "COMPLETED"
     assert (100, lm.code_reviewed) in label_adapter.added
     assert (100, lm.needs_rework) in label_adapter.removed
-    assert any(target == 100 and label == lm.code_review for target, label in label_adapter.removed)
+    assert any(
+        target == 100 and label == lm.code_review
+        for target, label in label_adapter.removed
+    )
     assert any(target == 100 for target, _body in pr_adapter.comments)
 
 
@@ -429,7 +514,9 @@ def _make_test_session(issue: Issue, worktree: Path) -> Session:
         terminal_id=terminal_id,
         branch_name=terminal_id,
         worktree_path=worktree,
-        agent_config=AgentConfig(prompt_path=worktree / "prompt.md", timeout_minutes=30),
+        agent_config=AgentConfig(
+            prompt_path=worktree / "prompt.md", timeout_minutes=30
+        ),
         run_assets=make_session_run_assets(worktree, session_name=terminal_id),
     )
 
@@ -444,7 +531,9 @@ def _apply_label_actions_to_issue(issue: Issue, actions: list[object]) -> Issue:
     return Issue(number=issue.number, title=issue.title, labels=sorted(labels))
 
 
-def test_publish_failure_multi_attempt_contract(tmp_path: Path, lm: LabelManager) -> None:
+def test_publish_failure_multi_attempt_contract(
+    tmp_path: Path, lm: LabelManager
+) -> None:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     _init_git_repo(worktree)
@@ -452,17 +541,19 @@ def test_publish_failure_multi_attempt_contract(tmp_path: Path, lm: LabelManager
     config = Config()
     config.repo = "owner/repo"
 
-    issue = Issue(number=1, title="Synthetic publish-fail issue", labels=["agent:coder"])
+    issue = Issue(
+        number=1, title="Synthetic publish-fail issue", labels=["agent:coder"]
+    )
     repository_host = type(
-            "RepoHost",
-            (),
-            {
-                "get_prs_for_branch": lambda self, branch: [],
-                "get_pr": lambda self, pr_number: None,
-                "get_issue": lambda self, issue_number: None,
-                "set_pr_draft": lambda self, pr_number, draft: None,
-            },
-        )()
+        "RepoHost",
+        (),
+        {
+            "get_prs_for_branch": lambda self, branch: [],
+            "get_pr": lambda self, pr_number: None,
+            "get_issue": lambda self, issue_number: None,
+            "set_pr_draft": lambda self, pr_number, draft: None,
+        },
+    )()
     handler = CompletionHandler(
         config=config,
         events=type("Sink", (), {"publish": lambda self, event: None})(),
@@ -477,7 +568,6 @@ def test_publish_failure_multi_attempt_contract(tmp_path: Path, lm: LabelManager
             InMemoryOpenIssueCorpusStore(),
             is_enabled=lambda: config.tech_lead.dedup.enabled,
         ),
-        active_session_run_id=lambda _n: None,
         provider_availability=make_provider_availability(config),
         tech_lead_run_activity=in_memory_run_activity(),
     )
@@ -491,10 +581,14 @@ def test_publish_failure_multi_attempt_contract(tmp_path: Path, lm: LabelManager
         )
         # Each attempt either adds publish-failed or escalates to needs-human
         assert any(
-            isinstance(action, AddLabelAction) and action.label in (lm.publish_failed, lm.needs_human)
+            isinstance(action, AddLabelAction)
+            and action.label in (lm.publish_failed, lm.needs_human)
             for action in result.actions
         )
-        assert any(isinstance(action, RemoveLabelAction) and action.label == lm.in_progress for action in result.actions)
+        assert any(
+            isinstance(action, RemoveLabelAction) and action.label == lm.in_progress
+            for action in result.actions
+        )
         issue = _apply_label_actions_to_issue(issue, result.actions)
 
     assert lm.publish_failed in issue.labels
@@ -505,7 +599,9 @@ def test_wrapper_and_git_guardrail_path_resolution(tmp_path: Path) -> None:
     repo.mkdir()
     _init_git_repo(repo)
 
-    scripts_dir = Path(__file__).resolve().parents[2] / "src" / "issue_orchestrator" / "scripts"
+    scripts_dir = (
+        Path(__file__).resolve().parents[2] / "src" / "issue_orchestrator" / "scripts"
+    )
     agent_done_wrapper = scripts_dir / "agent-done"
     git_wrapper = scripts_dir / "git"
 

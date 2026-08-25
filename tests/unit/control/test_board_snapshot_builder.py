@@ -51,6 +51,18 @@ from issue_orchestrator.domain.models import (
 from issue_orchestrator.domain.session_run import SessionRunAssets
 from issue_orchestrator.ports.timeline_store import TimelineRecord
 from tests.unit.session_run_helpers import make_session_run_assets
+from issue_orchestrator.domain.pause_state import (
+    PauseActor,
+    PauseReason,
+    PauseState,
+)
+
+
+def _paused_state() -> PauseState:
+    """An operator-paused state — the pause_state equivalent of the old ``paused=True``."""
+    return PauseState.paused_now(
+        reason=PauseReason.OPERATOR, actor=PauseActor.CONTROL_API
+    )
 
 FIXED_NOW = datetime(2026, 7, 10, 12, 0, 0)
 
@@ -267,7 +279,7 @@ class TestPatternCaseFiles:
 class TestQueuesBlockedAndFailures:
     def _state_with_queues(self) -> OrchestratorState:
         return OrchestratorState(
-            paused=True,
+            pause_state=_paused_state(),
             pending_reviews=[
                 PendingReview(
                     issue_key=FakeIssueKey("201"),
@@ -762,7 +774,7 @@ class TestStateBoardSnapshotProvider:
     """
 
     def test_snapshot_reads_current_state_and_forwards_failures(self) -> None:
-        state = OrchestratorState(paused=True)
+        state = OrchestratorState(pause_state=_paused_state())
         state.discovered_failures.append(
             DiscoveredFailure(
                 issue_number=301, issue_title="Boom", failure_reason="failed"

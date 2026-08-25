@@ -1333,14 +1333,15 @@ class ReviewSettings(BaseModel):
         description="Act-level: terminate a stuck session",
         json_schema_extra={
             "enum": list(TECH_LEAD_AUTHORITY_MODES),
-            "doc_examples": ["propose"],
+            "doc_examples": ["propose", "execute"],
             "doc_notes": (
                 "propose (default) files each proposal as a gated GitHub issue "
                 "carrying the proposed-tech-lead label; removing the label is "
                 "per-instance approval and executes the stored op after "
                 "re-validating the target session is still active (#6778). "
-                "Direct execute is not wired yet (#6764) and remains a startup "
-                "configuration error. Allowed values: execute, propose."
+                "execute terminates the exact session generation that was active "
+                "when the decision was planned, after re-validating that it is "
+                "still active. Allowed values: execute, propose."
             ),
             "section": _TECH_LEAD_SECTION,
             "config_attr": "tech_lead.authority.kill_hung_session",
@@ -2115,12 +2116,15 @@ class AdvancedSettings(BaseModel):
     session_output_retention_days: int = Field(
         7,
         title="Session Output Retention (days)",
-        description="Retention window in days for session run artifacts",
+        description="Requested retention metadata for artifacts in an existing worktree",
         ge=0,
         le=365,
         json_schema_extra={
             "doc_examples": ["0", "7", "30"],
-            "doc_notes": "Set to 0 to expire immediately; cleanup policy may still defer deletion.",
+            "doc_notes": (
+                "Worktree cleanup deletes these artifacts regardless of this value; "
+                "the orchestrator does not archive them elsewhere."
+            ),
             "section": "Observability",
             "config_attr": "session_output_retention_days",
             "yaml_path": "observability.session_output_retention_days",
@@ -2129,10 +2133,13 @@ class AdvancedSettings(BaseModel):
     session_output_retention_tier: Literal["hot", "cold"] = Field(
         "hot",
         title="Session Output Retention Tier",
-        description="Retention tier tag recorded in run manifests",
+        description="Classification tag recorded in run manifests",
         json_schema_extra={
             "doc_examples": ["hot", "cold"],
-            "doc_notes": "Use hot for short-term troubleshooting and cold for longer forensic retention.",
+            "doc_notes": (
+                "Metadata only: this tag does not copy or move artifacts, and worktree "
+                "cleanup deletes them."
+            ),
             "section": "Observability",
             "config_attr": "session_output_retention_tier",
             "yaml_path": "observability.session_output_retention_tier",

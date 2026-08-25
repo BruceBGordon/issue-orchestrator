@@ -346,8 +346,10 @@ observability:
   session_no_output_max_bytes: 10000
   session_no_output_repeat_seconds: 120
   session_output_retention_runs: 7
+  # These two values annotate artifacts while the worktree exists. Cleanup
+  # deletes the worktree and its artifacts; no archive is created.
   session_output_retention_days: 7
-  session_output_retention_tier: "hot"  # hot | cold
+  session_output_retention_tier: "hot"  # metadata tag: hot | cold
   stale_escalation_ticks: 0
   comment_headings:
     implementation: "## Implementation"
@@ -424,8 +426,8 @@ tech_lead:
   # (per-instance approval, #6778). "execute" files the follow-up issue directly.
   # reset_retry "execute" runs the reset+retry-from-scratch owner with
   # execution-time re-validation (stale proposals are surfaced, not run).
-  # Unwired act-level actions (kill_hung_session) must stay "propose"
-  # until their executors land (#6764) - "execute" fails at startup.
+  # kill_hung_session "execute" terminates only the exact session generation
+  # observed by the tech lead, after re-validating that it is still active.
   # A create_issue follow-up routes its new issue to review.tech_lead_follow_up_agent
   # (set above; REQUIRED whenever tech_lead.enabled is true, #6779).
   # authority:
@@ -433,7 +435,7 @@ tech_lead:
   #   create_issue: "execute"       # execute | propose (propose = gated issue)
   #   flag_pattern: "execute"       # execute | propose
   #   reset_retry: "propose"        # execute | propose
-  #   kill_hung_session: "propose"  # propose only until #6764
+  #   kill_hung_session: "propose"  # execute | propose
   # Health reviews (ADR-0031 §4 + reaction-model amendment): the interval is
   # the periodic floor. A storm of K recent blocked/failed problem issues
   # creates one immediate health review instead of K investigations. The

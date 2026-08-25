@@ -40,9 +40,15 @@ from issue_orchestrator.infra.config import Config
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 PROMPT_VARIANTS = {
-    "setup_wizard": build_tech_lead_review_prompt_text("tech-lead-review", "tech-lead-reviewed"),
-    "examples": (REPO_ROOT / "examples" / "prompts" / "tech-lead-review.md").read_text(),
-    "repo_specific": (REPO_ROOT / "repo-specific" / "prompts" / "tech-lead.md").read_text(),
+    "setup_wizard": build_tech_lead_review_prompt_text(
+        "tech-lead-review", "tech-lead-reviewed"
+    ),
+    "examples": (
+        REPO_ROOT / "examples" / "prompts" / "tech-lead-review.md"
+    ).read_text(),
+    "repo_specific": (
+        REPO_ROOT / "repo-specific" / "prompts" / "tech-lead.md"
+    ).read_text(),
 }
 
 NO_MANIFEST_MARKER = "**If the manifest is missing or lists no PRs:**"
@@ -216,11 +222,17 @@ def test_non_batch_flows_contain_no_batch_only_instructions(
 def test_act_level_wiring_state_is_synchronized(variant: str) -> None:
     """#6764/#6778: every variant must document the gated-proposal tier
     (propose = reviewable issue, approval = removing the gate label), the
-    wired reset_retry execute authority, and the agent's prohibition on the
-    gate label itself."""
+    wired direct authorities, and the agent's prohibition on the gate label
+    itself."""
     text = PROMPT_VARIANTS[variant]
     assert "`tech_lead.authority.reset_retry: execute`" in text, (
         f"{variant} does not document the wired reset_retry authority"
+    )
+    assert "`tech_lead.authority.kill_hung_session: execute`" in text, (
+        f"{variant} does not document the wired kill_hung_session authority"
+    )
+    assert "never auto-executes" not in text, (
+        f"{variant} still promises human gating for every kill"
     )
     assert "`proposed-tech-lead`" in text, (
         f"{variant} does not document the gated-proposal label"
@@ -247,9 +259,7 @@ def test_step_back_mandate_synchronized(variant: str) -> None:
     assert "pattern_signature" in text, (
         f"{variant} does not document the required flag_pattern signature"
     )
-    assert "case file" in text, (
-        f"{variant} does not document the durable case file"
-    )
+    assert "case file" in text, f"{variant} does not document the durable case file"
     assert "Step back on recurrence" in text, (
         f"{variant} does not teach the step-back mandate"
     )
@@ -361,7 +371,9 @@ def test_generic_rule_act_level_verbs_match_the_domain_contract() -> None:
     act-level action type cannot be added to the runtime scope check while the
     generic prompt rule silently keeps teaching the old pair.
     """
-    from issue_orchestrator.domain.tech_lead_artifacts import ACT_LEVEL_TECH_LEAD_ACTIONS
+    from issue_orchestrator.domain.tech_lead_artifacts import (
+        ACT_LEVEL_TECH_LEAD_ACTIONS,
+    )
 
     for variant, text in sorted(PROMPT_VARIANTS.items()):
         section = _flow_section(text, "Required Output Artifacts (MANDATORY)")
@@ -389,6 +401,15 @@ def test_board_snapshot_fields_document_e2e_health(variant: str) -> None:
     """The snapshot field list must surface the aggregate E2E-health signal."""
     assert "`e2e_health`" in PROMPT_VARIANTS[variant], (
         f"{variant} does not document the e2e_health snapshot field"
+    )
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_board_snapshot_fields_document_exact_session_generation(variant: str) -> None:
+    """Kill-capable prompts name both halves of the immutable target identity."""
+    text = PROMPT_VARIANTS[variant]
+    assert "`terminal_id`/`run_id`" in text, (
+        f"{variant} does not document exact session generation fields"
     )
 
 
@@ -435,9 +456,7 @@ def test_board_snapshot_fields_document_hung_evidence(variant: str) -> None:
     """The snapshot field list must surface the per-session hung-evidence."""
     text = PROMPT_VARIANTS[variant]
     for token in ("`idle_minutes`", "`commits_ahead`"):
-        assert token in text, (
-            f"{variant} does not document the {token} snapshot field"
-        )
+        assert token in text, f"{variant} does not document the {token} snapshot field"
 
 
 @pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
@@ -535,7 +554,9 @@ def test_all_variants_teach_the_duplicate_of_dedup_field(variant: str) -> None:
     bounded dedup clause so unrelated prose can't satisfy it, in both directions."""
     clause = _dedup_clause(PROMPT_VARIANTS[variant])
     assert "duplicate_of" in clause, f"{variant} dedup clause omits duplicate_of"
-    assert "untrusted" in clause, f"{variant} does not mark duplicate_of as untrusted intent"
+    assert "untrusted" in clause, (
+        f"{variant} does not mark duplicate_of as untrusted intent"
+    )
     assert "verif" in clause, f"{variant} dedup clause omits verification semantics"
     assert "gated" in clause, f"{variant} dedup clause omits gating semantics"
     assert "candidate" in clause and "preserv" in clause, (
@@ -544,9 +565,9 @@ def test_all_variants_teach_the_duplicate_of_dedup_field(variant: str) -> None:
     assert "title" in clause and "body" in clause, (
         f"{variant} dedup clause drops the title/body requirement"
     )
-    assert (
-        "instead of filing a duplicate" not in clause
-    ), f"{variant} dedup clause still promises unconditional comment routing"
+    assert "instead of filing a duplicate" not in clause, (
+        f"{variant} dedup clause still promises unconditional comment routing"
+    )
 
 
 def _fix_class_clause(text: str) -> str:
@@ -566,9 +587,13 @@ def test_all_variants_teach_the_fix_class_promotion_gate(variant: str) -> None:
     clause = _fix_class_clause(PROMPT_VARIANTS[variant])
     assert "fix_class" in clause
     assert '"code"' in clause and '"human"' in clause
-    assert "flag_pattern" in clause, f"{variant} does not scope fix_class to flag_pattern"
+    assert "flag_pattern" in clause, (
+        f"{variant} does not scope fix_class to flag_pattern"
+    )
     assert "never" in clause, f"{variant} omits the fix:human promotion exclusion"
-    assert "omit" in clause, f"{variant} does not teach omitting an unknown classification"
+    assert "omit" in clause, (
+        f"{variant} does not teach omitting an unknown classification"
+    )
 
 
 @pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))

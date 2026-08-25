@@ -66,6 +66,13 @@ agents:
 
 execution:
   concurrency:
+    # Six concurrent sessions means six worktrees, each with its own venv.
+    # On macOS that is nearly free (uv clones from its cache on APFS), but
+    # Codespaces is ext4/overlayfs with no reflinks, so uv hardlinks only when
+    # the cache shares a filesystem with the worktrees -- and by default it does
+    # not. Before raising this number, or if a Codespace runs short of disk,
+    # see issue #7102: co-locate UV_CACHE_DIR with /workspaces and set
+    # UV_LINK_MODE=hardlink. Do NOT reintroduce a shared venv.
     max_concurrent_sessions: 6
     session_timeout_minutes: 10
   terminal_adapter: subprocess
@@ -114,7 +121,13 @@ tech_lead:
   inherit_labels: ["io-e2e-test-data", "test-data"]
 
 goal_pilot:
-  enabled: true
+  # Disabled until the first Codespaces run is proven (#7100). Every other
+  # agent in this config is claude-code; goal-pilot is the only Codex one,
+  # and Codex sandboxes with bubblewrap, which fails inside a container
+  # without SYS_ADMIN/SYS_CHROOT capabilities that Codespaces may not
+  # honour. Keeping it off means the first run exercises exactly one
+  # provider, so a failure names its own cause.
+  enabled: false
   agent: agent:goal-pilot
 
 e2e:

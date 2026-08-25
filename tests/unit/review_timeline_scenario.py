@@ -15,6 +15,7 @@ from issue_orchestrator.execution.session_output_adapter import FileSystemSessio
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.timeline_store import TimelineRecord
 from issue_orchestrator.timeline import TIMELINE_SCHEMA_VERSION, TimelineStream
+from issue_orchestrator.domain.pause_state import PauseState
 
 
 def _create_mock_orchestrator(issue_number: int, title: str) -> MagicMock:
@@ -43,7 +44,7 @@ def _create_mock_orchestrator(issue_number: int, title: str) -> MagicMock:
         active_sessions=[],
         session_history=[],
         completed_today=[],
-        paused=False,
+        pause_state=PauseState.running(),
         priority_queue=[],
         startup_status="complete",
         cached_queue_issues=[Issue(number=issue_number, title=title, labels=["agent:web"])],

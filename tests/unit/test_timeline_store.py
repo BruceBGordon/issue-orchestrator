@@ -19,7 +19,7 @@ from issue_orchestrator.execution.timeline_artifact_expectations import (
     REVIEW_PHASE_LOG_TIMELINE_EVENTS,
 )
 from issue_orchestrator.execution.timeline_writer import DefaultTimelineWriter
-from issue_orchestrator.ports.event_sink import TraceEvent
+from issue_orchestrator.ports.event_sink import TraceEvent, run_scoped_event_names
 from issue_orchestrator.ports.timeline_store import TimelineRecord, TimelineStore
 from issue_orchestrator.events import EventName
 from issue_orchestrator.events.catalog import EVENT_SCHEMA_VERSION
@@ -755,6 +755,7 @@ def test_timeline_writer_requires_completion_record_for_session_completed(
         EventName.SESSION_COMPLETED,
         {
             "issue_number": 4057,
+            "run_dir": str(tmp_path),
             "completion_path_absolute": str(completion),
             "task": "code",
         },
@@ -904,7 +905,10 @@ class TestNarrativeEnrichment:
         store = RecordingTimelineStore()
         writer = DefaultTimelineWriter(store)
         data.setdefault("issue_number", 42)
-        if event_name.value in REVIEW_PHASE_LOG_TIMELINE_EVENTS:
+        if (
+            event_name in run_scoped_event_names()
+            or event_name.value in REVIEW_PHASE_LOG_TIMELINE_EVENTS
+        ):
             data.setdefault("run_dir", "/tmp/review-phase-run")
         writer.record(TraceEvent(event_name, data))
         for r in store.records:

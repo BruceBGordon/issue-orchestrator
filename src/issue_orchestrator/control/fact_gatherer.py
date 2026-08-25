@@ -508,27 +508,18 @@ class FactGatherer:
     def _run_stuck_sweep_if_due(
         self, state: "OrchestratorState", now: float
     ) -> None:
-        """Run the tech-lead stuck sweep and record what it recovered (#6823).
+        """Arm the tech-lead stuck sweep (#6823).
 
-        All policy lives in the ``stuck_sweep`` owner; this seam only arms it,
-        records the recovered failures through the state owner method, stamps
-        and persists the timer, and emits an observation event. No new control
-        vocabulary enters this module.
+        The cycle — arming, failure classification, recording, stamping,
+        persisting — lives in the ``stuck_sweep`` owner. This seam only supplies
+        the collaborators it cannot reach and routes its two observations.
         """
-        from .label_manager import LabelManager
-        from .stuck_sweep import (
-            persist_stuck_sweep_state,
-            run_stuck_sweep,
-            stuck_sweep_due,
-        )
+        from .stuck_sweep import run_stuck_sweep_cycle
 
-        if not stuck_sweep_due(self.config, state, now):
-            return
-        result = run_stuck_sweep(
+        run_stuck_sweep_cycle(
             self.config,
             state,
             self.repository_host,
-            LabelManager(self.config),
             now,
             # Issues with an OPEN gated proposal are owned by the human who must
             # delabel it — the sweep must not re-investigate them or spend their
@@ -536,17 +527,10 @@ class FactGatherer:
             # #6824 F1). The ledger rows ARE the open-proposal set.
             open_proposal_targets=self._open_proposal_targets(),
             provider_circuit_open=self.provider_circuit_open,
+            queue_cache_store=self.queue_cache_store,
+            on_result=self._emit_stuck_sweep,
+            on_scan_incomplete=self._emit_stuck_sweep_incomplete,
         )
-        for failure in result.recovered:
-            state.record_discovered_failure(failure)
-        # Escalate to needs-human through the Planner/Applier (authoritative,
-        # label-only). Re-emit the idempotent label for EVERY unacknowledged
-        # escalation (the durable pending set) so a crash/apply failure retries
-        # until it lands (#6824 R1). The durable set itself is persisted below.
-        state.stuck_sweep_escalations = list(state.pending_stuck_sweep_escalations)
-        state.last_stuck_sweep_at = now
-        persist_stuck_sweep_state(state, self.queue_cache_store)
-        self._emit_stuck_sweep(result)
 
     def _open_proposal_targets(self) -> frozenset[int]:
         """Target issue numbers with an OPEN gated proposal in the ledger (#6824)."""
@@ -554,6 +538,26 @@ class FactGatherer:
             return frozenset()
         return frozenset(
             op.target_issue_number for _, op in self.tech_lead_authority.list_ops()
+        )
+
+    def _emit_stuck_sweep_incomplete(self, error: Exception) -> None:
+        """Surface an unprovable sweep scan as a first-class observation.
+
+        A log line alone repeats every cadence and is easy to miss; the event
+        is what a dashboard or alert can react to.
+        """
+        if self.events is None:
+            return
+        self.events.publish(
+            make_trace_event(
+                EventName.TECH_LEAD_STUCK_SWEEP,
+                {
+                    "recovered": [],
+                    "exhausted": [],
+                    "scan_incomplete": True,
+                    "error": str(error),
+                },
+            )
         )
 
     def _emit_stuck_sweep(self, result: object) -> None:

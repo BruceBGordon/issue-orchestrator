@@ -8,6 +8,7 @@ import threading
 
 import httpx
 
+from ..domain.pause_state import PauseActor
 from ..ports.orchestrator_api import OrchestratorApi
 
 
@@ -207,11 +208,17 @@ class OrchestratorAsyncHttpApi:
         client: httpx.AsyncClient | None = None,
         timeout_seconds: float = 10.0,
         token_provider: Callable[[], str | None] = _default_token_provider,
+        *,
+        pause_actor: PauseActor,
     ) -> None:
         self._base_url_provider = base_url_provider
         self._refresh_base_url = refresh_base_url
         self._client = client or httpx.AsyncClient(timeout=timeout_seconds)
         self._token_provider = token_provider
+        # REQUIRED, with no default: this one client class is instantiated by
+        # both MCP and the Control Center, so a default would silently
+        # mis-attribute every pause from whichever surface did not set it.
+        self._pause_actor = pause_actor
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -262,10 +269,16 @@ class OrchestratorAsyncHttpApi:
         return await self._request("GET", "/api/history")
 
     async def pause(self) -> dict[str, Any]:
-        return await self._request("POST", "/api/pause")
+        # Declare who is asking so the pause journal can tell the operator
+        # surfaces apart.
+        return await self._request(
+            "POST", "/api/pause", json_body={"actor": str(self._pause_actor)}
+        )
 
     async def resume(self) -> dict[str, Any]:
-        return await self._request("POST", "/api/resume")
+        return await self._request(
+            "POST", "/api/resume", json_body={"actor": str(self._pause_actor)}
+        )
 
     async def refresh(self, inflight_stable_ids: list[str]) -> dict[str, Any]:
         return await self._request("POST", "/api/refresh", json_body={"inflight_stable_ids": inflight_stable_ids})

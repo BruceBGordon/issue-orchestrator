@@ -10,6 +10,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch, Mock, AsyncMock
 from fastapi.testclient import TestClient
 
+from tests.conftest import attach_real_pause_controller
 from issue_orchestrator.entrypoints.web import (
     app,
     get_orchestrator,
@@ -74,6 +75,7 @@ from issue_orchestrator.timeline import (
 )
 from issue_orchestrator.events import EventName
 from tests.unit.session_run_helpers import make_session_run_assets
+from issue_orchestrator.domain.pause_state import PauseState
 
 _TEST_RUN_DIR_BY_ISSUE: dict[int, str] = {}
 
@@ -170,7 +172,7 @@ def create_mock_orchestrator():
         active_sessions=[],
         session_history=[],
         completed_today=[],
-        paused=False,
+        pause_state=PauseState.running(),
         priority_queue=[],
         startup_status="complete",  # Required for dashboard to show issues
     )
@@ -194,6 +196,8 @@ def create_mock_orchestrator():
     mock_orch.repository_host.get_issue.return_value = None
     mock_orch.repository_host.update_label_cache = MagicMock()
 
+
+    attach_real_pause_controller(mock_orch)
     return mock_orch
 
 

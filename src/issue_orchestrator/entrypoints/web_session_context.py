@@ -7,6 +7,7 @@ from typing import Annotated, Any, Callable
 from fastapi import Depends, FastAPI, Request
 
 from ..infra.orchestrator import Orchestrator
+from ..execution.manifest_accessor import worktree_path_from_run_dir
 from ..ports.review_artifact_reader import ReviewArtifactReader
 
 _WEB_SESSION_CONTEXT_GETTER_STATE_KEY = "web_session_context_get_orchestrator"
@@ -110,17 +111,6 @@ def resolve_issue_session_context(
 
     # Fail-fast: do not scan sibling worktrees/repos for session state.
     return IssueSessionContext()
-
-
-def worktree_path_from_run_dir(run_dir: Path) -> Path | None:
-    """Infer worktree root from a run directory path."""
-    parts = run_dir.resolve().parts
-    if ".issue-orchestrator" not in parts:
-        return None
-    idx = parts.index(".issue-orchestrator")
-    if idx <= 0:
-        return None
-    return Path(*parts[:idx])
 
 
 def issue_title_for(

@@ -82,6 +82,14 @@ def run_doctor(
         "working_directory", workspace.check_working_directory, runner, config.repo_root
     ))
     result.checks.extend(_timed("hook_dependencies", workspace.check_hook_dependencies, config.repo_root))
+    result.checks.append(
+        _timed(
+            "python_environment",
+            workspace.check_python_environment,
+            config.repo_root,
+            runner,
+        )
+    )
     result.checks.extend(_timed("hook_verification", hooks.check_hook_verification, config))
     result.checks.extend(_timed("repo_guardrails", hooks.check_repo_guardrails, config))
     result.checks.extend(_timed("worktree_hook_corruption", hooks.check_worktree_hook_corruption, config))

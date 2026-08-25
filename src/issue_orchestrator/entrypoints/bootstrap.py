@@ -54,6 +54,8 @@ from ..ports.issue_tracker import IssueTracker
 from ..ports.session_runner import SessionRunner, NullSessionRunner
 from ..ports.timeline_reader import NullTimelineReader
 from ..ports.timeline_store import NullTimelineStore, TimelineStore
+from ..infra.pause_journal import PAUSE_JOURNAL_FILENAME, JsonlPauseJournal
+from ..ports.pause_journal import NullPauseJournal
 from ..ports.timeline_writer import NullTimelineWriter
 from ..control.orchestrator_deps import OrchestratorDeps
 from ..control.provider_resilience import ProviderResilienceManager
@@ -772,6 +774,9 @@ def build_orchestrator(
         action_applier.publish_recovery = publish_recovery
 
     infra_services = InfraServices(
+        pause_journal=JsonlPauseJournal(
+            state_dir(config.repo_root) / PAUSE_JOURNAL_FILENAME
+        ),
         label_manager=label_manager,
         label_store=label_store,
         queue_cache_store=queue_cache_store,
@@ -1199,6 +1204,9 @@ def build_orchestrator_for_testing(
         action_applier.run_ownership = run_ownership
 
     infra_services = InfraServices(
+        # Null, matching NullTimelineWriter above: a bounded test
+        # composition must not write through a production adapter.
+        pause_journal=NullPauseJournal(),
         label_manager=label_manager,
         label_store=label_store,
         queue_cache_store=queue_cache_store,

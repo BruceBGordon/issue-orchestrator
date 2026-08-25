@@ -10,6 +10,7 @@ import time
 import uvicorn
 import pytest
 
+from issue_orchestrator.domain.pause_state import PauseActor
 from issue_orchestrator.entrypoints import mcp_server, web
 from issue_orchestrator.execution.orchestrator_http_api import (
     OrchestratorHttpApi,
@@ -108,7 +109,7 @@ async def test_mcp_snapshot_uses_api(sample_orchestrator, sample_issues):
                 auto_start=False,
             )
             app = mcp_server.McpApp(settings)
-            app._api = OrchestratorAsyncHttpApi(lambda: f"http://127.0.0.1:{port}")  # test hook
+            app._api = OrchestratorAsyncHttpApi(lambda: f"http://127.0.0.1:{port}", pause_actor=PauseActor.MCP)  # test hook
             snapshot = await app.snapshot()
             assert "status" in snapshot
             assert "info" in snapshot

@@ -84,7 +84,9 @@ def make_session(
     return Session(
         key=SessionKey(issue=FakeIssueKey(str(issue.number)), task=TaskKind.CODE),
         issue=issue,
-        agent_config=AgentConfig(prompt_path=tmp_path / "prompt.md", timeout_minutes=45),
+        agent_config=AgentConfig(
+            prompt_path=tmp_path / "prompt.md", timeout_minutes=45
+        ),
         terminal_id=terminal_id,
         worktree_path=tmp_path,
         branch_name=f"issue-{issue.number}",
@@ -134,9 +136,11 @@ def make_planner(
     # same post-refresh boundary without making planning read GitHub.
     open_issue_corpus.sync()
     return CompletionActionPlanner(
-        config, repository_host, LabelManager(config), tech_lead_authority,
+        config,
+        repository_host,
+        LabelManager(config),
+        tech_lead_authority,
         open_issue_corpus,
-        lambda _n: None,  # no live target session in these unit fixtures (#6779 R1)
         make_provider_availability(config),
     )
 
@@ -153,10 +157,14 @@ def removed_labels(actions: tuple[object, ...]) -> set[str]:
 
 def comments(actions: tuple[object, ...]) -> list[str]:
     """Return comments emitted by a planner result."""
-    return [action.comment for action in actions if isinstance(action, AddCommentAction)]
+    return [
+        action.comment for action in actions if isinstance(action, AddCommentAction)
+    ]
 
 
-def test_timeout_issue_session_marks_blocked_failed_and_releases_claim(tmp_path: Path) -> None:
+def test_timeout_issue_session_marks_blocked_failed_and_releases_claim(
+    tmp_path: Path,
+) -> None:
     config = Config()
     actions = make_planner(config).generate_completion_actions(
         make_session(tmp_path),
@@ -179,7 +187,9 @@ def test_failed_issue_session_without_retry_needs_human(tmp_path: Path) -> None:
 
     assert "needs-human" in added_labels(actions)
     assert "in-progress" in removed_labels(actions)
-    assert any("Session Needs Investigation" in comment for comment in comments(actions))
+    assert any(
+        "Session Needs Investigation" in comment for comment in comments(actions)
+    )
 
 
 def test_blocked_issue_session_uses_reported_label_and_reason(tmp_path: Path) -> None:
@@ -344,7 +354,9 @@ def make_tech_lead_session(tmp_path: Path, *, terminal_id: str = "issue-1") -> S
     return make_session(tmp_path, issue=issue, terminal_id=terminal_id)
 
 
-def plant_tech_lead_assignment(session: Session, assignment: TechLeadAssignment) -> None:
+def plant_tech_lead_assignment(
+    session: Session, assignment: TechLeadAssignment
+) -> None:
     """Write the launch-time assignment into the session's tech-lead-data dir."""
     assignment_path = session.run_dir / "tech-lead-data" / TECH_LEAD_ASSIGNMENT_FILENAME
     assignment.write(assignment_path)
@@ -358,8 +370,12 @@ def plant_tech_lead_manifest(tmp_path: Path, session: Session) -> None:
     """Write a two-PR tech_lead manifest discoverable via the run manifest."""
     manifest = TechLeadManifest(
         prs=[
-            PRToReview(number=101, title="PR 101", url="https://example/pr/101", branch="b1"),
-            PRToReview(number=102, title="PR 102", url="https://example/pr/102", branch="b2"),
+            PRToReview(
+                number=101, title="PR 101", url="https://example/pr/101", branch="b1"
+            ),
+            PRToReview(
+                number=102, title="PR 102", url="https://example/pr/102", branch="b2"
+            ),
         ]
     )
     manifest_path = tmp_path / "tech-lead-manifest.json"
@@ -417,7 +433,8 @@ def plant_tech_lead_decision_pair(
 
 def _tech_lead_labels(actions: tuple[object, ...]) -> list[AddLabelAction]:
     return [
-        action for action in actions
+        action
+        for action in actions
         if isinstance(action, AddLabelAction) and action.label == "tech-lead-reviewed"
     ]
 
@@ -438,7 +455,8 @@ def test_completed_tech_lead_session_labels_manifest_prs_and_plans_decision(
     assert {action.issue_number for action in _tech_lead_labels(actions)} == {101, 102}
     assert "in-progress" in removed_labels(actions)
     decision_comments = [
-        action for action in actions
+        action
+        for action in actions
         if isinstance(action, AddCommentAction) and action.number == 101
     ]
     assert len(decision_comments) == 1
@@ -460,13 +478,16 @@ def test_completed_tech_lead_session_missing_pair_fails_labels_and_surfaces_reje
     )
 
     failed_actions = [
-        action for action in actions
+        action
+        for action in actions
         if isinstance(action, AddLabelAction) and action.label == "tech-lead-failed"
     ]
     assert {action.issue_number for action in failed_actions} == {101, 102}
     assert "tech-lead-reviewed" not in added_labels(actions)
     rejections = [
-        action for action in actions if isinstance(action, SurfaceTechLeadProposalAction)
+        action
+        for action in actions
+        if isinstance(action, SurfaceTechLeadProposalAction)
     ]
     assert len(rejections) == 1
     assert rejections[0].mode == "rejected"
@@ -539,8 +560,10 @@ def test_completed_tech_lead_investigation_session_plans_decision_without_labels
     assert "tech-lead-reviewed" not in added_labels(actions)
     assert "tech-lead-failed" not in added_labels(actions)
     decision_comments = [
-        action for action in actions
-        if isinstance(action, AddCommentAction) and action.number == 1
+        action
+        for action in actions
+        if isinstance(action, AddCommentAction)
+        and action.number == 1
         and "Diagnosis" in action.comment
     ]
     assert len(decision_comments) == 1
@@ -566,7 +589,8 @@ def _close_actions(actions: tuple[object, ...]) -> list[CloseIssueAction]:
 
 def _tech_lead_failed_labels(actions: tuple[object, ...]) -> list[AddLabelAction]:
     return [
-        action for action in actions
+        action
+        for action in actions
         if isinstance(action, AddLabelAction) and action.label == "tech-lead-failed"
     ]
 
@@ -680,7 +704,8 @@ def test_completed_health_review_plans_decision_and_closes_anchor(
     assert "tech-lead-reviewed" not in added_labels(actions)
     assert "tech-lead-failed" not in added_labels(actions)
     decision_comments = [
-        action for action in actions
+        action
+        for action in actions
         if isinstance(action, AddCommentAction)
         and action.number == session.issue.number
         and "Diagnosis" in action.comment
@@ -708,7 +733,9 @@ def test_health_review_missing_pair_surfaces_rejection_and_keeps_anchor_open(
     )
 
     rejections = [
-        action for action in actions if isinstance(action, SurfaceTechLeadProposalAction)
+        action
+        for action in actions
+        if isinstance(action, SurfaceTechLeadProposalAction)
     ]
     assert len(rejections) == 1
     assert rejections[0].mode == "rejected"
@@ -764,15 +791,15 @@ def test_health_review_decision_targeting_other_issue_is_rejected(
         SessionStatus.COMPLETED,
     )
     rejections = [
-        action for action in actions if isinstance(action, SurfaceTechLeadProposalAction)
+        action
+        for action in actions
+        if isinstance(action, SurfaceTechLeadProposalAction)
     ]
     assert len(rejections) == 1
     assert rejections[0].mode == "rejected"
     assert not any(isinstance(a, CloseIssueAction) for a in actions)
     # And the out-of-scope comment is never planned.
-    assert not any(
-        isinstance(a, AddCommentAction) and a.number == 999 for a in actions
-    )
+    assert not any(isinstance(a, AddCommentAction) and a.number == 999 for a in actions)
 
 
 def _plant_flag_pattern_decision(
@@ -890,7 +917,8 @@ def test_tech_lead_session_without_launch_authority_is_rejected(
 
     assert _tech_lead_labels(actions) == []
     rejections = [
-        a for a in actions
+        a
+        for a in actions
         if isinstance(a, SurfaceTechLeadProposalAction) and a.mode == "rejected"
     ]
     assert len(rejections) == 1
@@ -916,7 +944,11 @@ def test_tech_lead_artifacts_in_sibling_run_dir_are_ignored(
         sibling / "tech-lead-data" / TECH_LEAD_ASSIGNMENT_FILENAME
     )
     manifest = TechLeadManifest(
-        prs=[PRToReview(number=301, title="Stale", url="https://example/pr/301", branch="s1")]
+        prs=[
+            PRToReview(
+                number=301, title="Stale", url="https://example/pr/301", branch="s1"
+            )
+        ]
     )
     manifest_path = sibling / "tech-lead-manifest.json"
     manifest.write(manifest_path)
@@ -929,7 +961,10 @@ def test_tech_lead_artifacts_in_sibling_run_dir_are_ignored(
         SessionStatus.COMPLETED,
     )
 
-    assert not any(isinstance(a, AddLabelAction) and a.label.startswith("tech-lead-") for a in actions)
+    assert not any(
+        isinstance(a, AddLabelAction) and a.label.startswith("tech-lead-")
+        for a in actions
+    )
     assert "Launch authority rejected" in caplog.text
 
 
@@ -954,7 +989,8 @@ def test_successful_batch_completion_closes_tracking_issue(tmp_path: Path) -> No
     closes = [a for a in actions if isinstance(a, CloseIssueAction)]
     assert [c.issue_number for c in closes] == [session.issue.number]
     label_indexes = [
-        i for i, a in enumerate(actions)
+        i
+        for i, a in enumerate(actions)
         if isinstance(a, AddLabelAction) and a.label == "tech-lead-reviewed"
     ]
     assert label_indexes and actions.index(closes[0]) > max(label_indexes)
@@ -1013,8 +1049,10 @@ def test_failure_investigation_completion_preserves_source_issue(
 
 def _rejections(actions: tuple[object, ...]) -> list[SurfaceTechLeadProposalAction]:
     return [
-        action for action in actions
-        if isinstance(action, SurfaceTechLeadProposalAction) and action.mode == "rejected"
+        action
+        for action in actions
+        if isinstance(action, SurfaceTechLeadProposalAction)
+        and action.mode == "rejected"
     ]
 
 
@@ -1060,7 +1098,8 @@ class TestFailureInvestigationDiagnosisRequired:
 
         assert _rejections(actions) == []
         diagnosis = [
-            action for action in actions
+            action
+            for action in actions
             if isinstance(action, AddCommentAction) and action.number == 1
         ]
         assert diagnosis and "Diagnosis" in diagnosis[0].comment
@@ -1276,9 +1315,7 @@ class TestDecisionTargetScope:
         config = make_tech_lead_config(tmp_path)
         config.tech_lead.authority.reset_retry = "execute"
         session = make_tech_lead_session(tmp_path)
-        arm_health_review_session(
-            config, session, problem_issue_numbers=(41, 42, 43)
-        )
+        arm_health_review_session(config, session, problem_issue_numbers=(41, 42, 43))
         _plant_decision_with_actions(
             session,
             [
@@ -1316,9 +1353,7 @@ class TestDecisionTargetScope:
     ) -> None:
         config = make_tech_lead_config(tmp_path)
         session = make_tech_lead_session(tmp_path)
-        arm_health_review_session(
-            config, session, problem_issue_numbers=(41, 42, 43)
-        )
+        arm_health_review_session(config, session, problem_issue_numbers=(41, 42, 43))
         _plant_decision_with_actions(
             session,
             [
@@ -1434,15 +1469,11 @@ class TestDecisionTargetScope:
         """Rewriting the snapshot's COHORT surface is still caught."""
         config = make_tech_lead_config(tmp_path)
         session = make_tech_lead_session(tmp_path)
-        arm_health_review_session(
-            config, session, problem_issue_numbers=(41, 42, 43)
-        )
+        arm_health_review_session(config, session, problem_issue_numbers=(41, 42, 43))
         BoardSnapshot(
             generated_at="2026-07-14T12:01:00+00:00",
             orchestrator_paused=False,
-            recent_failures=[
-                BoardFailure(99, "Injected problem", "failed", [])
-            ],
+            recent_failures=[BoardFailure(99, "Injected problem", "failed", [])],
             problem_cohort=[99],
         ).write(session.run_dir / "tech-lead-data" / "board-snapshot.json")
 
@@ -1566,7 +1597,8 @@ class TestResetRetryExecutionPipeline:
         assert reset.finding_ids == ("T1",)
         # No shadow surface for the executed proposal.
         surfaced = [
-            a for a in actions
+            a
+            for a in actions
             if isinstance(a, SurfaceTechLeadProposalAction)
             and a.proposal_type == "reset_retry"
         ]
@@ -1620,7 +1652,9 @@ class TestResetRetryExecutionPipeline:
         )
 
         run_reset = MagicMock(
-            return_value=ResetRetryRunOutcome(success=True, details={"queued_now": True})
+            return_value=ResetRetryRunOutcome(
+                success=True, details={"queued_now": True}
+            )
         )
         executor = TechLeadResetRetryExecutor(
             events=MagicMock(),
@@ -1794,7 +1828,8 @@ def test_protected_agent_label_on_create_issue_rejects_decision(
     assert "protected" in rejection.body_preview
     assert "in-progress" in rejection.body_preview
     assert not any(
-        isinstance(a, AddLabelAction) and a.label == "tech-lead-reviewed" for a in actions
+        isinstance(a, AddLabelAction) and a.label == "tech-lead-reviewed"
+        for a in actions
     )
 
 
@@ -1829,7 +1864,8 @@ class TestTechLeadDecisionFailureTransition:
         )
 
         failed = [
-            a for a in actions
+            a
+            for a in actions
             if isinstance(a, AddLabelAction) and a.label == "tech-lead-failed"
         ]
         assert {a.issue_number for a in failed} == {101, 102}
@@ -1868,7 +1904,9 @@ class TestTechLeadDecisionFailureTransition:
         )
 
 
-def test_interrupted_retry_adds_guard_and_keeps_retry_loop_bounded(tmp_path: Path) -> None:
+def test_interrupted_retry_adds_guard_and_keeps_retry_loop_bounded(
+    tmp_path: Path,
+) -> None:
     config = Config()
     config.retry.interrupted_sessions.enabled = True
     actions = make_planner(config).generate_completion_actions(
@@ -1963,9 +2001,7 @@ class TestProductionOpenIssueDedupCorpus:
             for action in actions
         )
 
-    def test_propose_gates_verified_open_issue_duplicate(
-        self, tmp_path: Path
-    ) -> None:
+    def test_propose_gates_verified_open_issue_duplicate(self, tmp_path: Path) -> None:
         from issue_orchestrator.domain.open_issue_corpus import (
             build_open_issue_fingerprint,
         )
@@ -1994,7 +2030,9 @@ class TestProductionOpenIssueDedupCorpus:
         ).generate_completion_actions(session, SessionStatus.COMPLETED)
 
         [gated] = [
-            action for action in actions if isinstance(action, CreateTechLeadIssueAction)
+            action
+            for action in actions
+            if isinstance(action, CreateTechLeadIssueAction)
         ]
         assert PROPOSED_TECH_LEAD_LABEL in gated.labels
         assert "DUPLICATE of #1" in gated.body
@@ -2086,7 +2124,9 @@ class TestMilestoneResolutionBoundary:
             for action in actions
         )
         [create] = [
-            action for action in actions if isinstance(action, CreateTechLeadIssueAction)
+            action
+            for action in actions
+            if isinstance(action, CreateTechLeadIssueAction)
         ]
         assert PROPOSED_TECH_LEAD_LABEL in create.labels
 
@@ -2109,7 +2149,9 @@ class TestMilestoneResolutionBoundary:
 
         host.list_milestones.assert_not_called()
         [create] = [
-            action for action in actions if isinstance(action, CreateTechLeadIssueAction)
+            action
+            for action in actions
+            if isinstance(action, CreateTechLeadIssueAction)
         ]
         assert create.milestone == TechLeadMilestoneIntent(explicit_name="M5")
 

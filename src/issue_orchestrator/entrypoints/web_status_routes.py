@@ -62,7 +62,11 @@ async def get_status(orchestrator: WebOrchestratorDependency) -> JSONResponse:
     e2e_role = get_e2e_role(config.e2e, instance_id=instance_id)
 
     return JSONResponse({
-        "paused": state.paused,
+        # Carries ``paused`` plus its provenance: why, who, since when. Without
+        # the provenance the UI can only show that the engine is stopped, never
+        # why — which left a breaker-tripped engine looking indistinguishable
+        # from a deliberate pause.
+        **state.pause_state.to_payload(),
         "shutdown_requested": orchestrator.shutdown_requested,
         # Exposed so the Control Center's server-to-server probe (in
         # control_center_repo_status._apply_internal_runtime_state) can

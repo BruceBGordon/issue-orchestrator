@@ -101,7 +101,7 @@ class TestTimelineActionWiring:
                 "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
                 "artifacts": [
                     {"type": "pull_request", "label": "PR", "value": "https://example.com/pr/1"},
-                    {"type": "worktree", "label": "Worktree", "value": "/tmp/wt"},
+                    {"type": "worktree", "label": "Worktree", "value": str(worktree)},
                 ],
             },
         ]
@@ -289,52 +289,6 @@ class TestTimelineActionWiring:
                 4057,
             )
 
-    def test_no_action_type_without_js_handler(self) -> None:
-        """Ensure the registry is exhaustive — every known action type
-        maps to exactly one endpoint or None (client-only)."""
-        # This is a meta-test: if someone adds a new action type to the
-        # backend, they must also update this registry.
-        from issue_orchestrator.entrypoints.web import (
-            _timeline_event_default_actions,
-            _timeline_event_recommended_actions,
-        )
-
-        # Collect all hardcoded action types from the default/recommended helpers
-        captured: list[dict] = []
-
-        def _capture(action: dict, _dedupe: str) -> None:
-            captured.append(action)
-
-        _timeline_event_default_actions(
-            event={"event": "session.started", "event_intent": "coding"},
-            event_name="session.started",
-            issue_number=1,
-            add_action=_capture,
-        )
-        _timeline_event_recommended_actions(
-            event={"event": "session.started", "event_intent": "coding"},
-            event_name="session.started", issue_number=1, add_action=_capture,
-        )
-        _timeline_event_recommended_actions(
-            event={"event": "session.failed", "event_intent": "coding"},
-            event_name="session.failed", issue_number=1, add_action=_capture,
-        )
-        _timeline_event_recommended_actions(
-            event={"event": "validation.failed", "event_intent": "orchestrator"},
-            event_name="validation.failed", issue_number=1, add_action=_capture,
-        )
-        _timeline_event_recommended_actions(
-            event={"event": "review.comment_added", "event_intent": "review"},
-            event_name="review.comment_added", issue_number=1, add_action=_capture,
-        )
-
-        default_types = {a["type"] for a in captured}
-        unregistered = default_types - set(self._ACTION_ENDPOINT_MAP)
-        assert not unregistered, (
-            f"Action types in default/recommended helpers not in wiring registry: "
-            f"{unregistered}"
-        )
-
     def test_timeline_artifact_types_produce_viewable_actions(self, tmp_path: Path) -> None:
         """All known timeline artifact types should map to a usable UI action."""
         from issue_orchestrator.entrypoints.web import _timeline_event_actions
@@ -350,13 +304,20 @@ class TestTimelineActionWiring:
         claude_log.write_text('{"type":"assistant","content":"ok"}\n', encoding="utf-8")
         session_output.update_manifest(run.run_dir, {"claude_log_path": str(claude_log)})
 
-        completion_path = worktree / ".issue-orchestrator" / "completion.json"
-        completion_path.parent.mkdir(parents=True, exist_ok=True)
+        completion_path = run.run_dir / "completion.json"
         completion_path.write_text('{"status":"completed"}\n', encoding="utf-8")
-        validation_path = worktree / ".issue-orchestrator" / "validation.json"
+        validation_path = run.run_dir / "validation.json"
         validation_path.write_text('{"ok":true}\n', encoding="utf-8")
         diagnostic_path = run.run_dir / "invalid-completion-1.json"
         diagnostic_path.write_text('{"kind":"invalid-completion-record"}\n', encoding="utf-8")
+        session_output.update_manifest(
+            run.run_dir,
+            {
+                "completion_path": str(completion_path),
+                "validation_record_path": str(validation_path),
+                "diagnostic_path": str(diagnostic_path),
+            },
+        )
 
         event = {
             "event": "review.comment_added",
@@ -401,6 +362,39 @@ class TestTimelineActionWiring:
         assert "open_agent_log" in run_scoped
         assert "view_claude_log" in run_scoped
         assert "open_orchestrator_log" in run_scoped
+
+    def test_available_run_with_missing_local_artifact_fails_fast(
+        self, tmp_path: Path
+    ) -> None:
+        from issue_orchestrator.entrypoints.web import _timeline_event_actions
+        from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+
+        worktree = tmp_path / "wt-missing-local-artifact"
+        worktree.mkdir()
+        run = FileSystemSessionOutput().start_run(
+            worktree, "issue-4057", issue_number=4057
+        )
+        missing_completion = worktree / ".issue-orchestrator" / "completion.json"
+
+        with pytest.raises(
+            RuntimeError, match="timeline event references missing local artifact"
+        ):
+            _timeline_event_actions(
+                {
+                    "event": "issue.unblocked",
+                    "issue_number": 4057,
+                    "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
+                    "run_dir": str(run.run_dir),
+                    "artifacts": [
+                        {
+                            "type": "completion_record",
+                            "label": "Completion",
+                            "value": str(missing_completion),
+                        }
+                    ],
+                },
+                4057,
+            )
 
     def test_agent_log_action_label_matches_event_context(self, tmp_path: Path) -> None:
         from issue_orchestrator.entrypoints.web import _timeline_event_actions
@@ -471,6 +465,9 @@ class TestTimelineActionWiring:
     ) -> None:
         from issue_orchestrator.entrypoints.web import _timeline_event_actions
         from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+        from issue_orchestrator.ports.event_sink import (
+            make_review_exchange_completed_event,
+        )
 
         session_output = FileSystemSessionOutput()
         worktree = tmp_path / "wt-review-exchange-aggregate"
@@ -488,19 +485,34 @@ class TestTimelineActionWiring:
             {"review_exchange_transcript_path": str(transcript)},
         )
 
-        completed_actions = _timeline_event_actions(
+        completed_event = make_review_exchange_completed_event(
             {
-                "event": "review_exchange.completed",
                 "issue_number": 4057,
                 "run_dir": str(run.run_dir),
-                "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
+                "session_name": "review-aggregate",
                 "rounds": 1,
+                "status": "ok",
+                "reason": "reviewer_ok",
+            }
+        )
+        completed_actions = _timeline_event_actions(
+            {
+                "event": completed_event.name,
+                **completed_event.data,
+                "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
             },
             4057,
         )
         completed_types = {action.get("type") for action in completed_actions}
         assert "open_review_transcript" in completed_types
         assert "open_agent_log" not in completed_types
+        transcript_action = next(
+            action
+            for action in completed_actions
+            if action.get("type") == "open_review_transcript"
+        )
+        assert transcript_action["issue_number"] == 4057
+        assert transcript_action["run_dir"] == str(run.run_dir)
 
         started_actions = _timeline_event_actions(
             {
@@ -514,12 +526,12 @@ class TestTimelineActionWiring:
         )
         assert all(action.get("type") != "open_agent_log" for action in started_actions)
 
-    def test_review_events_fall_back_to_agent_log_when_review_transcript_missing(self, tmp_path: Path) -> None:
+    def test_review_events_keep_agent_log_when_optional_transcript_is_missing(self, tmp_path: Path) -> None:
         from issue_orchestrator.entrypoints.web import _timeline_event_actions
         from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 
         session_output = FileSystemSessionOutput()
-        worktree = tmp_path / "wt-review-transcript-fallback"
+        worktree = tmp_path / "wt-review-transcript-optional"
         worktree.mkdir(parents=True)
         run = session_output.start_run(worktree, "review-1", issue_number=1)
 
@@ -993,8 +1005,6 @@ class TestTimelineActionWiring:
         non_run_scoped_types = [action.get("type") for action in actions_without_run_dir]
         assert non_run_scoped_types == [
             "open_review_feedback",
-            "open_orchestrator_log",
-            "open_session_diagnostics",
         ]
 
         session_output = FileSystemSessionOutput()
@@ -1024,6 +1034,9 @@ class TestTimelineActionWiring:
         (
             "review_exchange.round_started",
             "review_exchange.round_completed",
+            "review_exchange.role_prompted",
+            "review_exchange.role_feedback",
+            "review_exchange.role_timeout",
             "review.rework_started",
             "review.rework_completed",
         ),
@@ -1045,7 +1058,7 @@ class TestTimelineActionWiring:
                 1,
             )
 
-    def test_review_phase_log_event_with_missing_round_recording_shows_unavailable_action(self, tmp_path: Path) -> None:
+    def test_review_phase_log_event_with_missing_round_recording_fails_fast(self, tmp_path: Path) -> None:
         from issue_orchestrator.entrypoints.web import _timeline_event_actions
         from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 
@@ -1055,27 +1068,22 @@ class TestTimelineActionWiring:
         run = session_output.start_run(worktree, "review-1", issue_number=1)
         (run.run_dir / "ui-session.log").write_text("review output\n", encoding="utf-8")
 
-        actions = _timeline_event_actions(
-            {
-                "event": "review_exchange.round_completed",
-                "issue_number": 1,
-                "run_dir": str(run.run_dir),
-                "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
-                "round_index": 2,
-                "logical_run": 1,
-                "logical_cycle": 1,
-                "logical_phase": "review",
-            },
-            1,
-        )
-
-        assert [a for a in actions if a.get("type") == "open_agent_log"] == []
-        unavailable = next(
-            a for a in actions if a.get("type") == "show_actions_error"
-        )
-        assert unavailable["label"] == "Reviewer Recording unavailable"
-        assert unavailable["primary"] is True
-        assert "timeline review phase recording missing" not in str(unavailable)
+        with pytest.raises(
+            RuntimeError, match="required Timeline phase recording is missing"
+        ):
+            _timeline_event_actions(
+                {
+                    "event": "review_exchange.round_completed",
+                    "issue_number": 1,
+                    "run_dir": str(run.run_dir),
+                    "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
+                    "round_index": 2,
+                    "logical_run": 1,
+                    "logical_cycle": 1,
+                    "logical_phase": "review",
+                },
+                1,
+            )
 
     def test_review_exchange_aggregate_row_does_not_open_run_level_recording(self, tmp_path: Path) -> None:
         from issue_orchestrator.entrypoints.web import _timeline_event_actions
@@ -1106,7 +1114,7 @@ class TestTimelineActionWiring:
 
         assert [a for a in actions if a.get("type") == "open_agent_log"] == []
 
-    def test_decorate_timeline_events_preserves_fallback_actions_when_strict_actions_fail(self) -> None:
+    def test_decorate_timeline_events_does_not_hide_missing_required_run_dir(self) -> None:
         from issue_orchestrator.entrypoints.web import _decorate_timeline_events
 
         events = [
@@ -1120,28 +1128,12 @@ class TestTimelineActionWiring:
             }
         ]
 
-        decorated = _decorate_timeline_events(events, 4057)
-        assert len(decorated) == 1
-        payload = decorated[0]
-        action_types = {action.get("type") for action in payload.get("actions", [])}
-
-        assert "open_path" in action_types
-        assert "open_orchestrator_log" in action_types
-        assert "open_session_diagnostics" in action_types
-        assert "open_agent_log" not in action_types
-        assert "actions_error" in payload
+        with pytest.raises(RuntimeError, match="missing required run_dir"):
+            _decorate_timeline_events(events, 4057)
 
 
 class TestPerRoundLogActions:
     """Pin replacement of stale per-round path guessing with run-scoped sessions."""
-
-    def _capture(self) -> tuple[list[dict], Callable]:
-        captured: list[dict] = []
-
-        def _add(action: dict, _dedupe: str) -> None:
-            captured.append(action)
-
-        return captured, _add
 
     def test_review_exchange_rows_emit_run_scoped_replacement_actions(self, tmp_path: Path) -> None:
         from issue_orchestrator.entrypoints.web import _timeline_event_actions
@@ -1194,123 +1186,83 @@ class TestPerRoundLogActions:
             assert session_action["round_index"] == 1
             assert session_action["session_role"] == expected_role
 
-    def test_round_started_does_not_emit_legacy_agent_output_paths(self) -> None:
-        from issue_orchestrator.entrypoints.web import _timeline_event_recommended_actions
+    def test_required_round_event_rejects_missing_run_dir(self) -> None:
+        from issue_orchestrator.entrypoints.web import _timeline_event_actions
 
-        captured, add = self._capture()
-        _timeline_event_recommended_actions(
-            event={
-                "event": "review_exchange.round_started",
-                "round_index": 2,
-                "run_dir": "/tmp/sessions/run-1",
-            },
-            event_name="review_exchange.round_started",
-            issue_number=1,
-            add_action=add,
-        )
-        open_path_actions = [a for a in captured if a["type"] == "open_path"]
-        assert open_path_actions == []
+        with pytest.raises(RuntimeError, match="missing required run_dir"):
+            _timeline_event_actions(
+                {
+                    "event": "review_exchange.round_started",
+                    "issue_number": 1,
+                    "round_index": 1,
+                    "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
+                },
+                1,
+            )
 
-    def test_round_completed_does_not_emit_legacy_agent_output_paths(self) -> None:
-        from issue_orchestrator.entrypoints.web import _timeline_event_recommended_actions
+    def test_missing_run_keeps_durable_actions_only(self, tmp_path: Path) -> None:
+        from issue_orchestrator.entrypoints.web import _timeline_event_actions
 
-        captured, add = self._capture()
-        _timeline_event_recommended_actions(
-            event={
+        deleted_run = tmp_path / "deleted-run"
+        actions = _timeline_event_actions(
+            {
                 "event": "review_exchange.round_completed",
+                "issue_number": 1,
+                "run_dir": str(deleted_run),
                 "round_index": 1,
-                "run_dir": "/tmp/sessions/run-1",
+                "reviewer_response_text": "Approved",
+                "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
+                "artifacts": [
+                    {
+                        "type": "pull_request",
+                        "label": "PR",
+                        "value": "https://example.com/pull/1",
+                    },
+                    {
+                        "type": "review_report",
+                        "label": "Review report",
+                        "value": str(deleted_run / "review.md"),
+                    },
+                ],
             },
-            event_name="review_exchange.round_completed",
-            issue_number=1,
-            add_action=add,
+            1,
         )
-        open_path_actions = [a for a in captured if a["type"] == "open_path"]
-        assert open_path_actions == []
 
-    def test_review_rework_completed_does_not_emit_legacy_agent_output_paths(self) -> None:
-        from issue_orchestrator.entrypoints.web import _timeline_event_recommended_actions
+        assert {action["type"] for action in actions} == {
+            "open_review_feedback",
+            "open_url",
+        }
 
-        captured, add = self._capture()
-        _timeline_event_recommended_actions(
-            event={
-                "event": "review.rework_completed",
-                "round_index": 1,
-                "run_dir": "/tmp/sessions/run-1",
-            },
-            event_name="review.rework_completed",
+
+    def test_local_artifact_type_cannot_disguise_url_as_durable(self, tmp_path: Path) -> None:
+        from issue_orchestrator.entrypoints.web import _timeline_event_actions
+        from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        run = FileSystemSessionOutput().start_run(
+            worktree,
+            "issue-1",
             issue_number=1,
-            add_action=add,
         )
-        open_path_actions = [a for a in captured if a["type"] == "open_path"]
-        assert open_path_actions == []
 
-    def test_role_prompted_does_not_emit_legacy_agent_output_path(self) -> None:
-        from issue_orchestrator.entrypoints.web import _timeline_event_recommended_actions
-
-        captured, add = self._capture()
-        _timeline_event_recommended_actions(
-            event={
-                "event": "review_exchange.role_prompted",
-                "round_index": 1,
-                "run_dir": "/tmp/sessions/run-1",
-                "role": "reviewer",
-            },
-            event_name="review_exchange.role_prompted",
-            issue_number=1,
-            add_action=add,
-        )
-        open_path_actions = [a for a in captured if a["type"] == "open_path"]
-        assert open_path_actions == []
-
-    def test_round_actions_skipped_when_round_index_missing(self) -> None:
-        from issue_orchestrator.entrypoints.web import _timeline_event_recommended_actions
-
-        captured, add = self._capture()
-        _timeline_event_recommended_actions(
-            event={
-                "event": "review_exchange.round_started",
-                "run_dir": "/tmp/sessions/run-1",
-            },
-            event_name="review_exchange.round_started",
-            issue_number=1,
-            add_action=add,
-        )
-        open_path_actions = [a for a in captured if a["type"] == "open_path"]
-        assert len(open_path_actions) == 0
-
-    def test_round_actions_skipped_when_run_dir_missing(self) -> None:
-        from issue_orchestrator.entrypoints.web import _timeline_event_recommended_actions
-
-        captured, add = self._capture()
-        _timeline_event_recommended_actions(
-            event={
-                "event": "review_exchange.round_started",
-                "round_index": 1,
-            },
-            event_name="review_exchange.round_started",
-            issue_number=1,
-            add_action=add,
-        )
-        open_path_actions = [a for a in captured if a["type"] == "open_path"]
-        assert len(open_path_actions) == 0
-
-    def test_non_round_events_do_not_produce_round_actions(self) -> None:
-        from issue_orchestrator.entrypoints.web import _timeline_event_recommended_actions
-
-        captured, add = self._capture()
-        _timeline_event_recommended_actions(
-            event={
-                "event": "review.approved",
-                "round_index": 3,
-                "run_dir": "/tmp/sessions/run-1",
-            },
-            event_name="review.approved",
-            issue_number=1,
-            add_action=add,
-        )
-        round_actions = [a for a in captured if "Round" in a.get("label", "")]
-        assert len(round_actions) == 0
+        with pytest.raises(RuntimeError, match="local artifact path is not absolute"):
+            _timeline_event_actions(
+                {
+                    "event": "issue.unblocked",
+                    "issue_number": 1,
+                    "run_dir": str(run.run_dir),
+                    "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
+                    "artifacts": [
+                        {
+                            "type": "completion_record",
+                            "label": "Completion",
+                            "value": "https://example.com/not-a-completion-record",
+                        }
+                    ],
+                },
+                1,
+            )
 
 
 class TestIsAgentScopedEvent:

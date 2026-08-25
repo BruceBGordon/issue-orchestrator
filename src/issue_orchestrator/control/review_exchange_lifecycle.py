@@ -12,6 +12,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterable, Protocol
 
+from ..domain.session_key import TaskKind
+from ..domain.tech_lead_session import TechLeadSessionGeneration
 from .completion_review_exchange import is_review_exchange_job_for_issue
 
 if TYPE_CHECKING:
@@ -46,6 +48,7 @@ class IssuePublishRetryRuntime(PublishRetryAbandoner, Protocol):
 
     def has_active_retry(self, issue_number: int) -> bool: ...
 
+
 from .session_manager import SessionType
 
 logger = logging.getLogger(__name__)
@@ -76,6 +79,33 @@ class IssueRuntimeTermination:
         return self.review_exchange.cancelled_job_ids
 
 
+@dataclass(frozen=True)
+class GenerationBoundTermination:
+    """Exact-generation kill result: one mutation or a fail-closed stale reason."""
+
+    termination: IssueRuntimeTermination | None = None
+    stale_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.termination is None) == (self.stale_reason is None):
+            raise ValueError(
+                "generation-bound termination requires exactly one outcome"
+            )
+
+
+class GenerationTerminationPartialFailure(RuntimeError):
+    """The exact terminal stopped, but its lifecycle acknowledgement failed."""
+
+    def __init__(self, target: TechLeadSessionGeneration, cause: Exception) -> None:
+        self.target = target
+        self.cause = cause
+        super().__init__(
+            f"{target.task_kind.value} terminal {target.terminal_id} "
+            f"(run {target.run_id}) stopped, but its stop owner raised after "
+            f"commit: {cause}"
+        )
+
+
 def cancel_issue_review_exchange(
     *,
     issue_number: int,
@@ -91,16 +121,30 @@ def cancel_issue_review_exchange(
     the visible issue session can stop while a hidden exchange continues to
     report "still running".
     """
+    errors: list[Exception] = []
     if pair_registry is not None:
-        pair_registry.release(issue_number, reason=reason)
+        try:
+            pair_registry.release(issue_number, reason=reason)
+        except Exception as exc:
+            errors.append(exc)
 
     cancelled: tuple[str, ...] = ()
     if job_supervisor is not None:
-        cancelled = tuple(
-            job_supervisor.cancel_matching(
-                lambda job_id: is_review_exchange_job_for_issue(job_id, issue_number),
-                reason=reason,
+        try:
+            cancelled = tuple(
+                job_supervisor.cancel_matching(
+                    lambda job_id: is_review_exchange_job_for_issue(
+                        job_id, issue_number
+                    ),
+                    reason=reason,
+                )
             )
+        except Exception as exc:
+            errors.append(exc)
+    if errors:
+        _raise_lifecycle_errors(
+            f"failed to cancel all review-exchange owners for issue #{issue_number}",
+            errors,
         )
     if pair_registry is not None or cancelled:
         logger.info(
@@ -189,6 +233,161 @@ def terminate_issue_runtime(
     )
 
 
+def terminate_issue_session_generation(
+    *,
+    target: TechLeadSessionGeneration,
+    reason: str,
+    active_sessions: list["Session"],
+    session_exists: Callable[[str], bool],
+    kill_session: Callable[[str], None],
+    pair_registry: "PersistentExchangePairRegistry | None",
+    job_supervisor: "BackgroundJobSupervisor | None",
+    publish_recovery: "PublishRetryAbandoner | None" = None,
+) -> GenerationBoundTermination:
+    """Conditionally stop the exact launch-observed worker generation.
+
+    Capture, live eligibility, generation comparison, and mutation meet at
+    this single behavior boundary. Only CODE/REWORK sessions participate. A
+    missing, replacement, review-only, or ambiguous runtime returns a stale
+    outcome without touching any terminal or hidden owner.
+    """
+    candidates = [
+        session
+        for session in active_sessions
+        if session.issue.number == target.issue_number
+        and session.key.task in {TaskKind.CODE, TaskKind.REWORK}
+    ]
+    if not candidates:
+        return GenerationBoundTermination(
+            stale_reason=(
+                f"issue #{target.issue_number} has no active killable session; "
+                "the observed generation is already gone"
+            )
+        )
+    if len(candidates) != 1:
+        return GenerationBoundTermination(
+            stale_reason=(
+                f"issue #{target.issue_number} has {len(candidates)} active "
+                "killable sessions; refusing an ambiguous termination"
+            )
+        )
+    current = candidates[0]
+    if (
+        current.key.task is not target.task_kind
+        or current.terminal_id != target.terminal_id
+        or current.run_assets.run_id != target.run_id
+    ):
+        return GenerationBoundTermination(
+            stale_reason=(
+                f"issue #{target.issue_number}'s live generation "
+                f"({current.key.task.value} terminal {current.terminal_id}, "
+                f"run {current.run_assets.run_id}) is not the observed generation "
+                f"({target.task_kind.value} terminal {target.terminal_id}, "
+                f"run {target.run_id}); refusing to kill a replacement"
+            )
+        )
+    if not session_exists(target.terminal_id):
+        return GenerationBoundTermination(
+            stale_reason=(
+                f"issue #{target.issue_number}'s observed terminal "
+                f"{target.terminal_id} is no longer running"
+            )
+        )
+
+    # Prepare every hidden owner before committing the visible terminal stop.
+    # Each teardown is idempotent, and every owner is attempted even when a
+    # sibling fails. A preparation failure deliberately leaves the terminal and
+    # exact active row intact so the action remains retryable. Once the terminal
+    # stop commits, no fallible external cleanup remains before reconciliation.
+    cleanup_errors: list[Exception] = []
+    review_exchange: ReviewExchangeCancellation | None = None
+    try:
+        review_exchange = cancel_issue_review_exchange(
+            issue_number=target.issue_number,
+            reason=reason,
+            pair_registry=pair_registry,
+            job_supervisor=job_supervisor,
+        )
+    except Exception as exc:
+        cleanup_errors.append(exc)
+    if publish_recovery is not None:
+        try:
+            publish_recovery.abandon_issue(target.issue_number)
+        except Exception as exc:
+            cleanup_errors.append(exc)
+    if cleanup_errors:
+        _raise_lifecycle_errors(
+            f"failed to prepare all runtime owners for issue #{target.issue_number}",
+            cleanup_errors,
+        )
+    assert review_exchange is not None
+
+    # The orchestrator serializes lifecycle mutations; this opaque terminal id
+    # is exactly the one retained on the generation-matched Session record.
+    _stop_exact_generation(
+        target=target,
+        active_sessions=active_sessions,
+        session_exists=session_exists,
+        kill_session=kill_session,
+    )
+    termination = IssueRuntimeTermination(
+        issue_number=target.issue_number,
+        review_exchange=review_exchange,
+        stopped_session_ids=(target.terminal_id,),
+        cleared_active_session_ids=(target.terminal_id,),
+    )
+    return GenerationBoundTermination(termination=termination)
+
+
+def _raise_lifecycle_errors(message: str, errors: list[Exception]) -> None:
+    """Raise one lifecycle failure directly, or preserve all sibling failures."""
+    if len(errors) == 1:
+        raise errors[0]
+    raise ExceptionGroup(message, errors)
+
+
+def _drop_exact_generation(
+    active_sessions: list["Session"], target: TechLeadSessionGeneration
+) -> None:
+    """Reconcile only the active row proven to represent the stopped generation."""
+    active_sessions[:] = [
+        session
+        for session in active_sessions
+        if not (
+            session.issue.number == target.issue_number
+            and session.key.task is target.task_kind
+            and session.terminal_id == target.terminal_id
+            and session.run_assets.run_id == target.run_id
+        )
+    ]
+
+
+def _stop_exact_generation(
+    *,
+    target: TechLeadSessionGeneration,
+    active_sessions: list["Session"],
+    session_exists: Callable[[str], bool],
+    kill_session: Callable[[str], None],
+) -> None:
+    """Stop one exact terminal and reconcile whether a raised stop committed."""
+    try:
+        kill_session(target.terminal_id)
+    except Exception as stop_error:
+        try:
+            terminal_still_running = session_exists(target.terminal_id)
+        except Exception as probe_error:
+            raise ExceptionGroup(
+                "terminal stop failed and its commit state is unverifiable",
+                (stop_error, probe_error),
+            ) from stop_error
+        if terminal_still_running:
+            raise
+        _drop_exact_generation(active_sessions, target)
+        raise GenerationTerminationPartialFailure(target, stop_error) from stop_error
+
+    _drop_exact_generation(active_sessions, target)
+
+
 def has_active_issue_runtime(
     *,
     issue_number: int,
@@ -217,14 +416,19 @@ def has_active_issue_runtime(
         lambda: _issue_runtime_session_active(
             issue_number, session_manager, active_sessions, session_types
         ),
-        lambda: pair_registry is not None
-        and pair_registry.has_active_pair(issue_number),
-        lambda: job_supervisor is not None
-        and job_supervisor.has_matching(
-            lambda job_id: is_review_exchange_job_for_issue(job_id, issue_number)
+        lambda: (
+            pair_registry is not None and pair_registry.has_active_pair(issue_number)
         ),
-        lambda: publish_recovery is not None
-        and publish_recovery.has_active_retry(issue_number),
+        lambda: (
+            job_supervisor is not None
+            and job_supervisor.has_matching(
+                lambda job_id: is_review_exchange_job_for_issue(job_id, issue_number)
+            )
+        ),
+        lambda: (
+            publish_recovery is not None
+            and publish_recovery.has_active_retry(issue_number)
+        ),
     )
     return any(_owner_active_or_unverifiable(probe) for probe in probes)
 
@@ -290,7 +494,8 @@ def _active_session_ids_to_clear(
     if active_sessions is None or not terminal_ids:
         return ()
     return tuple(
-        session.terminal_id for session in active_sessions
+        session.terminal_id
+        for session in active_sessions
         if session.terminal_id in terminal_ids
     )
 
@@ -303,6 +508,7 @@ def _drop_active_session_records(
         return
     terminal_id_set = set(terminal_ids)
     active_sessions[:] = [
-        session for session in active_sessions
+        session
+        for session in active_sessions
         if session.terminal_id not in terminal_id_set
     ]

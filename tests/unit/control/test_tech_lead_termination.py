@@ -134,11 +134,15 @@ class _Host:
         )
         self.killed: list[str] = []
         self.pause_calls = 0
+        self.pause_reasons: list = []
         self.tick_count = 0
 
     # -- TechLeadDispatchHost -------------------------------------------
-    def pause(self) -> None:
+    def pause(self, *, reason=None, actor=None, detail: str = "") -> None:
         self.pause_calls += 1
+        # Recorded so tests can assert the dispatch host names WHY it paused
+        # the planner, not merely that it did.
+        self.pause_reasons.append(reason)
 
     def tick(self) -> bool:
         # Deliberately never drains the session: this IS the timeout path.

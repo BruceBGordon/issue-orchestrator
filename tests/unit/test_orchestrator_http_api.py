@@ -9,6 +9,7 @@ import httpx
 
 import pytest
 
+from issue_orchestrator.domain.pause_state import PauseActor
 from issue_orchestrator.execution.orchestrator_http_api import (
     OrchestratorHttpApi,
     OrchestratorAsyncHttpApi,
@@ -119,6 +120,7 @@ async def test_async_request_refreshes_base_url_on_request_error():
         base_url_provider=lambda: "http://old",
         refresh_base_url=lambda: "http://new",
         client=FlakyAsyncClient(),
+        pause_actor=PauseActor.MCP,
     )
 
     assert await api.status() == {"ok": True}
@@ -153,6 +155,7 @@ async def test_async_client_allows_concurrent_requests():
     api = OrchestratorAsyncHttpApi(
         base_url_provider=lambda: "http://test",
         client=client,
+        pause_actor=PauseActor.MCP,
     )
 
     task1 = asyncio.create_task(api.status())

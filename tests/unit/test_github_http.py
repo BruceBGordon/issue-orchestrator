@@ -24,6 +24,7 @@ from issue_orchestrator.adapters.github.http_client import (
     GitHubHttpClient,
     GitHubHttpConfig,
     GitHubHttpError,
+    GitHubScanIncompleteError,
     GitHubTransportError,
     describe_github_token_sources,
     resolve_github_token,
@@ -749,7 +750,7 @@ def test_list_issues_exhaustive_cap_exhaustion_fails_loud() -> None:
         return httpx.Response(200, json=full_page)  # always a full page
 
     client = _client_with_transport(httpx.MockTransport(handler))
-    with pytest.raises(GitHubHttpError):
+    with pytest.raises(GitHubScanIncompleteError):
         client.list_issues(labels=["tech-lead-agent"], limit=2000, exhaustive=True)
 
 
@@ -931,7 +932,10 @@ def test_issue_comment_marker_present_fails_loud_at_page_cap() -> None:
 
     client = _client_with_transport(httpx.MockTransport(handler))
 
-    with pytest.raises(GitHubHttpError):
+    # Typed as a completeness failure, not a generic HTTP error: consumers that
+    # answer a negative-existence question must be able to tell "I scanned
+    # everything and it wasn't there" from "I could not finish scanning".
+    with pytest.raises(GitHubScanIncompleteError):
         client.issue_comment_marker_present(318, _TEST_MARKER)
     # The scan walked every page up to the cap before failing loud (it did not
     # bail out early treating a full page as the end).
@@ -2457,3 +2461,33 @@ def test_never_closed_issue_has_no_closing_pull_request() -> None:
     client, _ = _closing_pr_client([])
 
     assert client.get_closing_pull_request(501) is None
+
+
+def test_list_labels_first_page_non_list_fails_loud() -> None:
+    """A 2xx non-list body must not prove every label absent.
+
+    ``list_labels`` promises the COMPLETE set and its callers make
+    negative-existence decisions on it — notably refusing gated tech-lead
+    proposal creation when ``proposed-tech-lead`` is missing. Returning [] for a
+    malformed first page is the same page-1 hole closed for exhaustive issue
+    scans, and it silently answers "no such label" for every label at once.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": "API rate limit exceeded"})
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    with pytest.raises(GitHubScanIncompleteError, match="complete label set"):
+        client.list_labels()
+
+
+def test_list_labels_returns_a_short_first_page() -> None:
+    """The valid-exhaustion path must keep working."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"name": "bug"}, {"name": "agent:web"}])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert [label["name"] for label in client.list_labels()] == ["bug", "agent:web"]

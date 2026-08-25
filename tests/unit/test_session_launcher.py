@@ -7588,3 +7588,291 @@ def _test_claim_store(tmp_path=None):
     return SqlitePendingWorkClaimStore.for_repo(
         _Path(tmp_path) if tmp_path is not None else _Path(tempfile.mkdtemp())
     )
+
+
+class TestSetupRunsExactlyOncePerLaunch:
+    """Setup must run once per launch, from the acquisition owner only.
+
+    Structural tests are not enough here: the AST guardrails passed while a
+    validation retry executed every configured setup command twice, because
+    the second caller *delegated* to the owner rather than reimplementing it.
+    Only counting executions catches that. For this repository a duplicate
+    means `make worktree-setup` twice per retry; for others, setup commands
+    are not guaranteed to be idempotent or cheap.
+    """
+
+    @staticmethod
+    def _setup_runs(runner) -> list[str]:
+        return [
+            call["command"]
+            for call in runner.run_calls
+            if call["command"] == "echo provision"
+        ]
+
+    def test_issue_launch_runs_setup_once(
+        self, launcher_bundle, sample_issue, mock_command_runner
+    ):
+        launcher_bundle.launcher.config.setup_worktree = ["echo provision"]
+
+        result = launcher_bundle.launcher.launch_issue_session(
+            sample_issue, active_sessions=[]
+        )
+
+        assert result.success is True, result.reason
+        assert self._setup_runs(mock_command_runner) == ["echo provision"]
+
+    def test_validation_retry_runs_setup_once(
+        self, launcher_bundle, mock_command_runner
+    ):
+        """The regression: acquisition provisioned, then the retry did it again.
+
+        Reusing a worktree is not a second trigger -- the acquisition owner
+        already provisioned that worktree during this same launch.
+        """
+        launcher_bundle.launcher.config.setup_worktree = ["echo provision"]
+        retry = PendingValidationRetry(
+            issue_number=123,
+            issue_title="Fix checkout",
+            agent_label="agent:web",
+            worktree_path="/tmp/worktree-123",
+            branch_name="123-fix-checkout",
+            original_prompt="Work on issue #123: Fix checkout",
+            validation_error="dirty worktree",
+            validation_error_file="/tmp/validation-errors.txt",
+            retry_count=1,
+            source_task=TaskKind.CODE,
+            validation_cmd="make test",
+        )
+
+        result = launcher_bundle.launcher.launch_validation_retry_session(
+            retry, active_sessions=[]
+        )
+
+        assert result.success is True, result.reason
+        assert self._setup_runs(mock_command_runner) == ["echo provision"], (
+            "validation retry must not re-provision a worktree acquisition "
+            "already provisioned in this launch"
+        )
+
+    def test_setup_runs_even_with_no_commands_configured(
+        self, launcher_bundle, sample_issue, mock_command_runner
+    ):
+        """The empty case must stay a no-op, not an error or a stray command."""
+        launcher_bundle.launcher.config.setup_worktree = []
+
+        result = launcher_bundle.launcher.launch_issue_session(
+            sample_issue, active_sessions=[]
+        )
+
+        assert result.success is True, result.reason
+        assert self._setup_runs(mock_command_runner) == []
+
+
+class TestEveryLaunchPathProvisionsExactlyOnce:
+    """The non-coding paths newly provision, so their behaviour must be pinned.
+
+    Review, rework, retrospective-review and tech-lead scratch launches used to
+    run no setup at all and survived only because the adapter symlinked the
+    repo's venv into every worktree. This PR routes them through the
+    acquisition owner, which is a behaviour change on each of them.
+
+    Source-level checks cannot pin this: they show a launcher *mentions* the
+    owner, not that the configured command ran once, in the acquired worktree,
+    or that a failure stops the terminal being created. The duplicate-retry
+    defect proved those structural tests stay green while launch behaviour is
+    wrong.
+    """
+
+    SETUP = "echo provision"
+
+    @staticmethod
+    def _runs(runner) -> list[dict]:
+        return [c for c in runner.run_calls if c["command"] == "echo provision"]
+
+    @pytest.fixture(autouse=True)
+    def _no_feedback_sleep(self, monkeypatch):
+        monkeypatch.setattr(
+            "issue_orchestrator.control.session_launcher.time.sleep", lambda _: None
+        )
+
+    def _review(self) -> PendingReview:
+        return PendingReview(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            pr_number=456,
+            pr_url="https://github.com/test/repo/pull/456",
+            branch_name="123-feature",
+            _issue_number=123,
+        )
+
+    def _retrospective(self) -> PendingRetrospectiveReview:
+        return PendingRetrospectiveReview(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="365"),
+            issue_number=365,
+            issue_title="Review old implementation",
+            agent_label="agent:web",
+            trigger_label="lack-of-review-redo",
+            prior_pr_number=512,
+            prior_pr_url="https://github.com/test/repo/pull/512",
+        )
+
+    def _rework(self, mock_repo_host) -> PendingRework:
+        mock_repo_host.prs[123] = [
+            PRInfo(
+                number=456,
+                title="Fix issue #123",
+                url="https://github.com/test/repo/pull/456",
+                branch="123-feature",
+                body="",
+                state="open",
+                labels=[],
+            )
+        ]
+        return PendingRework(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            agent_type="agent:web",
+            rework_cycle=1,
+        )
+
+    def test_review_launch_provisions_once_in_its_worktree(
+        self, launcher_bundle, mock_command_runner, mock_worktree_manager
+    ):
+        launcher_bundle.launcher.config.setup_worktree = [self.SETUP]
+
+        result = launcher_bundle.launcher.launch_review_session(
+            self._review(), active_sessions=[]
+        )
+
+        assert result.success is True, result.reason
+        runs = self._runs(mock_command_runner)
+        assert len(runs) == 1, f"review provisioned {len(runs)} times"
+        # It must run in the worktree that was actually acquired, not the repo
+        # root: provisioning the wrong directory is indistinguishable from not
+        # provisioning at all until an agent fails inside the worktree.
+        assert runs[0]["cwd"] == mock_worktree_manager.tmp_path / "worktree-123"
+        assert runs[0]["shell"] is True
+
+    def test_retrospective_launch_provisions_once(
+        self, launcher_bundle, mock_command_runner
+    ):
+        launcher_bundle.launcher.config.setup_worktree = [self.SETUP]
+
+        result = launcher_bundle.launcher.launch_retrospective_review_session(
+            self._retrospective(), active_sessions=[]
+        )
+
+        assert result.success is True, result.reason
+        assert len(self._runs(mock_command_runner)) == 1
+
+    def test_rework_launch_provisions_once(
+        self, launcher_bundle, mock_command_runner, mock_repo_host
+    ):
+        launcher_bundle.launcher.config.setup_worktree = [self.SETUP]
+
+        result = launcher_bundle.launcher.launch_rework_session(
+            self._rework(mock_repo_host), active_sessions=[]
+        )
+
+        assert result.success is True, result.reason
+        assert len(self._runs(mock_command_runner)) == 1
+
+    def test_review_setup_failure_starts_no_terminal(
+        self, launcher_bundle, mock_command_runner
+    ):
+        """A path that cannot provision must not run an agent in that worktree."""
+        launcher_bundle.launcher.config.setup_worktree = [self.SETUP]
+        mock_command_runner.results = [
+            CommandResult(returncode=1, stdout="", stderr="boom", timed_out=False)
+        ]
+
+        result = launcher_bundle.launcher.launch_review_session(
+            self._review(), active_sessions=[]
+        )
+
+        assert result.success is False
+        assert launcher_bundle.create_session_calls == []
+        # Escalation: it takes the standard worktree-preparation path, which
+        # surfaces the underlying setup failure rather than a generic message.
+        assert "preparation failed" in result.reason
+        assert "Setup commands failed" in result.reason
+
+    def test_rework_setup_failure_starts_no_terminal(
+        self, launcher_bundle, mock_command_runner, mock_repo_host
+    ):
+        launcher_bundle.launcher.config.setup_worktree = [self.SETUP]
+        mock_command_runner.results = [
+            CommandResult(returncode=1, stdout="", stderr="boom", timed_out=False)
+        ]
+
+        result = launcher_bundle.launcher.launch_rework_session(
+            self._rework(mock_repo_host), active_sessions=[]
+        )
+
+        assert result.success is False
+        assert launcher_bundle.create_session_calls == []
+        assert "Setup commands failed" in result.reason
+
+    def test_retrospective_setup_failure_starts_no_terminal(
+        self, launcher_bundle, mock_command_runner
+    ):
+        launcher_bundle.launcher.config.setup_worktree = [self.SETUP]
+        mock_command_runner.results = [
+            CommandResult(returncode=1, stdout="", stderr="boom", timed_out=False)
+        ]
+
+        result = launcher_bundle.launcher.launch_retrospective_review_session(
+            self._retrospective(), active_sessions=[]
+        )
+
+        assert result.success is False
+        assert launcher_bundle.create_session_calls == []
+        assert "Setup commands failed" in result.reason
+
+    def test_tech_lead_scratch_launch_provisions_its_own_worktree_once(
+        self,
+        launcher_bundle,
+        mock_command_runner,
+        mock_worktree_manager,
+        sample_config,
+        tmp_path,
+    ):
+        """A scratch investigation gets a disposable worktree of its own.
+
+        It is force-fresh, so it can never inherit provisioning from the focus
+        issue's worktree — if acquisition did not provision it, the agent would
+        run in an empty environment.
+        """
+        launcher_bundle.launcher.config.setup_worktree = [self.SETUP]
+        sample_config.agents["agent:tech-lead"] = AgentConfig(
+            prompt_path=tmp_path / "prompt.md",
+            model="sonnet",
+            timeout_minutes=45,
+        )
+        sample_config.tech_lead_review_agent = "agent:tech-lead"
+        focus = 5980
+        tech_lead_issue = Issue(
+            number=focus,
+            title="Investigate stranded failure",
+            labels=["agent:tech-lead"],
+            repo="test/repo",
+        )
+
+        result = launcher_bundle.launcher.launch_issue_session(
+            tech_lead_issue,
+            active_sessions=[],
+            tech_lead_scope=TechLeadLaunchScope(
+                flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION
+            ),
+        )
+
+        assert result.success is True, result.reason
+        runs = self._runs(mock_command_runner)
+        assert len(runs) == 1, f"scratch launch provisioned {len(runs)} times"
+
+        call = next(
+            c for c in mock_worktree_manager.create_calls if c["issue_number"] == focus
+        )
+        scratch_name = call["worktree_name"]
+        assert scratch_name is not None and scratch_name != f"repo-{focus}"
+        assert runs[0]["cwd"] == mock_worktree_manager.tmp_path / scratch_name, (
+            "the scratch worktree must be provisioned, not the focus worktree"
+        )

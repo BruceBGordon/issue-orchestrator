@@ -13,6 +13,9 @@ from issue_orchestrator.execution.internal_review_prompt import (
     FileInternalReviewPromptAddendum,
     build_coder_prompt_addendum_provider,
 )
+from issue_orchestrator.execution.setup_wizard_prompts import (
+    build_internal_review_instructions_text,
+)
 from issue_orchestrator.infra.config import Config
 
 
@@ -62,6 +65,22 @@ def test_enabled_provider_wraps_repository_instructions(tmp_path: Path) -> None:
     assert "at most 3 internal reviewer verdict(s)" in addendum
     assert "independent external reviewer" in addendum
     assert "blocked instead of reporting successful completion" in addendum
+
+
+def test_repository_instructions_match_setup_template_and_review_contract() -> None:
+    repository_root = Path(__file__).resolve().parents[3]
+    repository_instructions = (
+        repository_root / "repo-specific/prompts/internal-review.md"
+    ).read_text(encoding="utf-8")
+
+    assert repository_instructions == build_internal_review_instructions_text()
+    assert "State the governing requirements and invariants" in repository_instructions
+    assert (
+        "Compare tests and fixtures with the production path" in repository_instructions
+    )
+    assert "Apply an additional adversarial pass" in repository_instructions
+    assert "stop enumerating spellings" in repository_instructions
+    assert "approval covers only that snapshot" in repository_instructions
 
 
 def test_loaded_config_normalizes_instruction_path_before_runtime_read(

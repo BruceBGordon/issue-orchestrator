@@ -1,6 +1,46 @@
 {
   "additionalProperties": true,
-  "properties": {},
+  "description": "Why the engine paused, who paused it, and when.\n\nEvery producer-guaranteed field is REQUIRED. Optional/defaulted fields would\nlet ``model_validate({})`` succeed \u2014 i.e. the contract would still accept the\nexact empty payload this work exists to eliminate, and a producer that\nregressed to ``{}`` would keep the tests green.",
+  "properties": {
+    "pause_actor": {
+      "title": "Pause Actor",
+      "type": "string"
+    },
+    "pause_detail": {
+      "default": "",
+      "title": "Pause Detail",
+      "type": "string"
+    },
+    "pause_is_incident": {
+      "title": "Pause Is Incident",
+      "type": "boolean"
+    },
+    "pause_reason": {
+      "title": "Pause Reason",
+      "type": "string"
+    },
+    "paused": {
+      "const": true,
+      "title": "Paused",
+      "type": "boolean"
+    },
+    "paused_held_seconds": {
+      "title": "Paused Held Seconds",
+      "type": "number"
+    },
+    "paused_since": {
+      "title": "Paused Since",
+      "type": "string"
+    }
+  },
+  "required": [
+    "paused",
+    "pause_reason",
+    "pause_actor",
+    "paused_since",
+    "paused_held_seconds",
+    "pause_is_incident"
+  ],
   "title": "OrchestratorPausedPayload",
   "type": "object"
 }

@@ -44,6 +44,11 @@ from issue_orchestrator.view_models.lifecycle_semantics import (
     DashboardTimelineContainer,
     E2ESuiteTimelineContainer,
 )
+from tests.fixtures.timeline_run_artifacts import (
+    TimelineFixturePathField,
+    rewrite_timeline_fixture_path,
+    write_available_timeline_run_manifest,
+)
 from tests.fixtures.web_contract_mocks import MockOrchestratorForWeb
 
 
@@ -63,11 +68,6 @@ TEST_CLICK_ISSUE_LABEL = "inflight-discovery"
 TEST_CLICK_ISSUE_NUMBER_2 = 5724
 TEST_CLICK_ISSUE_LABEL_2 = "ui-surface-provider-cir\u2026"
 _INVALID_TIME_TEXTS = {"", "-", "n/a", "na", "unknown"}
-FIXTURE_RUN_DIR_REWRITTEN_PATH_KEYS = (
-    "worktree_path",
-    "session_prompt_path",
-    "completion_path_absolute",
-)
 FIXTURE_REVIEW_PHASE_RECORDING_ROLES = {
     "review_exchange.round_started": "reviewer",
     "review_exchange.round_completed": "reviewer",
@@ -104,7 +104,11 @@ _SYNTHETIC_SESSION_OUTPUT_FOLLOWUP = "PLAYWRIGHT-FIXTURE-AGENT-READY"
 _SYNTHETIC_RUN_LOG_TEXT = "PLAYWRIGHT-FIXTURE-RUN-LOG"
 
 
-def _materialize_synthetic_session_dir(session_dir: Path) -> None:
+def _materialize_synthetic_session_dir(
+    session_dir: Path,
+    *,
+    issue_number: int,
+) -> None:
     """Create a real run_dir with a non-empty terminal-recording.jsonl.
 
     The session-log action decorator (``_preferred_run_scoped_session_action``
@@ -146,6 +150,11 @@ def _materialize_synthetic_session_dir(session_dir: Path) -> None:
     ]
     recording.write_text(
         "\n".join(json.dumps(e, sort_keys=True) for e in events) + "\n",
+    )
+    write_available_timeline_run_manifest(
+        run_dir=session_dir,
+        terminal_recording=recording,
+        issue_number=issue_number,
     )
 
 
@@ -224,12 +233,17 @@ def _wire_event_to_session_dir(
         data = json.loads(row["data_json"]) if row["data_json"] else {}
         if isinstance(data, dict):
             data["run_dir"] = run_dir_str
-            for key in FIXTURE_RUN_DIR_REWRITTEN_PATH_KEYS:
-                if key in data and isinstance(data[key], str):
-                    if key == "worktree_path":
-                        data[key] = str(session_dir.parent)
-                    else:
-                        data[key] = run_dir_str + "/" + Path(data[key]).name
+            for field in TimelineFixturePathField:
+                value = data.get(field.value)
+                if not isinstance(value, str):
+                    continue
+                data[field.value] = str(
+                    rewrite_timeline_fixture_path(
+                        field=field,
+                        run_dir=session_dir,
+                        original_value=value,
+                    )
+                )
         conn.execute(
             "UPDATE timeline_events SET run_dir = ?, data_json = ? WHERE sequence = ?",
             (run_dir_str, json.dumps(data), row["sequence"]),
@@ -241,29 +255,50 @@ def _materialize_fixture_run_dirs(worktree_db: Path, run_dir_root: Path) -> None
     """Replace sanitized fixture run_dir paths with real directories."""
     import sqlite3
 
-    rows: list[tuple[int, str, str, str]] = []
+    rows: list[tuple[int, int, str, str, str]] = []
     with sqlite3.connect(str(worktree_db)) as conn:
-        for sequence, event_name, run_dir, data_json in conn.execute(
+        for sequence, issue_number, event_name, run_dir, data_json in conn.execute(
             """
-            SELECT sequence, event, run_dir, data_json
+            SELECT sequence, issue_number, event, run_dir, data_json
             FROM timeline_events
             WHERE run_dir != ''
             ORDER BY sequence ASC
             """
         ):
             rows.append(
-                (int(sequence), str(event_name), str(run_dir), str(data_json or "{}"))
+                (
+                    int(sequence),
+                    int(issue_number),
+                    str(event_name),
+                    str(run_dir),
+                    str(data_json or "{}"),
+                )
             )
 
-        replacements: dict[str, Path] = {}
-        for _sequence, _event_name, original_run_dir, _data_json in rows:
+        replacements: dict[str, tuple[Path, int]] = {}
+        for _sequence, issue_number, _event_name, original_run_dir, _data_json in rows:
             if original_run_dir not in replacements:
-                synthetic_run_dir = run_dir_root / f"session-{len(replacements) + 1}"
-                _materialize_synthetic_session_dir(synthetic_run_dir)
-                replacements[original_run_dir] = synthetic_run_dir
+                run_index = len(replacements) + 1
+                synthetic_run_dir = (
+                    run_dir_root
+                    / f"worktree-{run_index}"
+                    / ".issue-orchestrator"
+                    / "sessions"
+                    / f"fixture-{run_index}__session-{run_index}"
+                )
+                _materialize_synthetic_session_dir(
+                    synthetic_run_dir,
+                    issue_number=issue_number,
+                )
+                replacements[original_run_dir] = (synthetic_run_dir, issue_number)
+            elif replacements[original_run_dir][1] != issue_number:
+                raise ValueError(
+                    "Captured Timeline run belongs to multiple issues: "
+                    f"run_dir={original_run_dir}"
+                )
 
-        for sequence, event_name, original_run_dir, data_json in rows:
-            synthetic_run_dir = replacements[original_run_dir]
+        for sequence, _issue_number, event_name, original_run_dir, data_json in rows:
+            synthetic_run_dir = replacements[original_run_dir][0]
             data = json.loads(data_json)
             if isinstance(data, dict):
                 data["run_dir"] = str(synthetic_run_dir)
@@ -275,14 +310,17 @@ def _materialize_fixture_run_dirs(worktree_db: Path, run_dir_root: Path) -> None
                         round_index=round_index,
                         role=role,
                     )
-                for key in FIXTURE_RUN_DIR_REWRITTEN_PATH_KEYS:
-                    value = data.get(key)
+                for field in TimelineFixturePathField:
+                    value = data.get(field.value)
                     if not isinstance(value, str):
                         continue
-                    if key == "worktree_path":
-                        data[key] = str(synthetic_run_dir.parent)
-                    else:
-                        data[key] = str(synthetic_run_dir / Path(value).name)
+                    data[field.value] = str(
+                        rewrite_timeline_fixture_path(
+                            field=field,
+                            run_dir=synthetic_run_dir,
+                            original_value=value,
+                        )
+                    )
             conn.execute(
                 "UPDATE timeline_events SET run_dir = ?, data_json = ? WHERE sequence = ?",
                 (str(synthetic_run_dir), json.dumps(data), sequence),
@@ -339,10 +377,28 @@ def _stage_fixture(fixture: Path, tmp_path: Path) -> Path:
     # a non-empty terminal-recording.jsonl for both the action decorator
     # and the session-replay endpoint to surface real data.
     _materialize_fixture_run_dirs(wt_state / "timeline.sqlite", tmp_path / "run-dirs")
-    session_dir = tmp_path / "session1"
-    review_session_dir = tmp_path / "review-session1"
-    _materialize_synthetic_session_dir(session_dir)
-    _materialize_synthetic_session_dir(review_session_dir)
+    session_dir = (
+        tmp_path
+        / "session1"
+        / ".issue-orchestrator"
+        / "sessions"
+        / "fixture-coding__session1"
+    )
+    review_session_dir = (
+        tmp_path
+        / "review-session1"
+        / ".issue-orchestrator"
+        / "sessions"
+        / "fixture-review__review-session1"
+    )
+    _materialize_synthetic_session_dir(
+        session_dir,
+        issue_number=TEST_CLICK_ISSUE_NUMBER,
+    )
+    _materialize_synthetic_session_dir(
+        review_session_dir,
+        issue_number=TEST_CLICK_ISSUE_NUMBER,
+    )
     _wire_event_to_session_dir(
         wt_state / "timeline.sqlite",
         issue_number=TEST_CLICK_ISSUE_NUMBER,

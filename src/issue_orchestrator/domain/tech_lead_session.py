@@ -23,6 +23,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Collection, cast
 
+from .session_key import TaskKind
 from .tech_lead_artifacts import ACT_LEVEL_TECH_LEAD_ACTIONS
 
 TECH_LEAD_ASSIGNMENT_FILENAME = "tech-lead-assignment.json"
@@ -79,7 +80,7 @@ def tech_lead_area_from_labels(labels: Collection[str]) -> str:
     """
     for label in labels:
         if label.casefold().startswith(TECH_LEAD_AREA_LABEL_PREFIX.casefold()):
-            return label[len(TECH_LEAD_AREA_LABEL_PREFIX):]
+            return label[len(TECH_LEAD_AREA_LABEL_PREFIX) :]
     return ""
 
 
@@ -352,12 +353,86 @@ class TechLeadLaunchScope:
             raise ValueError(
                 "TechLeadLaunchScope problem_issue_numbers must contain positive ints"
             )
-        if self.problem_issue_numbers != tuple(
-            sorted(set(self.problem_issue_numbers))
-        ):
+        if self.problem_issue_numbers != tuple(sorted(set(self.problem_issue_numbers))):
             raise ValueError(
                 "TechLeadLaunchScope problem_issue_numbers must be sorted and unique"
             )
+
+
+@dataclass(frozen=True)
+class TechLeadSessionGeneration:
+    """One immutable, launch-observed worker session generation.
+
+    ``terminal_id`` identifies the opaque terminal slot while ``run_id``
+    identifies the particular launch occupying it.  Both are required: the
+    slot is reusable, so checking only the terminal id can terminate a
+    replacement session.  Tech-lead kills are intentionally limited to the
+    two mutable issue-runtime task kinds; review and tech-lead sessions are
+    never eligible targets.
+    """
+
+    issue_number: int
+    task_kind: TaskKind
+    terminal_id: str
+    run_id: str
+
+    def __post_init__(self) -> None:
+        issue_number = cast(object, self.issue_number)
+        if (
+            isinstance(issue_number, bool)
+            or not isinstance(issue_number, int)
+            or issue_number <= 0
+        ):
+            raise ValueError("session generation issue_number must be a positive int")
+        task_kind = cast(object, self.task_kind)
+        if not isinstance(task_kind, TaskKind) or task_kind not in {
+            TaskKind.CODE,
+            TaskKind.REWORK,
+        }:
+            raise ValueError(
+                "session generation task_kind must be code or rework, got "
+                f"{task_kind!r}"
+            )
+        terminal_id = cast(object, self.terminal_id)
+        if not isinstance(terminal_id, str) or not terminal_id.strip():
+            raise ValueError("session generation terminal_id must be non-empty")
+        run_id = cast(object, self.run_id)
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("session generation run_id must be non-empty")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "issue_number": self.issue_number,
+            "task_kind": self.task_kind.value,
+            "terminal_id": self.terminal_id,
+            "run_id": self.run_id,
+        }
+
+    def sort_key(self) -> tuple[int, str, str, str]:
+        """Stable canonical ordering without comparing non-orderable enums."""
+        return (
+            self.issue_number,
+            self.task_kind.value,
+            self.terminal_id,
+            self.run_id,
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "TechLeadSessionGeneration":
+        raw_issue = data.get("issue_number")
+        raw_task = data.get("task_kind")
+        try:
+            task_kind = TaskKind(raw_task)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"unknown session generation task_kind: {raw_task!r}"
+            ) from None
+        return cls(
+            issue_number=raw_issue,  # type: ignore[arg-type]
+            task_kind=task_kind,
+            terminal_id=str(data.get("terminal_id", "")),
+            run_id=str(data.get("run_id", "")),
+        )
 
 
 @dataclass(frozen=True)
@@ -381,6 +456,11 @@ class TechLeadLaunchAuthority:
     # board snapshot, whose failure list is deliberately broader context.
     # Immutable act-level authority, not agent-provided scope.
     problem_issue_numbers: tuple[int, ...] = ()
+    # Exact killable session generations present in the immutable board input
+    # at launch. This trusted copy lives outside the agent-writable worktree;
+    # direct and gated kill commands bind to it rather than to live state at
+    # completion time.
+    observed_session_generations: tuple[TechLeadSessionGeneration, ...] = ()
     schema_version: int = _SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -425,6 +505,16 @@ class TechLeadLaunchAuthority:
             raise ValueError(
                 "TechLeadLaunchAuthority problem_issue_numbers must be sorted "
                 "and unique"
+            )
+        if self.observed_session_generations != tuple(
+            sorted(
+                set(self.observed_session_generations),
+                key=TechLeadSessionGeneration.sort_key,
+            )
+        ):
+            raise ValueError(
+                "TechLeadLaunchAuthority observed_session_generations must be "
+                "sorted and unique"
             )
 
     def allowed_targets(self) -> frozenset[int]:
@@ -474,6 +564,23 @@ class TechLeadLaunchAuthority:
             and assignment.focus_issue_number == self.focus_issue_number
         )
 
+    def observed_kill_target(
+        self, issue_number: int
+    ) -> TechLeadSessionGeneration | None:
+        """The single killable generation observed for an issue, if unambiguous.
+
+        Zero matches means the launch snapshot did not observe live issue work;
+        multiple matches are an invariant violation. Both cases fail closed by
+        returning ``None`` so no later live-state lookup can silently choose a
+        target.
+        """
+        matches = tuple(
+            generation
+            for generation in self.observed_session_generations
+            if generation.issue_number == issue_number
+        )
+        return matches[0] if len(matches) == 1 else None
+
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
@@ -482,6 +589,9 @@ class TechLeadLaunchAuthority:
             "focus_issue_number": self.focus_issue_number,
             "manifest_pr_numbers": list(self.manifest_pr_numbers),
             "problem_issue_numbers": list(self.problem_issue_numbers),
+            "observed_session_generations": [
+                generation.to_dict() for generation in self.observed_session_generations
+            ],
         }
 
     @classmethod
@@ -505,7 +615,9 @@ class TechLeadLaunchAuthority:
                 f"tech_lead authority anchor_issue_number must be an int, got {anchor!r}"
             )
         focus = data.get("focus_issue_number")
-        if focus is not None and (isinstance(focus, bool) or not isinstance(focus, int)):
+        if focus is not None and (
+            isinstance(focus, bool) or not isinstance(focus, int)
+        ):
             raise ValueError(
                 "tech_lead authority focus_issue_number must be an int or null, "
                 f"got {focus!r}"
@@ -526,12 +638,23 @@ class TechLeadLaunchAuthority:
                 "tech_lead authority problem_issue_numbers must be a list of ints, "
                 f"got {raw_problems!r}"
             )
+        raw_generations = data.get("observed_session_generations", [])
+        if not isinstance(raw_generations, list) or any(
+            not isinstance(item, dict) for item in raw_generations
+        ):
+            raise ValueError(
+                "tech_lead authority observed_session_generations must be a "
+                f"list of objects, got {raw_generations!r}"
+            )
         return cls(
             flavor=flavor,
             anchor_issue_number=anchor,
             focus_issue_number=focus,
             manifest_pr_numbers=tuple(raw_prs),
             problem_issue_numbers=tuple(raw_problems),
+            observed_session_generations=tuple(
+                TechLeadSessionGeneration.from_dict(item) for item in raw_generations
+            ),
             schema_version=raw_schema,
         )
 
@@ -553,14 +676,15 @@ class StoredTechLeadOp:
     source_session_name: str
     source_action_id: str  # the decision artifact action id (A<n>)
     created_at: str  # ISO-8601 UTC timestamp
-    # The target issue's ACTIVE session run id captured at proposal time
-    # (#6779 R1). ``kill_hung_session`` consents to terminating exactly THAT
-    # generation: the kill executor refuses to act unless the target issue's
-    # live session still carries this run id, so a replacement session that
-    # started before approval is never killed. Empty for ``reset_retry`` —
+    # The trusted session generation captured in launch authority from the
+    # board input (#6779 R1). ``kill_hung_session`` consents to terminating
+    # exactly THAT typed terminal/run pair; a replacement is never rebound at
+    # completion or approval time. Empty for ``reset_retry`` —
     # that op is stale-checked by labels/no-active-session, never bound to a
     # specific generation (a non-empty value there is a bug).
     target_session_id: str = ""
+    target_terminal_id: str = ""
+    target_session_type: str = ""
     # The decision findings the approver saw for this op (#6779 R6): forwarded
     # into ``TECH_LEAD_ACTION_EXECUTED`` so execution correlates to those findings.
     finding_ids: tuple[str, ...] = ()
@@ -601,18 +725,7 @@ class StoredTechLeadOp:
             raise ValueError(
                 f"StoredTechLeadOp rationale must be a string, got {rationale!r}"
             )
-        session_id = cast(object, self.target_session_id)
-        if not isinstance(session_id, str):
-            raise ValueError(
-                "StoredTechLeadOp target_session_id must be a string,"
-                f" got {session_id!r}"
-            )
-        if self.op_type == "reset_retry" and session_id.strip():
-            raise ValueError(
-                "StoredTechLeadOp target_session_id must be empty for reset_retry;"
-                " that op is never bound to a specific session generation,"
-                f" got {session_id!r}"
-            )
+        _validate_stored_op_session_fields(self)
         findings = cast(object, self.finding_ids)
         if not isinstance(findings, tuple) or any(
             not isinstance(item, str) for item in findings
@@ -633,6 +746,8 @@ class StoredTechLeadOp:
             "source_action_id": self.source_action_id,
             "created_at": self.created_at,
             "target_session_id": self.target_session_id,
+            "target_terminal_id": self.target_terminal_id,
+            "target_session_type": self.target_session_type,
             "finding_ids": list(self.finding_ids),
         }
 
@@ -662,8 +777,32 @@ class StoredTechLeadOp:
             source_action_id=str(data.get("source_action_id", "")),
             created_at=str(data.get("created_at", "")),
             target_session_id=str(data.get("target_session_id", "")),
+            target_terminal_id=str(data.get("target_terminal_id", "")),
+            target_session_type=str(data.get("target_session_type", "")),
             finding_ids=tuple(str(item) for item in raw_findings),
             schema_version=raw_schema,
+        )
+
+
+def _validate_stored_op_session_fields(op: StoredTechLeadOp) -> None:
+    """Validate the optional generation envelope without inflating op complexity."""
+    session_fields = {
+        "target_session_id": cast(object, op.target_session_id),
+        "target_terminal_id": cast(object, op.target_terminal_id),
+        "target_session_type": cast(object, op.target_session_type),
+    }
+    for field_name, value in session_fields.items():
+        if not isinstance(value, str):
+            raise ValueError(
+                f"StoredTechLeadOp {field_name} must be a string, got {value!r}"
+            )
+    if op.op_type == "reset_retry" and any(
+        cast(str, value).strip() for value in session_fields.values()
+    ):
+        raise ValueError(
+            "StoredTechLeadOp target session fields must be empty for reset_retry;"
+            " that op is never bound to a specific session generation,"
+            f" got {session_fields!r}"
         )
 
 

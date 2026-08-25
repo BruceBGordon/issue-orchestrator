@@ -7,8 +7,9 @@ from pathlib import Path
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from ..execution.manifest_accessor import ArtifactNotFoundError, ManifestAccessor, RunIdentity
+from ..execution.manifest_accessor import ArtifactNotFoundError
 from ..infra.session_log_prettify import prettify_session_log
+from .web_exact_recorded_run import exact_recorded_run_response
 from .web_session_context import WebOrchestratorDependency, resolve_issue_session_context
 from .web_session_routes import (
     build_ui_log_stream_observation as _build_ui_log_stream_observation,
@@ -98,8 +99,11 @@ async def get_agent_ui_log(
             "hint": "Open logs from a run-scoped timeline action.",
         }, status_code=400)
 
-    run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
-    accessor = ManifestAccessor(run_identity)
+    exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
+    if isinstance(exact_run, JSONResponse):
+        return exact_run
+    run_identity = exact_run.artifacts.run_identity
+    accessor = exact_run.artifacts
     stream_observation = _build_ui_log_stream_observation(run_identity.run_dir, resolved_log_path=None)
     try:
         artifact = accessor.get_agent_log(allow_empty=True)
