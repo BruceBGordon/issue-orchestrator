@@ -10,7 +10,8 @@
 # claude-code. Everything else (validation, review, merge queue, tech lead,
 # e2e, hooks) is deliberately identical, so a diff against the default mode
 # should show agent provider/model lines and nothing more. Keep it that way:
-# any non-agent change belongs in both files or in neither.
+# any non-agent change belongs in every mode file or in none.
+# tests/unit/test_config_modes.py enforces this.
 
 repo:
   name: issue-orchestrator/issue-orchestrator
@@ -177,11 +178,12 @@ tech_lead:
   # investigations, batch reviews) run even when the worker budget is saturated;
   # total live agents are then bounded at max_concurrent_sessions + 1.
   max_concurrent: 1
-  # Graduated act-level authority (ADR-0031). reset_retry is wired to the
-  # scratch-reset owner (#6764/#6777) and graduated to execute; kill_hung_session
-  # stays a gated proposal (execute is still a startup error until fully wired).
+  # Both act-level actions execute through owners that revalidate immediately
+  # before mutating: reset_retry checks failure/runtime state and kill binds to
+  # the exact observed session generation.
   authority:
-    reset_retry: propose
+    reset_retry: execute
+    kill_hung_session: execute
     # Auto-file create_issue follow-ups directly (the default), made explicit now
     # that it is safe: duplicate proposals are deduped against the full open
     # backlog (#6880 gate + #6882 trusted SQL corpus), so the tech lead cannot

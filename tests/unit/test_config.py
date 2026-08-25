@@ -6,6 +6,17 @@ from pathlib import Path
 from issue_orchestrator.infra.config import Config, ConfigSectionError
 from issue_orchestrator.infra.config_models import PromotionRouteTarget
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+# Discovered, not hand-listed: a new shipped mode file is covered the moment it
+# exists. tests/unit/test_config_modes.py asserts the discovery is non-empty
+# and matches the expected mode set.
+_SHIPPED_MODE_CONFIGS = sorted(
+    str(path.relative_to(_REPO_ROOT))
+    for path in (_REPO_ROOT / ".issue-orchestrator" / "config" / "modes").glob(
+        "*/*.yaml"
+    )
+)
+
 
 class TestConfig:
     """Test the Config class."""
@@ -15,8 +26,7 @@ class TestConfig:
         [
             "examples/config.example.yaml",
             ".issue-orchestrator/config/maintenance/hooks-validate.yaml",
-            ".issue-orchestrator/config/modes/default/main.yaml",
-            ".issue-orchestrator/config/modes/default/z-codespaces.yaml",
+            *_SHIPPED_MODE_CONFIGS,
         ],
     )
     def test_shipped_configs_validate_clean(self, tmp_path, config_path):

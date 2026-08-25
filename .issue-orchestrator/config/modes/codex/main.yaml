@@ -8,11 +8,13 @@
 # Modes have NO inheritance: each config file is complete and standalone. This
 # file is a copy of `modes/default/main.yaml` and differs from it ONLY in the
 # `agents` section — the four Claude agents (backend, frontend, mobile,
-# tech-lead) move to codex; reviewer and goal-pilot were already codex and are
-# untouched. Everything else (validation, review, merge queue, tech lead, e2e,
-# hooks) is deliberately identical, so a diff against the default mode should
-# show agent provider/model lines and nothing more. Keep it that way: any
-# non-agent change belongs in every mode file or in none.
+# tech-lead) move to codex; reviewer was already codex and is untouched, and
+# goal-pilot (also already codex) additionally pins reasoning_effort so every
+# agent in this mode runs at the same ceiling. Everything else (validation,
+# review, merge queue, tech lead, e2e, hooks) is deliberately identical, so a
+# diff against the default mode should show agent provider/model/effort lines
+# and nothing more. Keep it that way: any non-agent change belongs in every
+# mode file or in none. tests/unit/test_config_modes.py enforces this.
 
 repo:
   name: issue-orchestrator/issue-orchestrator
@@ -85,6 +87,9 @@ agents:
       sandbox: "workspace-write"
       reasoning_effort: "xhigh"
     initial_prompt: "Tech Lead review for issue #{issue_number}: {issue_title}. Follow the instructions in {prompt}. When done, use coding-done to report completion."
+  # Pinned to the same reasoning ceiling as every other agent in this mode so
+  # the A/B against the claude mode (effort: xhigh) stays controlled; without
+  # the explicit key CodexProvider falls back to the ambient Codex default.
   agent:goal-pilot:
     prompt: repo-specific/prompts/goal-pilot.md
     provider: codex
@@ -93,6 +98,7 @@ agents:
     provider_args:
       approval_mode: full-auto
       sandbox: workspace-write
+      reasoning_effort: xhigh
 
 execution:
   concurrency:
@@ -180,11 +186,12 @@ tech_lead:
   # investigations, batch reviews) run even when the worker budget is saturated;
   # total live agents are then bounded at max_concurrent_sessions + 1.
   max_concurrent: 1
-  # Graduated act-level authority (ADR-0031). reset_retry is wired to the
-  # scratch-reset owner (#6764/#6777) and graduated to execute; kill_hung_session
-  # stays a gated proposal (execute is still a startup error until fully wired).
+  # Both act-level actions execute through owners that revalidate immediately
+  # before mutating: reset_retry checks failure/runtime state and kill binds to
+  # the exact observed session generation.
   authority:
-    reset_retry: propose
+    reset_retry: execute
+    kill_hung_session: execute
     # Auto-file create_issue follow-ups directly (the default), made explicit now
     # that it is safe: duplicate proposals are deduped against the full open
     # backlog (#6880 gate + #6882 trusted SQL corpus), so the tech lead cannot
