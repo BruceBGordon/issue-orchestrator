@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 
 import pytest
@@ -12,6 +14,7 @@ import pytest
 from issue_orchestrator.control.executor_admission import (
     ExecutorAdmissionPolicy,
     ExecutorLearningPolicy,
+    ExecutorResourceObservation,
     ExecutorSaturationPolicy,
     ExecutorWorkDemandEstimator,
 )
@@ -38,6 +41,16 @@ from issue_orchestrator.execution.host_executor import (
 from issue_orchestrator.execution.process_group_terminator import (
     PosixProcessGroupTerminator,
 )
+from issue_orchestrator.execution.host_executor._history import (
+    ExecutorWorkHistoryStore,
+)
+from issue_orchestrator.execution.host_executor._contracts import WorkHistoryRecord
+from issue_orchestrator.execution.host_executor._types import (
+    ExecutorRepositoryIdentity,
+    ExecutorWorkIdentity,
+    RecordedExecutorObservation,
+)
+from issue_orchestrator.execution.host_executor import _history as history_module
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -59,6 +72,105 @@ def _demand_estimator() -> ExecutorWorkDemandEstimator:
             recent_observation_weight=0.3,
         )
     )
+
+
+def _recorded_observation(*, recorded_at_unix: float) -> RecordedExecutorObservation:
+    return RecordedExecutorObservation(
+        resources=ExecutorResourceObservation(
+            concurrency=1,
+            wall_seconds=1.0,
+            cpu_seconds=0.5,
+            max_rss_bytes=1024,
+            input_blocks=0,
+            output_blocks=0,
+        ),
+        exit_code=0,
+        recorded_at_unix=recorded_at_unix,
+    )
+
+
+def test_history_reader_holds_shared_lock_across_read_and_pruning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A writer cannot prune a profile between its existence check and read."""
+    history_dir = tmp_path / "history"
+    store = ExecutorWorkHistoryStore(
+        history_dir,
+        ExecutorHistoryRetentionPolicy(
+            maximum_profiles=1,
+            maximum_observations_per_profile=2,
+        ),
+    )
+    repository = ExecutorRepositoryIdentity(tmp_path.resolve(), "test-repository")
+    first_identity = ExecutorWorkIdentity(
+        repository,
+        ExecutorWorkKey("history:first"),
+    )
+    second_identity = ExecutorWorkIdentity(
+        repository,
+        ExecutorWorkKey("history:second"),
+    )
+    store.record_successful(
+        first_identity,
+        _recorded_observation(recorded_at_unix=1.0),
+    )
+
+    reader_inside_record = threading.Event()
+    release_reader = threading.Event()
+    observe_writer_attempt = threading.Event()
+    writer_attempting_exclusive_lock = threading.Event()
+    original_read_record = ExecutorWorkHistoryStore._read_record
+    original_flock = history_module.fcntl.flock
+    [first_profile] = history_dir.glob("*.json")
+
+    def synchronized_read(path: Path) -> WorkHistoryRecord:
+        if path == first_profile:
+            reader_inside_record.set()
+            if not release_reader.wait(timeout=5.0):
+                raise RuntimeError("history reader synchronization timed out")
+        return original_read_record(path)
+
+    def observed_flock(descriptor: int, operation: int) -> None:
+        if (
+            observe_writer_attempt.is_set()
+            and operation == history_module.fcntl.LOCK_EX
+        ):
+            writer_attempting_exclusive_lock.set()
+        original_flock(descriptor, operation)
+
+    monkeypatch.setattr(
+        ExecutorWorkHistoryStore,
+        "_read_record",
+        staticmethod(synchronized_read),
+    )
+    monkeypatch.setattr(history_module.fcntl, "flock", observed_flock)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        reader = workers.submit(store.successful_resources, first_identity)
+        assert reader_inside_record.wait(timeout=5.0)
+        observe_writer_attempt.set()
+        writer = workers.submit(
+            store.record_successful,
+            second_identity,
+            _recorded_observation(recorded_at_unix=2.0),
+        )
+        assert writer_attempting_exclusive_lock.wait(timeout=5.0)
+        with pytest.raises(FutureTimeoutError):
+            writer.result(timeout=0.05)
+
+        release_reader.set()
+        assert len(reader.result(timeout=5.0)) == 1
+        writer.result(timeout=5.0)
+
+        # The writer already owns LOCK_EX while reading its current profile;
+        # this must use the explicit lock-assuming helper, not nest LOCK_SH.
+        same_identity_writer = workers.submit(
+            store.record_successful,
+            second_identity,
+            _recorded_observation(recorded_at_unix=3.0),
+        )
+        same_identity_writer.result(timeout=5.0)
 
 
 def test_history_prunes_old_profiles_and_bounds_samples_per_profile(

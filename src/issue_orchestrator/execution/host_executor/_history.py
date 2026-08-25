@@ -48,11 +48,15 @@ class ExecutorWorkHistoryStore:
         identity: ExecutorWorkIdentity,
     ) -> tuple[ExecutorResourceObservation, ...]:
         """Return successful resource observations in recording order."""
-        return tuple(
-            observation.resources
-            for observation in self._observations(identity)
-            if observation.exit_code == 0
-        )
+        self._history_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self._history_dir / "retention.lock"
+        with lock_path.open("a+b") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
+            return tuple(
+                observation.resources
+                for observation in self._observations_unlocked(identity)
+                if observation.exit_code == 0
+            )
 
     def record_successful(
         self,
@@ -70,7 +74,9 @@ class ExecutorWorkHistoryStore:
         with lock_path.open("a+b") as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
             existing = tuple(
-                item for item in self._observations(identity) if item.exit_code == 0
+                item
+                for item in self._observations_unlocked(identity)
+                if item.exit_code == 0
             )
             bounded = (*existing, observation)[
                 -self._retention_policy.maximum_observations_per_profile :
@@ -169,10 +175,11 @@ class ExecutorWorkHistoryStore:
         for path in oldest_first[:excess]:
             path.unlink()
 
-    def _observations(
+    def _observations_unlocked(
         self,
         identity: ExecutorWorkIdentity,
     ) -> tuple[RecordedExecutorObservation, ...]:
+        """Read one profile while the caller holds ``retention.lock``."""
         path = self._profile_path(identity)
         if not path.exists():
             return ()

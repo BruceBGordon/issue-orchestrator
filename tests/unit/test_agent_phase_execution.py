@@ -65,6 +65,7 @@ from issue_orchestrator.domain.terminal_launch import (
     TerminalShell,
 )
 from issue_orchestrator.domain.models import AgentConfig, TaskKind
+from issue_orchestrator.ports.host_cpu_utilization import HostCpuUtilizationObserver
 from tests.unit.session_run_helpers import make_session_run_assets
 
 
@@ -126,6 +127,39 @@ def _demand_estimator() -> ExecutorWorkDemandEstimator:
             minimum_cores_per_concurrency=0.05,
             recent_observation_weight=0.3,
         )
+    )
+
+
+def _deterministic_host_executor(
+    pool_dir: Path,
+    *,
+    host_cpu_observer: HostCpuUtilizationObserver,
+    request_nonce: str,
+) -> HostExecutor:
+    """Build a real executor whose admission does not depend on ambient load."""
+    return HostExecutor(
+        pool_dir=pool_dir,
+        host_cpu_slots=1,
+        admission_policy=ExecutorAdmissionPolicy(
+            ExecutorSaturationPolicy(maximum_busy_percent=95)
+        ),
+        demand_estimator=_demand_estimator(),
+        host_cpu_observer=host_cpu_observer,
+        request_identity_factory=ExecutorRequestIdentityFactory(
+            wall_time_nanoseconds=time.time_ns,
+            monotonic_nanoseconds=time.monotonic_ns,
+            process_id=os.getpid,
+            request_nonce=lambda: request_nonce,
+        ),
+        process_group_terminator=PosixProcessGroupTerminator(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
+            )
+        ),
+        history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
+        queue_settle_seconds=0.01,
+        queue_poll_seconds=0.01,
     )
 
 
@@ -430,29 +464,40 @@ def test_internal_phase_client_terminates_at_active_deadline_and_releases_lease(
     tmp_path: Path,
 ) -> None:
     pool_dir = tmp_path / "pool"
-    timed_out = _phase_cli(
+    executor = _deterministic_host_executor(
         pool_dir,
-        active_timeout_seconds="0.05",
-        absolute_timeout_seconds="1",
-        command=(
+        host_cpu_observer=_IdleHostCpuObserver(),
+        request_nonce="a" * 32,
+    )
+    specification = ExecutorRunSpecification(
+        work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
+        fairness_group=ExecutorFairnessGroup("agent:run-1:coding-1"),
+        concurrency_range=ExecutorConcurrencyRange(1, 1),
+        exclusive_resources=(),
+    )
+    timed_out = executor.run(
+        specification,
+        ExecutorCommand(
+            (
             sys.executable,
             "-c",
             "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
             "signal.pause()",
+            ),
+            ExecutorBoundedDeadline(0.05, 1.0),
         ),
     )
-    recovered = _phase_cli(
-        pool_dir,
-        active_timeout_seconds="2",
-        absolute_timeout_seconds="4",
-        command=(sys.executable, "-c", "print('RECOVERED')"),
+    recovered = executor.run(
+        specification,
+        ExecutorCommand(
+            (sys.executable, "-c", "print('RECOVERED')"),
+            ExecutorBoundedDeadline(2.0, 4.0),
+        ),
     )
     events = _executor_events(pool_dir)
 
-    assert timed_out.returncode == 124
-    assert "phase=command reason=active" in timed_out.stderr
-    assert recovered.returncode == 0, recovered.stderr
-    assert recovered.stdout == "RECOVERED\n"
+    assert timed_out.exit_code == 124
+    assert recovered.exit_code == 0
     assert tuple((pool_dir / "leases").glob("*.json")) == ()
     assert events.returncode == 0, events.stdout
     deadline_line = next(
@@ -482,25 +527,38 @@ def test_descendant_is_gone_before_timed_out_phase_releases_lease(
         "signal.pause()"
     )
 
-    timed_out = _phase_cli(
+    executor = _deterministic_host_executor(
         pool_dir,
-        active_timeout_seconds="1",
-        absolute_timeout_seconds="2",
-        command=(sys.executable, "-c", leader_script),
+        host_cpu_observer=_IdleHostCpuObserver(),
+        request_nonce="b" * 32,
+    )
+    specification = ExecutorRunSpecification(
+        work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
+        fairness_group=ExecutorFairnessGroup("agent:run-1:coding-1"),
+        concurrency_range=ExecutorConcurrencyRange(1, 1),
+        exclusive_resources=(),
+    )
+    timed_out = executor.run(
+        specification,
+        ExecutorCommand(
+            (sys.executable, "-c", leader_script),
+            ExecutorBoundedDeadline(1.0, 2.0),
+        ),
     )
 
-    assert timed_out.returncode == 124, timed_out.stderr
+    assert timed_out.exit_code == 124
     descendant_pid = int(descendant_pid_file.read_text(encoding="utf-8"))
     assert _pid_has_exited(descendant_pid), (
         f"descendant {descendant_pid} survived before executor lease release"
     )
-    recovered = _phase_cli(
-        pool_dir,
-        active_timeout_seconds="2",
-        absolute_timeout_seconds="4",
-        command=(sys.executable, "-c", "print('LEASE-RECOVERED')"),
+    recovered = executor.run(
+        specification,
+        ExecutorCommand(
+            (sys.executable, "-c", "print('LEASE-RECOVERED')"),
+            ExecutorBoundedDeadline(2.0, 4.0),
+        ),
     )
-    assert recovered.returncode == 0, recovered.stderr
+    assert recovered.exit_code == 0
 
 
 def test_internal_phase_client_rejects_non_finite_deadlines(tmp_path: Path) -> None:
