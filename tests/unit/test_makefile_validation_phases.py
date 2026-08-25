@@ -34,6 +34,7 @@ def _dry_run(target: str, **overrides: str) -> list[str]:
     # These may be exported by an outer validation Make invocation. A dry run
     # must derive its own defaults unless the test explicitly overrides one.
     for variable in (
+        "GITHUB_ACTIONS",
         "PARALLEL",
         "UNIT_PARALLEL",
         "SIMULATED_PARALLEL",
@@ -94,6 +95,14 @@ def _assert_no_job_count(line: str) -> None:
     assert not re.search(r"(?:^|\s)-j\s*\d+(?:\s|$)", line), line
 
 
+def _assert_inside_timing_boundary(line: str, command: str) -> None:
+    start_index = line.index("[validate-timing] START")
+    command_index = line.index(command)
+    end_index = line.index("[validate-timing] END")
+
+    assert start_index < command_index < end_index
+
+
 def _makefile_variable_words(name: str) -> list[str]:
     makefile = REPO_ROOT / "Makefile"
     text = makefile.read_text(encoding="utf-8")
@@ -113,7 +122,9 @@ def _makefile_variable_words(name: str) -> list[str]:
         assert referenced_name in variables, (
             f"Makefile variable {name} references unknown {referenced_name}"
         )
-        value = value[: match.start()] + variables[referenced_name] + value[match.end() :]
+        value = (
+            value[: match.start()] + variables[referenced_name] + value[match.end() :]
+        )
     return value.split()
 
 
@@ -140,7 +151,10 @@ def _has_live_codex_marker(path: Path) -> bool:
 def _files_with_pytest_marker(marker_name: str) -> set[str]:
     marker = f"pytest.mark.{marker_name}"
     files: set[str] = set()
-    for root in (REPO_ROOT / "tests/integration", REPO_ROOT / "tests/simulated_scenarios"):
+    for root in (
+        REPO_ROOT / "tests/integration",
+        REPO_ROOT / "tests/simulated_scenarios",
+    ):
         for path in root.rglob("*.py"):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             if any(
@@ -184,8 +198,9 @@ def test_validate_impl_submits_static_and_six_core_lanes_concurrently():
     )
 
     assert "--work-key io:static-v2" in static_lines[static_index]
-    assert "-j${ISSUE_ORCHESTRATOR_EXECUTOR_CONCURRENCY:" in (
-        granted_static_lines[granted_static_index]
+    assert (
+        "-j${ISSUE_ORCHESTRATOR_EXECUTOR_CONCURRENCY:"
+        in (granted_static_lines[granted_static_index])
     )
     _assert_job_count(lines[core_lanes_index], 7)
 
@@ -346,7 +361,7 @@ def test_provider_lane_can_be_forced_serial_for_diagnosis():
             "--min-concurrency 1",
             "--max-concurrency 1",
             "--exclusive claude",
-            'provider_claude and not requires_infra',
+            "provider_claude and not requires_infra",
         )
     ]
 
@@ -412,7 +427,7 @@ def test_provider_range_does_not_expose_machine_capacity_to_client_command():
             "--min-concurrency 1",
             "--max-concurrency 2",
             "--exclusive claude",
-            'provider_claude and not requires_infra',
+            "provider_claude and not requires_infra",
         )
     ]
 
@@ -484,9 +499,7 @@ def test_codex_lane_does_not_collapse_every_provider_test_to_one_worker():
     assert 'xdist_group("codex-interactive")' in interactive
     assert 'xdist_group("codex-exec")' in execution
     assert 'xdist_group("codex-exec")' in foreign
-    assert 'xdist_group("codex")' not in "\n".join(
-        (interactive, execution, foreign)
-    )
+    assert 'xdist_group("codex")' not in "\n".join((interactive, execution, foreign))
 
 
 def test_validate_full_impl_runs_e2e_after_pr_phase():
@@ -525,21 +538,38 @@ def test_validate_pr_uses_cache_aware_verify_script():
 
 
 def test_vscode_directory_change_cannot_escape_the_timing_boundary():
-    lines = _dry_run("test-vscode")
+    lines = _dry_run("test-vscode", GITHUB_ACTIONS="")
     command = lines[_find_line(lines, "cd packages/vscode && npm test")]
 
-    assert "(cd packages/vscode && npm test)" in command
+    _assert_inside_timing_boundary(
+        command,
+        "(cd packages/vscode && npm test)",
+    )
+
+
+def test_vscode_ci_skip_remains_inside_the_timing_boundary():
+    lines = _dry_run("test-vscode", GITHUB_ACTIONS="true")
+    command = lines[_find_line(lines, "Skipping test-vscode in GitHub Actions")]
+
+    _assert_inside_timing_boundary(
+        command,
+        'echo "Skipping test-vscode in GitHub Actions"',
+    )
 
 
 def test_agent_validation_targets_emit_timing_markers():
     simulated_lines = _dry_run("test-simulated-agent", SIMULATED_PARALLEL="0")
-    integration_lines = _dry_run("test-integration-agent", INTEGRATION_AGENT_PARALLEL="0")
+    integration_lines = _dry_run(
+        "test-integration-agent", INTEGRATION_AGENT_PARALLEL="0"
+    )
 
     _find_line(simulated_lines, "[validate-timing] START target=$target")
     _find_line(simulated_lines, "[validate-timing] END target=$target")
     _find_line(simulated_lines, 'target="test-simulated-agent"')
 
-    starts = _matching_indexes(integration_lines, "[validate-timing] START target=$target")
+    starts = _matching_indexes(
+        integration_lines, "[validate-timing] START target=$target"
+    )
     ends = _matching_indexes(integration_lines, "[validate-timing] END target=$target")
     assert len(starts) == 1
     assert len(ends) == 1
@@ -573,7 +603,8 @@ def test_core_validation_runs_live_codex_marker_serially():
     assert non_live_marker_index == core_index
     assert live_marker_index == live_codex_index
     assert all(
-        "::test_real_interactive_codex_reviewer_round_trips_through_exchange" not in line
+        "::test_real_interactive_codex_reviewer_round_trips_through_exchange"
+        not in line
         for line in lines
     )
 
@@ -614,9 +645,7 @@ def test_agent_backed_integration_files_do_not_reintroduce_live_codex_marker():
     agent_files = _makefile_variable_words("INTEGRATION_AGENT_FILES")
 
     offenders = [
-        path
-        for path in agent_files
-        if _has_live_codex_marker(REPO_ROOT / path)
+        path for path in agent_files if _has_live_codex_marker(REPO_ROOT / path)
     ]
 
     assert offenders == [], (
