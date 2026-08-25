@@ -9,12 +9,33 @@ from issue_orchestrator.domain.terminal_launch import (
     TerminalInteractionIntent,
     TerminalShell,
 )
+from issue_orchestrator.domain.executor import (
+    ExecutorInteractiveSessionCancellation,
+)
+from issue_orchestrator.domain.terminal_session_termination import (
+    TerminalSessionProcess,
+)
 from issue_orchestrator.execution.terminal_subprocess import (
     SubprocessPlugin,
     _SessionRecord,
     _SubprocessRegistry,
 )
 from issue_orchestrator.infra.env import ENV_PREFIX
+from tests.unit.terminal_session_termination_helpers import (
+    RecordingTerminalSessionTerminator,
+)
+
+
+def _plugin(
+    *,
+    session_interactions_enabled: bool = False,
+    worktree_base: Path | None = None,
+) -> SubprocessPlugin:
+    return SubprocessPlugin(
+        RecordingTerminalSessionTerminator(),
+        session_interactions_enabled=session_interactions_enabled,
+        worktree_base=worktree_base,
+    )
 
 
 def _read_recording_output(path):
@@ -48,7 +69,7 @@ def test_subprocess_session_writes_log(tmp_path, monkeypatch):
     worktree.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = SubprocessPlugin()
+    plugin = _plugin()
     command, run_dir = _command_with_run_dir(
         worktree,
         "issue-123",
@@ -116,7 +137,7 @@ def test_session_exists_returns_false_when_session_not_alive(tmp_path, monkeypat
     worktree.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = SubprocessPlugin()
+    plugin = _plugin()
 
     # Register a session in the registry so session_exists finds it
     record = _SessionRecord(
@@ -146,7 +167,7 @@ def test_discover_running_sessions_includes_canonical_session_name(tmp_path, mon
     worktree.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = SubprocessPlugin()
+    plugin = _plugin()
     run_dir = (
         worktree
         / ".issue-orchestrator"
@@ -183,7 +204,7 @@ def test_session_log_path_uses_issue_orchestrator_run_dir_when_present(tmp_path,
     worktree.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = SubprocessPlugin()
+    plugin = _plugin()
     run_dir = worktree / ".issue-orchestrator" / "sessions" / "20260221-000000Z__coding-1"
     command = f"export ISSUE_ORCHESTRATOR_RUN_DIR='{run_dir}' && echo test"
 
@@ -211,7 +232,7 @@ def test_subprocess_session_auto_accepts_claude_trust_prompt(tmp_path, monkeypat
     fake_claude.chmod(0o755)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = SubprocessPlugin(session_interactions_enabled=True, worktree_base=repo_root)
+    plugin = _plugin(session_interactions_enabled=True, worktree_base=repo_root)
     command, run_dir = _command_with_run_dir(
         worktree,
         "issue-123",
@@ -246,7 +267,7 @@ def test_subprocess_session_interactions_require_worktree_under_base(tmp_path, m
     outside_worktree.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = SubprocessPlugin(session_interactions_enabled=True, worktree_base=allowed_base)
+    plugin = _plugin(session_interactions_enabled=True, worktree_base=allowed_base)
 
     handler = plugin._interaction_handler("claude", "issue-7", outside_worktree)  # noqa: SLF001
 
@@ -259,9 +280,41 @@ def test_subprocess_session_interactions_require_configured_worktree_base(tmp_pa
     worktree.mkdir(parents=True)
     monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
 
-    plugin = SubprocessPlugin(session_interactions_enabled=True, worktree_base=None)
+    plugin = _plugin(session_interactions_enabled=True, worktree_base=None)
 
     handler = plugin._interaction_handler("claude", "issue-7", worktree)  # noqa: SLF001
 
     assert handler is None
     assert "worktree_base is not configured" in caplog.text
+
+
+def test_kill_session_delegates_complete_containment_to_typed_port(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    worktree = repo_root / "wt"
+    run_dir = worktree / ".issue-orchestrator" / "sessions" / "issue-71"
+    run_dir.mkdir(parents=True)
+    monkeypatch.setenv(f"{ENV_PREFIX}REPO_ROOT", str(repo_root))
+    terminator = RecordingTerminalSessionTerminator()
+    plugin = SubprocessPlugin(terminator)
+    record = _SessionRecord(
+        session_name="issue-71",
+        issue_number=71,
+        worktree_path=str(worktree),
+        pid=4271,
+        started_at="2026-01-01T00:00:00",
+        log_path=str(run_dir / "terminal-recording.jsonl"),
+        tab_name="Issue 71",
+        is_review=False,
+    )
+    plugin._registry.upsert(record)  # noqa: SLF001
+
+    assert plugin.kill_session(71, "issue-71") is True
+    assert terminator.processes == (
+        TerminalSessionProcess(
+            4271,
+            ExecutorInteractiveSessionCancellation.for_run_dir(run_dir.resolve()),
+        ),
+    )

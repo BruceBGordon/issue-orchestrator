@@ -11,6 +11,7 @@ from typing import Mapping, Optional, TypedDict
 import pluggy
 
 from ..domain.terminal_launch import TerminalLaunch
+from ..ports.terminal_session_terminator import TerminalSessionTerminator
 
 from ..infra.hooks.hookspec import PROJECT_NAME, TerminalSpec, LifecycleSpec
 
@@ -27,7 +28,8 @@ UI_MODE_PLUGINS = {
 }
 
 
-class _BuiltinPluginKwargs(TypedDict, total=False):
+class _BuiltinPluginKwargs(TypedDict):
+    session_terminator: TerminalSessionTerminator
     session_interactions_enabled: bool
     worktree_base: Path | None
 
@@ -59,6 +61,7 @@ def _load_plugin_class(
 
 
 def create_plugin_manager(
+    terminal_session_terminator: TerminalSessionTerminator,
     terminal_plugin: Optional[str] = None,
     ui_mode: str = "web",
     session_interactions_enabled: bool = False,
@@ -68,6 +71,8 @@ def create_plugin_manager(
     """Create and configure a plugin manager.
 
     Args:
+        terminal_session_terminator: Required behavior-level owner for stopping
+            persisted terminal sessions.
         terminal_plugin: Explicit terminal plugin to load.
             Can be: "tmux" or a class path like "mypackage:MyPlugin"
         ui_mode: Fallback UI mode if terminal_plugin not specified.
@@ -77,6 +82,11 @@ def create_plugin_manager(
         Configured PluginManager with hooks ready to call.
     """
     pm = pluggy.PluginManager(PROJECT_NAME)
+    if not isinstance(terminal_session_terminator, TerminalSessionTerminator):
+        raise ValueError(
+            "create_plugin_manager.terminal_session_terminator must be a "
+            "TerminalSessionTerminator"
+        )
 
     # Register hook specifications
     pm.add_hookspecs(TerminalSpec)
@@ -96,10 +106,13 @@ def create_plugin_manager(
         class_path = plugin_ref
 
     try:
-        plugin_kwargs: _BuiltinPluginKwargs = {}
+        plugin_kwargs: _BuiltinPluginKwargs | None = None
         if plugin_ref in BUILTIN_PLUGINS:
-            plugin_kwargs["session_interactions_enabled"] = session_interactions_enabled
-            plugin_kwargs["worktree_base"] = worktree_base
+            plugin_kwargs = _BuiltinPluginKwargs(
+                session_terminator=terminal_session_terminator,
+                session_interactions_enabled=session_interactions_enabled,
+                worktree_base=worktree_base,
+            )
         plugin = _load_plugin_class(class_path, constructor_kwargs=plugin_kwargs)
         pm.register(plugin, name=f"terminal_{plugin_ref}")
         logger.info("Loaded terminal plugin: %s", plugin_ref)
@@ -124,6 +137,7 @@ class PluginManager:
 
     def __init__(
         self,
+        terminal_session_terminator: TerminalSessionTerminator,
         terminal_plugin: Optional[str] = None,
         ui_mode: str = "web",
         session_interactions_enabled: bool = False,
@@ -132,10 +146,13 @@ class PluginManager:
         """Initialize the plugin manager.
 
         Args:
+            terminal_session_terminator: Required behavior-level owner for
+                stopping persisted terminal sessions.
             terminal_plugin: Explicit terminal plugin to load.
             ui_mode: Fallback UI mode for backwards compatibility.
         """
         self._pm = create_plugin_manager(
+            terminal_session_terminator=terminal_session_terminator,
             terminal_plugin=terminal_plugin,
             ui_mode=ui_mode,
             session_interactions_enabled=session_interactions_enabled,

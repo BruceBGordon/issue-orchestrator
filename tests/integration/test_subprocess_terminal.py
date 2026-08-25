@@ -16,6 +16,9 @@ import pytest
 pytestmark = pytest.mark.xdist_group("pty")
 
 from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_terminator,
+)
 from issue_orchestrator.domain.terminal_launch import (
     TerminalInteractionIntent,
     TerminalShell,
@@ -125,7 +128,7 @@ def test_subprocess_session_writes_completion_and_log(tmp_path, monkeypatch):
         "coding-done completed --implementation 'subprocess test' --problems 'none'"
     )
 
-    plugin = SubprocessPlugin()
+    plugin = SubprocessPlugin(build_terminal_session_terminator())
     created = plugin.create_session(
         session_id=42,
         command=command,
@@ -170,7 +173,7 @@ def test_subprocess_send_input_writes_to_log(tmp_path, monkeypatch):
         f"touch {shlex.quote(str(ready_file))}; read -r line; echo \"INPUT:$line\""
     )
 
-    plugin = SubprocessPlugin()
+    plugin = SubprocessPlugin(build_terminal_session_terminator())
     created = plugin.create_session(
         session_id=7,
         command=command,

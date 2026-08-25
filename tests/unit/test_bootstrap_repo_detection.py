@@ -20,6 +20,9 @@ from issue_orchestrator.infra.env import ENV_PREFIX
 from issue_orchestrator.infra.secret_env import EXTRA_FORBIDDEN_ENV_VARS_ENV
 from issue_orchestrator.ports import NullEventSink, NullSessionRunner
 from issue_orchestrator.ports.claim_manager import NullClaimManager
+from issue_orchestrator.ports.terminal_session_terminator import (
+    TerminalSessionTerminator,
+)
 
 
 class TestRepoAutoDetection:
@@ -1074,6 +1077,13 @@ class TestBuildOrchestrator:
 
                         # Verify pm.register was called for SSE plugin
                         assert mock_pm.register.called
+                        terminal_session_terminator = mock_pm_factory.call_args.kwargs[
+                            "terminal_session_terminator"
+                        ]
+                        assert isinstance(
+                            terminal_session_terminator,
+                            TerminalSessionTerminator,
+                        )
 
     def test_build_orchestrator_disables_sse_when_requested(self, minimal_config: Config) -> None:
         """Skips SSE plugin when enable_sse=False."""

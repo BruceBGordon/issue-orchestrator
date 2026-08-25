@@ -26,17 +26,13 @@ from ..domain.terminal_launch import (
     TerminalShell,
 )
 from ..domain.executor import ExecutorInteractiveSessionCancellation
+from ..domain.terminal_session_termination import TerminalSessionProcess
+from ..ports.terminal_session_terminator import TerminalSessionTerminator
 from .agent_runner import AgentRunner, AgentSession, AgentSpec
 from .session_interactions import (
     SessionInteractionHandler,
     builtin_session_interaction_rules,
 )
-from .session_process_group_terminator import (
-    PosixTerminalSessionProcessGroupTerminator,
-    TerminalSessionProcess,
-    TerminalSessionTerminationPolicy,
-)
-from .executor_guardian_cancellation import ExecutorSessionGuardianCanceller
 from ..infra.env import get_env
 from ..infra.hooks.hookspec import hookimpl
 from ..infra.repo_identity import state_dir
@@ -259,21 +255,21 @@ class SubprocessPlugin:
 
     def __init__(
         self,
+        session_terminator: TerminalSessionTerminator,
         *,
         session_interactions_enabled: bool = False,
         worktree_base: Path | None = None,
     ) -> None:
+        if not isinstance(session_terminator, TerminalSessionTerminator):
+            raise ValueError(
+                "SubprocessPlugin.session_terminator must be a "
+                "TerminalSessionTerminator"
+            )
         repo_root = Path(get_env("REPO_ROOT") or Path.cwd()).resolve()
         self._registry = _SubprocessRegistry(repo_root)
         self._sessions: dict[str, AgentSession] = {}
         self._watcher_threads: dict[str, threading.Thread] = {}
-        self._session_terminator = PosixTerminalSessionProcessGroupTerminator(
-            TerminalSessionTerminationPolicy(
-                graceful_shutdown_seconds=5.0,
-                forceful_shutdown_seconds=5.0,
-            ),
-            ExecutorSessionGuardianCanceller(forceful_shutdown_seconds=5.0),
-        )
+        self._session_terminator = session_terminator
         deny_stdin_val = get_env("SUBPROCESS_DENY_STDIN") or ""
         self._allow_stdin = deny_stdin_val.lower() not in {"1", "true", "yes"}
         self._session_interactions_enabled = session_interactions_enabled

@@ -42,6 +42,7 @@ from .bootstrap_executor import (
     build_contained_command_capture as build_contained_command_capture,
     build_executor_monitor as build_executor_monitor,
     build_process_group_supervisor as build_process_group_supervisor,
+    build_terminal_session_terminator,
     compose_executor,
 )
 from .bootstrap_pair_registry import build_pair_registry_with_worktree_hook
@@ -466,6 +467,7 @@ def build_orchestrator(
 
     # Create the pluggy plugin manager and register SSE plugin
     pm = create_plugin_manager(
+        terminal_session_terminator=build_terminal_session_terminator(),
         terminal_plugin=config.terminal_adapter,
         ui_mode=config.ui_mode,
         session_interactions_enabled=config.session_interactions.enabled,

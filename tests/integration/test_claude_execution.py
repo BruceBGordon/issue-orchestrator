@@ -470,6 +470,9 @@ class TestClaudeViaAdapterPath:
     def test_claude_via_subprocess_backend(self, tmp_path, require_claude, monkeypatch):
         """Run Claude via subprocess backend in a real git worktree."""
         from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
+        from issue_orchestrator.entrypoints.bootstrap_executor import (
+            build_terminal_session_terminator,
+        )
 
         source_repo_root = Path(__file__).resolve().parents[2]
         worktree = tmp_path / f"real-worktree-{uuid4().hex[:8]}"
@@ -497,7 +500,7 @@ class TestClaudeViaAdapterPath:
                 f"\"{escaped_prompt}\""
             )
 
-            plugin = SubprocessPlugin()
+            plugin = SubprocessPlugin(build_terminal_session_terminator())
             created = plugin.create_session(
                 session_id=999,
                 command=claude_cmd,

@@ -10,6 +10,9 @@ from issue_orchestrator.ports.provider_resilience import NO_PROVIDER_CIRCUIT_STA
 from tests.unit import test_web as _support
 from tests.unit.route_helpers import iter_route_paths
 from tests.unit.test_web import *  # noqa: F403
+from tests.unit.terminal_session_termination_helpers import (
+    RecordingTerminalSessionTerminator,
+)
 
 globals().update(
     {name: value for name, value in vars(_support).items() if not name.startswith("__")}
@@ -324,7 +327,10 @@ class TestEmitEventHelper:
                 events_received.append((event, data))
 
         # Create plugin manager and register test plugin
-        pm = PluginManager(terminal_plugin="subprocess")
+        pm = PluginManager(
+            RecordingTerminalSessionTerminator(),
+            terminal_plugin="subprocess",
+        )
         pm.register_plugin(TestPlugin(), name="test_plugin")
 
         # Emit an event
@@ -478,7 +484,10 @@ class TestIssueRowsEndpoint:
             def on_trace_event(self, event: str, data: dict) -> None:
                 events_received.append((event, data))
 
-        pm = PluginManager(terminal_plugin="subprocess")
+        pm = PluginManager(
+            RecordingTerminalSessionTerminator(),
+            terminal_plugin="subprocess",
+        )
         pm.register_plugin(TestPlugin(), name="test_plugin")
 
         # Emit without data

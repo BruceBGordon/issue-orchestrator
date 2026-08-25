@@ -21,6 +21,7 @@ from ..domain.executor import (
 )
 from ..domain.executor_guardian import ExecutorGuardianTerminationPolicy
 from ..domain.terminal_launch import TerminalShell
+from ..domain.terminal_session_termination import TerminalSessionTerminationPolicy
 from ..execution.agent_phase_command_scheduler import HostAgentPhaseCommandScheduler
 from ..ports.agent_phase_command_scheduler import AgentPhaseCommandScheduler
 from ..ports.contained_command import ContainedCommandCapture
@@ -30,11 +31,24 @@ from ..ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ..ports.executor_monitor import ExecutorMonitor
 from ..ports.host_cpu_utilization import HostCpuUtilizationObserver
 from ..ports.process_group_supervisor import ProcessGroupSupervisor
+from ..ports.terminal_session_terminator import TerminalSessionTerminator
 
 
 _PROCESS_TERMINATION = ExecutorProcessTerminationPolicy(
     graceful_shutdown_seconds=2.0,
     forceful_shutdown_seconds=2.0,
+)
+_TERMINAL_SESSION_RELAY_MARGIN_SECONDS = 1.0
+_TERMINAL_SESSION_GUARDIAN_RELAY_SECONDS = (
+    _PROCESS_TERMINATION.graceful_shutdown_seconds
+    + _PROCESS_TERMINATION.forceful_shutdown_seconds
+    + _TERMINAL_SESSION_RELAY_MARGIN_SECONDS
+)
+_TERMINAL_SESSION_TERMINATION = TerminalSessionTerminationPolicy(
+    # The outer wrapper gets enough courtesy time to relay SIGTERM and let its
+    # executor supervisor spend both inner TERM/KILL bounds, plus one margin.
+    graceful_shutdown_seconds=_TERMINAL_SESSION_GUARDIAN_RELAY_SECONDS,
+    forceful_shutdown_seconds=_TERMINAL_SESSION_GUARDIAN_RELAY_SECONDS,
 )
 _HISTORY_RETENTION = ExecutorHistoryRetentionPolicy(
     maximum_profiles=2048,
@@ -101,6 +115,26 @@ def build_process_group_supervisor() -> ProcessGroupSupervisor:
 
     return PosixProcessGroupSupervisor(
         PosixProcessGroupTerminator(_PROCESS_TERMINATION)
+    )
+
+
+def build_terminal_session_terminator() -> TerminalSessionTerminator:
+    """Compose persisted outer-session and guardian containment policy."""
+    _require_posix_process_groups()
+    from ..execution.executor_guardian_cancellation import (
+        ExecutorSessionGuardianCanceller,
+    )
+    from ..execution.session_process_group_terminator import (
+        PosixTerminalSessionProcessGroupTerminator,
+    )
+
+    return PosixTerminalSessionProcessGroupTerminator(
+        _TERMINAL_SESSION_TERMINATION,
+        ExecutorSessionGuardianCanceller(
+            forceful_shutdown_seconds=(
+                _TERMINAL_SESSION_TERMINATION.forceful_shutdown_seconds
+            )
+        ),
     )
 
 

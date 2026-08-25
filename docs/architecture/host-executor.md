@@ -173,10 +173,14 @@ the guardian. The terminal-session owner can therefore distinguish a crashed
 outer wrapper from a deliberate stop, including after orchestrator recovery,
 and can contain the guardian group before reporting the session stopped. It
 logs whether outer containment was absent, graceful, or forced, plus the
-guardian outcome and exact record path. The guardian owns the exact remaining
-active/absolute deadline and retains the
-process-group identity through final TERM/KILL containment, including when a
-descendant used `close_fds`. Missing or malformed terminal records fail loudly;
+guardian outcome and exact record path. The composition root injects this
+behavior into the terminal adapter through `TerminalSessionTerminator`; the
+adapter contains no POSIX signal, lock, or shutdown-bound construction. The
+root derives its five-second outer relay bound from the executor's two-second
+TERM bound, two-second KILL bound, and one-second relay margin. The guardian
+owns the exact remaining active/absolute deadline and retains the process-group
+identity through final TERM/KILL containment, including when a descendant used
+`close_fds`. Missing or malformed terminal records fail loudly;
 they never become fabricated success or exit 124. A later invocation prunes a
 record only after its ownership lock is no longer held.
 Capacity discovery/reconfiguration and admission share one cross-process guard,

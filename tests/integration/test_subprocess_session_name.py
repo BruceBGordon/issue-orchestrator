@@ -23,6 +23,9 @@ import pytest
 pytestmark = pytest.mark.xdist_group("pty")
 
 from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_terminator,
+)
 from issue_orchestrator.infra.hooks.hookspec import PROJECT_NAME, TerminalSpec
 from tests.unit.session_run_helpers import make_session_run_assets
 
@@ -57,7 +60,7 @@ def plugin_manager(temp_repo_root: Path, monkeypatch: pytest.MonkeyPatch) -> plu
     pm.add_hookspecs(TerminalSpec)
 
     # Create and register the subprocess plugin
-    plugin = SubprocessPlugin()
+    plugin = SubprocessPlugin(build_terminal_session_terminator())
     pm.register(plugin, name="terminal_subprocess")
 
     return pm

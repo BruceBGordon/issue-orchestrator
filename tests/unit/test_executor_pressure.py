@@ -268,8 +268,9 @@ def test_pressure_guardian_enforces_deadline_after_executor_parent_crash(
             )
         )
         rig.crash_parent(crashed_parent)
-        follower = rig.defer(PressureWork("FOLLOWER", "pressure-follower"))
-        rig.require_none_started((follower,))
+        # The real deadline may expire before a contended host schedules this
+        # process. The unbounded scenario above owns the pre-release invariant.
+        follower = rig.submit(PressureWork("FOLLOWER", "pressure-follower"))
 
         rig.require_started(follower)
         hung.require_command_contained()

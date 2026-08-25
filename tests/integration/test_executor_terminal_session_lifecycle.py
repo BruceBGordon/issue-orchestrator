@@ -28,6 +28,9 @@ from issue_orchestrator.domain.executor import (
 )
 from issue_orchestrator.execution.session_runner_adapter import PluggySessionRunner
 from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_terminator,
+)
 from issue_orchestrator.infra.hooks.hookspec import PROJECT_NAME, TerminalSpec
 from issue_orchestrator.infra.terminal_recording import TERMINAL_RECORDING_FILENAME
 from tests.unit.session_run_helpers import make_session_run_assets
@@ -54,7 +57,10 @@ class _OutputRecordingEvent(BaseModel):
 def _runner() -> PluggySessionRunner:
     manager = pluggy.PluginManager(PROJECT_NAME)
     manager.add_hookspecs(TerminalSpec)
-    manager.register(SubprocessPlugin(), name="terminal_subprocess")
+    manager.register(
+        SubprocessPlugin(build_terminal_session_terminator()),
+        name="terminal_subprocess",
+    )
     return PluggySessionRunner(manager)
 
 
