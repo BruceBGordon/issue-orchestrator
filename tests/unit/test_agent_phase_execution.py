@@ -49,6 +49,7 @@ from issue_orchestrator.domain.executor_monitoring import (
 from issue_orchestrator.execution.agent_phase_command_scheduler import (
     HostAgentPhaseCommandScheduler,
 )
+from issue_orchestrator.entrypoints.cli_tools.agent_phase_run import run_agent_phase
 from issue_orchestrator.execution.atomic_record_store import OsAtomicPathReplacement
 from issue_orchestrator.execution.host_executor import (
     ExecutorRequestIdentityFactory,
@@ -459,36 +460,51 @@ def test_scheduled_phase_executes_bash_language_without_shell_drift(
             observer_margin_seconds=58.0,
         ),
     ).schedule(specification)
-
-    result = subprocess.run(
-        (
-            scheduled.terminal_launch.shell.value,
-            "-lc",
-            scheduled.terminal_launch.shell_command,
-        ),
-        cwd=REPO_ROOT,
-        env={**os.environ, POOL_DIR_ENV: str(tmp_path / "pool")},
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
+    scheduled_arguments = shlex.split(scheduled.terminal_launch.shell_command)
+    executor = _deterministic_host_executor(
+        tmp_path / "pool",
+        host_cpu_observer=_IdleHostCpuObserver(),
+        request_nonce="c" * 32,
     )
 
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert scheduled_arguments[:3] == [
+        sys.executable,
+        "-m",
+        "issue_orchestrator.entrypoints.cli_tools.agent_phase_run",
+    ]
+    assert run_agent_phase(scheduled_arguments[3:], executor) == 0
 
 
 def test_internal_phase_client_runs_a_plain_command_without_orchestrator(
     tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
-    result = _phase_cli(
+    executor = _deterministic_host_executor(
         tmp_path / "pool",
-        active_timeout_seconds="2",
-        absolute_timeout_seconds="4",
-        command=(sys.executable, "-c", "print('PHASE-RAN')"),
+        host_cpu_observer=_IdleHostCpuObserver(),
+        request_nonce="d" * 32,
     )
+    result = run_agent_phase(
+        (
+            "--work-key",
+            "agent-phase:agent:web:code",
+            "--group",
+            "agent:run-1:coding-1",
+            "--active-timeout-seconds",
+            "2",
+            "--absolute-timeout-seconds",
+            "4",
+            "--",
+            sys.executable,
+            "-c",
+            "print('PHASE-RAN')",
+        ),
+        executor,
+    )
+    captured = capfd.readouterr()
 
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == "PHASE-RAN\n"
+    assert result == 0, captured.err
+    assert captured.out == "PHASE-RAN\n"
 
 
 def test_internal_phase_client_terminates_at_active_deadline_and_releases_lease(

@@ -15,6 +15,7 @@ from ...domain.executor import (
     ExecutorRunSpecification,
     ExecutorWorkKey,
 )
+from ...ports.executor import Executor
 from ..bootstrap import build_executor
 from ..command_exit_status import forward_command_exit_status
 
@@ -29,7 +30,11 @@ def _positive_float(raw: str) -> float:
     return parsed
 
 
-def main(arguments: Sequence[str] | None = None) -> int:
+def run_agent_phase(
+    arguments: Sequence[str] | None,
+    executor: Executor,
+) -> int:
+    """Parse and execute one phase through the required executor boundary."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-key", required=True)
     parser.add_argument("--group", required=True)
@@ -43,7 +48,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if command_arguments[:1] == ("--",):
         command_arguments = command_arguments[1:]
     try:
-        result = build_executor().run(
+        result = executor.run(
             ExecutorRunSpecification(
                 work_key=ExecutorWorkKey(parsed.work_key),
                 fairness_group=ExecutorFairnessGroup(parsed.group),
@@ -65,6 +70,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         print(f"agent phase execution failed: {exc}")
         return 2
     return forward_command_exit_status(result.exit_code)
+
+
+def main(arguments: Sequence[str] | None = None) -> int:
+    return run_agent_phase(arguments, build_executor())
 
 
 if __name__ == "__main__":
