@@ -234,9 +234,11 @@ issue-orchestrator executor-events --limit 50
 
 `issue-orchestrator executor-status` shows the detected host CPU slots, the
 effective percentage and its source, the total successful learning samples,
-the exact learning fingerprint, and each human-readable repository/work
-profile. This is the compact live view; `executor-events` is the detailed
-after-the-fact decision trail.
+the number of historical failed observations excluded from learning, the exact
+learning fingerprint, and each human-readable repository/work profile. Failed
+commands remain visible by repository and work key but never teach the demand
+estimator that a prematurely terminated command is cheap. This is the compact
+live view; `executor-events` is the detailed after-the-fact decision trail.
 
 The CLI queries the typed `ExecutorMonitor` port used as the future UI seam.
 Accurate live-state projection and a polished UI remain deferred to the

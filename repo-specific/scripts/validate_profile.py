@@ -27,16 +27,25 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal, cast
 
 from issue_orchestrator.domain.executor import ExecutorPolicySource
 from issue_orchestrator.domain.executor_monitoring import (
-    ExecutorEventTimeline,
+    ExecutorAdmissionDeadlineExceeded,
+    ExecutorCommandDeadlineExceeded,
+    ExecutorCommandStartFailed,
+    ExecutorEvent,
+    ExecutorPolicyChanged,
     ExecutorRecentEventsQuery,
     ExecutorStatus,
+    ExecutorWorkAdmitted,
+    ExecutorWorkCompleted,
+    ExecutorWorkEnqueued,
+    ExecutorWorkWaiting,
 )
 from issue_orchestrator.entrypoints.bootstrap import (
     build_executor,
@@ -147,13 +156,37 @@ class ProfileExecutorStatus:
     learned_work: tuple[ProfileLearnedWork, ...]
 
 
+class ProfileExecutorEventType(StrEnum):
+    """Stable discriminator for a retained executor-domain event."""
+
+    ENQUEUED = "enqueued"
+    WAITING = "waiting"
+    ADMITTED = "admitted"
+    COMMAND_START_FAILED = "command-start-failed"
+    ADMISSION_DEADLINE_EXCEEDED = "admission-deadline-exceeded"
+    COMMAND_DEADLINE_EXCEEDED = "command-deadline-exceeded"
+    COMPLETED = "completed"
+    POLICY_CHANGED = "policy-changed"
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileExecutorEventRecord:
+    """Self-discriminating serialization wrapper for one domain event."""
+
+    event: ExecutorEvent
+    event_type: ProfileExecutorEventType = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "event_type", profile_event_type(self.event))
+
+
 @dataclass(frozen=True, slots=True)
 class ProfileExecutorEventCapture:
     """Typed executor events retained before the temporary pool is removed."""
 
     query_limit: int
     possibly_truncated: bool
-    timeline: ExecutorEventTimeline
+    events: tuple[ProfileExecutorEventRecord, ...]
 
     def __post_init__(self) -> None:
         if type(self.query_limit) is not int or self.query_limit < 1:
@@ -164,9 +197,12 @@ class ProfileExecutorEventCapture:
             raise ValueError(
                 "ProfileExecutorEventCapture.possibly_truncated must be a boolean"
             )
-        if type(self.timeline) is not ExecutorEventTimeline:
+        if type(self.events) is not tuple or any(
+            type(event) is not ProfileExecutorEventRecord for event in self.events
+        ):
             raise ValueError(
-                "ProfileExecutorEventCapture.timeline must be ExecutorEventTimeline"
+                "ProfileExecutorEventCapture.events must contain only "
+                "ProfileExecutorEventRecord values"
             )
 
 
@@ -219,7 +255,7 @@ class ValidateProfileSummary:
 class ValidateProfileReport:
     """Versioned JSON report written by the profiler."""
 
-    schema_version: Literal[3]
+    schema_version: Literal[4]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
     target_runs: tuple[CommandResult, ...]
@@ -761,14 +797,39 @@ def capture_executor_events(
     return ProfileExecutorEventCapture(
         query_limit=EXECUTOR_EVENT_CAPTURE_LIMIT,
         possibly_truncated=len(unfiltered.events) == EXECUTOR_EVENT_CAPTURE_LIMIT,
-        timeline=ExecutorEventTimeline(
-            tuple(
-                event
-                for event in unfiltered.events
-                if event.metadata.recorded_at_unix >= recorded_since_unix
-            )
+        events=tuple(
+            ProfileExecutorEventRecord(event)
+            for event in unfiltered.events
+            if event.metadata.recorded_at_unix >= recorded_since_unix
         ),
     )
+
+
+def profile_event_type(event: ExecutorEvent) -> ProfileExecutorEventType:
+    """Map every closed executor-event variant to an explicit report tag."""
+    event_types = (
+        (ExecutorWorkEnqueued, ProfileExecutorEventType.ENQUEUED),
+        (ExecutorWorkWaiting, ProfileExecutorEventType.WAITING),
+        (ExecutorWorkAdmitted, ProfileExecutorEventType.ADMITTED),
+        (
+            ExecutorCommandStartFailed,
+            ProfileExecutorEventType.COMMAND_START_FAILED,
+        ),
+        (
+            ExecutorAdmissionDeadlineExceeded,
+            ProfileExecutorEventType.ADMISSION_DEADLINE_EXCEEDED,
+        ),
+        (
+            ExecutorCommandDeadlineExceeded,
+            ProfileExecutorEventType.COMMAND_DEADLINE_EXCEEDED,
+        ),
+        (ExecutorWorkCompleted, ProfileExecutorEventType.COMPLETED),
+        (ExecutorPolicyChanged, ProfileExecutorEventType.POLICY_CHANGED),
+    )
+    for event_class, event_type in event_types:
+        if type(event) is event_class:
+            return event_type
+    raise ValueError(f"unsupported executor event: {type(event).__name__}")
 
 
 def project_executor_status(status: ExecutorStatus) -> ProfileExecutorStatus:
@@ -899,7 +960,7 @@ def main() -> int:
         jobs=arguments.jobs,
     )
     report = ValidateProfileReport(
-        schema_version=3,
+        schema_version=4,
         config=ValidateProfileConfiguration(
             make_bin=arguments.make_bin,
             repo_root=str(repo_root),

@@ -146,7 +146,7 @@ def test_profile_jobs_control_outer_make_and_inner_lane_limit(
     assert report["config"]["executor_learning"] == (
         "one fresh pool: cold aggregate, lane training, learned aggregate"
     )
-    assert report["schema_version"] == 3
+    assert report["schema_version"] == 4
     assert len(report["config"]["profiled_commit_sha"]) == 40
     assert report["config"]["aggressiveness"] == {
         "percent": 125,
@@ -177,7 +177,7 @@ def test_profile_jobs_control_outer_make_and_inner_lane_limit(
         assert aggregate["executor_events"] == {
             "query_limit": 1000,
             "possibly_truncated": False,
-            "timeline": {"events": []},
+            "events": [],
         }
     assert not Path(cold_aggregate["command_result"]["worktree_path"]).exists()
     assert not Path(learned_aggregate["command_result"]["worktree_path"]).exists()
@@ -312,8 +312,13 @@ def test_aggregate_event_capture_is_typed_bounded_and_restores_environment(
 
     assert capture.query_limit == 1000
     assert capture.possibly_truncated is True
-    assert capture.timeline.events == (new_event,) * 999
+    assert tuple(record.event for record in capture.events) == (new_event,) * 999
+    assert all(
+        record.event_type is profile.ProfileExecutorEventType.POLICY_CHANGED
+        for record in capture.events
+    )
     assert os.environ[profile.EXECUTOR_POOL_DIR_ENV] == "original-pool"
     assert os.environ[profile.EXECUTOR_AGGRESSIVENESS_ENV] == "75"
     serialized = json.dumps(asdict(capture))
+    assert '"event_type": "policy-changed"' in serialized
     assert '"effective_source": "environment"' in serialized

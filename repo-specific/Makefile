@@ -11,6 +11,8 @@ PYTEST ?= .venv/bin/pytest
 # Usage:
 #   make -f repo-specific/Makefile validate-profile
 #   make -f repo-specific/Makefile validate-profile DRY_RUN=1
+# The JSON report and its sibling *-artifacts directory retain the exact
+# command output and bounded typed executor-event evidence.
 validate-profile:
 	@args=""; \
 	if [ ! -x ".venv/bin/python" ]; then echo "Missing .venv/bin/python. Run: make worktree-setup"; exit 1; fi; \

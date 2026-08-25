@@ -237,28 +237,52 @@ later sample showed recovery. Use `executor-events` to distinguish this from
 capacity, fairness, exclusive-resource, and lease-race waits. Load average is
 recorded for context but does not drive this decision.
 
-The 2026-08-24 calibration on the 18-core, 64 GB host found the full uncached
-PR gate at 95.86s with 100% aggressiveness, 84.24s at 125%, and 96.76s at 150%.
-Provider round trips vary substantially, but local static and unit work also
-slowed at 150%, placing 125% at the measured knee. Use
-`issue-orchestrator executor-policy --aggressiveness 125` on that host. Older
-timing-history rows may have been migrated from the previous machine; only
-explicitly retained runs known to have executed on this host are calibration
-evidence.
+The 2026-08-24 backtracking calibration on the 18-core, 64 GiB host measured the
+full validation-result-cache-miss gate at 95.86s with 100% aggressiveness,
+84.24s at 125%, and 96.76s at 150%. The 125% point improved on 100% by about
+12%, while 150% gave the gain back and slowed local static and unit work as well
+as the variable provider path. That places 125% at the measured knee; more
+parallelism was not a credible further 5% win. Use
+`issue-orchestrator executor-policy --aggressiveness 125` on this host.
 
-After native CPU-pressure feedback and learned range admission were complete,
-three independent full uncached confirmations passed in **83.23s**,
-**81.45s**, and **83.52s** (82.73s mean). The third includes the final
-adversarial fixes to learning-history retention, low-core grant selection,
-monotonic queue ordering, and profiler accounting. All seven lanes were
-admitted within 0.13s. Their critical paths were provider lanes at 79–82s;
-local lanes completed in 15–47s. Peak recorded lane RSS remained far below the
-available 64 GB and swap stayed unused, so memory did not constrain these runs.
+An exact clean committed `make validate-pr` at `443ecdd` then passed in
+**83.888s**. Its seven-lane phase took 81s: browser 30s, static 41s, unit 44s,
+local integration 52s, simulated scenarios 55s, Codex 66s, and Claude 81s;
+VS Code took 1s afterwards. The executor granted xdist-aware work between 2 and
+12 workers according to learned demand, rather than the historical accidental
+single-worker behavior. This is the normal-response confirmation for the
+approximately 85-second goal.
 
-This is a repeatable scheduling result, not a hard wall-clock upper bound on
-remote services. One otherwise-identical confirmation took 128.8s because the
-real interactive Codex smoke alone varied to 122.02s; its executor admission
-took 0.12s and its entire lane consumed only about 20 child CPU seconds. An
+Timing rows live in the repository's shared Git directory and can therefore
+survive a machine migration. For calibration, select records by the captured
+host name, OS, architecture, CPU count, and physical-memory bytes; a date alone
+does not prove which machine produced a row. Records without the new host
+identity, or with the previous machine's identity, are historical context
+rather than evidence for this calibration.
+
+Across 222 resource samples recorded on this 18-core/64 GiB host, memory-free
+pressure never fell below 86% and swap use remained 0 MiB. The largest observed
+single lane was static at about 1.2 GiB RSS. There is therefore no evidence that
+64 GiB makes this gate faster than 48 GiB would; the measured workload had ample
+headroom at 48 GiB. The extra memory is still useful headroom for simultaneous
+repositories, browsers, worktrees, IDEs, and agent sessions, but current data
+does not justify memory-aware admission or another RAM upgrade for this use
+case.
+
+This is repeatable scheduler behavior, not a hard wall-clock upper bound on
+remote services. A later exact fresh-pool profile of clean commit `b38378e`
+passed both aggregates but took 146.39s cold and 148.09s learned. The retained
+evidence attributes the result: Claude was admitted after at most 0.124s, then
+spent 141.18s cold and 143.36s learned in its command while using only
+30.93–33.36 child CPU seconds. Learning changed aggregate time by just 1.70s,
+well inside provider variance. The same profile's isolated lanes were Claude
+77.02s, Codex 62.70s, unit 41.37s, integration 27.47s, static 27.80s, web
+21.16s, simulated 18.82s, and VS Code 2.40s. More CPU concurrency cannot remove
+an external response tail.
+
+One otherwise-identical earlier confirmation took 128.8s because the real
+interactive Codex smoke alone varied to 122.02s; its executor admission took
+0.12s and its entire lane consumed only about 20 child CPU seconds. An
 instrumented isolated run split 42.5s into 9.0s of interactive startup, 4.1s of
 safe prompt submission, and 29.4s awaiting the review response. Faster-model
 experiments were not retained: Spark was fast but emitted an invalid protocol
@@ -275,13 +299,17 @@ filesystem, installed dependency, browser, CLI, and external-service caches
 remain part of the real-world measurement.
 
 `make -f repo-specific/Makefile validate-profile` measures detached fresh
-worktrees against committed `HEAD`. Each measured command receives a fresh
-executor-learning pool, while normal external caches remain enabled. Its
+worktrees against committed `HEAD`. Each profile invocation creates one fresh
+executor-learning pool shared by its cold aggregate, isolated lane training,
+and learned aggregate, while normal external caches remain enabled. Its
 `VALIDATE_JOBS` value controls both aggregate GNU make fan-out and the inner
 validation-lane fan-out; the JSON report records both facts explicitly. The
 headline serial sum includes the aggregate static lane exactly once; nested
 typecheck, architecture, and quality components are not double-counted as
-independent execution lanes.
+independent execution lanes. A sibling `*-artifacts` directory retains one
+combined-output log per command and explicitly discriminated typed executor
+events for each aggregate. Check `possibly_truncated` before treating an event
+window as complete.
 
 Use `issue-orchestrator executor-events --limit 100` to inspect the durable
 typed decision trail after a run. It reports human repository/work identities,

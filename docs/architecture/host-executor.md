@@ -75,7 +75,8 @@ At admission time the policy:
 6. reserves the learned charge of compatible queued requests' minimum
    concurrency before expanding the selected request toward its maximum;
 7. chooses the largest accepted concurrency that fits the remainder; and
-8. scales every learned charge by the machine aggressiveness percentage.
+8. divides every learned charge by the machine aggressiveness percentage, so
+   values above 100% deliberately permit more overlap.
 
 If even the declared minimum is wider than a small host's learned capacity,
 the executor may admit exactly that minimum while charging the whole host. It
@@ -146,10 +147,42 @@ The bounded typed executor event store records enqueue facts, the coalescing
 interval, wait-reason transitions, grants, minimum reservations, policy
 changes, command observations, learned-demand changes, successful sample
 counts, native CPU samples, decision reasons, admission/command deadline
-expirations, and host load. `executor-events`
-queries it through the read-only
-`ExecutorMonitor` port; the CLI does not parse persistence or executor locks. A
-live status projection and UI remain deferred to #7105.
+expirations, and host load. `executor-events` queries it through the read-only
+`ExecutorMonitor` port; the CLI does not parse persistence or executor locks.
+`executor-status` projects current policy, successful learning, explicitly
+excluded failure history, and the exact learning fingerprint through the same
+port. A live status projection and UI remain deferred to #7105.
+
+The detached validation profiler preserves evidence before deleting its fresh
+worktrees and executor pool. Each command gets a durable combined-output log,
+and each aggregate gets a bounded typed event snapshot whose records carry an
+explicit event discriminator. The snapshot says when its 1,000-event query may
+have truncated the beginning. Thus a slow aggregate remains attributable after
+the disposable execution environment has gone away.
+
+## Verification model
+
+Two complementary pressure facilities exercise the actual policy rather than
+waiting for rare production timing:
+
+- The real-process pressure DSL drives independent executor processes and
+  controlled child lifetimes. It proves cross-group round-robin fairness,
+  exclusive-resource serialization, old-wide-request drainage, opposite lock
+  order progress, simultaneous history writers, queued-parent death, and the
+  invariant that a child retains its lease after its executor parent crashes.
+- The virtual-time workload DSL drives the pure production admission policy.
+  Its dials cover machine size, aggressiveness, arrival schedule, lane demand,
+  decision cadence, external CPU windows, and either run-to-completion or
+  application-declared cooperative boundaries. The representative workload is
+  ten validation microbursts over thirty virtual minutes, not an unrealistic
+  permanent all-at-once flood.
+
+Virtual time proves feedback behavior in milliseconds: unmanaged saturation
+holds new admissions and recovery resumes them; a deliberately overaggressive
+burst cannot exceed internal lease capacity; repository-local opaque work keys
+learn independently; and optional safe boundaries can reduce overload. Those
+cooperative boundaries are an escape-valve experiment only. Production yields
+remain whole issue-orchestrator lifecycle phases.
 
 ## Deferred extensions
 
