@@ -14,7 +14,7 @@ from types import TracebackType
 from typing import TextIO, cast
 
 from issue_orchestrator.domain.executor import ExecutorConcurrencyRange
-from tests.process_tree_fixture import TermResistantChildProgram
+from tests.process_tree_fixture import ProcessTreeMember, TermResistantChildProgram
 
 
 POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
@@ -58,7 +58,7 @@ class CloseFdsTreePressureCommand:
                 )
 
     def arguments(self, label: str) -> tuple[str, ...]:
-        descendant_source = TermResistantChildProgram(30).python_source()
+        descendant_source = TermResistantChildProgram(300).python_source()
         source = (
             "import os, pathlib, signal, subprocess, sys\n"
             "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n"
@@ -86,7 +86,9 @@ class CloseFdsTreePressureCommand:
         return (sys.executable, "-u", "-c", source)
 
     def require_descendant_contained(self) -> None:
-        _require_process_exited(self.descendant_pid_path)
+        ProcessTreeMember(
+            _recorded_process_id(self.descendant_pid_path)
+        ).assert_contained()
 
     def request_guardian_termination(self) -> None:
         os.kill(_recorded_process_id(self.guardian_pid_path), signal.SIGTERM)
@@ -124,7 +126,9 @@ class HungPressureCommand:
         return (sys.executable, "-u", "-c", source)
 
     def require_command_contained(self) -> None:
-        _require_process_exited(self.command_pid_path)
+        ProcessTreeMember(
+            _recorded_process_id(self.command_pid_path)
+        ).assert_contained()
 
     def cleanup(self) -> None:
         _contain_recorded_guardian(self.guardian_pid_path)
@@ -163,25 +167,6 @@ class BoundedPressureDeadline:
 
 
 PressureDeadline = UnboundedPressureDeadline | BoundedPressureDeadline
-
-
-def _require_process_exited(pid_path: Path) -> None:
-    pid = _recorded_process_id(pid_path)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return
-    status = subprocess.run(
-        ("ps", "-o", "stat=", "-p", str(pid)),
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout.strip()
-    if not status or status.startswith("Z"):
-        return
-    raise AssertionError(
-        f"process {pid} remained executable after guardian containment: {status}"
-    )
 
 
 def _recorded_process_id(pid_path: Path) -> int:

@@ -76,6 +76,7 @@ from issue_orchestrator.ports.host_cpu_utilization import HostCpuUtilizationObse
 from tests.process_tree_fixture import (
     CooperativeTermResistantProcessTreeProgram,
     ExitingTermResistantProcessTreeProgram,
+    ProcessTreeMember,
 )
 from tests.unit.session_run_helpers import make_session_run_assets
 from tests.unit.executor_guardian_helpers import executor_command_guardian
@@ -248,20 +249,6 @@ def _executor_events(pool_dir: Path) -> subprocess.CompletedProcess[str]:
         check=False,
         timeout=5,
     )
-
-
-def _pid_has_exited(pid: int, *, deadline_seconds: float = 5.0) -> bool:
-    """Bounded kernel observation for a reparented real subprocess."""
-    deadline = time.monotonic() + deadline_seconds
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            return False
-        time.sleep(0.01)
-    return False
 
 
 def test_phase_specification_converts_active_timeout_to_fixed_absolute_bound(
@@ -667,9 +654,7 @@ def test_descendant_is_gone_before_timed_out_phase_releases_lease(
 
     assert timed_out.exit_code == 124
     descendant_pid = int(descendant_pid_file.read_text(encoding="utf-8"))
-    assert _pid_has_exited(descendant_pid), (
-        f"descendant {descendant_pid} survived before executor lease release"
-    )
+    ProcessTreeMember(descendant_pid).assert_contained()
     recovered = executor.run(
         specification,
         ExecutorCommand(
@@ -716,9 +701,7 @@ def test_natural_phase_completion_contains_descendant_before_lease_release(
 
     assert result.exit_code == 0
     descendant_pid = int(descendant_pid_file.read_text(encoding="utf-8"))
-    assert _pid_has_exited(descendant_pid), (
-        f"descendant {descendant_pid} survived normal executor completion"
-    )
+    ProcessTreeMember(descendant_pid).assert_contained()
 
 
 def test_internal_phase_client_rejects_non_finite_deadlines(tmp_path: Path) -> None:

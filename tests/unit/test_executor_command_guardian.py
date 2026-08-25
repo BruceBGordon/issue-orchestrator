@@ -6,7 +6,6 @@ import json
 import os
 import signal
 import sys
-import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
@@ -41,7 +40,10 @@ from issue_orchestrator.domain.executor import ExecutorProcessTerminationPolicy
 from issue_orchestrator.ports.executor_command_guardian import (
     ExecutorGuardianRequest,
 )
-from tests.process_tree_fixture import ExitingTermResistantProcessTreeProgram
+from tests.process_tree_fixture import (
+    ExitingTermResistantProcessTreeProgram,
+    ProcessTreeMember,
+)
 
 
 def _guardian(
@@ -180,24 +182,13 @@ def test_guardian_reports_command_start_failure_without_exit_fabrication() -> No
     assert "/definitely/missing/executor-command" in terminal.error_repr
 
 
-def _pid_has_exited(pid: int) -> bool:
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        time.sleep(0.01)
-    return False
-
-
 def test_missing_guardian_result_is_explicit_and_outer_contains_group(
     tmp_path: Path,
 ) -> None:
     descendant_path = (tmp_path / "guardian-crash-descendant.pid").resolve()
     fault = ExitingTermResistantProcessTreeProgram(
         descendant_path,
-        30,
+        300,
         23,
     ).python_source()
     with _lease_descriptor() as lease_fd:
@@ -216,7 +207,7 @@ def test_missing_guardian_result_is_explicit_and_outer_contains_group(
             )
 
     descendant_pid = int(descendant_path.read_text(encoding="utf-8"))
-    assert _pid_has_exited(descendant_pid)
+    ProcessTreeMember(descendant_pid).assert_contained()
 
 
 def test_malformed_guardian_result_is_never_treated_as_command_success() -> None:

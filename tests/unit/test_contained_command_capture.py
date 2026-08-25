@@ -8,7 +8,6 @@ from enum import StrEnum
 from io import TextIOBase
 from pathlib import Path
 import shlex
-import signal
 import subprocess
 import sys
 import threading
@@ -48,6 +47,7 @@ from issue_orchestrator.ports.process_group_supervisor import (
     ProcessGroupInterruption,
     ProcessGroupSupervisor,
 )
+from tests.process_tree_fixture import ProcessTreeMember
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,8 +204,7 @@ def test_output_pump_setup_failure_contains_and_reaps_started_group(
     assert type(result.cleanup) is ContainedCommandCaptureAborted
     assert result.failure.error is setup_failure
     process_id = int(process_id_path.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(process_id, signal.SIGCONT)
+    ProcessTreeMember(process_id).assert_contained()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process containment")
@@ -308,8 +307,7 @@ def test_output_pump_finalization_failure_is_typed_after_group_containment(
         assert type(result.cleanup) is ContainedCommandSupervised
         assert result.failure.error is finalization_failure
     process_id = int(process_id_path.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(process_id, signal.SIGCONT)
+    ProcessTreeMember(process_id).assert_contained()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process containment")
@@ -355,5 +353,4 @@ def test_capture_and_supervision_failures_are_both_preserved(
         supervision_failure,
     )
     process_id = int(process_id_path.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(process_id, signal.SIGCONT)
+    ProcessTreeMember(process_id).assert_contained()

@@ -33,6 +33,7 @@ from issue_orchestrator.entrypoints.bootstrap_executor import (
 )
 from issue_orchestrator.infra.hooks.hookspec import PROJECT_NAME, TerminalSpec
 from issue_orchestrator.infra.terminal_recording import TERMINAL_RECORDING_FILENAME
+from tests.process_tree_fixture import ProcessTreeMember
 from tests.unit.session_run_helpers import make_session_run_assets
 
 
@@ -132,20 +133,6 @@ def _await(requirement: Callable[[], bool]) -> None:
             return
         time.sleep(0.01)
     raise AssertionError("terminal session lifecycle requirement was not observed")
-
-
-def _process_is_executable(process_id: int) -> bool:
-    try:
-        os.kill(process_id, 0)
-    except ProcessLookupError:
-        return False
-    status = subprocess.run(
-        ("ps", "-o", "stat=", "-p", str(process_id)),
-        check=False,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    return bool(status) and not status.startswith("Z")
 
 
 def _recording_contains(recording_path: Path, payload: bytes) -> bool:
@@ -277,8 +264,8 @@ def test_interactive_guardian_survives_outer_crash_until_its_deadline(
         continue_path.write_text("continue\n", encoding="utf-8")
 
         _await(survived_path.exists)
-        assert _process_is_executable(opaque_process_id)
-        _await(lambda: not _process_is_executable(opaque_process_id))
+        assert ProcessTreeMember(opaque_process_id).is_executable()
+        ProcessTreeMember(opaque_process_id).assert_contained()
 
         follower = subprocess.run(
             (
@@ -350,7 +337,7 @@ def test_session_stop_contains_executor_guardian_and_opaque_command(
 
         stopping_runner.kill_session(7017, session_name)
 
-        assert not _process_is_executable(opaque_process_id)
+        ProcessTreeMember(opaque_process_id).assert_contained()
         assert not tuple((pool_dir / "leases").glob("*.json"))
         assert not (run_dir / EXECUTOR_SESSION_CANCELLATION_FILENAME).exists()
         assert not stopping_runner.session_exists(7017, session_name)
@@ -397,7 +384,7 @@ def test_stalled_outer_session_cannot_strand_executor_guardian(
         os.killpg(outer_process_id, signal.SIGSTOP)
         runner.kill_session(7017, "stalled-outer-stop")
 
-        assert not _process_is_executable(opaque_process_id)
+        ProcessTreeMember(opaque_process_id).assert_contained()
         assert not (run_dir / EXECUTOR_SESSION_CANCELLATION_FILENAME).exists()
         assert not runner.session_exists(7017, "stalled-outer-stop")
         follower = subprocess.run(

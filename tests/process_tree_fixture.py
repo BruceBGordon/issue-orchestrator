@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+
+_CONTAINMENT_WATCHDOG_SECONDS = 30.0
+_CONTAINMENT_POLL_SECONDS = 0.05
+_PROCESS_STATE_PROBE_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,9 +21,13 @@ class TermResistantChildProgram:
     lifetime_seconds: int
 
     def __post_init__(self) -> None:
-        if type(self.lifetime_seconds) is not int or self.lifetime_seconds <= 0:
+        if (
+            type(self.lifetime_seconds) is not int
+            or self.lifetime_seconds <= _CONTAINMENT_WATCHDOG_SECONDS
+        ):
             raise ValueError(
-                "TermResistantChildProgram.lifetime_seconds must be positive"
+                "TermResistantChildProgram.lifetime_seconds must exceed the "
+                "containment watchdog"
             )
 
     def python_source(self) -> str:
@@ -27,6 +39,79 @@ class TermResistantChildProgram:
             "print(os.getpid(), flush=True)\n"
             f"time.sleep({self.lifetime_seconds})\n"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessTreeMember:
+    """Portable containment observation for one real fixture process."""
+
+    process_id: int
+
+    def __post_init__(self) -> None:
+        if type(self.process_id) is not int or self.process_id <= 1:
+            raise ValueError("ProcessTreeMember.process_id must be an integer above 1")
+
+    def is_executable(self) -> bool:
+        """Return false for an absent process or a non-executable zombie."""
+        return self._is_executable(_PROCESS_STATE_PROBE_TIMEOUT_SECONDS)
+
+    def _is_executable(self, probe_timeout_seconds: float) -> bool:
+        try:
+            os.kill(self.process_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError as error:
+            raise AssertionError(
+                f"cannot observe fixture process {self.process_id}"
+            ) from error
+        try:
+            observation = subprocess.run(
+                ("ps", "-o", "stat=", "-p", str(self.process_id)),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=probe_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError(
+                f"ps did not observe fixture process {self.process_id} within "
+                f"{probe_timeout_seconds:.3f} seconds"
+            ) from error
+        status = observation.stdout.strip()
+        if observation.returncode == 0 and status:
+            return not status.startswith("Z")
+        try:
+            os.kill(self.process_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError as error:
+            raise AssertionError(
+                f"cannot observe fixture process {self.process_id}"
+            ) from error
+        if observation.returncode == 0:
+            raise AssertionError(
+                f"ps returned no state for fixture process {self.process_id}"
+            )
+        raise AssertionError(
+            f"ps failed for fixture process {self.process_id}: "
+            f"returncode={observation.returncode} stderr={observation.stderr!r}"
+        )
+
+    def assert_contained(self) -> None:
+        """Wait until this member is absent or unable to execute user code."""
+        watchdog_deadline = time.monotonic() + _CONTAINMENT_WATCHDOG_SECONDS
+        while True:
+            remaining_seconds = watchdog_deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise AssertionError(
+                    f"fixture process {self.process_id} remained executable "
+                    f"for {_CONTAINMENT_WATCHDOG_SECONDS:.0f} seconds"
+                )
+            if not self._is_executable(
+                min(_PROCESS_STATE_PROBE_TIMEOUT_SECONDS, remaining_seconds)
+            ):
+                return
+            time.sleep(min(_CONTAINMENT_POLL_SECONDS, remaining_seconds))
 
 
 @dataclass(frozen=True, slots=True)

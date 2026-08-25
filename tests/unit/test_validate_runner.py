@@ -47,6 +47,7 @@ from issue_orchestrator.ports.process_group_supervisor import (
 from tests.process_tree_fixture import (
     CooperativeTermResistantProcessTreeProgram,
     ExitingTermResistantProcessTreeProgram,
+    ProcessTreeMember,
 )
 from tests.unit.threading_helpers import run_in_thread
 
@@ -384,7 +385,7 @@ class TestValidateRunner:
         child_pid_path = (tmp_path / "validation-child.pid").resolve()
         cooperative_leader = CooperativeTermResistantProcessTreeProgram(
             child_pid_path,
-            30,
+            300,
             (
                 "[validate-timing] START target=duplicate at=one",
                 "[validate-timing] START target=duplicate at=two",
@@ -413,8 +414,7 @@ class TestValidateRunner:
             )
 
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-        with pytest.raises(ProcessLookupError):
-            os.kill(child_pid, 0)
+        ProcessTreeMember(child_pid).assert_contained()
         sampler_threads_after = {
             thread.ident
             for thread in threading.enumerate()
@@ -448,7 +448,7 @@ class TestValidateRunner:
         child_pid_path = (tmp_path / "cleanup-failure-child.pid").resolve()
         cooperative_leader = CooperativeTermResistantProcessTreeProgram(
             child_pid_path,
-            30,
+            300,
             (
                 "[validate-timing] START target=duplicate at=one",
                 "[validate-timing] START target=duplicate at=two",
@@ -483,8 +483,7 @@ class TestValidateRunner:
             )
 
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-        with pytest.raises(ProcessLookupError):
-            os.kill(child_pid, 0)
+        ProcessTreeMember(child_pid).assert_contained()
         sampler_threads_after = {
             thread.ident
             for thread in threading.enumerate()
@@ -592,8 +591,7 @@ class TestValidateRunner:
 
         assert completed_before_descendant_release
         assert validation_result.unwrap() == 0
-        with pytest.raises(ProcessLookupError):
-            os.kill(descendant_pid, 0)
+        ProcessTreeMember(descendant_pid).assert_contained()
 
     def test_appends_resource_samples_to_shared_git_dir(self, fake_git_repo: Path):
         """Validate runs should persist periodic resource samples."""

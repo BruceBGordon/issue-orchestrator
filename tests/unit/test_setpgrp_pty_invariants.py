@@ -30,6 +30,8 @@ import time
 
 import pytest
 
+from tests.process_tree_fixture import ProcessTreeMember
+
 
 @pytest.mark.xdist_group("pty")
 class TestSetpgrpPreservesControllingTerminal:
@@ -214,10 +216,8 @@ class TestSetpgrpKillpgIsolation:
         os.killpg(pgid, signal.SIGTERM)
         proc.wait(timeout=5)
 
-        # Grandchild should also be dead
-        time.sleep(0.2)
-        with pytest.raises(ProcessLookupError):
-            os.kill(grandchild_pid, 0)
+        # Grandchild should also be unable to execute user code.
+        ProcessTreeMember(grandchild_pid).assert_contained()
 
 
 def _agent_preexec() -> None:

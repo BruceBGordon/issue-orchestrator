@@ -6,7 +6,6 @@ import os
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -27,24 +26,11 @@ from issue_orchestrator.execution.process_group_terminator import (
 from tests.process_tree_fixture import (
     CooperativeTermResistantProcessTreeProgram,
     ExitingTermResistantProcessTreeProgram,
+    ProcessTreeMember,
 )
 
 
-pytestmark = pytest.mark.timeout(30)
-
-
-def _pid_has_exited(pid: int, *, deadline_seconds: float = 5.0) -> bool:
-    """Bounded kernel observation for a reparented real subprocess."""
-    deadline = time.monotonic() + deadline_seconds
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            return False
-        time.sleep(0.01)
-    return False
+pytestmark = pytest.mark.timeout(45)
 
 
 def test_term_resistant_descendant_dies_when_cooperative_leader_exits(
@@ -83,9 +69,7 @@ def test_term_resistant_descendant_dies_when_cooperative_leader_exits(
         termination = terminator.terminate(OwnedProcessGroupLeader(process.pid))
         process.returncode = termination.leader_exit_code
         assert process.returncode == 0
-        assert _pid_has_exited(descendant_pid), (
-            f"TERM-resistant descendant {descendant_pid} survived its leader"
-        )
+        ProcessTreeMember(descendant_pid).assert_contained()
     finally:
         try:
             os.kill(descendant_pid, signal.SIGKILL)
@@ -105,7 +89,7 @@ def test_natural_leader_exit_contains_descendant_before_reaping(
     descendant_pid_path = (tmp_path / "natural-descendant.pid").resolve()
     natural_leader = ExitingTermResistantProcessTreeProgram(
         descendant_pid_path,
-        30,
+        300,
         0,
     )
     process = subprocess.Popen(
@@ -134,7 +118,7 @@ def test_natural_leader_exit_contains_descendant_before_reaping(
         assert type(supervision) is ProcessGroupCompleted
         assert process.returncode == 0
         descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
-        assert _pid_has_exited(descendant_pid)
+        ProcessTreeMember(descendant_pid).assert_contained()
     finally:
         if descendant_pid_path.exists():
             descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
