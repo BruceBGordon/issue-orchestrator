@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta
+from collections.abc import Iterator
 import socket
 import time
 from threading import Thread
@@ -34,6 +35,17 @@ class FlowWebDeps:
     timeline_store: SqliteTimelineStore
     timeline_reader: DefaultTimelineReader
     publish_recovery: MagicMock
+
+
+@dataclass(frozen=True, slots=True)
+class TwoAgentWebServer:
+    """Typed test-scoped view of a dashboard serving two stable agents."""
+
+    url: str
+
+    def __post_init__(self) -> None:
+        if type(self.url) is not str or not self.url:
+            raise ValueError("TwoAgentWebServer.url must not be empty")
 
 
 def find_free_port() -> int:
@@ -399,6 +411,35 @@ def web_server(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
     finally:
         server.stop()
         web_module.set_orchestrator(original)
+
+
+@pytest.fixture
+def two_agent_web_server(
+    web_server: dict[str, object],
+) -> Iterator[TwoAgentWebServer]:
+    """Keep server and refresh payloads on one two-agent source of truth."""
+    orchestrator = web_server["orchestrator"]
+    url = web_server["url"]
+    if type(orchestrator) is not FlowWebMockOrchestrator:
+        raise ValueError(
+            "two_agent_web_server requires a FlowWebMockOrchestrator"
+        )
+    if type(url) is not str or not url:
+        raise ValueError("two_agent_web_server requires a non-empty URL")
+    previous_agents = orchestrator.config.agents
+    web_agent = previous_agents["agent:web"]
+    orchestrator.config.agents = {
+        "agent:web": web_agent,
+        "agent:vscode": AgentConfig(
+            prompt_path=Path("/tmp/vscode-prompt.txt"),
+            model="sonnet",
+            timeout_minutes=45,
+        ),
+    }
+    try:
+        yield TwoAgentWebServer(url)
+    finally:
+        orchestrator.config.agents = previous_agents
 
 
 # ---------------------------------------------------------------------------

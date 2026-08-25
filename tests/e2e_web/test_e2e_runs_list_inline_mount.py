@@ -19,15 +19,74 @@ end-to-end live-pipeline proof.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 import json
+from typing import Protocol
 
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 
 _RUN_ID = 7777
+
+
+class _TwoAgentWebServer(Protocol):
+    """Typed fixture surface needed by the row-scoping smoke test."""
+
+    url: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CreateIssuesRequest:
+    """Strict request captured by the row-scoping browser smoke test."""
+
+    agent: str
+    nodeids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.agent) is not str or not self.agent:
+            raise ValueError("_CreateIssuesRequest.agent must not be empty")
+        if type(self.nodeids) is not tuple or not self.nodeids or any(
+            type(nodeid) is not str or not nodeid for nodeid in self.nodeids
+        ):
+            raise ValueError(
+                "_CreateIssuesRequest.nodeids must contain non-empty strings"
+            )
+
+    @classmethod
+    def from_json(cls, payload: str) -> _CreateIssuesRequest:
+        decoded: object = json.loads(payload)
+        if type(decoded) is not dict:
+            raise ValueError("create-issues request must be a JSON object")
+        agent = decoded.get("agent")
+        nodeids = decoded.get("nodeids")
+        if type(agent) is not str:
+            raise ValueError("create-issues request agent must be a string")
+        if type(nodeids) is not list or any(
+            type(nodeid) is not str for nodeid in nodeids
+        ):
+            raise ValueError(
+                "create-issues request nodeids must be an array of strings"
+            )
+        return cls(agent, tuple(nodeids))
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedCreateIssuesCall:
+    """URL plus its strongly typed create-issues request."""
+
+    url: str
+    request: _CreateIssuesRequest
+
+    def __post_init__(self) -> None:
+        if type(self.url) is not str or not self.url:
+            raise ValueError("_CapturedCreateIssuesCall.url must not be empty")
+        if type(self.request) is not _CreateIssuesRequest:
+            raise ValueError(
+                "_CapturedCreateIssuesCall.request must be _CreateIssuesRequest"
+            )
 
 
 _STUB_RUN_DETAIL: dict[str, object] = {
@@ -621,7 +680,7 @@ def test_open_e2e_run_command_reroutes_to_row_expansion_not_modal(
 
 def test_create_issues_for_untriaged_uses_row_scoped_agent_and_run_id(
     page: Page,
-    web_server: dict[str, object],
+    two_agent_web_server: _TwoAgentWebServer,
 ) -> None:
     """End-to-end click-through proves the ``create_e2e_untriaged_issues``
     typed Command resolves the agent + nodeids + run_id from the
@@ -689,14 +748,18 @@ def test_create_issues_for_untriaged_uses_row_scoped_agent_and_run_id(
     # Intercept the bulk-create endpoint and capture every body the
     # frontend sent. ``page.expect_response`` waits until the route
     # handler has captured and fulfilled the POST.
-    create_calls: list[dict[str, object]] = []
+    create_calls: list[_CapturedCreateIssuesCall] = []
 
-    def _route_create(route):
-        try:
-            body = json.loads(route.request.post_data or "{}")
-        except Exception:
-            body = {"_raw": route.request.post_data}
-        create_calls.append({"url": route.request.url, "body": body})
+    def _route_create(route: Route) -> None:
+        post_data = route.request.post_data
+        if post_data is None:
+            raise ValueError("create-issues request must carry a JSON body")
+        create_calls.append(
+            _CapturedCreateIssuesCall(
+                route.request.url,
+                _CreateIssuesRequest.from_json(post_data),
+            )
+        )
         route.fulfill(
             status=200,
             content_type="application/json",
@@ -713,31 +776,36 @@ def test_create_issues_for_untriaged_uses_row_scoped_agent_and_run_id(
     # no-op (otherwise Playwright opens a real popup tab).
     page.add_init_script("window.open = () => null;")
 
-    _goto_dashboard_e2e_tab(page, str(web_server["url"]))
-    # Override ``dashboardData.agents`` AFTER the dashboard's inline
-    # script runs (an ``add_init_script`` write to dashboardData gets
-    # clobbered by the template's own ``window.dashboardData = ...``).
-    # The runs-list renderer reads ``dashboardData.agents`` at
-    # banner-render time, so this has to land before ``renderE2ERunsList``.
+    _goto_dashboard_e2e_tab(page, two_agent_web_server.url)
+    # Both the initial page and every background view-model refresh now carry
+    # the same two-agent server truth. The earlier browser-only override raced
+    # an ordinary refresh and could remove ``agent:vscode`` between the two
+    # asynchronous detail renders.
     page.evaluate(
-        f"""(payload) => {{
-            window.dashboardData = window.dashboardData || {{}};
-            window.dashboardData.agents = ['agent:web', 'agent:vscode'];
+        """(payload) => {
             window.REPO_ROOT = window.REPO_ROOT || '/tmp/repo';
             window.CONFIG_NAME = window.CONFIG_NAME || 'default.yaml';
             const container = document.querySelector('#panel-e2e')
                 || document.querySelector('main')
                 || document.body;
-            if (!document.getElementById('e2eRunsListRoot')) {{
+            if (!document.getElementById('e2eRunsListRoot')) {
                 const root = document.createElement('div');
                 root.id = 'e2eRunsListRoot';
                 container.appendChild(root);
-            }}
+            }
             const root = document.getElementById('e2eRunsListRoot');
             root.innerHTML = window.renderE2ERunsList(payload);
-        }}""",
+        }""",
         _STUB_RECENT_RUNS_PAYLOAD,
     )
+    # Force the previously racy refresh boundary before either async detail
+    # render. The server must republish the same agents, not erase the second
+    # option as the old browser-only override did.
+    page.evaluate("() => refreshViewModel({reloadOnListChange: false})")
+    assert page.evaluate("() => window.dashboardData.agents") == [
+        "agent:web",
+        "agent:vscode",
+    ]
 
     row_a = page.locator(f"details.e2e-run-row[data-e2e-run-id='{run_a_id}']")
     row_b = page.locator(f"details.e2e-run-row[data-e2e-run-id='{run_b_id}']")
@@ -771,19 +839,23 @@ def test_create_issues_for_untriaged_uses_row_scoped_agent_and_run_id(
 
     # Exactly one POST fired, against row A's run id, with row A's
     # agent + row A's untriaged nodeids.  Row B's URL never hit.
-    a_calls = [c for c in create_calls if f"/create-issues/{run_a_id}" in c["url"]]
-    b_calls = [c for c in create_calls if f"/create-issues/{run_b_id}" in c["url"]]
+    a_calls = [
+        call for call in create_calls if f"/create-issues/{run_a_id}" in call.url
+    ]
+    b_calls = [
+        call for call in create_calls if f"/create-issues/{run_b_id}" in call.url
+    ]
     assert len(a_calls) == 1, f"expected 1 POST to row A's URL, got: {create_calls}"
     assert not b_calls, f"row B must not be touched; saw: {create_calls}"
 
-    a_body = a_calls[0]["body"]
-    assert a_body["agent"] == "agent:web", (
+    a_request = a_calls[0].request
+    assert a_request.agent == "agent:web", (
         f"create-issues POST carried wrong agent — handler resolved against a "
-        f"different row's select? got: {a_body!r}"
+        f"different row's select? got: {a_request!r}"
     )
-    assert a_body["nodeids"] == ["tests/row_a.py::test_alpha"], (
+    assert a_request.nodeids == ("tests/row_a.py::test_alpha",), (
         f"create-issues POST carried wrong nodeids — handler resolved against a "
-        f"different row's detail? got: {a_body!r}"
+        f"different row's detail? got: {a_request!r}"
     )
 
     assert not errors, f"unexpected page errors: {errors}"
