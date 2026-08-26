@@ -335,15 +335,18 @@ class SqliteTerminalSessionRegistry:
     def remove(self, session_name: str) -> None:
         self._delete_named("sessions", session_name)
 
+    _DELETE_STATEMENTS = {
+        "pending_sessions": "DELETE FROM pending_sessions WHERE session_name = ?",
+        "sessions": "DELETE FROM sessions WHERE session_name = ?",
+    }
+
     def _delete_named(self, table: str, session_name: str) -> None:
-        if table not in {"pending_sessions", "sessions"}:
+        statement = self._DELETE_STATEMENTS.get(table)
+        if statement is None:
             raise ValueError("terminal registry table is a closed set")
         try:
             with self._connect() as conn:
-                conn.execute(
-                    f"DELETE FROM {table} WHERE session_name = ?",  # noqa: S608
-                    (session_name,),
-                )
+                conn.execute(statement, (session_name,))
                 conn.commit()
         except sqlite3.DatabaseError as exc:
             raise TerminalSessionRegistryError(

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
@@ -43,17 +42,17 @@ from .bootstrap_claims import (
 from .bootstrap_dependencies import Dependencies as Dependencies
 from .bootstrap_executor import (
     build_agent_phase_command_scheduler,
+    build_executor as build_executor,
+    build_executor_child_resource_observer as build_executor_child_resource_observer,
+    build_terminal_session_terminator as build_terminal_session_terminator,
     build_contained_command_capture as build_contained_command_capture,
     build_executor_monitor as build_executor_monitor,
-    build_process_group_observer,
     build_process_group_supervisor as build_process_group_supervisor,
     build_posix_process_launcher as build_posix_process_launcher,
     build_terminal_session_owner,
     build_terminal_session_registry,
     build_terminal_session_watcher_factory,
     build_validation_command_runner as build_validation_command_runner,
-    compose_terminal_session_terminator,
-    compose_executor,
     terminal_session_watcher_policy,
 )
 from .bootstrap_pair_registry import build_pair_registry_with_worktree_hook
@@ -76,12 +75,9 @@ from .bootstrap_completion import (
 from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import GitRepoError, get_repo_from_git
-from ..adapters.host_cpu_utilization import SystemHostCpuUtilizationObserver
-from ..ports.executor_child_resources import ExecutorChildResourceObserver
 from ..ports.event_sink import EventSink, NullEventSink
 from ..ports.issue_tracker import IssueTracker
 from ..ports.session_runner import SessionRunner, NullSessionRunner
-from ..ports.terminal_session_terminator import TerminalSessionTerminator
 from ..ports.timeline_reader import NullTimelineReader
 from ..ports.timeline_store import NullTimelineStore, TimelineStore
 from ..infra.pause_journal import PAUSE_JOURNAL_FILENAME, JsonlPauseJournal
@@ -117,17 +113,12 @@ from ..control.governed_label_set import GovernedLabelSet
 from ..control.fact_gatherer import FactGatherer
 from ..control.health_gate import HealthGate
 from ..adapters.github import (
-    GitHubAuth,
     GitHubIssueResolver,
-    GitHubCache,
-    build_github_auth,
 )
 from ..adapters.github.ref_claim_adapter import (
     GitHubRefClaimAdapter,
     GitHubRefRunLedgerAdapter,
 )
-from ..execution.verification_service import DefaultVerificationService
-from ..ports.verification import VerificationBudget
 from ..execution.worktree_adapter import GitWorktreeManager
 from ..execution.git_working_copy import GitWorkingCopy
 from ..execution.command_runner import LocalCommandRunner
@@ -154,7 +145,14 @@ from ..control.workflows import (
     TechLeadWorkflow,
 )
 from ..control.worktree_manager import extract_issue_branches
-from ..infra import gh_audit, runtime_identity
+from ..infra import runtime_identity
+from .bootstrap_adapters import (
+    _configure_gh_audit,
+    _create_github_adapter,
+    _create_github_auth,
+    _create_io_adapters,
+    create_attempt_store,
+)
 from .bootstrap_tech_lead import (
     create_board_snapshot_builder,
     create_tech_lead_composition,
@@ -168,7 +166,6 @@ from ..control.tech_lead_run_ownership import TechLeadRunOwnership
 from ..ports.claim_manager import ClaimManager, NullClaimManager
 from ..ports.run_ledger_store import SingleInstanceRunLedgerStore
 from ..domain.lease_config import LeaseConfig
-from ..ports.executor import Executor
 
 if TYPE_CHECKING:
     from ..ports.label_set import LabelSet
@@ -177,68 +174,15 @@ if TYPE_CHECKING:
     from ..control.completion_processor import CompletionProcessor
     from ..control.publish_recovery import PublishRecoveryService
     from ..ports.fresh_issue_reader import FreshIssueReader
-    from ..ports.attempt_store import AttemptStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
 
 logger = logging.getLogger(__name__)
 
 
-def build_terminal_session_terminator() -> TerminalSessionTerminator:
-    """Compose the portable process observer and terminal containment owner."""
-    return compose_terminal_session_terminator(build_process_group_observer())
 
-
-def build_executor() -> Executor:
-    """Choose the system CPU observer at the sole adapter-aware root."""
-    return compose_executor(SystemHostCpuUtilizationObserver())
-
-
-def build_executor_child_resource_observer() -> ExecutorChildResourceObserver:
-    """Choose isolated guardian child-resource accounting at the sole root."""
-    from ..execution.executor_child_resources import (
-        SystemExecutorChildResourceObserver,
-    )
-
-    return SystemExecutorChildResourceObserver()
 
 
 _AGENT_PHASE_COMMAND_SCHEDULER = build_agent_phase_command_scheduler()
-
-
-def _create_github_auth(repo: str, config: Config) -> GitHubAuth:
-    """Create the shared GitHub auth owner for API and git transport."""
-    return build_github_auth(
-        **config.github_auth_kwargs(),
-        repo=repo,
-        api_url=config.github_api_url,
-        timeout_seconds=float(config.github_http_timeout_seconds),
-    )
-
-
-def _create_github_adapter(
-    repo: str, config: Config, auth: GitHubAuth
-) -> GitHubAdapter:
-    """Create GitHub adapter with cache and verification service."""
-    cache_ttl = float(max(0, getattr(config, "fetch_layer_network_sync_seconds", 0)))
-    github_cache = GitHubCache(default_ttl=cache_ttl)
-
-    default_budget = VerificationBudget(
-        timeout_seconds=config.gh_write_verify_timeout_seconds,
-        max_attempts=20,
-        initial_delay_ms=config.gh_write_verify_initial_delay_ms,
-        max_delay_ms=config.gh_write_verify_max_delay_ms,
-        backoff_factor=config.gh_write_verify_backoff,
-        jitter_ms=config.gh_write_verify_jitter_ms,
-    )
-    verification_service = DefaultVerificationService(default_budget=default_budget)
-
-    return GitHubAdapter(
-        repo,
-        config=config,
-        cache=github_cache,
-        verification_service=verification_service,
-        auth=auth,
-    )
 
 
 def _setup_event_sinks(
@@ -258,34 +202,6 @@ def _setup_event_sinks(
         events = base_events
     events = SequencedEventSink(events)
     return events, event_hub
-
-
-def _configure_gh_audit(
-    config: Config,
-    events: EventSink,
-    github: GitHubAdapter | None,
-) -> None:
-    """Configure GitHub audit logging."""
-    gh_audit.set_event_sink(events)
-    if github:
-        gh_audit.set_rate_limit_fetcher(github.get_rate_limit_snapshot)
-    gh_audit.configure(
-        enabled=config.gh_audit_enabled,
-        include_events=config.gh_audit_events,
-        audit_path=config.gh_audit_file,
-    )
-    gh_audit.configure_rate_limit(
-        every_calls=config.gh_rate_limit_every_calls,
-        warn_fraction=config.gh_rate_limit_warn_fraction,
-        warn_remaining=config.gh_rate_limit_warn_remaining,
-    )
-    if config.gh_rate_limit_startup:
-        rl_start = time.time()
-        gh_audit.check_rate_limit("startup")
-        logger.info(
-            "[STARTUP_TIMING] phase=gh_rate_limit_probe elapsed=%.3fs",
-            time.time() - rl_start,
-        )
 
 
 def _create_claim_components(
@@ -406,30 +322,6 @@ def _create_planner(
         label_manager=label_manager,
     )
     return planner, scheduler, dependency_evaluator, label_sync
-
-
-def _create_io_adapters(
-    github_auth: GitHubAuth | None = None,
-) -> tuple[
-    GitWorktreeManager,
-    GitWorkingCopy,
-    LocalCommandRunner,
-    FileSystemSessionOutput,
-]:
-    """Create IO adapter instances."""
-    return (
-        GitWorktreeManager(),
-        GitWorkingCopy(git_auth=github_auth),
-        LocalCommandRunner(),
-        FileSystemSessionOutput(),
-    )
-
-
-def create_attempt_store(config: Config) -> "AttemptStore":
-    """Create the attempt store for this repository."""
-    from ..adapters.sidecar_attempt_store import SidecarAttemptStore
-
-    return SidecarAttemptStore(config.repo_root)
 
 
 def _wire_stack_publish_gate(

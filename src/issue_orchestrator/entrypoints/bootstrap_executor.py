@@ -30,6 +30,7 @@ from ..ports.agent_phase_command_scheduler import AgentPhaseCommandScheduler
 from ..ports.atomic_record_store import AtomicRecordStoreFactory
 from ..ports.contained_command import ContainedCommandCapture
 from ..ports.executor import Executor
+from ..ports.executor_child_resources import ExecutorChildResourceObserver
 from ..ports.executor_command_guardian import ExecutorCommandGuardian
 from ..ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ..ports.executor_monitor import ExecutorMonitor
@@ -538,3 +539,24 @@ def _raise_missing_posix_executor_dependency(exc: ModuleNotFoundError) -> None:
         "the pooled host executor requires POSIX fcntl and resource support; "
         "use executor-run-direct explicitly for unpooled execution"
     ) from exc
+
+
+def build_terminal_session_terminator() -> TerminalSessionTerminator:
+    """Compose the portable process observer and terminal containment owner."""
+    return compose_terminal_session_terminator(build_process_group_observer())
+
+
+def build_executor() -> Executor:
+    """Choose the system CPU observer at an adapter-aware composition root."""
+    from ..adapters.host_cpu_utilization import SystemHostCpuUtilizationObserver
+
+    return compose_executor(SystemHostCpuUtilizationObserver())
+
+
+def build_executor_child_resource_observer() -> ExecutorChildResourceObserver:
+    """Choose isolated guardian child-resource accounting at the root."""
+    from ..execution.executor_child_resources import (
+        SystemExecutorChildResourceObserver,
+    )
+
+    return SystemExecutorChildResourceObserver()
