@@ -12,6 +12,8 @@ layer_boundaries:
     allow:
       # bootstrap.py is the composition root - it wires adapters to protocols
       - src/issue_orchestrator/entrypoints/bootstrap.py
+      # bootstrap_executor.py is the host-executor composition root
+      - src/issue_orchestrator/entrypoints/bootstrap_executor.py
       # provider factory (when introduced) is part of composition wiring
       - src/issue_orchestrator/entrypoints/repository_host_factory.py
   - name: core_no_github_adapter_imports
