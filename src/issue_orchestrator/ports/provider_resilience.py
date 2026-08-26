@@ -98,6 +98,22 @@ class ProviderCircuitState:
 
 
 @dataclass(frozen=True)
+class ProviderEvidenceWatermarks:
+    """Durable chronology for provider-call evidence.
+
+    This ledger is deliberately separate from :class:`ProviderCircuitState`.
+    A confirmed healthy provider has no active circuit row, but its success
+    observation must survive so a late, older failure cannot reopen the
+    circuit after completion effects drain out of order.
+    """
+
+    provider: str
+    success_observed_at: datetime | None = None
+    transient_failure_observed_at: datetime | None = None
+    quota_failure_observed_at: datetime | None = None
+
+
+@dataclass(frozen=True)
 class ProviderCircuitStatus:
     """Derived, point-in-time read model of a provider's circuit.
 
@@ -159,7 +175,7 @@ NO_PROVIDER_CIRCUIT_STATUS: StaticProviderCircuitStatusReader = (
 
 
 class ProviderCircuitStore(Protocol):
-    """Persistence for provider circuit breaker state."""
+    """Persistence for active circuits and their durable evidence ledger."""
 
     def get(self, provider: str) -> ProviderCircuitState | None:
         ...
@@ -173,12 +189,24 @@ class ProviderCircuitStore(Protocol):
     def delete(self, provider: str) -> None:
         ...
 
+    def get_evidence(self, provider: str) -> ProviderEvidenceWatermarks | None:
+        ...
+
+    def save_reduction(
+        self,
+        evidence: ProviderEvidenceWatermarks,
+        state: ProviderCircuitState | None,
+    ) -> None:
+        """Atomically persist evidence and its resulting active circuit state."""
+        ...
+
 
 class InMemoryProviderCircuitStore:
     """In-memory store for tests."""
 
     def __init__(self) -> None:
         self._states: dict[str, ProviderCircuitState] = {}
+        self._evidence: dict[str, ProviderEvidenceWatermarks] = {}
 
     def get(self, provider: str) -> ProviderCircuitState | None:
         return self._states.get(provider)
@@ -191,3 +219,17 @@ class InMemoryProviderCircuitStore:
 
     def delete(self, provider: str) -> None:
         self._states.pop(provider, None)
+
+    def get_evidence(self, provider: str) -> ProviderEvidenceWatermarks | None:
+        return self._evidence.get(provider)
+
+    def save_reduction(
+        self,
+        evidence: ProviderEvidenceWatermarks,
+        state: ProviderCircuitState | None,
+    ) -> None:
+        self._evidence[evidence.provider] = evidence
+        if state is None:
+            self._states.pop(evidence.provider, None)
+        else:
+            self._states[state.provider] = state

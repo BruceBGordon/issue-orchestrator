@@ -42,6 +42,14 @@ class ProviderStatus:
 
     @classmethod
     def from_dict(cls, data: dict) -> "ProviderStatus":
+        try:
+            last_attempt_at = data["last_attempt_at"]
+        except KeyError as exc:
+            raise ValueError(
+                "provider status must include last_attempt_at"
+            ) from exc
+        if not isinstance(last_attempt_at, str):
+            raise ValueError("provider status last_attempt_at must be a string")
         error_type = data.get("error_type")
         parsed_error_type = None
         if error_type:
@@ -57,7 +65,7 @@ class ProviderStatus:
             exit_code=data.get("exit_code"),
             timed_out=bool(data.get("timed_out", False)),
             last_error_summary=data.get("last_error_summary"),
-            last_attempt_at=data.get("last_attempt_at", now_iso()),
+            last_attempt_at=last_attempt_at,
         )
 
 

@@ -312,6 +312,40 @@ class TestSessionControllerTerminated:
 
         assert provider_success_from_status(status) is None
 
+    def test_provider_status_missing_observation_time_fails_loudly(self) -> None:
+        """Persisted recovery evidence must never fabricate a fresh timestamp."""
+        with pytest.raises(
+            ValueError, match="provider status must include last_attempt_at"
+        ):
+            ProviderStatus.from_dict(
+                {
+                    "provider": "codex",
+                    "succeeded": True,
+                    "attempts": 1,
+                }
+            )
+
+    @pytest.mark.parametrize(
+        "last_attempt_at",
+        ["not-a-timestamp", "2026-08-26T00:20:00"],
+    )
+    def test_provider_success_invalid_observation_time_fails_loudly(
+        self, last_attempt_at: str
+    ) -> None:
+        status = ProviderStatus(
+            provider="codex",
+            error_type=None,
+            attempts=1,
+            succeeded=True,
+            exit_code=0,
+            timed_out=False,
+            last_error_summary=None,
+            last_attempt_at=last_attempt_at,
+        )
+
+        with pytest.raises(ValueError, match="last_attempt_at"):
+            provider_success_from_status(status)
+
     def test_provider_success_is_returned_as_decision_effect(
         self,
         tmp_path: Path,

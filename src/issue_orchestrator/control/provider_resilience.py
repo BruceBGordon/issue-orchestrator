@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 
 from ..events import EventName
 from ..ports import EventSink,  make_trace_event
@@ -11,12 +12,27 @@ from ..ports.provider_resilience import (
     ProviderCircuitState,
     ProviderCircuitStatus,
     ProviderCircuitStore,
+    ProviderEvidenceWatermarks,
 )
 from ..infra.config import ProviderResilienceConfig
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class _ProviderEvidenceKind(Enum):
+    SUCCESS = "success"
+    TRANSIENT_FAILURE = "transient_failure"
+    QUOTA_FAILURE = "quota_failure"
+
+
+@dataclass(frozen=True)
+class _EvidenceReduction:
+    evidence: ProviderEvidenceWatermarks
+    accepted: bool
+    clears_transient: bool = False
+    clears_quota: bool = False
 
 
 @dataclass(frozen=True)
@@ -29,6 +45,93 @@ class ProviderResilienceManager:
 
     def get_state(self, provider: str) -> ProviderCircuitState | None:
         return self.store.get(provider)
+
+    @staticmethod
+    def _require_observation_time(observed_at: datetime) -> None:
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("provider evidence observed_at must include a timezone")
+
+    @staticmethod
+    def _latest(
+        first: datetime | None, second: datetime | None
+    ) -> datetime | None:
+        if first is None:
+            return second
+        if second is None:
+            return first
+        return max(first, second)
+
+    def _evidence_for(
+        self, provider: str, state: ProviderCircuitState | None
+    ) -> ProviderEvidenceWatermarks:
+        """Load durable evidence and absorb active pre-ledger state."""
+        stored = self.store.get_evidence(provider)
+        return ProviderEvidenceWatermarks(
+            provider=provider,
+            success_observed_at=(
+                stored.success_observed_at if stored is not None else None
+            ),
+            transient_failure_observed_at=self._latest(
+                stored.transient_failure_observed_at if stored is not None else None,
+                state.transient_observed_at if state is not None else None,
+            ),
+            quota_failure_observed_at=self._latest(
+                stored.quota_failure_observed_at if stored is not None else None,
+                state.quota_observed_at if state is not None else None,
+            ),
+        )
+
+    def _reduce_evidence(
+        self,
+        provider: str,
+        *,
+        observed_at: datetime,
+        kind: _ProviderEvidenceKind,
+        state: ProviderCircuitState | None,
+    ) -> _EvidenceReduction:
+        """Reduce one provider fact monotonically, independent of apply order."""
+        self._require_observation_time(observed_at)
+        current = self._evidence_for(provider, state)
+        if kind is _ProviderEvidenceKind.SUCCESS:
+            if (
+                current.success_observed_at is not None
+                and observed_at <= current.success_observed_at
+            ):
+                return _EvidenceReduction(current, accepted=False)
+            return _EvidenceReduction(
+                replace(current, success_observed_at=observed_at),
+                accepted=True,
+                clears_transient=(
+                    current.transient_failure_observed_at is None
+                    or observed_at > current.transient_failure_observed_at
+                ),
+                clears_quota=(
+                    current.quota_failure_observed_at is None
+                    or observed_at > current.quota_failure_observed_at
+                ),
+            )
+
+        latest_failure = (
+            current.transient_failure_observed_at
+            if kind is _ProviderEvidenceKind.TRANSIENT_FAILURE
+            else current.quota_failure_observed_at
+        )
+        older_than_recovery = (
+            current.success_observed_at is not None
+            and observed_at < current.success_observed_at
+        )
+        duplicate_or_older_failure = (
+            latest_failure is not None and observed_at <= latest_failure
+        )
+        if older_than_recovery or duplicate_or_older_failure:
+            return _EvidenceReduction(current, accepted=False)
+        if kind is _ProviderEvidenceKind.TRANSIENT_FAILURE:
+            updated = replace(
+                current, transient_failure_observed_at=observed_at
+            )
+        else:
+            updated = replace(current, quota_failure_observed_at=observed_at)
+        return _EvidenceReduction(updated, accepted=True)
 
     def is_open(self, provider: str, now: datetime | None = None) -> bool:
         if not provider:
@@ -103,6 +206,14 @@ class ProviderResilienceManager:
 
         now = now or _now()
         state = self.store.get(provider)
+        reduction = self._reduce_evidence(
+            provider,
+            observed_at=now,
+            kind=_ProviderEvidenceKind.TRANSIENT_FAILURE,
+            state=state,
+        )
+        if not reduction.accepted:
+            return state
         consecutive = (state.consecutive_outages + 1) if state else 1
 
         multiplier = 2 ** max(0, min(consecutive - 1, self.config.circuit_breaker.max_cooldowns - 1))
@@ -131,7 +242,7 @@ class ProviderResilienceManager:
             ),
             quota_observed_at=state.quota_observed_at if state else None,
         )
-        self.store.save(new_state)
+        self.store.save_reduction(reduction.evidence, new_state)
 
         self.events.publish(make_trace_event(
             EventName.PROVIDER_TRANSIENT_ERROR,
@@ -295,6 +406,14 @@ class ProviderResilienceManager:
 
         now = now or _now()
         state = self.store.get(provider)
+        reduction = self._reduce_evidence(
+            provider,
+            observed_at=now,
+            kind=_ProviderEvidenceKind.QUOTA_FAILURE,
+            state=state,
+        )
+        if not reduction.accepted:
+            return state
         consecutive_quota = (state.consecutive_quota_failures + 1) if state else 1
         quota_open_until = now + timedelta(
             seconds=self.config.circuit_breaker.auth_cooldown_seconds
@@ -315,7 +434,7 @@ class ProviderResilienceManager:
             consecutive_quota_failures=consecutive_quota,
             quota_observed_at=now,
         )
-        self.store.save(new_state)
+        self.store.save_reduction(reduction.evidence, new_state)
 
         self.events.publish(make_trace_event(
             EventName.PROVIDER_QUOTA_EXHAUSTED,
@@ -398,6 +517,65 @@ class ProviderResilienceManager:
             ))
         return updated
 
+    @staticmethod
+    def _state_after_success(
+        state: ProviderCircuitState,
+        reduction: _EvidenceReduction,
+        now: datetime,
+    ) -> ProviderCircuitState | None:
+        """Apply accepted recovery evidence to active circuit causes."""
+        transient_active = (
+            state.transient_open_until is not None
+            or state.transient_observed_at is not None
+        )
+        transient_unknown = (
+            transient_active
+            and reduction.evidence.transient_failure_observed_at is None
+        )
+        preserve_transient = transient_active and (
+            transient_unknown or not reduction.clears_transient
+        )
+        quota_active = (
+            state.quota_open_until is not None
+            or state.quota_observed_at is not None
+        )
+        quota_unknown = (
+            quota_active and reduction.evidence.quota_failure_observed_at is None
+        )
+        preserve_quota = quota_active and (
+            quota_unknown or not reduction.clears_quota
+        )
+        auth_remains = (
+            state.auth_open_until is not None
+            or state.consecutive_auth_failures > 0
+        )
+        if not (preserve_transient or auth_remains or preserve_quota):
+            return None
+        return ProviderCircuitState(
+            provider=state.provider,
+            transient_open_until=(
+                state.transient_open_until if preserve_transient else None
+            ),
+            transient_observed_at=(
+                state.transient_observed_at if preserve_transient else None
+            ),
+            auth_open_until=state.auth_open_until,
+            consecutive_outages=(
+                state.consecutive_outages if preserve_transient else 0
+            ),
+            last_error_summary=state.last_error_summary,
+            updated_at=now,
+            consecutive_auth_failures=state.consecutive_auth_failures,
+            last_auth_sample_id=state.last_auth_sample_id,
+            quota_open_until=state.quota_open_until if preserve_quota else None,
+            consecutive_quota_failures=(
+                state.consecutive_quota_failures if preserve_quota else 0
+            ),
+            quota_observed_at=(
+                state.quota_observed_at if preserve_quota else None
+            ),
+        )
+
     def record_success(
         self,
         provider: str | None,
@@ -442,76 +620,24 @@ class ProviderResilienceManager:
         """
         if not provider:
             return None
-        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
-            raise ValueError("provider success observed_at must include a timezone")
         now = now or _now()
         state = self.store.get(provider)
-        if state is None:
-            return None
+        reduction = self._reduce_evidence(
+            provider,
+            observed_at=observed_at,
+            kind=_ProviderEvidenceKind.SUCCESS,
+            state=state,
+        )
+        if not reduction.accepted:
+            return state
 
         was_open = self._is_open_state(state, now)
-        transient_cause_exists = (
-            state.transient_open_until is not None
-            or state.consecutive_outages > 0
-            or state.transient_observed_at is not None
+        updated = (
+            self._state_after_success(state, reduction, now)
+            if state is not None
+            else None
         )
-        transient_is_newer_than_success = transient_cause_exists and (
-            state.transient_observed_at is None
-            or observed_at <= state.transient_observed_at
-        )
-        quota_cause_exists = (
-            state.quota_open_until is not None
-            or state.consecutive_quota_failures > 0
-            or state.quota_observed_at is not None
-        )
-        quota_is_newer_than_success = quota_cause_exists and (
-            state.quota_observed_at is None
-            or observed_at <= state.quota_observed_at
-        )
-        updated: ProviderCircuitState | None = ProviderCircuitState(
-            provider=provider,
-            transient_open_until=(
-                state.transient_open_until
-                if transient_is_newer_than_success
-                else None
-            ),
-            # Untouched: a service call that succeeded says nothing about the
-            # credential, and the auth cause is retired by a READY probe only.
-            auth_open_until=state.auth_open_until,
-            transient_observed_at=(
-                state.transient_observed_at
-                if transient_is_newer_than_success
-                else None
-            ),
-            consecutive_outages=(
-                state.consecutive_outages if transient_is_newer_than_success else 0
-            ),
-            last_error_summary=state.last_error_summary,
-            updated_at=now,
-            consecutive_auth_failures=state.consecutive_auth_failures,
-            last_auth_sample_id=state.last_auth_sample_id,
-            # A completed call is positive allowance evidence only for quota
-            # observations older than itself. Preserve an equal/newer fact: an
-            # out-of-order completion must never re-admit exhausted work.
-            quota_open_until=(
-                state.quota_open_until if quota_is_newer_than_success else None
-            ),
-            consecutive_quota_failures=(
-                state.consecutive_quota_failures if quota_is_newer_than_success else 0
-            ),
-            quota_observed_at=(
-                state.quota_observed_at if quota_is_newer_than_success else None
-            ),
-        )
-        cause_remains = transient_is_newer_than_success or (
-            state.auth_open_until is not None or state.consecutive_auth_failures > 0
-        ) or quota_is_newer_than_success
-        if cause_remains:
-            self.store.save(updated)
-        else:
-            # Nothing is left to remember, and a healthy circuit has no row.
-            self.store.delete(provider)
-            updated = None
+        self.store.save_reduction(reduction.evidence, updated)
 
         if was_open and not self._is_open_state(updated, now):
             self.events.publish(make_trace_event(

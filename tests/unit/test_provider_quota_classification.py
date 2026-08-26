@@ -534,3 +534,6 @@ class TestQuotaPersistence:
         assert loaded.quota_observed_at == datetime(
             2026, 8, 26, 0, 10, tzinfo=timezone.utc
         )
+        evidence = store.get_evidence("codex")
+        assert evidence is not None
+        assert evidence.quota_failure_observed_at == loaded.quota_observed_at

@@ -2212,6 +2212,9 @@ def test_split_deadlines_survive_a_single_open_until_database(tmp_path: Path) ->
     assert state.transient_observed_at == datetime(
         2026, 8, 4, 22, 0, tzinfo=timezone.utc
     )
+    evidence = store.get_evidence("claude-code")
+    assert evidence is not None
+    assert evidence.transient_failure_observed_at == state.transient_observed_at
     assert state.auth_open_until is None
     assert state.open_until == state.transient_open_until
 
