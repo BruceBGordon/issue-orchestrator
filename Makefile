@@ -468,7 +468,12 @@ else
 endif
 
 test-simulated-agent: sync-deps
-ifeq ($(SIMULATED_PARALLEL),0)
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,test-simulated-agent,\
+		$(LANE_RUN) --backend condor --work-key test-simulated-agent --request-cpus 2 \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) test-simulated-agent LANE_EXECUTOR=direct)
+else ifeq ($(SIMULATED_PARALLEL),0)
 	$(call TIMED_RUN,test-simulated-agent,\
 		$(PYTEST) $(SIMULATED_AGENT_FILES) -x -q --tb=short $(PYTEST_TIMINGS))
 else
@@ -524,7 +529,12 @@ test-integration-core-live-codex: sync-deps
 test-integration-no-infra: test-integration-core
 
 test-integration-agent: sync-deps
-ifeq ($(INTEGRATION_AGENT_PARALLEL),0)
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,test-integration-agent,\
+		$(LANE_RUN) --backend condor --work-key test-integration-agent --request-cpus 4 \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) test-integration-agent LANE_EXECUTOR=direct)
+else ifeq ($(INTEGRATION_AGENT_PARALLEL),0)
 	$(call TIMED_RUN,test-integration-agent,\
 		$(PYTEST) $(INTEGRATION_AGENT_FILES) -x -q --tb=short $(PYTEST_TIMINGS))
 else
@@ -708,10 +718,23 @@ _validate-static-impl: typecheck lint-arch lint-complexity
 _validate-core-tests-impl: test-unit test-simulated-core test-integration-core-local
 
 _validate-pr-impl:
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,validate-pr-flat-phase,\
+		$(GMAKE) -j12 --output-sync=target _validate-pr-flat-impl)
+else
 	$(call TIMED_RUN,validate-main-phase,\
 		$(GMAKE) --output-sync=target _validate-impl)
 	$(call TIMED_RUN,validate-agent-phase,\
 		$(GMAKE) -j$(VALIDATE_AGENT_JOBS) --output-sync=target _validate-agent-impl)
+endif
+
+# Flat condor-mode gate: ordering between lanes is scheduling, not
+# policy — every lane must pass either way, and the pool's admission
+# (request_cpus, exclusives) replaces the sequential phase structure
+# that protected the direct path from oversubscription.
+_validate-pr-flat-impl: typecheck lint-arch lint-complexity test-unit \
+	test-simulated-core test-integration-core-local test-simulated-agent \
+	test-integration-agent test-integration-core-live-codex test-web
 
 _validate-agent-impl: test-simulated-agent test-integration-agent
 
