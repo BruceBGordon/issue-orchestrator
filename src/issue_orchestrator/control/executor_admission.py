@@ -53,7 +53,7 @@ class ExecutorResourceObservation:
     concurrency: int
     wall_seconds: float
     cpu_seconds: float
-    executor_process_lifetime_children_max_rss_bytes: int
+    guardian_process_lifetime_children_max_rss_bytes: int
     input_blocks: int
     output_blocks: int
 
@@ -64,8 +64,8 @@ class ExecutorResourceObservation:
         _require_finite_non_negative(owner, "cpu_seconds", self.cpu_seconds)
         for field_name, value in (
             (
-                "executor_process_lifetime_children_max_rss_bytes",
-                self.executor_process_lifetime_children_max_rss_bytes,
+                "guardian_process_lifetime_children_max_rss_bytes",
+                self.guardian_process_lifetime_children_max_rss_bytes,
             ),
             ("input_blocks", self.input_blocks),
             ("output_blocks", self.output_blocks),

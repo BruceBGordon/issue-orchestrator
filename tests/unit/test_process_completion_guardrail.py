@@ -13,6 +13,7 @@ EXECUTOR_COMPLETION_CLIENTS = (
     REPO_ROOT / "tests/unit/test_test_executor_pool.py",
     REPO_ROOT / "tests/unit/executor_pool_dsl.py",
     REPO_ROOT / "tests/unit/test_executor_history_retention.py",
+    REPO_ROOT / "tests/unit/test_executor_command_guardian.py",
     REPO_ROOT / "tests/unit/test_setpgrp_pty_invariants.py",
     REPO_ROOT / "tests/unit/test_agent_phase_execution.py",
     REPO_ROOT / "tests/unit/executor_pressure_dsl.py",

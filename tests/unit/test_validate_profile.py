@@ -1172,7 +1172,7 @@ def test_profile_serializes_command_finalization_failure_without_losing_result(
         resources=ExecutorResourceUsage(
             wall_seconds=85.0,
             cpu_seconds=240.0,
-            executor_process_lifetime_children_max_rss_bytes=4_000_000_000,
+            guardian_process_lifetime_children_max_rss_bytes=4_000_000_000,
             input_blocks=12,
             output_blocks=34,
         ),

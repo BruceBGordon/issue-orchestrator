@@ -161,7 +161,7 @@ class ExecutorResourceUsage:
 
     wall_seconds: float
     cpu_seconds: float
-    executor_process_lifetime_children_max_rss_bytes: int
+    guardian_process_lifetime_children_max_rss_bytes: int
     input_blocks: int
     output_blocks: int
 
@@ -184,8 +184,8 @@ class ExecutorResourceUsage:
             )
         for field_name, value in (
             (
-                "executor_process_lifetime_children_max_rss_bytes",
-                self.executor_process_lifetime_children_max_rss_bytes,
+                "guardian_process_lifetime_children_max_rss_bytes",
+                self.guardian_process_lifetime_children_max_rss_bytes,
             ),
             ("input_blocks", self.input_blocks),
             ("output_blocks", self.output_blocks),
@@ -194,6 +194,20 @@ class ExecutorResourceUsage:
                 raise ValueError(
                     f"ExecutorResourceUsage.{field_name} must be non-negative"
                 )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorResourceUsageUnavailable:
+    """The command terminated but its resource observation failed."""
+
+    availability: str = "unavailable"
+
+    def __post_init__(self) -> None:
+        if self.availability != "unavailable":
+            raise ValueError(
+                "ExecutorResourceUsageUnavailable.availability must be "
+                "'unavailable'"
+            )
 
 
 class ExecutorWaitReason(StrEnum):
@@ -405,16 +419,23 @@ class ExecutorCommandFinalizationFailed:
     concurrency: int
     charged_cpu_slots: int
     exit_code: int
-    resources: ExecutorResourceUsage
+    resources: ExecutorResourceUsage | ExecutorResourceUsageUnavailable
     failures: tuple[ExecutorFinalizationFailureDetail, ...]
 
     def __post_init__(self) -> None:
         for field_name, value, expected_type in (
             ("metadata", self.metadata, ExecutorEventMetadata),
             ("work", self.work, ExecutorMonitoredWork),
-            ("resources", self.resources, ExecutorResourceUsage),
         ):
             _require_exact_type(type(self).__name__, field_name, value, expected_type)
+        if type(self.resources) not in (
+            ExecutorResourceUsage,
+            ExecutorResourceUsageUnavailable,
+        ):
+            raise ValueError(
+                "ExecutorCommandFinalizationFailed.resources must be "
+                "ExecutorResourceUsage or ExecutorResourceUsageUnavailable"
+            )
         _require_positive_integer(type(self).__name__, "concurrency", self.concurrency)
         _require_positive_integer(
             type(self).__name__, "charged_cpu_slots", self.charged_cpu_slots
@@ -516,6 +537,37 @@ class ExecutorCommandDeadlineExceeded:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutorCommandInterrupted:
+    """An admitted command group was explicitly interrupted and contained."""
+
+    metadata: ExecutorEventMetadata
+    work: ExecutorMonitoredWork
+    concurrency: int
+    charged_cpu_slots: int
+    signal_number: int
+    exit_code: int
+
+    def __post_init__(self) -> None:
+        _require_exact_type(
+            type(self).__name__, "metadata", self.metadata, ExecutorEventMetadata
+        )
+        _require_exact_type(
+            type(self).__name__, "work", self.work, ExecutorMonitoredWork
+        )
+        _require_positive_integer(type(self).__name__, "concurrency", self.concurrency)
+        _require_positive_integer(
+            type(self).__name__, "charged_cpu_slots", self.charged_cpu_slots
+        )
+        _require_positive_integer(
+            type(self).__name__, "signal_number", self.signal_number
+        )
+        if type(self.exit_code) is not int or self.exit_code != -self.signal_number:
+            raise ValueError(
+                "ExecutorCommandInterrupted.exit_code must be the negative signal"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutorWorkCompleted:
     metadata: ExecutorEventMetadata
     work: ExecutorMonitoredWork
@@ -592,6 +644,7 @@ ExecutorEvent = (
     | ExecutorCommandFinalizationFailed
     | ExecutorAdmissionDeadlineExceeded
     | ExecutorCommandDeadlineExceeded
+    | ExecutorCommandInterrupted
     | ExecutorWorkCompleted
     | ExecutorPolicyChanged
 )
@@ -624,6 +677,7 @@ class ExecutorEventTimeline:
             ExecutorCommandFinalizationFailed,
             ExecutorAdmissionDeadlineExceeded,
             ExecutorCommandDeadlineExceeded,
+            ExecutorCommandInterrupted,
             ExecutorWorkCompleted,
             ExecutorPolicyChanged,
         )

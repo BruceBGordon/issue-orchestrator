@@ -23,11 +23,14 @@ from ..domain.executor_monitoring import (
     ExecutorAdmissionDeadlineExceeded,
     ExecutorCommandFinalizationFailed,
     ExecutorCommandDeadlineExceeded,
+    ExecutorCommandInterrupted,
     ExecutorCommandLifecycleFailed,
     ExecutorEvent,
     ExecutorPolicyChanged,
     ExecutorRecentEventsQuery,
     ExecutorRepositoryLabelFilter,
+    ExecutorResourceUsage,
+    ExecutorResourceUsageUnavailable,
     ExecutorStatusQuery,
     ExecutorWorkAdmitted,
     ExecutorWorkCompleted,
@@ -272,8 +275,7 @@ def _format_executor_event(event: ExecutorEvent) -> str:
             f"{prefix} command-finalization-failed exit={event.exit_code} "
             f"concurrency={event.concurrency} "
             f"charged_cpu_slots={event.charged_cpu_slots} "
-            f"wall={event.resources.wall_seconds:.3f}s "
-            f"child_cpu={event.resources.cpu_seconds:.3f}s "
+            f"{_format_finalization_resources(event.resources)} "
             f"failures={failures}"
         )
     if isinstance(event, ExecutorAdmissionDeadlineExceeded):
@@ -283,14 +285,11 @@ def _format_executor_event(event: ExecutorEvent) -> str:
             f"active_timeout={event.active_timeout_seconds:.3f}s "
             f"absolute_timeout={event.absolute_timeout_seconds:.3f}s"
         )
-    if isinstance(event, ExecutorCommandDeadlineExceeded):
-        return (
-            f"{prefix} deadline-exceeded phase=command "
-            f"reason={event.reason.value} concurrency={event.concurrency} "
-            f"elapsed={event.elapsed_seconds:.3f}s "
-            f"active_timeout={event.active_timeout_seconds:.3f}s "
-            f"absolute_timeout={event.absolute_timeout_seconds:.3f}s"
-        )
+    if isinstance(
+        event,
+        (ExecutorCommandDeadlineExceeded, ExecutorCommandInterrupted),
+    ):
+        return _format_command_terminal_decision(prefix, event)
     if isinstance(event, ExecutorWorkCompleted):
         return (
             f"{prefix} completed exit={event.exit_code} "
@@ -298,8 +297,8 @@ def _format_executor_event(event: ExecutorEvent) -> str:
             f"charged_cpu_slots={event.charged_cpu_slots} "
             f"wall={event.resources.wall_seconds:.3f}s "
             f"child_cpu={event.resources.cpu_seconds:.3f}s "
-            "executor_process_lifetime_children_max_rss="
-            f"{event.resources.executor_process_lifetime_children_max_rss_bytes} "
+            "guardian_process_lifetime_children_max_rss="
+            f"{event.resources.guardian_process_lifetime_children_max_rss_bytes} "
             f"successful_samples={event.successful_observation_count} "
             f"learned_cores_per_worker="
             f"{event.previous_cores_per_concurrency:.3f}->"
@@ -307,6 +306,41 @@ def _format_executor_event(event: ExecutorEvent) -> str:
             f"{_format_host_load(event.host_load)}"
         )
     raise AssertionError(f"unsupported executor event: {type(event).__name__}")
+
+
+def _format_finalization_resources(
+    resources: ExecutorResourceUsage | ExecutorResourceUsageUnavailable,
+) -> str:
+    """Render the closed command-resource union without losing terminal facts."""
+    if type(resources) is ExecutorResourceUsage:
+        return (
+            f"wall={resources.wall_seconds:.3f}s "
+            f"child_cpu={resources.cpu_seconds:.3f}s"
+        )
+    if type(resources) is ExecutorResourceUsageUnavailable:
+        return "resources=unavailable"
+    raise AssertionError("executor finalization resources are a closed union")
+
+
+def _format_command_terminal_decision(
+    prefix: str,
+    event: ExecutorCommandDeadlineExceeded | ExecutorCommandInterrupted,
+) -> str:
+    if type(event) is ExecutorCommandDeadlineExceeded:
+        return (
+            f"{prefix} deadline-exceeded phase=command "
+            f"reason={event.reason.value} concurrency={event.concurrency} "
+            f"elapsed={event.elapsed_seconds:.3f}s "
+            f"active_timeout={event.active_timeout_seconds:.3f}s "
+            f"absolute_timeout={event.absolute_timeout_seconds:.3f}s"
+        )
+    if type(event) is ExecutorCommandInterrupted:
+        return (
+            f"{prefix} command-interrupted exit={event.exit_code} "
+            f"signal={event.signal_number} concurrency={event.concurrency} "
+            f"charged_cpu_slots={event.charged_cpu_slots}"
+        )
+    raise AssertionError("executor command terminal decisions are a closed union")
 
 
 def _format_host_load(host_load: ExecutorHostLoad) -> str:

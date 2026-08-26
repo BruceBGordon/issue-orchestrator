@@ -136,6 +136,12 @@ class ValidationCommandNotStarted:
 
     error: BaseException
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.error, BaseException):
+            raise ValueError(
+                "ValidationCommandNotStarted.error must be a BaseException"
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class ValidationCommandExitUnknown:

@@ -39,6 +39,7 @@ from issue_orchestrator.domain.executor_monitoring import (
     ExecutorAllRepositories,
     ExecutorCommandFinalizationFailed,
     ExecutorRecentEventsQuery,
+    ExecutorResourceUsage,
     ExecutorStatusQuery,
 )
 from issue_orchestrator.execution.host_executor import (
@@ -258,6 +259,7 @@ def test_post_command_evidence_failure_releases_lease_and_records_terminal_fact(
     ]
     assert failure.exit_code == 0
     assert failure.concurrency == 1
+    assert type(failure.resources) is ExecutorResourceUsage
     assert failure.resources.wall_seconds > 0
     assert tuple(detail.attempt_name for detail in failure.failures) == (
         "record successful command history",
@@ -265,6 +267,75 @@ def test_post_command_evidence_failure_releases_lease_and_records_terminal_fact(
     standard_error = capsys.readouterr().err
     assert "[executor] completed work=history:post-command-failure" in standard_error
     assert "[executor] finalization-failed" in standard_error
+
+
+def test_lease_release_failure_preserves_result_and_recovers_for_next_contender(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool_dir = tmp_path / "pool"
+    leases_dir = pool_dir / "leases"
+    displaced_leases_dir = pool_dir / "leases-displaced"
+    retention = ExecutorHistoryRetentionPolicy(3, 2)
+    lock_path = (pool_dir / "work-history" / "retention.lock").resolve()
+    executor = _executor(
+        pool_dir,
+        retention,
+        PosixExecutorHistoryRetentionLock(lock_path),
+        request_nonce="3" * 32,
+        atomic_path_replacement=OsAtomicPathReplacement(),
+    )
+    monkeypatch.chdir(REPO_ROOT)
+    corrupt_lease_namespace = (
+        "from pathlib import Path; import sys; "
+        "active=Path(sys.argv[1]); displaced=Path(sys.argv[2]); "
+        "active.rename(displaced); active.write_text('not-a-directory')"
+    )
+
+    try:
+        with pytest.raises(ExecutorCommandFinalizationError) as raised:
+            executor.run(
+                ExecutorRunSpecification(
+                    work_key=ExecutorWorkKey("history:lease-release-failure"),
+                    fairness_group=ExecutorFairnessGroup(
+                        "history:lease-release-failure"
+                    ),
+                    concurrency_range=ExecutorConcurrencyRange(1, 1),
+                    exclusive_resources=(),
+                ),
+                ExecutorCommand(
+                    (
+                        sys.executable,
+                        "-c",
+                        corrupt_lease_namespace,
+                        str(leases_dir),
+                        str(displaced_leases_dir),
+                    ),
+                    ExecutorUnboundedDeadline(),
+                    ExecutorCommandLifecycle.DETACHED,
+                    ExecutorNoCommandCancellation(),
+                ),
+            )
+    finally:
+        if leases_dir.is_file():
+            leases_dir.unlink()
+        if displaced_leases_dir.exists():
+            displaced_leases_dir.rename(leases_dir)
+
+    assert raised.value.command_result.exit_code == 0
+    assert raised.value.command_result.grant.concurrency == 1
+    assert tuple(failure.attempt_name for failure in raised.value.failures) == (
+        "release executor command lease",
+    )
+    recovered = _executor(
+        pool_dir,
+        retention,
+        PosixExecutorHistoryRetentionLock(lock_path),
+        request_nonce="2" * 32,
+        atomic_path_replacement=OsAtomicPathReplacement(),
+    )
+    assert _run_work(recovered, "history:lease-release-recovered").exit_code == 0
+    assert tuple(leases_dir.glob("*.json")) == ()
 
 
 def test_admission_report_failure_rolls_back_lease_for_same_process_contender(

@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,7 +24,9 @@ from issue_orchestrator.domain.executor import (
 from issue_orchestrator.domain.executor_guardian import (
     ExecutorGuardianBoundedBudget,
     ExecutorGuardianCommandCompleted,
+    ExecutorGuardianCommandResourceUsage,
     ExecutorGuardianCommandStartFailed,
+    ExecutorGuardianPostContainmentError,
     ExecutorGuardianCommandTimedOut,
     ExecutorGuardianTerminationPolicy,
     ExecutorGuardianUnboundedBudget,
@@ -31,6 +34,7 @@ from issue_orchestrator.domain.executor_guardian import (
 from issue_orchestrator.domain.process_group import (
     OwnedProcessGroupLeader,
     ProcessGroupCompleted,
+    ProcessGroupCourtesyFailed,
     ProcessGroupSupervision,
     ProcessGroupTermination,
     ProcessGroupWait,
@@ -70,6 +74,7 @@ from issue_orchestrator.ports.process_group_supervisor import (
 )
 from issue_orchestrator.ports.posix_process import (
     PosixProcessLaunch,
+    PosixProcessHandle,
     PosixProcessLauncher,
     PosixProcessLaunchRecoveryFailed,
     PosixProcessLaunchStarted,
@@ -80,13 +85,24 @@ from tests.process_tree_fixture import (
     ProcessTreeMember,
 )
 from tests.process_completion_fixture import build_test_process_group_observer
+from tests.process_completion_fixture import (
+    NoDescendantProcessContainment,
+    PROCESS_COMPLETION_WATCHDOG,
+    TextProcessInvocation,
+)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+pytestmark = pytest.mark.timeout(180)
 
 
 def _guardian(
     program: ExecutorGuardianProgram | None = None,
 ) -> PosixExecutorCommandGuardian:
     termination = ExecutorProcessTerminationPolicy(0.1, 1.0)
-    return PosixExecutorCommandGuardian(
+    return _guardian_with_components(
         program
         if program is not None
         else ExecutorGuardianProgram(
@@ -96,17 +112,31 @@ def _guardian(
                 "issue_orchestrator.execution.host_executor.guardian",
             )
         ),
-        _sentinel_program(),
-        ProcessGroupSentinelPolicy(0.1, 1.0),
-        OsAtomicRecordStoreFactory(),
         build_posix_process_launcher(),
-        PosixGuardianLaunchPipesFactory(OsPosixPipeFactory()),
         PosixProcessGroupSupervisor(
             PosixProcessGroupTerminator(
                 termination,
                 build_test_process_group_observer(),
             )
         ),
+        termination,
+    )
+
+
+def _guardian_with_components(
+    program: ExecutorGuardianProgram,
+    process_launcher: PosixProcessLauncher,
+    process_group_supervisor: ProcessGroupSupervisor,
+    termination: ExecutorProcessTerminationPolicy,
+) -> PosixExecutorCommandGuardian:
+    return PosixExecutorCommandGuardian(
+        program,
+        _sentinel_program(),
+        ProcessGroupSentinelPolicy(0.1, 1.0),
+        OsAtomicRecordStoreFactory(),
+        process_launcher,
+        PosixGuardianLaunchPipesFactory(OsPosixPipeFactory()),
+        process_group_supervisor,
         ExecutorGuardianTerminationPolicy(termination.graceful_shutdown_seconds),
     )
 
@@ -208,6 +238,78 @@ class _LateInterruptionAfterCompletionSupervisor:
         return self._delegate.abort(leader)
 
 
+@dataclass(slots=True)
+class _ExternalReapFailingHandle:
+    """Retained-handle port fake rejecting only post-containment evidence."""
+
+    delegate: PosixProcessHandle
+
+    @property
+    def process_id(self) -> int:
+        return self.delegate.process_id
+
+    @property
+    def return_code(self) -> int | None:
+        return self.delegate.return_code
+
+    def poll(self) -> int | None:
+        return self.delegate.poll()
+
+    def wait(self, timeout_seconds: float) -> int:
+        """Forward the owner's bounded wait; this fake does not initiate a wait."""
+        retained_owner_wait = self.delegate.wait
+        return retained_owner_wait(timeout_seconds)
+
+    def kill(self) -> None:
+        self.delegate.kill()
+
+    def record_external_reap(self, exit_code: int) -> None:
+        self.delegate.record_external_reap(exit_code)
+        raise OSError("injected guardian external-reap evidence failure")
+
+
+class _ExternalReapFailingLauncher:
+    def __init__(self, delegate: PosixProcessLauncher) -> None:
+        self._delegate = delegate
+
+    def launch(self, specification: PosixProcessLaunchSpec) -> PosixProcessLaunch:
+        outcome = self._delegate.launch(specification)
+        if type(outcome) is PosixProcessLaunchStarted:
+            return PosixProcessLaunchStarted(
+                _ExternalReapFailingHandle(outcome.process)
+            )
+        return outcome
+
+
+class _CourtesyFailingSupervisor:
+    def __init__(
+        self,
+        delegate: ProcessGroupSupervisor,
+        failure: BaseException,
+    ) -> None:
+        self._delegate = delegate
+        self._failure = failure
+
+    def supervise(
+        self,
+        leader: OwnedProcessGroupLeader,
+        wait: ProcessGroupWait,
+        interruption: ProcessGroupInterruption,
+    ) -> ProcessGroupSupervision:
+        supervision = self._delegate.supervise(leader, wait, interruption)
+        if type(supervision) is not ProcessGroupCompleted:
+            raise AssertionError("courtesy fault requires natural completion")
+        return ProcessGroupCompleted(
+            ProcessGroupTermination(
+                supervision.termination.leader_exit_code,
+                ProcessGroupCourtesyFailed(self._failure),
+            )
+        )
+
+    def abort(self, leader: OwnedProcessGroupLeader) -> ProcessGroupTermination:
+        return self._delegate.abort(leader)
+
+
 class _IndeterminateGuardianLauncher:
     """Report a real started guardian as uncontained after parent finalization."""
 
@@ -254,6 +356,54 @@ def test_guardian_preserves_exact_command_exit_status(
     assert terminal.exit_code == expected_exit_code
 
 
+def test_foreign_parent_child_cannot_contaminate_guardian_resource_usage(
+    tmp_path: Path,
+) -> None:
+    command_started = tmp_path / "command-started"
+
+    def run_foreign_cpu_child() -> None:
+        source = (
+            "from pathlib import Path; import sys, time; "
+            "marker=Path(sys.argv[1]); "
+            "exec('while not marker.exists():\\n time.sleep(0.01)'); "
+            "end=time.process_time()+0.5; "
+            "exec('while time.process_time() < end:\\n pass')"
+        )
+        result = PROCESS_COMPLETION_WATCHDOG.run_text(
+            TextProcessInvocation(
+                operation="foreign resource-accounting child",
+                arguments=(sys.executable, "-c", source, str(command_started)),
+                working_directory=REPO_ROOT,
+                environment=os.environ,
+                timeout_containment=NoDescendantProcessContainment(),
+            )
+        )
+        assert result.returncode == 0, result.stderr
+
+    command = (
+        "from pathlib import Path; import sys, time; "
+        "Path(sys.argv[1]).touch(); time.sleep(1.0)"
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        foreign_child = pool.submit(run_foreign_cpu_child)
+        with _lease_descriptor() as lease_fd:
+            terminal = _guardian().run(
+                _request(
+                    lease_fd,
+                    (sys.executable, "-c", command, str(command_started)),
+                    budget=ExecutorGuardianUnboundedBudget(),
+                )
+            )
+        PROCESS_COMPLETION_WATCHDOG.future_result(
+            foreign_child,
+            operation="foreign resource-accounting child worker",
+        )
+
+    assert type(terminal) is ExecutorGuardianCommandCompleted
+    assert type(terminal.resources) is ExecutorGuardianCommandResourceUsage
+    assert terminal.resources.cpu_seconds < 0.2
+
+
 def test_completed_terminal_record_wins_over_late_parent_sigterm(
     tmp_path: Path,
 ) -> None:
@@ -298,6 +448,84 @@ def test_completed_terminal_record_wins_over_late_parent_sigterm(
 
     assert type(terminal) is ExecutorGuardianCommandCompleted
     assert terminal.exit_code == 17
+
+
+def test_valid_terminal_survives_external_reap_evidence_failure() -> None:
+    termination = ExecutorProcessTerminationPolicy(0.1, 1.0)
+    guardian = _guardian_with_components(
+        ExecutorGuardianProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.execution.host_executor.guardian",
+            )
+        ),
+        _ExternalReapFailingLauncher(build_posix_process_launcher()),
+        PosixProcessGroupSupervisor(
+            PosixProcessGroupTerminator(
+                termination,
+                build_test_process_group_observer(),
+            )
+        ),
+        termination,
+    )
+
+    with _lease_descriptor() as lease_fd:
+        with pytest.raises(ExecutorGuardianPostContainmentError) as raised:
+            guardian.run(
+                _request(
+                    lease_fd,
+                    (sys.executable, "-c", "raise SystemExit(19)"),
+                    budget=ExecutorGuardianUnboundedBudget(),
+                )
+            )
+
+    assert type(raised.value.terminal) is ExecutorGuardianCommandCompleted
+    assert raised.value.terminal.exit_code == 19
+    [failure] = raised.value.failures
+    assert failure.attempt_name == "record guardian external reap"
+    assert "injected guardian external-reap" in str(failure.error)
+
+
+def test_valid_terminal_survives_courtesy_evidence_failure() -> None:
+    termination = ExecutorProcessTerminationPolicy(0.1, 1.0)
+    courtesy_error = OSError("injected guardian courtesy evidence failure")
+    guardian = _guardian_with_components(
+        ExecutorGuardianProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.execution.host_executor.guardian",
+            )
+        ),
+        build_posix_process_launcher(),
+        _CourtesyFailingSupervisor(
+            PosixProcessGroupSupervisor(
+                PosixProcessGroupTerminator(
+                    termination,
+                    build_test_process_group_observer(),
+                )
+            ),
+            courtesy_error,
+        ),
+        termination,
+    )
+
+    with _lease_descriptor() as lease_fd:
+        with pytest.raises(ExecutorGuardianPostContainmentError) as raised:
+            guardian.run(
+                _request(
+                    lease_fd,
+                    (sys.executable, "-c", "raise SystemExit(23)"),
+                    budget=ExecutorGuardianUnboundedBudget(),
+                )
+            )
+
+    assert type(raised.value.terminal) is ExecutorGuardianCommandCompleted
+    assert raised.value.terminal.exit_code == 23
+    [failure] = raised.value.failures
+    assert failure.attempt_name == "retain guardian courtesy-wait failure"
+    assert failure.error is courtesy_error
 
 
 def test_guardian_timeout_wins_over_cooperative_term_exit() -> None:
@@ -527,7 +755,11 @@ def test_valid_terminal_record_cannot_fabricate_containment() -> None:
     fault = _fault_guardian_protocol_prelude() + (
         "raw = sys.argv[sys.argv.index('--request-json') + 1]; "
         "fd = json.loads(raw)['result_file_descriptor']; "
-        'os.write(fd, b\'{"outcome":"completed","exit_code":0}\')'
+        "os.write(fd, b'{\"outcome\":\"completed\",\"exit_code\":0,"
+        "\"resources\":{\"availability\":\"available\","
+        "\"wall_seconds\":1.0,\"cpu_seconds\":0.0,"
+        "\"max_rss_bytes\":0,\"input_blocks\":0,"
+        "\"output_blocks\":0}}')"
     )
     with _lease_descriptor() as lease_fd:
         with pytest.raises(

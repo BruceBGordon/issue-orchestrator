@@ -27,6 +27,10 @@ from ._host_observation import observe_host_load
 from ._host_observation import ExecutorHostLoadObservation
 from ._journal import ExecutorEventStore
 from ._types import (
+    ExecutorCommandExecution,
+    ExecutorCommandResourceObservationFailed,
+    ExecutorCommandResourceObservationNotApplicable,
+    ExecutorCommandWithoutResourceObservation,
     ExecutedExecutorCommand,
     ExecutorWorkIdentity,
     RecordedExecutorObservation,
@@ -39,9 +43,10 @@ class ExecutorCommandCompletion:
 
     identity: ExecutorWorkIdentity
     work: QueuedExecutorWork
-    command: ExecutedExecutorCommand
+    command: ExecutorCommandExecution
     previous_demand: ExecutorLearnedDemand
     aggressiveness_percent: int
+    initial_failures: tuple[ExecutorCommandFinalizationFailure, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.identity) is not ExecutorWorkIdentity:
@@ -52,9 +57,13 @@ class ExecutorCommandCompletion:
             raise ValueError(
                 "ExecutorCommandCompletion.work must be QueuedExecutorWork"
             )
-        if type(self.command) is not ExecutedExecutorCommand:
+        if type(self.command) not in (
+            ExecutedExecutorCommand,
+            ExecutorCommandWithoutResourceObservation,
+        ):
             raise ValueError(
-                "ExecutorCommandCompletion.command must be ExecutedExecutorCommand"
+                "ExecutorCommandCompletion.command must be an "
+                "ExecutorCommandExecution"
             )
         if type(self.previous_demand) is not ExecutorLearnedDemand:
             raise ValueError(
@@ -68,6 +77,14 @@ class ExecutorCommandCompletion:
             raise ValueError(
                 "ExecutorCommandCompletion.aggressiveness_percent must be "
                 "25 through 400"
+            )
+        if type(self.initial_failures) is not tuple or any(
+            type(failure) is not ExecutorCommandFinalizationFailure
+            for failure in self.initial_failures
+        ):
+            raise ValueError(
+                "ExecutorCommandCompletion.initial_failures must contain only "
+                "ExecutorCommandFinalizationFailure values"
             )
 
     @property
@@ -135,7 +152,7 @@ class ExecutorCompletionEvents(Protocol):
         self,
         identity: ExecutorWorkIdentity,
         work: QueuedExecutorWork,
-        result: ExecutedExecutorCommand,
+        result: ExecutorCommandExecution,
         error: ExecutorCommandFinalizationError,
     ) -> None: ...
 
@@ -199,19 +216,25 @@ class StderrExecutorCompletionReporter:
 
     def completed(self, completion: ExecutorCommandCompletion) -> None:
         command = completion.command
-        print(
+        prefix = (
             f"[executor] completed work={completion.identity.work_key.value} "
             f"cpu_slots={command.admission_grant.cpu_slots}/"
             f"{self._host_cpu_slots} "
             f"concurrency={command.admission_grant.concurrency} "
-            f"exit={command.exit_code} "
-            f"wall={command.resources.wall_seconds:.3f}s "
-            f"child_cpu={command.resources.cpu_seconds:.3f}s "
-            "executor_process_lifetime_children_max_rss="
-            f"{command.resources.executor_process_lifetime_children_max_rss_bytes}",
-            file=sys.stderr,
-            flush=True,
+            f"exit={command.exit_code}"
         )
+        if type(command) is ExecutedExecutorCommand:
+            suffix = (
+                f" wall={command.resources.wall_seconds:.3f}s "
+                f"child_cpu={command.resources.cpu_seconds:.3f}s "
+                "guardian_process_lifetime_children_max_rss="
+                f"{command.resources.guardian_process_lifetime_children_max_rss_bytes}"
+            )
+        elif type(command) is ExecutorCommandWithoutResourceObservation:
+            suffix = " resources=unavailable"
+        else:
+            raise AssertionError("executor command execution is a closed union")
+        print(prefix + suffix, file=sys.stderr, flush=True)
 
     def finalization_failed(
         self,
@@ -263,9 +286,10 @@ class ExecutorCommandFinalizer:
                 "ExecutorCommandFinalizer.finalize.completion must be "
                 "ExecutorCommandCompletion"
             )
-        failures: list[ExecutorCommandFinalizationFailure] = []
-        observation = self._construct_observation(completion)
-        self._retain_observation_failure(observation, failures)
+        failures = list(completion.initial_failures)
+        observation = self._completion_observation(completion.command)
+        if observation is not None:
+            self._retain_observation_failure(observation, failures)
 
         report = self._attempt(
             "report command completion",
@@ -279,6 +303,8 @@ class ExecutorCommandFinalizer:
             learned_history = self._read_learned_history(completion)
             self._retain_history_failure(learned_history, failures)
             if (
+                not completion.initial_failures
+                and
                 type(history_write) is _FinalizationAttemptSucceeded
                 and type(learned_history) is _LearnedHistoryAvailable
             ):
@@ -288,7 +314,10 @@ class ExecutorCommandFinalizer:
                     learned_history,
                 )
                 self._retain_attempt_failure(completed_event, failures)
-        elif type(observation) is not _RecordedObservationUnavailable:
+        elif (
+            observation is not None
+            and type(observation) is not _RecordedObservationUnavailable
+        ):
             raise AssertionError("recorded observation is a closed union")
 
         if not failures:
@@ -317,15 +346,35 @@ class ExecutorCommandFinalizer:
             tuple(failures),
         )
 
+    def _completion_observation(
+        self,
+        command: ExecutorCommandExecution,
+    ) -> _RecordedObservation | None:
+        if type(command) is ExecutedExecutorCommand:
+            return self._construct_observation(command)
+        if type(command) is not ExecutorCommandWithoutResourceObservation:
+            raise AssertionError("executor command execution is a closed union")
+        cause = command.cause
+        if type(cause) is ExecutorCommandResourceObservationFailed:
+            return _RecordedObservationUnavailable(
+                ExecutorCommandFinalizationFailure(
+                    "observe executor command completion resources",
+                    cause.error,
+                )
+            )
+        if type(cause) is ExecutorCommandResourceObservationNotApplicable:
+            return None
+        raise AssertionError("executor command resource cause is a closed union")
+
     def _construct_observation(
         self,
-        completion: ExecutorCommandCompletion,
+        command: ExecutedExecutorCommand,
     ) -> _RecordedObservation:
         try:
             return _RecordedObservationAvailable(
                 RecordedExecutorObservation(
-                    resources=completion.command.resources,
-                    exit_code=completion.command.exit_code,
+                    resources=command.resources,
+                    exit_code=command.exit_code,
                     recorded_at_unix=self._clock.observed_at_unix(),
                 )
             )

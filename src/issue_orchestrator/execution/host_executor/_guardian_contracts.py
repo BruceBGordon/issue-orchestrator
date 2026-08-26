@@ -12,9 +12,12 @@ from ...domain.executor_guardian import (
     ExecutorGuardianBoundedBudget,
     ExecutorGuardianBudget,
     ExecutorGuardianCommandCompleted,
+    ExecutorGuardianCommandInterrupted,
+    ExecutorGuardianCommandResourceUsage,
     ExecutorGuardianCommandStartFailed,
     ExecutorGuardianCommandTimedOut,
     ExecutorGuardianInternalFailed,
+    ExecutorGuardianResourceObservationFailed,
     ExecutorGuardianTerminal,
     ExecutorGuardianTerminationPolicy,
     ExecutorGuardianUnboundedBudget,
@@ -150,12 +153,61 @@ class GuardianInvocationRecord(ExecutorStrictRecord):
         )
 
 
+class GuardianAvailableCommandResourceRecord(ExecutorStrictRecord):
+    availability: Literal["available"] = "available"
+    wall_seconds: float = Field(ge=0)
+    cpu_seconds: float = Field(ge=0)
+    max_rss_bytes: int = Field(ge=0)
+    input_blocks: int = Field(ge=0)
+    output_blocks: int = Field(ge=0)
+
+    def to_domain(self) -> ExecutorGuardianCommandResourceUsage:
+        return ExecutorGuardianCommandResourceUsage(
+            wall_seconds=self.wall_seconds,
+            cpu_seconds=self.cpu_seconds,
+            guardian_process_lifetime_children_max_rss_bytes=self.max_rss_bytes,
+            input_blocks=self.input_blocks,
+            output_blocks=self.output_blocks,
+        )
+
+
+class GuardianUnavailableCommandResourceRecord(ExecutorStrictRecord):
+    availability: Literal["unavailable"] = "unavailable"
+    error_type: str = Field(min_length=1)
+    error_repr: str = Field(min_length=1)
+
+    def to_domain(self) -> ExecutorGuardianResourceObservationFailed:
+        return ExecutorGuardianResourceObservationFailed(
+            self.error_type,
+            self.error_repr,
+        )
+
+
+GuardianCommandResourceRecord = Annotated[
+    GuardianAvailableCommandResourceRecord
+    | GuardianUnavailableCommandResourceRecord,
+    Field(discriminator="availability"),
+]
+
+
 class GuardianCompletedRecord(ExecutorStrictRecord):
     outcome: Literal["completed"] = "completed"
     exit_code: int
+    resources: GuardianCommandResourceRecord
 
     def to_domain(self) -> ExecutorGuardianCommandCompleted:
-        return ExecutorGuardianCommandCompleted(self.exit_code)
+        return ExecutorGuardianCommandCompleted(
+            self.exit_code,
+            self.resources.to_domain(),
+        )
+
+
+class GuardianCommandInterruptedRecord(ExecutorStrictRecord):
+    outcome: Literal["interrupted"] = "interrupted"
+    signal_number: int = Field(gt=0)
+
+    def to_domain(self) -> ExecutorGuardianCommandInterrupted:
+        return ExecutorGuardianCommandInterrupted(self.signal_number)
 
 
 class GuardianTimedOutRecord(ExecutorStrictRecord):
@@ -189,6 +241,7 @@ class GuardianInternalFailedRecord(ExecutorStrictRecord):
 
 GuardianTerminalRecord = Annotated[
     GuardianCompletedRecord
+    | GuardianCommandInterruptedRecord
     | GuardianTimedOutRecord
     | GuardianCommandStartFailedRecord
     | GuardianInternalFailedRecord,
@@ -204,7 +257,34 @@ def guardian_terminal_record(
     terminal: ExecutorGuardianTerminal,
 ) -> GuardianTerminalRecord:
     if type(terminal) is ExecutorGuardianCommandCompleted:
-        return GuardianCompletedRecord(exit_code=terminal.exit_code)
+        resources = terminal.resources
+        if type(resources) is ExecutorGuardianCommandResourceUsage:
+            resource_record: GuardianCommandResourceRecord = (
+                GuardianAvailableCommandResourceRecord(
+                    wall_seconds=resources.wall_seconds,
+                    cpu_seconds=resources.cpu_seconds,
+                    max_rss_bytes=(
+                        resources.guardian_process_lifetime_children_max_rss_bytes
+                    ),
+                    input_blocks=resources.input_blocks,
+                    output_blocks=resources.output_blocks,
+                )
+            )
+        elif type(resources) is ExecutorGuardianResourceObservationFailed:
+            resource_record = GuardianUnavailableCommandResourceRecord(
+                error_type=resources.error_type,
+                error_repr=resources.error_repr,
+            )
+        else:
+            raise AssertionError("guardian command resources are a closed union")
+        return GuardianCompletedRecord(
+            exit_code=terminal.exit_code,
+            resources=resource_record,
+        )
+    if type(terminal) is ExecutorGuardianCommandInterrupted:
+        return GuardianCommandInterruptedRecord(
+            signal_number=terminal.signal_number,
+        )
     if type(terminal) is ExecutorGuardianCommandTimedOut:
         return GuardianTimedOutRecord(reason=terminal.reason)
     if type(terminal) is ExecutorGuardianCommandStartFailed:

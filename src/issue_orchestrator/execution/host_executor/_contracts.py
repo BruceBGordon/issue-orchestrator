@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field
 
@@ -209,8 +209,8 @@ class ResourceObservationRecord(ExecutorStrictRecord):
     concurrency: int = Field(ge=1)
     wall_seconds: float = Field(gt=0)
     cpu_seconds: float = Field(ge=0)
-    # Schema v1 compatibility: this wire key stores the executor process's
-    # exited-child lifetime RSS high-water mark, not a per-command measurement.
+    # Schema v1 compatibility: this wire key stores the isolated guardian's
+    # exited-child lifetime RSS high-water mark, not an additive delta.
     max_rss_bytes: int = Field(ge=0)
     input_blocks: int = Field(ge=0)
     output_blocks: int = Field(ge=0)
@@ -227,7 +227,7 @@ class ResourceObservationRecord(ExecutorStrictRecord):
             concurrency=resources.concurrency,
             wall_seconds=resources.wall_seconds,
             cpu_seconds=resources.cpu_seconds,
-            max_rss_bytes=(resources.executor_process_lifetime_children_max_rss_bytes),
+            max_rss_bytes=(resources.guardian_process_lifetime_children_max_rss_bytes),
             input_blocks=resources.input_blocks,
             output_blocks=resources.output_blocks,
             exit_code=observation.exit_code,
@@ -240,7 +240,7 @@ class ResourceObservationRecord(ExecutorStrictRecord):
                 concurrency=self.concurrency,
                 wall_seconds=self.wall_seconds,
                 cpu_seconds=self.cpu_seconds,
-                executor_process_lifetime_children_max_rss_bytes=(self.max_rss_bytes),
+                guardian_process_lifetime_children_max_rss_bytes=(self.max_rss_bytes),
                 input_blocks=self.input_blocks,
                 output_blocks=self.output_blocks,
             ),
@@ -252,6 +252,7 @@ class ResourceObservationRecord(ExecutorStrictRecord):
 class ExecutedCommandResourceRecord(ExecutorStrictRecord):
     """Resource facts that do not depend on post-command wall time."""
 
+    availability: Literal["available"] = "available"
     concurrency: int = Field(ge=1)
     wall_seconds: float = Field(gt=0)
     cpu_seconds: float = Field(ge=0)
@@ -269,11 +270,23 @@ class ExecutedCommandResourceRecord(ExecutorStrictRecord):
             wall_seconds=resources.wall_seconds,
             cpu_seconds=resources.cpu_seconds,
             max_rss_bytes=(
-                resources.executor_process_lifetime_children_max_rss_bytes
+                resources.guardian_process_lifetime_children_max_rss_bytes
             ),
             input_blocks=resources.input_blocks,
             output_blocks=resources.output_blocks,
         )
+
+
+class UnavailableCommandResourceRecord(ExecutorStrictRecord):
+    """Wire discriminator for a failed post-command resource observation."""
+
+    availability: Literal["unavailable"] = "unavailable"
+
+
+CommandResourceRecord = Annotated[
+    ExecutedCommandResourceRecord | UnavailableCommandResourceRecord,
+    Field(discriminator="availability"),
+]
 
 
 class WorkHistoryRecord(ExecutorStrictRecord):

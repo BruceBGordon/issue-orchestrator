@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -29,6 +30,7 @@ from issue_orchestrator.control.agent_phase_launch_planner import (
 from issue_orchestrator.domain.executor import (
     ExecutorBoundedDeadline,
     ExecutorCommand,
+    ExecutorCommandFinalizationError,
     ExecutorCommandLifecycle,
     ExecutorConcurrencyRange,
     ExecutorDeadlineExceededError,
@@ -42,10 +44,19 @@ from issue_orchestrator.domain.executor import (
     ExecutorWorkKey,
 )
 from issue_orchestrator.domain.executor_host import ExecutorHostCpuUtilization
+from issue_orchestrator.domain.executor_guardian import (
+    ExecutorGuardianCommandInterrupted,
+    ExecutorGuardianCommandCompleted,
+    ExecutorGuardianResourceObservationFailed,
+    ExecutorGuardianTerminal,
+)
 from issue_orchestrator.domain.executor_monitoring import (
     ExecutorAdmissionDeadlineExceeded,
     ExecutorCommandDeadlineExceeded,
+    ExecutorCommandFinalizationFailed,
+    ExecutorCommandInterrupted,
     ExecutorRecentEventsQuery,
+    ExecutorResourceUsageUnavailable,
     ExecutorWorkAdmitted,
     ExecutorWorkCompleted,
 )
@@ -73,6 +84,10 @@ from issue_orchestrator.domain.models import AgentConfig, TaskKind
 from issue_orchestrator.domain.session_run import SessionRunAssets
 from issue_orchestrator.domain.session_watchdog import ScheduledSessionWatchdog
 from issue_orchestrator.ports.host_cpu_utilization import HostCpuUtilizationObserver
+from issue_orchestrator.ports.executor_command_guardian import (
+    ExecutorCommandGuardian,
+    ExecutorGuardianRequest,
+)
 from tests.process_tree_fixture import (
     CooperativeTermResistantProcessTreeProgram,
     ExitingTermResistantProcessTreeProgram,
@@ -116,6 +131,28 @@ class _IdleHostCpuObserver:
 
     def observe(self) -> ExecutorHostCpuUtilization:
         return ExecutorHostCpuUtilization(0.0, 0.01)
+
+
+class _InterruptedCommandGuardian:
+    """Guardian port fake returning one already-contained interruption."""
+
+    def run(self, request: ExecutorGuardianRequest) -> ExecutorGuardianTerminal:
+        del request
+        return ExecutorGuardianCommandInterrupted(int(signal.SIGTERM))
+
+
+class _ResourceObservationFailedGuardian:
+    """Guardian port fake preserving completion across observation failure."""
+
+    def run(self, request: ExecutorGuardianRequest) -> ExecutorGuardianTerminal:
+        del request
+        return ExecutorGuardianCommandCompleted(
+            0,
+            ExecutorGuardianResourceObservationFailed(
+                "OSError",
+                "OSError('simulated isolated resource observation failure')",
+            ),
+        )
 
 
 class _AdmissionThenExpiredClock:
@@ -184,6 +221,26 @@ def _deterministic_host_executor(
     request_nonce: str,
 ) -> HostExecutor:
     """Build a real executor whose admission does not depend on ambient load."""
+    return _host_executor(
+        pool_dir,
+        host_cpu_observer=host_cpu_observer,
+        request_nonce=request_nonce,
+        command_guardian=executor_command_guardian(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
+            )
+        ),
+    )
+
+
+def _host_executor(
+    pool_dir: Path,
+    *,
+    host_cpu_observer: HostCpuUtilizationObserver,
+    request_nonce: str,
+    command_guardian: ExecutorCommandGuardian,
+) -> HostExecutor:
     return HostExecutor(
         pool_dir=pool_dir,
         host_cpu_slots=1,
@@ -198,12 +255,7 @@ def _deterministic_host_executor(
             process_id=os.getpid,
             request_nonce=lambda: request_nonce,
         ),
-        command_guardian=executor_command_guardian(
-            ExecutorProcessTerminationPolicy(
-                graceful_shutdown_seconds=2.0,
-                forceful_shutdown_seconds=2.0,
-            )
-        ),
+        command_guardian=command_guardian,
         atomic_path_replacement=OsAtomicPathReplacement(),
         history_retention_lock=_history_lock(pool_dir),
         history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
@@ -629,6 +681,130 @@ def test_internal_phase_client_runs_a_plain_command_without_orchestrator(
     assert captured.out == "PHASE-RAN\n"
 
 
+def test_interrupted_command_is_durable_and_human_traceable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool_dir = tmp_path / "pool"
+    executor = _host_executor(
+        pool_dir,
+        host_cpu_observer=_IdleHostCpuObserver(),
+        request_nonce="6" * 32,
+        command_guardian=_InterruptedCommandGuardian(),
+    )
+    monkeypatch.chdir(REPO_ROOT)
+
+    result = executor.run(
+        ExecutorRunSpecification(
+            work_key=ExecutorWorkKey("agent-phase:test:interrupted"),
+            fairness_group=ExecutorFairnessGroup("agent:test:interrupted"),
+            concurrency_range=ExecutorConcurrencyRange(1, 1),
+            exclusive_resources=(),
+        ),
+        ExecutorCommand(
+            (sys.executable, "-c", "raise AssertionError('must not run')"),
+            ExecutorBoundedDeadline(2.0, 4.0),
+            ExecutorCommandLifecycle.INTERACTIVE_SESSION,
+            ExecutorInteractiveSessionCancellation.for_run_dir(tmp_path.resolve()),
+        ),
+    )
+
+    assert result.exit_code == -signal.SIGTERM
+    timeline = HostExecutorMonitor(
+        pool_dir,
+        1,
+        _demand_estimator(),
+        ExecutorHistoryRetentionPolicy(2048, 24),
+        _history_lock(pool_dir),
+        OsAtomicPathReplacement(),
+    ).recent_events(ExecutorRecentEventsQuery(20))
+    [interrupted] = [
+        event
+        for event in timeline.events
+        if type(event) is ExecutorCommandInterrupted
+    ]
+    assert interrupted.exit_code == -signal.SIGTERM
+    assert interrupted.signal_number == signal.SIGTERM
+    assert interrupted.concurrency == 1
+    assert interrupted.charged_cpu_slots == 1
+    events = _executor_events(pool_dir)
+    assert events.returncode == 0, events.stdout
+    line = next(
+        line for line in events.stdout.splitlines() if " command-interrupted " in line
+    )
+    assert "work=agent-phase:test:interrupted" in line
+    assert "group=agent:test:interrupted" in line
+    assert "exit=-15 signal=15 concurrency=1 charged_cpu_slots=1" in line
+
+
+def test_resource_observation_failure_preserves_result_lease_and_cli_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool_dir = tmp_path / "pool"
+    failed_executor = _host_executor(
+        pool_dir,
+        host_cpu_observer=_IdleHostCpuObserver(),
+        request_nonce="4" * 32,
+        command_guardian=_ResourceObservationFailedGuardian(),
+    )
+    specification = ExecutorRunSpecification(
+        work_key=ExecutorWorkKey("agent-phase:test:resource-failure"),
+        fairness_group=ExecutorFairnessGroup("agent:test:resource-failure"),
+        concurrency_range=ExecutorConcurrencyRange(1, 1),
+        exclusive_resources=(),
+    )
+    command = ExecutorCommand(
+        (sys.executable, "-c", "pass"),
+        ExecutorBoundedDeadline(2.0, 4.0),
+        ExecutorCommandLifecycle.DETACHED,
+        ExecutorNoCommandCancellation(),
+    )
+    monkeypatch.chdir(REPO_ROOT)
+
+    with pytest.raises(ExecutorCommandFinalizationError) as raised:
+        failed_executor.run(specification, command)
+
+    assert raised.value.command_result.exit_code == 0
+    assert raised.value.command_result.grant.concurrency == 1
+    assert tuple(failure.attempt_name for failure in raised.value.failures) == (
+        "observe executor command completion resources",
+    )
+    assert tuple((pool_dir / "leases").glob("*.json")) == ()
+    timeline = HostExecutorMonitor(
+        pool_dir,
+        1,
+        _demand_estimator(),
+        ExecutorHistoryRetentionPolicy(2048, 24),
+        _history_lock(pool_dir),
+        OsAtomicPathReplacement(),
+    ).recent_events(ExecutorRecentEventsQuery(20))
+    [failure_event] = [
+        event
+        for event in timeline.events
+        if type(event) is ExecutorCommandFinalizationFailed
+    ]
+    assert failure_event.exit_code == 0
+    assert failure_event.concurrency == 1
+    assert type(failure_event.resources) is ExecutorResourceUsageUnavailable
+    events = _executor_events(pool_dir)
+    assert events.returncode == 0, events.stdout
+    failure_line = next(
+        line
+        for line in events.stdout.splitlines()
+        if " command-finalization-failed " in line
+    )
+    assert "resources=unavailable" in failure_line
+    assert "exit=0 concurrency=1 charged_cpu_slots=1" in failure_line
+
+    recovered_executor = _deterministic_host_executor(
+        pool_dir,
+        host_cpu_observer=_IdleHostCpuObserver(),
+        request_nonce="5" * 32,
+    )
+    assert recovered_executor.run(specification, command).exit_code == 0
+
+
 def test_internal_phase_client_terminates_at_active_deadline_and_releases_lease(
     tmp_path: Path,
 ) -> None:
@@ -950,7 +1126,6 @@ def test_deadline_expiring_after_admission_records_terminal_events_without_spawn
         if isinstance(event, ExecutorCommandDeadlineExceeded)
     ]
     assert deadline_event.reason is ExecutorDeadlineReason.ABSOLUTE
-    [completed_event] = [
-        event for event in timeline.events if isinstance(event, ExecutorWorkCompleted)
-    ]
-    assert completed_event.exit_code == 124
+    assert not any(
+        isinstance(event, ExecutorWorkCompleted) for event in timeline.events
+    )

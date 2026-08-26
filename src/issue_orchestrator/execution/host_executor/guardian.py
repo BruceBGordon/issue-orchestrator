@@ -15,6 +15,7 @@ from types import FrameType
 from pydantic import ValidationError
 
 from ...domain.executor import ExecutorCommandLifecycle
+from ...domain.executor_child_resources import ExecutorChildResourceSnapshot
 from ...domain.posix_process import (
     PosixProcessEnvironment,
     PosixProcessJoinGroup,
@@ -26,9 +27,11 @@ from ...domain.executor_guardian import (
     ExecutorGuardianBoundedBudget,
     ExecutorGuardianBudget,
     ExecutorGuardianCommandCompleted,
+    ExecutorGuardianCommandResourceUsage,
     ExecutorGuardianCommandStartFailed,
     ExecutorGuardianCommandTimedOut,
     ExecutorGuardianInternalFailed,
+    ExecutorGuardianResourceObservationFailed,
     ExecutorGuardianTerminal,
     ExecutorGuardianTerminationPolicy,
     ExecutorGuardianUnboundedBudget,
@@ -43,6 +46,7 @@ from ...ports.posix_process import (
     PosixProcessLaunchRejected,
     PosixProcessLaunchStarted,
 )
+from ...ports.executor_child_resources import ExecutorChildResourceObserver
 from ..process_cancellation_endpoint import ProcessCancellationOwnerControls
 from ..process_group_sentinel import (
     ProcessGroupSentinelController,
@@ -60,6 +64,17 @@ from ._guardian_contracts import (
 _MAX_TERMINAL_RECORD_BYTES = 4096
 _COMMAND_POLL_SECONDS = 0.05
 _OWNER_READY_SIGNAL = b"R"
+
+
+def _require_child_resource_observer(
+    value: object,
+) -> ExecutorChildResourceObserver:
+    if not isinstance(value, ExecutorChildResourceObserver):
+        raise ValueError(
+            "PosixExecutorGuardianChild.child_resource_observer must implement "
+            "ExecutorChildResourceObserver"
+        )
+    return value
 
 
 def _retain_lease_until_contained(
@@ -129,6 +144,23 @@ class _StartedCommandProcess:
 
 
 _CommandActivation = _StartedCommandProcess | _RejectedCommandResolution
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardianResourceMeasurementStarted:
+    started_at_monotonic: float
+    child_resources_before: ExecutorChildResourceSnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardianResourceMeasurementUnavailable:
+    error_type: str
+    error_repr: str
+
+
+_GuardianResourceMeasurement = (
+    _GuardianResourceMeasurementStarted | _GuardianResourceMeasurementUnavailable
+)
 
 
 @dataclass(slots=True)
@@ -202,6 +234,7 @@ class PosixExecutorGuardianChild:
         self,
         termination_policy: ExecutorGuardianTerminationPolicy,
         process_launcher: PosixProcessLauncher,
+        child_resource_observer: ExecutorChildResourceObserver,
     ) -> None:
         if type(termination_policy) is not ExecutorGuardianTerminationPolicy:
             raise ValueError(
@@ -215,6 +248,9 @@ class PosixExecutorGuardianChild:
                 "PosixProcessLauncher"
             )
         self._process_launcher = process_launcher
+        self._child_resource_observer = _require_child_resource_observer(
+            child_resource_observer
+        )
 
     def run(
         self,
@@ -333,6 +369,7 @@ class PosixExecutorGuardianChild:
         if type(resolution) is not _ResolvedCommandArguments:
             raise AssertionError("command resolution is a closed union")
         arguments = resolution.arguments
+        resource_measurement = self._start_resource_measurement()
         activation = self._activate_resolved_command(
             arguments,
             result_writer,
@@ -348,6 +385,7 @@ class PosixExecutorGuardianChild:
             process,
             invocation.domain_budget(),
             group_owner,
+            resource_measurement,
         )
         try:
             result_writer.write(outcome.terminal)
@@ -458,9 +496,9 @@ class PosixExecutorGuardianChild:
         executable = arguments[0]
         executable_path = Path(executable)
         if executable_path.is_absolute():
-            resolved_executable = executable_path
+            resolved_executable = executable
         elif "/" in executable:
-            resolved_executable = (Path.cwd() / executable_path).resolve()
+            resolved_executable = os.path.abspath(executable)
         else:
             search_path = os.environ.get("PATH")
             if search_path is None:
@@ -472,8 +510,8 @@ class PosixExecutorGuardianChild:
                 raise FileNotFoundError(
                     f"executor command is not present on PATH: {executable!r}"
                 )
-            resolved_executable = Path(match).resolve()
-        return (str(resolved_executable), *arguments[1:])
+            resolved_executable = os.path.abspath(match)
+        return (resolved_executable, *arguments[1:])
 
     def _resolve_command(
         self,
@@ -510,12 +548,70 @@ class PosixExecutorGuardianChild:
         if signal_byte != GUARDIAN_START_SIGNAL:
             raise RuntimeError("executor guardian start gate closed without a grant")
 
-    @classmethod
+    def _start_resource_measurement(self) -> _GuardianResourceMeasurement:
+        try:
+            return _GuardianResourceMeasurementStarted(
+                time.monotonic(),
+                self._child_resource_observer.observe(),
+            )
+        except BaseException as error:
+            return _GuardianResourceMeasurementUnavailable(
+                type(error).__name__,
+                repr(error),
+            )
+
+    def _completed_terminal(
+        self,
+        exit_code: int,
+        measurement: _GuardianResourceMeasurement,
+    ) -> ExecutorGuardianCommandCompleted:
+        if type(measurement) is _GuardianResourceMeasurementUnavailable:
+            resources = ExecutorGuardianResourceObservationFailed(
+                measurement.error_type,
+                measurement.error_repr,
+            )
+            return ExecutorGuardianCommandCompleted(exit_code, resources)
+        if type(measurement) is not _GuardianResourceMeasurementStarted:
+            raise AssertionError("guardian resource measurement is a closed union")
+        try:
+            usage_after = self._child_resource_observer.observe()
+            resources = ExecutorGuardianCommandResourceUsage(
+                wall_seconds=time.monotonic() - measurement.started_at_monotonic,
+                cpu_seconds=(
+                    usage_after.user_cpu_seconds
+                    - measurement.child_resources_before.user_cpu_seconds
+                )
+                + (
+                    usage_after.system_cpu_seconds
+                    - measurement.child_resources_before.system_cpu_seconds
+                ),
+                guardian_process_lifetime_children_max_rss_bytes=(
+                    usage_after.process_lifetime_children_max_rss_bytes
+                ),
+                input_blocks=max(
+                    0,
+                    usage_after.input_blocks
+                    - measurement.child_resources_before.input_blocks,
+                ),
+                output_blocks=max(
+                    0,
+                    usage_after.output_blocks
+                    - measurement.child_resources_before.output_blocks,
+                ),
+            )
+        except BaseException as error:
+            resources = ExecutorGuardianResourceObservationFailed(
+                type(error).__name__,
+                repr(error),
+            )
+        return ExecutorGuardianCommandCompleted(exit_code, resources)
+
     def _wait_for_outcome(
-        cls,
+        self,
         process: PosixProcessHandle,
         budget: ExecutorGuardianBudget,
         group_owner: _GuardianGroupOwner,
+        resource_measurement: _GuardianResourceMeasurement,
     ) -> _GuardianCommandTerminal:
         if type(budget) is ExecutorGuardianUnboundedBudget:
             deadline: float | None = None
@@ -529,7 +625,10 @@ class PosixExecutorGuardianChild:
                 return_code = process.poll()
                 if return_code is not None:
                     return _GuardianCommandTerminal(
-                        ExecutorGuardianCommandCompleted(return_code)
+                        self._completed_terminal(
+                            return_code,
+                            resource_measurement,
+                        )
                     )
                 sleep_seconds = _COMMAND_POLL_SECONDS
                 if deadline is not None:
@@ -562,11 +661,15 @@ def main() -> int:
     parser.add_argument("--request-json", required=True)
     arguments = parser.parse_args()
     invocation = _parse_invocation(arguments.request_json)
-    from ...entrypoints.bootstrap import build_posix_process_launcher
+    from ...entrypoints.bootstrap import (
+        build_executor_child_resource_observer,
+        build_posix_process_launcher,
+    )
 
     return PosixExecutorGuardianChild(
         invocation.termination_policy(),
         build_posix_process_launcher(),
+        build_executor_child_resource_observer(),
     ).run(
         invocation,
         _GuardianResultWriter(invocation.result_file_descriptor),

@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from ...control.executor_admission import (
     ExecutorAdmissionGrant,
     ExecutorResourceObservation,
 )
-from ...domain.executor import ExecutorWorkKey
+from ...domain.executor import ExecutorCommandFinalizationFailure, ExecutorWorkKey
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,3 +80,108 @@ class ExecutedExecutorCommand:
             raise ValueError(
                 "ExecutedExecutorCommand grant and resource concurrency must match"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorCommandWithoutResourceObservation:
+    """Exact command terminal result whose resource observation failed."""
+
+    exit_code: int
+    admission_grant: ExecutorAdmissionGrant
+    cause: ExecutorCommandResourceObservationCause
+
+    def __post_init__(self) -> None:
+        if type(self.exit_code) is not int:
+            raise ValueError(
+                "ExecutorCommandWithoutResourceObservation.exit_code must be "
+                "an integer"
+            )
+        if type(self.admission_grant) is not ExecutorAdmissionGrant:
+            raise ValueError(
+                "ExecutorCommandWithoutResourceObservation.admission_grant must "
+                "be ExecutorAdmissionGrant"
+            )
+        if type(self.cause) not in (
+            ExecutorCommandResourceObservationFailed,
+            ExecutorCommandResourceObservationNotApplicable,
+        ):
+            raise ValueError(
+                "ExecutorCommandWithoutResourceObservation.cause must be an "
+                "ExecutorCommandResourceObservationCause"
+            )
+
+
+ExecutorCommandExecution = (
+    ExecutedExecutorCommand | ExecutorCommandWithoutResourceObservation
+)
+
+
+class ExecutorResourceObservationOmissionReason(StrEnum):
+    """Why command resource facts are intentionally unavailable."""
+
+    DEADLINE = "deadline"
+    INTERRUPTION = "interruption"
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorCommandResourceObservationFailed:
+    """A required exact observation failed after command completion."""
+
+    error: BaseException
+
+    def __post_init__(self) -> None:
+        _require_error(
+            self.error,
+            "ExecutorCommandResourceObservationFailed.error",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorCommandResourceObservationNotApplicable:
+    """Containment ended work without a reap-attributable command observation."""
+
+    reason: ExecutorResourceObservationOmissionReason
+
+    def __post_init__(self) -> None:
+        if type(self.reason) is not ExecutorResourceObservationOmissionReason:
+            raise ValueError(
+                "ExecutorCommandResourceObservationNotApplicable.reason must be "
+                "ExecutorResourceObservationOmissionReason"
+            )
+
+
+ExecutorCommandResourceObservationCause = (
+    ExecutorCommandResourceObservationFailed
+    | ExecutorCommandResourceObservationNotApplicable
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizableExecutorCommand:
+    """Exact command outcome plus failures discovered before finalization."""
+
+    command: ExecutorCommandExecution
+    initial_failures: tuple[ExecutorCommandFinalizationFailure, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.command) not in (
+            ExecutedExecutorCommand,
+            ExecutorCommandWithoutResourceObservation,
+        ):
+            raise ValueError(
+                "FinalizableExecutorCommand.command must be an "
+                "ExecutorCommandExecution"
+            )
+        if type(self.initial_failures) is not tuple or any(
+            type(failure) is not ExecutorCommandFinalizationFailure
+            for failure in self.initial_failures
+        ):
+            raise ValueError(
+                "FinalizableExecutorCommand.initial_failures must contain only "
+                "ExecutorCommandFinalizationFailure values"
+            )
+
+
+def _require_error(value: object, field_name: str) -> None:
+    if not isinstance(value, BaseException):
+        raise ValueError(f"{field_name} must be a BaseException")

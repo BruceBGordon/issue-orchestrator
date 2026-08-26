@@ -32,6 +32,7 @@ from issue_orchestrator.execution.host_executor._host_observation import (
     ExecutorHostLoadObservation,
 )
 from issue_orchestrator.execution.host_executor._types import (
+    ExecutorCommandExecution,
     ExecutedExecutorCommand,
     ExecutorRepositoryIdentity,
     ExecutorWorkIdentity,
@@ -131,7 +132,7 @@ class _ScenarioEvents:
         self,
         identity: ExecutorWorkIdentity,
         work: QueuedExecutorWork,
-        result: ExecutedExecutorCommand,
+        result: ExecutorCommandExecution,
         error: ExecutorCommandFinalizationError,
     ) -> None:
         del identity, work
@@ -170,7 +171,7 @@ def _resource_observation() -> ExecutorResourceObservation:
         concurrency=3,
         wall_seconds=4.0,
         cpu_seconds=6.0,
-        executor_process_lifetime_children_max_rss_bytes=1024,
+        guardian_process_lifetime_children_max_rss_bytes=1024,
         input_blocks=5,
         output_blocks=7,
     )

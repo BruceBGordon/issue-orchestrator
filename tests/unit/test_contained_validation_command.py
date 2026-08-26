@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from shlex import join as shell_join
 from shlex import quote as shell_quote
+from typing import cast
 
 import pytest
 
@@ -37,6 +38,7 @@ from issue_orchestrator.domain.validation_execution import (
     ValidationCommandCleanupFailed,
     ValidationCommandExited,
     ValidationCommandOutput,
+    ValidationCommandNotStarted,
     ValidationCommandTimedOut,
     ValidationCommandTimeoutPhase,
     ValidationExecutionDeadline,
@@ -81,8 +83,8 @@ from issue_orchestrator.ports.process_group_supervisor import (
     ProcessGroupSupervisor,
 )
 from issue_orchestrator.ports.posix_pipe import PosixPipeReader
-from issue_orchestrator.ports.posix_process import PosixProcessLauncher
 from issue_orchestrator.ports.posix_process import PosixProcessLaunchStarted
+from issue_orchestrator.ports.posix_process import PosixProcessLauncher
 from issue_orchestrator.ports.validation_pipe_capture import (
     ValidationPipeCapture,
     ValidationPipeCaptureFactory,
@@ -117,6 +119,11 @@ from tests.process_completion_fixture import (
     build_test_process_group_observer,
 )
 from tests.posix_process_fixture import ReapEvidenceFailingProcessLauncher
+
+
+def test_not_started_terminal_requires_exact_exception_evidence() -> None:
+    with pytest.raises(ValueError, match="must be a BaseException"):
+        ValidationCommandNotStarted(cast(BaseException, None))
 
 
 def _runner() -> PosixContainedValidationCommandRunner:

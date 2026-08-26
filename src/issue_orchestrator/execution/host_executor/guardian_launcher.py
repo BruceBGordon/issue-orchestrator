@@ -18,9 +18,11 @@ from types import FrameType
 from pydantic import ValidationError
 
 from ...domain.executor_guardian import (
-    ExecutorGuardianCommandCompleted,
+    ExecutorGuardianCommandInterrupted,
     ExecutorGuardianCommandStartFailed,
     ExecutorGuardianInternalFailed,
+    ExecutorGuardianPostContainmentError,
+    ExecutorGuardianPostContainmentFailure,
     ExecutorGuardianTerminal,
     ExecutorGuardianTerminationPolicy,
 )
@@ -394,7 +396,7 @@ class PosixExecutorCommandGuardian:
                 cancellation_lease.activate()
                 cancellation_lease.transfer_to_owner()
                 if interruption.requested:
-                    return ExecutorGuardianCommandCompleted(-signal.SIGTERM)
+                    return ExecutorGuardianCommandInterrupted(int(signal.SIGTERM))
                 terminal_foreground.grant(guardian.process_id)
                 if os.write(
                     endpoints.start_writer.fileno(),
@@ -748,36 +750,59 @@ class PosixExecutorCommandGuardian:
         result_read_fd: int,
     ) -> ExecutorGuardianTerminal:
         """Interpret one fully contained guardian supervision outcome."""
-        evidence_failures: list[BaseException] = []
+        terminal: ExecutorGuardianTerminal | None = None
+        terminal_error: BaseException | None = None
+        if type(supervision) is ProcessGroupInterrupted:
+            terminal = ExecutorGuardianCommandInterrupted(int(signal.SIGTERM))
+        elif type(supervision) is ProcessGroupCompleted:
+            try:
+                terminal = cls._read_terminal(result_read_fd)
+                cls._require_expected_guardian_exit(
+                    supervision.termination.leader_exit_code,
+                    terminal,
+                )
+            except BaseException as error:
+                terminal_error = error
+        else:
+            raise AssertionError("an unbounded guardian wait cannot time out")
+
+        evidence_failures: list[ExecutorGuardianPostContainmentFailure] = []
         try:
             guardian.record_external_reap(
                 supervision.termination.leader_exit_code
             )
         except BaseException as error:
-            evidence_failures.append(error)
+            evidence_failures.append(
+                ExecutorGuardianPostContainmentFailure(
+                    "record guardian external reap",
+                    error,
+                )
+            )
         courtesy_failure = supervision.termination.courtesy_failure()
         if courtesy_failure is not None:
-            evidence_failures.append(courtesy_failure.error)
-        if evidence_failures:
-            if len(evidence_failures) == 1:
-                raise evidence_failures[0]
-            raise BaseExceptionGroup(
-                "guardian post-containment evidence failed",
-                evidence_failures,
+            evidence_failures.append(
+                ExecutorGuardianPostContainmentFailure(
+                    "retain guardian courtesy-wait failure",
+                    courtesy_failure.error,
+                )
             )
-        if type(supervision) is ProcessGroupInterrupted:
-            return ExecutorGuardianCommandCompleted(-signal.SIGTERM)
-        if type(supervision) is not ProcessGroupCompleted:
-            raise AssertionError("an unbounded guardian wait cannot time out")
-        # A signal may arrive after the guardian has already completed and
-        # published its terminal record.  Completion evidence is authoritative;
-        # interruption is synthesized only when supervision actually observed
-        # an interrupted group.
-        terminal = cls._read_terminal(result_read_fd)
-        cls._require_expected_guardian_exit(
-            supervision.termination.leader_exit_code,
-            terminal,
-        )
+        if terminal_error is not None:
+            if not evidence_failures:
+                raise terminal_error
+            raise BaseExceptionGroup(
+                "guardian terminal and post-containment evidence failed",
+                (
+                    terminal_error,
+                    *(failure.error for failure in evidence_failures),
+                ),
+            )
+        if terminal is None:
+            raise AssertionError("guardian terminal attempt must publish one outcome")
+        if evidence_failures:
+            raise ExecutorGuardianPostContainmentError(
+                terminal,
+                tuple(evidence_failures),
+            )
         return terminal
 
     @staticmethod
@@ -791,6 +816,10 @@ class PosixExecutorCommandGuardian:
                     "executor guardian command-start record requires exit code 0"
                 )
             return
+        if type(terminal) is ExecutorGuardianCommandInterrupted:
+            raise ExecutorGuardianProtocolError(
+                "executor guardian cannot publish a synthesized interruption record"
+            )
         if type(terminal) is ExecutorGuardianInternalFailed:
             if guardian_exit_code not in (1, -signal.SIGKILL):
                 raise ExecutorGuardianProtocolError(

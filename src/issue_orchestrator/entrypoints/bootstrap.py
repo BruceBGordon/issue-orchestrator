@@ -77,6 +77,7 @@ from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import GitRepoError, get_repo_from_git
 from ..adapters.host_cpu_utilization import SystemHostCpuUtilizationObserver
+from ..ports.executor_child_resources import ExecutorChildResourceObserver
 from ..ports.event_sink import EventSink, NullEventSink
 from ..ports.issue_tracker import IssueTracker
 from ..ports.session_runner import SessionRunner, NullSessionRunner
@@ -190,6 +191,15 @@ def build_terminal_session_terminator() -> TerminalSessionTerminator:
 def build_executor() -> Executor:
     """Choose the system CPU observer at the sole adapter-aware root."""
     return compose_executor(SystemHostCpuUtilizationObserver())
+
+
+def build_executor_child_resource_observer() -> ExecutorChildResourceObserver:
+    """Choose isolated guardian child-resource accounting at the sole root."""
+    from ..execution.executor_child_resources import (
+        SystemExecutorChildResourceObserver,
+    )
+
+    return SystemExecutorChildResourceObserver()
 
 
 _AGENT_PHASE_COMMAND_SCHEDULER = build_agent_phase_command_scheduler()

@@ -32,6 +32,7 @@ from ...domain.executor_monitoring import (
     ExecutorAdmissionDeadlineExceeded,
     ExecutorCommandFinalizationFailed,
     ExecutorCommandDeadlineExceeded,
+    ExecutorCommandInterrupted,
     ExecutorCommandLifecycleFailed,
     ExecutorCpuSlotState,
     ExecutorEvent,
@@ -47,6 +48,7 @@ from ...domain.executor_monitoring import (
     ExecutorRepositoryReference,
     ExecutorRequestId,
     ExecutorResourceUsage,
+    ExecutorResourceUsageUnavailable,
     ExecutorWaitReason,
     ExecutorWorkAdmitted,
     ExecutorWorkCompleted,
@@ -55,14 +57,17 @@ from ...domain.executor_monitoring import (
 )
 from ._contracts import (
     AdmissionGrantRecord,
+    CommandResourceRecord,
     ExecutedCommandResourceRecord,
     ExecutorStrictRecord,
     HostCpuUtilizationRecord,
     HostLoadRecord,
     QueuedWorkRecord,
     ResourceObservationRecord,
+    UnavailableCommandResourceRecord,
 )
 from ._types import (
+    ExecutorCommandExecution,
     ExecutedExecutorCommand,
     ExecutorWorkIdentity,
     RecordedExecutorObservation,
@@ -154,7 +159,7 @@ class CommandFinalizationFailedEventRecord(_EventRecord):
     fairness_group: str = Field(min_length=1)
     grant: AdmissionGrantRecord
     exit_code: int
-    resources: ExecutedCommandResourceRecord
+    resources: CommandResourceRecord
     failures: tuple[FinalizationFailureRecord, ...] = Field(min_length=1)
 
 
@@ -183,6 +188,18 @@ class CommandDeadlineExceededEventRecord(_EventRecord):
     active_timeout_seconds: float = Field(gt=0)
     absolute_timeout_seconds: float = Field(gt=0)
     elapsed_seconds: float = Field(gt=0)
+
+
+class CommandInterruptedEventRecord(_EventRecord):
+    event: Literal["command-interrupted"] = "command-interrupted"
+    request_id: str = Field(min_length=1)
+    repository_key: str = Field(min_length=1)
+    repository_label: str = Field(min_length=1)
+    work_key: str = Field(min_length=1)
+    fairness_group: str = Field(min_length=1)
+    grant: AdmissionGrantRecord
+    signal_number: int = Field(gt=0)
+    exit_code: int
 
 
 class CompletedEventRecord(_EventRecord):
@@ -216,6 +233,7 @@ StoredExecutorEvent = (
     | CommandFinalizationFailedEventRecord
     | AdmissionDeadlineExceededEventRecord
     | CommandDeadlineExceededEventRecord
+    | CommandInterruptedEventRecord
     | CompletedEventRecord
     | PolicyChangedEventRecord
 )
@@ -367,7 +385,7 @@ class ExecutorEventStore:
         self,
         identity: ExecutorWorkIdentity,
         work: QueuedExecutorWork,
-        result: ExecutedExecutorCommand,
+        result: ExecutorCommandExecution,
         error: ExecutorCommandFinalizationError,
     ) -> None:
         self.append(
@@ -379,8 +397,10 @@ class ExecutorEventStore:
                 fairness_group=work.fairness_group.value,
                 grant=AdmissionGrantRecord.from_domain(result.admission_grant),
                 exit_code=result.exit_code,
-                resources=ExecutedCommandResourceRecord.from_domain(
-                    result.resources
+                resources=(
+                    ExecutedCommandResourceRecord.from_domain(result.resources)
+                    if type(result) is ExecutedExecutorCommand
+                    else UnavailableCommandResourceRecord()
                 ),
                 failures=tuple(
                     FinalizationFailureRecord(
@@ -445,6 +465,26 @@ class ExecutorEventStore:
                 active_timeout_seconds=deadline.active_timeout_seconds,
                 absolute_timeout_seconds=deadline.absolute_timeout_seconds,
                 elapsed_seconds=elapsed_seconds,
+            )
+        )
+
+    def command_interrupted(
+        self,
+        identity: ExecutorWorkIdentity,
+        work: QueuedExecutorWork,
+        grant: ExecutorAdmissionGrant,
+        signal_number: int,
+    ) -> None:
+        self.append(
+            CommandInterruptedEventRecord(
+                request_id=work.request_id.value,
+                repository_key=identity.repository.key,
+                repository_label=identity.repository.label,
+                work_key=identity.work_key.value,
+                fairness_group=work.fairness_group.value,
+                grant=AdmissionGrantRecord.from_domain(grant),
+                signal_number=signal_number,
+                exit_code=-signal_number,
             )
         )
 
@@ -698,6 +738,19 @@ def _to_domain_event(record: StoredExecutorEvent) -> ExecutorEvent:
             error_message=record.error_message,
         )
     if isinstance(record, CommandFinalizationFailedEventRecord):
+        resources = (
+            ExecutorResourceUsage(
+                wall_seconds=record.resources.wall_seconds,
+                cpu_seconds=record.resources.cpu_seconds,
+                guardian_process_lifetime_children_max_rss_bytes=(
+                    record.resources.max_rss_bytes
+                ),
+                input_blocks=record.resources.input_blocks,
+                output_blocks=record.resources.output_blocks,
+            )
+            if type(record.resources) is ExecutedCommandResourceRecord
+            else ExecutorResourceUsageUnavailable()
+        )
         return ExecutorCommandFinalizationFailed(
             metadata=_event_metadata(record),
             work=_monitored_work(
@@ -710,15 +763,7 @@ def _to_domain_event(record: StoredExecutorEvent) -> ExecutorEvent:
             concurrency=record.grant.concurrency,
             charged_cpu_slots=record.grant.capacity_units,
             exit_code=record.exit_code,
-            resources=ExecutorResourceUsage(
-                wall_seconds=record.resources.wall_seconds,
-                cpu_seconds=record.resources.cpu_seconds,
-                executor_process_lifetime_children_max_rss_bytes=(
-                    record.resources.max_rss_bytes
-                ),
-                input_blocks=record.resources.input_blocks,
-                output_blocks=record.resources.output_blocks,
-            ),
+            resources=resources,
             failures=tuple(
                 ExecutorFinalizationFailureDetail(
                     attempt_name=failure.attempt_name,
@@ -759,6 +804,21 @@ def _to_domain_event(record: StoredExecutorEvent) -> ExecutorEvent:
             absolute_timeout_seconds=record.absolute_timeout_seconds,
             elapsed_seconds=record.elapsed_seconds,
         )
+    if isinstance(record, CommandInterruptedEventRecord):
+        return ExecutorCommandInterrupted(
+            metadata=_event_metadata(record),
+            work=_monitored_work(
+                request_id=record.request_id,
+                repository_key=record.repository_key,
+                repository_label=record.repository_label,
+                work_key=record.work_key,
+                fairness_group=record.fairness_group,
+            ),
+            concurrency=record.grant.concurrency,
+            charged_cpu_slots=record.grant.capacity_units,
+            signal_number=record.signal_number,
+            exit_code=record.exit_code,
+        )
     if isinstance(record, CompletedEventRecord):
         return ExecutorWorkCompleted(
             metadata=_event_metadata(record),
@@ -776,7 +836,7 @@ def _to_domain_event(record: StoredExecutorEvent) -> ExecutorEvent:
             resources=ExecutorResourceUsage(
                 wall_seconds=record.observation.wall_seconds,
                 cpu_seconds=record.observation.cpu_seconds,
-                executor_process_lifetime_children_max_rss_bytes=(
+                guardian_process_lifetime_children_max_rss_bytes=(
                     record.observation.max_rss_bytes
                 ),
                 input_blocks=record.observation.input_blocks,

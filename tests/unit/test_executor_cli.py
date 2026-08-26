@@ -159,6 +159,38 @@ def test_run_acknowledges_validation_before_executor_admission(
             os.close(write_descriptor)
 
 
+def test_path_resolution_preserves_executable_symlink_identity(
+    tmp_path: Path,
+) -> None:
+    executable_dir = tmp_path / "bin"
+    executable_dir.mkdir()
+    target = executable_dir / "identity-target"
+    target.write_text('#!/bin/sh\nprintf \'%s\\n\' "$0"\n', encoding="utf-8")
+    target.chmod(0o755)
+    symlink = executable_dir / "identity-link"
+    symlink.symlink_to(target.name)
+    inherited_path = os.environ["PATH"]
+
+    result = _run_cli(
+        tmp_path / "pool",
+        "executor-run",
+        "--work-key",
+        "test:path-symlink",
+        "--min-concurrency",
+        "1",
+        "--max-concurrency",
+        "1",
+        "--group",
+        "path-symlink",
+        "--",
+        symlink.name,
+        deadline_environment={"PATH": f"{executable_dir}:{inherited_path}"},
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == f"{symlink}\n"
+
+
 def test_events_cli_preserves_human_identity_and_scheduler_rationale(
     tmp_path: Path,
 ) -> None:
