@@ -96,7 +96,13 @@ from tests.process_completion_fixture import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-pytestmark = pytest.mark.timeout(180)
+# Real guardian/sentinel machinery is load-sensitive: a 24-worker
+# fork storm starves activation and shutdown handshakes past any
+# honest bound. loadgroup serializes this module onto one worker.
+pytestmark = [
+    pytest.mark.timeout(180),
+    pytest.mark.xdist_group("executor-guardian-machinery"),
+]
 
 
 def _guardian(
