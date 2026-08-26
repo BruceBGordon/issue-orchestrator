@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+
+from ..domain.dirty_remediation import publish_is_best_effort
 from ..domain.artifact_contracts import ValidationFailed
 from .needs_human_block import (
     NO_OTHER_NEEDS_HUMAN_CAUSES,
@@ -104,7 +106,7 @@ from .completion_types import (
     ProcessingResult,
     REVIEW_EXCHANGE_ERROR_PREFIX,
 )
-from .dirty_escalation import dirty_escalation_env
+from .publish_failure import route_despite_publish_failure
 from .pre_publish_gate import PrePublishGate, PrePublishGateResult
 from .review_exchange_contracts import ReviewExchangeCanceller
 from .review_cache_boundary import review_cache_boundary_started_at
@@ -1390,15 +1392,17 @@ class CompletionProcessor:
         errors: list[str],
         run_assets: SessionRunAssets,
     ) -> ProcessingResult | None:
-        if self.pre_publish_gate is None:
+        if self.pre_publish_gate is None or publish_is_best_effort(
+            record.outcome.value
+        ):
+            # Nothing to learn from pre-checking a publish whose failure will not
+            # stop the completion; the push reports its own failure below.
             return None
         if RequestedAction.PUSH_BRANCH not in plan.ordered_actions:
             return None
         gate_session_name = run_assets.session_name
 
-        result = self.pre_publish_gate.check(
-            worktree, extra_env=dirty_escalation_env(self.git_adapter, worktree, record)
-        )
+        result = self.pre_publish_gate.check(worktree)
         if not result.ran:
             return None
         if result.allowed:
@@ -2070,11 +2074,7 @@ class CompletionProcessor:
         skip_hooks = skip_hooks or os.environ.get("E2E_SKIP_PUSH_HOOKS") == "1"
         # Resolved here rather than passed in: a rebase retry moves HEAD, and a
         # signal bound to the old commit must not authorize the new one.
-        result = self.git_adapter.push(
-            worktree,
-            skip_hooks=skip_hooks,
-            extra_env=dirty_escalation_env(self.git_adapter, worktree, record),
-        )
+        result = self.git_adapter.push(worktree, skip_hooks=skip_hooks)
         if result.success:
             actions_taken.append("Pushed branch to remote")
             logger.info("Push succeeded for #%d", issue_number)
@@ -2116,7 +2116,17 @@ class CompletionProcessor:
             retryable=result.retryable,
             branch=result.branch,
         )
-        return self._ActionResult(halt=True)
+        # Halt exactly when the outcome could not be routed without the push.
+        return self._ActionResult(
+            halt=not route_despite_publish_failure(
+                record=record,
+                worktree=worktree,
+                branch=result.branch,
+                reason=result.message,
+                step="push",
+                actions_taken=actions_taken,
+            )
+        )
 
     def _resolve_push_rebase_base(
         self,
@@ -2191,11 +2201,7 @@ class CompletionProcessor:
         )
         if rebase_result.success:
             actions_taken.append(f"Rebased onto origin/{rebase_base}")
-            return self.git_adapter.push(
-                worktree,
-                skip_hooks=skip_hooks,
-                extra_env=dirty_escalation_env(self.git_adapter, worktree, record),
-            )
+            return self.git_adapter.push(worktree, skip_hooks=skip_hooks)
 
         errors.append(f"{ERROR_PREFIX_PUSH}: Rebase failed: {rebase_result.message}")
         error_details.append({

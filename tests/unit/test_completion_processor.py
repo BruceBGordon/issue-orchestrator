@@ -3171,11 +3171,7 @@ class TestCompletionProcessorGitActions:
         )
 
         assert result.success
-        # extra_env is empty for a completed record: only an escalation is
-        # authorized to push a dirty tree, and nothing else may claim it.
-        mock_git_adapter.push.assert_called_once_with(
-            worktree, skip_hooks=False, extra_env={}
-        )
+        mock_git_adapter.push.assert_called_once_with(worktree, skip_hooks=False)
 
     def test_push_failure_is_recorded(
         self, processor, mock_git_adapter, mock_pr_adapter, worktree_with_completion
@@ -4258,14 +4254,8 @@ class TestCompletionProcessorPublishGate:
         )
 
         assert result.success
-        # No escalation signal for a completed record — the gate's hook runs
-        # with the dirty guard fully armed.
-        mock_pre_publish_gate.check.assert_called_once_with(worktree, extra_env={})
-        # extra_env is empty for a completed record: only an escalation is
-        # authorized to push a dirty tree, and nothing else may claim it.
-        mock_git_adapter.push.assert_called_once_with(
-            worktree, skip_hooks=False, extra_env={}
-        )
+        mock_pre_publish_gate.check.assert_called_once_with(worktree)
+        mock_git_adapter.push.assert_called_once_with(worktree, skip_hooks=False)
 
     def test_pre_publish_gate_failure_adds_validation_failed_and_blocks_push(
         self,
@@ -5401,6 +5391,165 @@ class TestRunScopedArtifacts:
 
         assert result.success is True
         assert (coding_run.run_dir / "completion-record.json").exists()
+
+
+class TestEscalationSurvivesAFailedPublish:
+    """A failed push must not swallow the escalation's whole point.
+
+    Both escalation statuses request PUSH_BRANCH before their label and
+    comment, and a push failure halted the remaining actions. The agent
+    therefore exited having successfully escalated while no label, no comment,
+    and no human ever appeared -- the same dead end as refusing the escalation,
+    arriving one step later.
+    """
+
+    @pytest.mark.parametrize(
+        "outcome,label,action",
+        [
+            (CompletionOutcome.BLOCKED, "blocked", RequestedAction.ADD_BLOCKED_LABEL),
+            (
+                CompletionOutcome.NEEDS_HUMAN,
+                "needs_human",
+                RequestedAction.ADD_NEEDS_HUMAN_LABEL,
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "push_message", ["non-fast-forward", "remote rejected: permission denied"]
+    )
+    def test_the_human_is_still_routed_when_the_push_fails(
+        self,
+        outcome,
+        label,
+        action,
+        push_message,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            event_bus=event_bus,
+            session_output=FileSystemSessionOutput(),
+            label_config={label: label},
+            config=Config(),
+        )
+        mock_git_adapter.push.return_value = PushResult(
+            success=False, branch="issue-123", remote="origin", message=push_message
+        )
+        record = make_record(
+            outcome=outcome,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                action,
+                RequestedAction.POST_COMMENT,
+            ],
+            summary="cannot classify dirty file operator_notes.py",
+        )
+        worktree = worktree_with_completion(record)
+
+        processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        mock_label_adapter.add_label.assert_any_call(123, label)
+        mock_pr_adapter.add_comment.assert_called()
+
+    def test_the_comment_says_where_the_unpushed_commits_are(
+        self,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """Cleanup removes worktrees by default; the human needs the path."""
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            event_bus=event_bus,
+            session_output=FileSystemSessionOutput(),
+            label_config={"blocked": "blocked"},
+            config=Config(),
+        )
+        mock_git_adapter.push.return_value = PushResult(
+            success=False, branch="issue-123", remote="origin", message="rejected"
+        )
+        record = make_record(
+            outcome=CompletionOutcome.BLOCKED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.ADD_BLOCKED_LABEL,
+                RequestedAction.POST_COMMENT,
+            ],
+            summary="blocked",
+        )
+        worktree = worktree_with_completion(record)
+
+        processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        posted = " ".join(
+            str(call) for call in mock_pr_adapter.add_comment.call_args_list
+        )
+        assert "issue-123" in posted
+        assert "not pushed" in posted
+
+    def test_a_failed_publish_still_stops_a_completed_record(
+        self,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """For completed work the push *is* the result, so failure must halt."""
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            event_bus=event_bus,
+            session_output=FileSystemSessionOutput(),
+            label_config={},
+            config=Config(),
+        )
+        mock_git_adapter.push.return_value = PushResult(
+            success=False, branch="issue-123", remote="origin", message="rejected"
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.CREATE_PR,
+            ],
+            summary="Done",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert not result.success
+        mock_pr_adapter.create_pr.assert_not_called()
 
 
 class TestEscalationVocabularyIsShared:

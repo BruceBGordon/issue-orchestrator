@@ -44,8 +44,6 @@ class GitAdapter(Protocol):
         remote: str = "origin",
         set_upstream: bool = True,
         skip_hooks: bool = False,
-        *,
-        extra_env: dict[str, str] | None = None,
     ) -> PushResult: ...
 
     def rebase_on_branch(self, worktree: Path, target: str = "origin/main") -> RebaseResult: ...

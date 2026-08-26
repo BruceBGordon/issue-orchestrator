@@ -24,8 +24,6 @@ class FailingPushWorkingCopy(StubWorkingCopy):
         force_with_lease: bool = True,
         set_upstream: bool = True,
         skip_hooks: bool = False,
-        *,
-        extra_env: dict[str, str] | None = None,
     ) -> PushResult:
         return PushResult(success=False, branch=self.branch, remote=remote, message="simulated push failure")
 

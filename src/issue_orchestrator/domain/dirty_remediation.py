@@ -91,8 +91,10 @@ REMEDIATION_LADDER: tuple[RemediationRung, ...] = (
             "classify, and it would hide a file someone else may be working "
             f"on. Report it instead: {ESCALATION_COMMAND} (or the needs_human "
             "status). Those two statuses are accepted on a dirty tree "
-            "precisely so this path is reachable -- the file stays on disk, "
-            "untouched, for a human to resolve."
+            "precisely so this path is reachable. The branch is not published "
+            "while the tree is dirty, so name what you committed in --reason; "
+            "the issue is labelled and commented either way, and the file "
+            "stays on disk, untouched, for a human to resolve."
         ),
     ),
 )
@@ -217,37 +219,34 @@ def dirty_tree_disposition(status: str) -> DirtyTreeDisposition:
     return DirtyTreeDisposition.REJECT
 
 
-#: How the orchestrator tells the pre-push hook that this particular dirty push
-#: is the escalation it already decided to allow.
-#:
-#: This is an environment variable on the processes the orchestrator itself
-#: spawns -- the pre-publish gate's hook run and the push -- and deliberately
-#: not a file in the worktree. A worktree file is writable by the agent, so it
-#: is an assertion anyone can make rather than a decision only the orchestrator
-#: can take; it also outlives a hard process exit, which turns a crash into a
-#: standing exemption. An environment variable can be neither forged by writing
-#: to the worktree nor left behind by a process that died.
-DIRTY_ESCALATION_ENV = "ISSUE_ORCHESTRATOR_DIRTY_ESCALATION"
+def publish_is_best_effort(outcome: str) -> bool:
+    """Whether publishing may fail without suppressing the rest of the completion.
 
+    An escalation exists to reach a human. Its label and its comment are the
+    authoritative result; pushing the committed history alongside them is a
+    convenience. When a push failure halts the remaining actions, a reported
+    problem becomes silence -- the agent exits successfully having escalated,
+    and nobody is ever told. That is the same dead end as refusing the
+    escalation outright, arriving one step later.
 
-def dirty_escalation_signal(worktree: str, head_sha: str) -> str:
-    """The value that authorizes a dirty push of ``worktree`` at ``head_sha``.
-
-    Binding both means a value observed in one context cannot be reused for a
-    different worktree or a different commit: the push publishes exactly this
-    HEAD, so an escalation approved for one commit says nothing about another.
+    Publishing finished work is the opposite: for ``completed`` the push *is*
+    the result, so a failed push must stop everything after it.
     """
-    return f"{worktree}@{head_sha}"
+    return outcome in ESCALATION_STATUSES
 
 
-def signal_authorizes_dirty_push(
-    value: str | None, worktree: str, head_sha: str | None
-) -> bool:
-    """Whether ``value`` authorizes a dirty push of this worktree at this HEAD.
+def unpublished_escalation_notice(
+    worktree: str, branch: str | None, reason: str
+) -> str:
+    """What to tell a human when an escalation's branch never reached the remote.
 
-    Fail closed on everything: no signal, an unresolvable HEAD, or a signal
-    naming any other worktree or commit.
+    Cleanup removes worktrees by default, so an escalation whose commits stayed
+    local is exactly how finished work goes missing. Naming the branch and the
+    path while someone can still act on it is the difference between "not
+    published" and "lost".
     """
-    if not value or not head_sha:
-        return False
-    return value == dirty_escalation_signal(worktree, head_sha)
+    return (
+        f"The branch was not pushed ({reason}). Any commits made for this "
+        f"issue are still local, on branch '{branch or 'unknown'}' in "
+        f"{worktree}. Recover them before this worktree is cleaned up."
+    )

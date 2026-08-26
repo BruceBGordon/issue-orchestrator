@@ -630,10 +630,7 @@ class StubWorkingCopy:
         force_with_lease: bool = True,
         set_upstream: bool = True,
         skip_hooks: bool = False,
-        *,
-        extra_env: dict[str, str] | None = None,
     ) -> PushResult:
-        self.last_push_extra_env = dict(extra_env or {})
         return PushResult(success=True, branch=self.branch, remote=remote, message="ok")
 
     def diff_against_base(self, worktree: Path, base_ref: str) -> DiffResult:

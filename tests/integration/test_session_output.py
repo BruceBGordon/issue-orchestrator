@@ -59,8 +59,6 @@ class DummyGitAdapter:
         remote: str = "origin",
         set_upstream: bool = True,
         skip_hooks: bool = False,
-        *,
-        extra_env: dict[str, str] | None = None,
     ) -> PushResult:
         return PushResult(success=True, branch="feature", remote=remote, message="ok")
 

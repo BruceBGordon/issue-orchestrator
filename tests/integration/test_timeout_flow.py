@@ -66,8 +66,7 @@ class StubPrAdapter:
 
 class StubGitAdapter:
     def push(self, worktree: Path, remote: str = "origin", force_with_lease: bool = True,
-             set_upstream: bool = True, skip_hooks: bool = False, *,
-             extra_env: dict[str, str] | None = None):
+             set_upstream: bool = True, skip_hooks: bool = False):
         raise RuntimeError("push not expected")
 
 

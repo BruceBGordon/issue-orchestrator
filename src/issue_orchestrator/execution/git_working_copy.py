@@ -575,8 +575,6 @@ class GitWorkingCopy:
         remote: str = "origin",
         set_upstream: bool = True,
         skip_hooks: bool = False,
-        *,
-        extra_env: dict[str, str] | None = None,
     ) -> PushResult:
         """Push current branch to remote with --force-with-lease.
 
@@ -620,11 +618,6 @@ class GitWorkingCopy:
         )
         if fetch_error:
             return fetch_error
-
-        if extra_env:
-            # The orchestrator's own decisions reach the pre-push hook here, on
-            # the process it spawns -- never through the worktree.
-            auth_env = {**(auth_env or {}), **extra_env}
 
         args = git_push_ops.build_push_args(remote, branch, set_upstream, skip_hooks)
 

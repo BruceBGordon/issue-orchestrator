@@ -13,7 +13,6 @@ Exit codes:
 """
 
 import logging
-import os
 import shutil
 import sys
 import time
@@ -22,12 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from ...domain.dirty_remediation import (
-    DIRTY_ESCALATION_ENV,
-    DirtyTreeDisposition,
-    guard_hint_lines,
-    signal_authorizes_dirty_push,
-)
+from ...domain.dirty_remediation import guard_hint_lines
 from ...control.validation import PublishGate
 from ...execution import GitWorkingCopy, LocalCommandRunner
 from ...infra.runtime_artifacts import filter_runtime_managed_dirty_paths
@@ -104,43 +98,6 @@ def _filter_guard_excluded_files(files: list[str], worktree: Path) -> list[str]:
     return filter_runtime_managed_dirty_paths(files, worktree)
 
 
-def _declared_dirty_disposition(worktree: Path) -> "DirtyTreeDisposition":
-    """Whether the orchestrator authorized a dirty push of this worktree, now.
-
-    The signal arrives in the environment of the process the orchestrator
-    spawned -- the pre-publish gate's hook run, or the push itself. It is not a
-    file, and that is the point: a file in the worktree is writable by the
-    agent, so it is an assertion anyone can make rather than a decision only
-    the orchestrator can take, and it survives a hard process exit, which turns
-    a crash into a standing exemption. An environment variable can be neither.
-
-    The value names a worktree and a commit, and both must match here, so a
-    value observed in one context cannot authorize a push of a different tree
-    or a different HEAD. Everything else fails closed: no signal, an
-    unresolvable HEAD, or any mismatch.
-    """
-    head_sha = GitWorkingCopy().get_head_sha(worktree)
-    if signal_authorizes_dirty_push(
-        os.environ.get(DIRTY_ESCALATION_ENV),
-        str(worktree.resolve()),
-        head_sha,
-    ):
-        return DirtyTreeDisposition.PRESERVE_AND_ESCALATE
-    return DirtyTreeDisposition.REJECT
-
-
-def _report_escalation_exemption(dirty_files: list[str], verbose: bool) -> None:
-    """Say plainly why a dirty tree was allowed through."""
-    if not verbose:
-        return
-    print(
-        "Dirty tree allowed: this completion is an escalation, and the files "
-        "below are preserved untouched for a human. Only committed history is "
-        "published."
-    )
-    _print_dirty_files(dirty_files)
-
-
 def _report_dirty_guard_failure(
     mode: str, dirty_files: list[str], verbose: bool
 ) -> None:
@@ -199,11 +156,6 @@ def _run_dirty_guard(worktree: Path, mode: str, verbose: bool) -> Optional[int]:
     if dirty_files is None:
         return 1
     if not dirty_files:
-        return None
-
-    disposition = _declared_dirty_disposition(worktree)
-    if disposition is DirtyTreeDisposition.PRESERVE_AND_ESCALATE:
-        _report_escalation_exemption(dirty_files, verbose)
         return None
 
     _report_dirty_guard_failure(mode, dirty_files, verbose)
