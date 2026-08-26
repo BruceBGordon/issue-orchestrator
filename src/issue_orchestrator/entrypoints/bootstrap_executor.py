@@ -210,11 +210,15 @@ def build_terminal_session_watcher_factory() -> TerminalSessionWatcherFactory:
 def build_retained_thread_factory() -> RetainedThreadFactory:
     """Compose the single owner for retained background-thread lifecycles."""
     from ..execution.retained_thread import (
+        ImmediateThreadNativeExitPrimitive,
         MaskedThreadStartPrimitive,
         ThreadingRetainedThreadFactory,
     )
 
-    return ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+    return ThreadingRetainedThreadFactory(
+        MaskedThreadStartPrimitive(),
+        ImmediateThreadNativeExitPrimitive(),
+    )
 
 
 def build_terminal_session_owner() -> TerminalSessionOwner:

@@ -562,13 +562,13 @@ class SubprocessPlugin:
             failures.append(containment_error)
         outcome = watcher.await_completion(self._watcher_policy)
         if type(outcome) is TerminalSessionWatcherTimedOut:
-            failures.append(
-                TerminalSessionWatcherShutdownError(
-                    "interrupted terminal watcher remained live after containment: "
-                    f"session_name={outcome.session_name!r} "
-                    f"pid={outcome.process_id} timeout={outcome.timeout_seconds:.3f}s"
-                )
+            shutdown_error = TerminalSessionWatcherShutdownError(
+                "interrupted terminal watcher remained live after containment: "
+                f"session_name={outcome.session_name!r} "
+                f"pid={outcome.process_id} timeout={outcome.timeout_seconds:.3f}s"
             )
+            shutdown_error.__cause__ = outcome.error
+            failures.append(shutdown_error)
             raise BaseExceptionGroup(
                 "terminal watcher activation recovery was incomplete",
                 failures,
@@ -654,7 +654,7 @@ class SubprocessPlugin:
                 "terminal session watcher remained live after containment: "
                 f"session_name={outcome.session_name!r} pid={outcome.process_id} "
                 f"timeout={outcome.timeout_seconds:.3f}s"
-            )
+            ) from outcome.error
         if type(outcome) is TerminalSessionWatcherFailed:
             raise TerminalSessionWatcherShutdownError(
                 "terminal session watcher failed during PTY finalization: "

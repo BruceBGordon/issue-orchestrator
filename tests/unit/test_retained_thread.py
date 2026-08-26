@@ -6,9 +6,11 @@ import threading
 from dataclasses import dataclass, field
 
 from issue_orchestrator.domain.retained_thread import (
+    RetainedThreadActivated,
     RetainedThreadActivationIndeterminate,
     RetainedThreadActivationRejected,
     RetainedThreadFinalized,
+    RetainedThreadStillRunning,
     RetainedThreadShutdownPolicy,
     RetainedThreadSpec,
     RetainedThreadState,
@@ -17,6 +19,8 @@ from issue_orchestrator.domain.retained_thread import (
     ThreadPrimitiveRejected,
 )
 from issue_orchestrator.execution.retained_thread import (
+    ImmediateThreadNativeExitPrimitive,
+    MaskedThreadStartPrimitive,
     ThreadingRetainedThreadFactory,
 )
 from tests.process_completion_fixture import PROCESS_COMPLETION_WATCHDOG
@@ -63,6 +67,21 @@ class _RejectedStart:
         return ThreadPrimitiveRejected(self.failure)
 
 
+@dataclass(slots=True)
+class _PausedNativeExit:
+    """Hold the native thread live after its target publishes terminal state."""
+
+    entered: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+
+    def before_native_return(self) -> None:
+        self.entered.set()
+        PROCESS_COMPLETION_WATCHDOG.wait_for_event(
+            self.release,
+            operation="release retained native thread return",
+        )
+
+
 _SHUTDOWN_POLICY = RetainedThreadShutdownPolicy(
     initial_timeout_seconds=1.0,
     recovery_timeout_seconds=1.0,
@@ -73,7 +92,10 @@ def test_indeterminate_start_retains_until_delayed_target_acknowledges() -> None
     interruption = KeyboardInterrupt("injected after native start request")
     primitive = _DelayedIndeterminateStart(interruption)
     target_ran = threading.Event()
-    lease = ThreadingRetainedThreadFactory(primitive).prepare(
+    lease = ThreadingRetainedThreadFactory(
+        primitive,
+        ImmediateThreadNativeExitPrimitive(),
+    ).prepare(
         RetainedThreadSpec(name="delayed-retained-target", daemon=True),
         target_ran.set,
     )
@@ -99,7 +121,10 @@ def test_indeterminate_start_retains_until_delayed_target_acknowledges() -> None
 def test_authoritative_primitive_rejection_never_runs_target() -> None:
     failure = RuntimeError("native thread allocation rejected")
     target_ran = threading.Event()
-    lease = ThreadingRetainedThreadFactory(_RejectedStart(failure)).prepare(
+    lease = ThreadingRetainedThreadFactory(
+        _RejectedStart(failure),
+        ImmediateThreadNativeExitPrimitive(),
+    ).prepare(
         RetainedThreadSpec(name="rejected-retained-target", daemon=True),
         target_ran.set,
     )
@@ -110,3 +135,28 @@ def test_authoritative_primitive_rejection_never_runs_target() -> None:
     assert activation.error is failure
     assert lease.state is RetainedThreadState.REJECTED
     assert not target_ran.is_set()
+
+
+def test_terminal_target_fact_cannot_precede_authoritative_native_exit() -> None:
+    native_exit = _PausedNativeExit()
+    lease = ThreadingRetainedThreadFactory(
+        MaskedThreadStartPrimitive(),
+        native_exit,
+    ).prepare(
+        RetainedThreadSpec(name="paused-native-exit", daemon=True),
+        lambda: None,
+    )
+
+    assert type(lease.activate()) is RetainedThreadActivated
+    PROCESS_COMPLETION_WATCHDOG.wait_for_event(
+        native_exit.entered,
+        operation="retained native-exit seam entered",
+    )
+    still_running = lease.finalize(
+        RetainedThreadShutdownPolicy(0.01, 0.01)
+    )
+
+    assert type(still_running) is RetainedThreadStillRunning
+    native_exit.release.set()
+    finalized = lease.finalize(_SHUTDOWN_POLICY)
+    assert type(finalized) is RetainedThreadFinalized

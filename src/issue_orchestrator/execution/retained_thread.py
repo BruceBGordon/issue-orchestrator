@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import signal
 import threading
+import time
 from collections.abc import Callable
 
 from ..domain.retained_thread import (
@@ -23,7 +24,11 @@ from ..domain.retained_thread import (
     ThreadPrimitiveRejected,
     ThreadPrimitiveStarted,
 )
-from ..ports.retained_thread import RetainedThreadLease, ThreadStartPrimitive
+from ..ports.retained_thread import (
+    RetainedThreadLease,
+    ThreadNativeExitPrimitive,
+    ThreadStartPrimitive,
+)
 
 
 _ACTIVATION_SIGNALS = frozenset((signal.SIGHUP, signal.SIGINT, signal.SIGTERM))
@@ -83,6 +88,7 @@ class ThreadingRetainedThreadLease:
         spec: RetainedThreadSpec,
         target: Callable[[], None],
         start_primitive: ThreadStartPrimitive,
+        native_exit_primitive: ThreadNativeExitPrimitive,
     ) -> None:
         if type(spec) is not RetainedThreadSpec:
             raise ValueError(
@@ -101,6 +107,12 @@ class ThreadingRetainedThreadLease:
         self._terminal = threading.Event()
         self._target = target
         self._start_primitive = start_primitive
+        if not isinstance(native_exit_primitive, ThreadNativeExitPrimitive):
+            raise ValueError(
+                "ThreadingRetainedThreadLease.native_exit_primitive must "
+                "implement ThreadNativeExitPrimitive"
+            )
+        self._native_exit_primitive = native_exit_primitive
         self._target_result: _RetainedTargetResult = _RetainedTargetHealthy()
         self._thread = threading.Thread(
             target=self._run_target,
@@ -181,9 +193,12 @@ class ThreadingRetainedThreadLease:
         attempt_name: str,
         timeout_seconds: float,
     ) -> _ThreadFinalizationAttempt:
+        deadline = time.monotonic() + timeout_seconds
         failures: list[BaseException] = []
         if self.state is RetainedThreadState.ACTIVATING:
-            if not self._activation_acknowledged.wait(timeout_seconds):
+            if not self._activation_acknowledged.wait(
+                self._remaining(deadline)
+            ):
                 return _ThreadFinalizationAttemptPending(
                     (
                         TimeoutError(
@@ -196,7 +211,9 @@ class ThreadingRetainedThreadLease:
             with self._state_lock:
                 self._state = RetainedThreadState.ACTIVATED
         try:
-            terminal = self._terminal.wait(timeout_seconds)
+            terminal = self._terminal.wait(
+                self._remaining(deadline)
+            )
         except BaseException as error:
             error.add_note(f"retained thread {attempt_name} terminal wait failed")
             failures.append(error)
@@ -209,11 +226,52 @@ class ThreadingRetainedThreadLease:
                 )
             )
             return _ThreadFinalizationAttemptPending(tuple(failures))
+        return self._join_after_terminal(
+            attempt_name,
+            timeout_seconds,
+            deadline,
+            failures,
+        )
+
+    def _join_after_terminal(
+        self,
+        attempt_name: str,
+        timeout_seconds: float,
+        deadline: float,
+        failures: list[BaseException],
+    ) -> _ThreadFinalizationAttempt:
         try:
-            self._thread.join(timeout=0.0)
+            remaining = self._remaining(deadline)
+            if remaining <= 0:
+                failures.append(
+                    TimeoutError(
+                        f"retained thread exhausted {attempt_name} native-join "
+                        "deadline"
+                    )
+                )
+                return _ThreadFinalizationAttemptPending(tuple(failures))
+            self._thread.join(
+                timeout=remaining
+            )
         except BaseException as error:
             error.add_note(f"retained thread {attempt_name} reap failed")
             failures.append(error)
+        try:
+            thread_is_live = self._thread.is_alive()
+        except BaseException as error:
+            error.add_note(
+                f"retained thread {attempt_name} live-state observation failed"
+            )
+            failures.append(error)
+            return _ThreadFinalizationAttemptPending(tuple(failures))
+        if thread_is_live:
+            failures.append(
+                TimeoutError(
+                    f"retained thread remained live after {attempt_name} "
+                    f"{timeout_seconds:.3f}s native join: {self._thread.name!r}"
+                )
+            )
+            return _ThreadFinalizationAttemptPending(tuple(failures))
         with self._state_lock:
             target_result = self._target_result
         if type(target_result) is _RetainedTargetFailed:
@@ -221,6 +279,10 @@ class ThreadingRetainedThreadLease:
         elif type(target_result) is not _RetainedTargetHealthy:
             raise AssertionError("retained target result is a closed union")
         return _ThreadFinalizationAttemptStopped(tuple(failures))
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        return max(0.0, deadline - time.monotonic())
 
     def _run_target(self) -> None:
         self._activation_acknowledged.set()
@@ -232,6 +294,28 @@ class ThreadingRetainedThreadLease:
                 self._target_result = _RetainedTargetFailed(error)
         finally:
             self._terminal.set()
+            try:
+                self._native_exit_primitive.before_native_return()
+            except BaseException as error:
+                with self._state_lock:
+                    previous = self._target_result
+                    if type(previous) is _RetainedTargetFailed:
+                        error = BaseExceptionGroup(
+                            "retained target and native-exit observation failed",
+                            (previous.error, error),
+                        )
+                    elif type(previous) is not _RetainedTargetHealthy:
+                        raise AssertionError(
+                            "retained target result is a closed union"
+                        )
+                    self._target_result = _RetainedTargetFailed(error)
+
+
+class ImmediateThreadNativeExitPrimitive:
+    """Production native-exit seam with no pre-return coordination."""
+
+    def before_native_return(self) -> None:
+        pass
 
 
 class MaskedThreadStartPrimitive:
@@ -280,17 +364,32 @@ class MaskedThreadStartPrimitive:
 class ThreadingRetainedThreadFactory:
     """Production construction adapter for retained threads."""
 
-    def __init__(self, start_primitive: ThreadStartPrimitive) -> None:
+    def __init__(
+        self,
+        start_primitive: ThreadStartPrimitive,
+        native_exit_primitive: ThreadNativeExitPrimitive,
+    ) -> None:
         if not isinstance(start_primitive, ThreadStartPrimitive):
             raise ValueError(
                 "ThreadingRetainedThreadFactory.start_primitive must implement "
                 "ThreadStartPrimitive"
             )
         self._start_primitive = start_primitive
+        if not isinstance(native_exit_primitive, ThreadNativeExitPrimitive):
+            raise ValueError(
+                "ThreadingRetainedThreadFactory.native_exit_primitive must "
+                "implement ThreadNativeExitPrimitive"
+            )
+        self._native_exit_primitive = native_exit_primitive
 
     def prepare(
         self,
         spec: RetainedThreadSpec,
         target: Callable[[], None],
     ) -> RetainedThreadLease:
-        return ThreadingRetainedThreadLease(spec, target, self._start_primitive)
+        return ThreadingRetainedThreadLease(
+            spec,
+            target,
+            self._start_primitive,
+            self._native_exit_primitive,
+        )

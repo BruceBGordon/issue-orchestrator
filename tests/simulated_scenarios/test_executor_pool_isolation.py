@@ -53,6 +53,10 @@ def test_spawned_agent_phase_uses_worker_local_executor_pool(
     _run_git(repository, "add", "tracked.txt")
     _run_git(repository, "commit", "-q", "-m", "fixture")
 
+    destination = make_session_run_assets(
+        repository,
+        session_name="executor-isolation",
+    ).terminal_destination
     specification = AgentPhaseRunSpecification.from_timeout_minutes(
         work_key=ExecutorWorkKey("simulated:executor-isolation"),
         fairness_group=ExecutorFairnessGroup("simulated:isolation-regression"),
@@ -60,12 +64,9 @@ def test_spawned_agent_phase_uses_worker_local_executor_pool(
         interaction_intent=TerminalInteractionIntent.NONE,
         shell_command=shlex.join((sys.executable, "-c", "pass")),
         cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
-            tmp_path.resolve()
+            destination.run_dir
         ),
-        destination=make_session_run_assets(
-            repository,
-            session_name="executor-isolation",
-        ).terminal_destination,
+        destination=destination,
     )
     scheduled = host_agent_phase_command_scheduler().schedule(specification)
     completed = subprocess.run(

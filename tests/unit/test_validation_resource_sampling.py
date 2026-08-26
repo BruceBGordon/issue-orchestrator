@@ -16,6 +16,7 @@ from issue_orchestrator.domain.validation_resource_sampling import (
     ValidationResourceSamplingPolicy,
 )
 from issue_orchestrator.execution.retained_thread import (
+    ImmediateThreadNativeExitPrimitive,
     MaskedThreadStartPrimitive,
     ThreadingRetainedThreadFactory,
 )
@@ -31,7 +32,10 @@ from tests.process_completion_fixture import PROCESS_COMPLETION_WATCHDOG
 
 
 def _retained_thread_factory() -> ThreadingRetainedThreadFactory:
-    return ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+    return ThreadingRetainedThreadFactory(
+        MaskedThreadStartPrimitive(),
+        ImmediateThreadNativeExitPrimitive(),
+    )
 
 
 def _sample() -> ValidationResourceSample:

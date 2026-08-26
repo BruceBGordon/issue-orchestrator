@@ -47,3 +47,10 @@ class ThreadStartPrimitive(Protocol):
     """Authoritative adapter boundary around one native thread start."""
 
     def start(self, thread: threading.Thread) -> ThreadPrimitiveActivation: ...
+
+
+@runtime_checkable
+class ThreadNativeExitPrimitive(Protocol):
+    """Observable seam immediately before the target's native thread returns."""
+
+    def before_native_return(self) -> None: ...

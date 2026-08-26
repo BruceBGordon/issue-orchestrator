@@ -60,6 +60,9 @@ class RetainedThreadActivationRejected:
 
     error: BaseException
 
+    def __post_init__(self) -> None:
+        _require_error(self.error, "RetainedThreadActivationRejected.error")
+
 
 @dataclass(frozen=True, slots=True)
 class RetainedThreadActivationInterrupted:
@@ -67,12 +70,18 @@ class RetainedThreadActivationInterrupted:
 
     error: BaseException
 
+    def __post_init__(self) -> None:
+        _require_error(self.error, "RetainedThreadActivationInterrupted.error")
+
 
 @dataclass(frozen=True, slots=True)
 class RetainedThreadActivationIndeterminate:
     """The primitive may have started a target that has not acknowledged yet."""
 
     error: BaseException
+
+    def __post_init__(self) -> None:
+        _require_error(self.error, "RetainedThreadActivationIndeterminate.error")
 
 
 RetainedThreadActivation = (
@@ -94,12 +103,18 @@ class ThreadPrimitiveRejected:
 
     error: BaseException
 
+    def __post_init__(self) -> None:
+        _require_error(self.error, "ThreadPrimitiveRejected.error")
+
 
 @dataclass(frozen=True, slots=True)
 class ThreadPrimitiveIndeterminate:
     """The primitive was interrupted after native activation may have begun."""
 
     error: BaseException
+
+    def __post_init__(self) -> None:
+        _require_error(self.error, "ThreadPrimitiveIndeterminate.error")
 
 
 ThreadPrimitiveActivation = (
@@ -118,6 +133,9 @@ class RetainedThreadFinalizedAfterFailure:
 
     error: BaseException
 
+    def __post_init__(self) -> None:
+        _require_error(self.error, "RetainedThreadFinalizedAfterFailure.error")
+
 
 @dataclass(frozen=True, slots=True)
 class RetainedThreadStillRunning:
@@ -125,9 +143,17 @@ class RetainedThreadStillRunning:
 
     error: BaseException
 
+    def __post_init__(self) -> None:
+        _require_error(self.error, "RetainedThreadStillRunning.error")
+
 
 RetainedThreadFinalization = (
     RetainedThreadFinalized
     | RetainedThreadFinalizedAfterFailure
     | RetainedThreadStillRunning
 )
+
+
+def _require_error(value: object, field_name: str) -> None:
+    if not isinstance(value, BaseException):
+        raise ValueError(f"{field_name} must be a BaseException")

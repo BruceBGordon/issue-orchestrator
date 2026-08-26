@@ -204,6 +204,7 @@ class TerminalSessionWatcher:
                 self._session_name,
                 self._session.pid,
                 policy.shutdown_timeout_seconds * 2,
+                finalization.error,
             )
         if type(finalization) is RetainedThreadFinalizedAfterFailure:
             return TerminalSessionWatcherFailed(

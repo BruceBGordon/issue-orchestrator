@@ -20,6 +20,7 @@ from issue_orchestrator.domain.terminal_session_lifecycle import (
 )
 from issue_orchestrator.execution.agent_runner import AgentResult, AgentSession
 from issue_orchestrator.execution.retained_thread import (
+    ImmediateThreadNativeExitPrimitive,
     MaskedThreadStartPrimitive,
     ThreadingRetainedThreadFactory,
 )
@@ -69,7 +70,10 @@ class BlockingTerminalSessionWatcherFactory:
         watcher = TerminalSessionWatcher(
             session_name,
             session,
-            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive()),
+            ThreadingRetainedThreadFactory(
+                MaskedThreadStartPrimitive(),
+                ImmediateThreadNativeExitPrimitive(),
+            ),
         )
         self._watchers.append(watcher)
         return watcher

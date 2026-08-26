@@ -41,6 +41,7 @@ from issue_orchestrator.execution.terminal_session_lifecycle import (
     ThreadTerminalSessionWatcherFactory,
 )
 from issue_orchestrator.execution.retained_thread import (
+    ImmediateThreadNativeExitPrimitive,
     MaskedThreadStartPrimitive,
     ThreadingRetainedThreadFactory,
 )
@@ -71,6 +72,13 @@ from tests.unit.terminal_session_owner_helpers import (
 )
 
 
+def _retained_thread_factory() -> ThreadingRetainedThreadFactory:
+    return ThreadingRetainedThreadFactory(
+        MaskedThreadStartPrimitive(),
+        ImmediateThreadNativeExitPrimitive(),
+    )
+
+
 def _plugin(
     repo_root: Path,
     *,
@@ -85,7 +93,7 @@ def _plugin(
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
         ThreadTerminalSessionWatcherFactory(
-            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+            _retained_thread_factory()
         ),
         session_interactions_enabled=session_interactions_enabled,
         worktree_base=worktree_base,
@@ -254,7 +262,7 @@ def test_identity_observation_failure_contains_unregistered_process_tree(
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
         ThreadTerminalSessionWatcherFactory(
-            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+            _retained_thread_factory()
         ),
     )
     launch, _run_dir = _term_resistant_launch(
@@ -301,7 +309,7 @@ def test_registry_publication_failure_contains_unregistered_process_tree(
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
         ThreadTerminalSessionWatcherFactory(
-            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+            _retained_thread_factory()
         ),
     )
     launch, _run_dir = _term_resistant_launch(
@@ -347,7 +355,7 @@ def test_terminal_owner_survives_one_sentinel_hard_crash(
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
         ThreadTerminalSessionWatcherFactory(
-            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+            _retained_thread_factory()
         ),
     )
     launch, _run_dir = _term_resistant_launch(
@@ -401,7 +409,7 @@ def test_subprocess_session_writes_log(tmp_path, monkeypatch):
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
         ThreadTerminalSessionWatcherFactory(
-            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+            _retained_thread_factory()
         ),
     )
     launch, run_dir = _launch_with_run_dir(
@@ -479,7 +487,7 @@ def test_session_exists_returns_false_when_session_not_alive(tmp_path, monkeypat
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
         ThreadTerminalSessionWatcherFactory(
-            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+            _retained_thread_factory()
         ),
     )
 
@@ -516,7 +524,7 @@ def test_discover_running_sessions_includes_canonical_session_name(
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
         ThreadTerminalSessionWatcherFactory(
-            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+            _retained_thread_factory()
         ),
     )
     run_dir = (
@@ -690,7 +698,7 @@ def test_kill_session_delegates_complete_containment_to_typed_port(
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
         ThreadTerminalSessionWatcherFactory(
-            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+            _retained_thread_factory()
         ),
     )
     record = _session_record(
@@ -736,7 +744,7 @@ def test_recycled_session_pid_is_retired_through_typed_terminator(
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
         ThreadTerminalSessionWatcherFactory(
-            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+            _retained_thread_factory()
         ),
     )
     record = _session_record(
@@ -789,7 +797,7 @@ def test_shutdown_attempts_every_session_and_preserves_failed_registry_rows(
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
         ThreadTerminalSessionWatcherFactory(
-            ThreadingRetainedThreadFactory(MaskedThreadStartPrimitive())
+            _retained_thread_factory()
         ),
     )
     first = _session_record(

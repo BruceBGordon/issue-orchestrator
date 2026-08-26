@@ -271,6 +271,10 @@ def _executor_events(pool_dir: Path) -> subprocess.CompletedProcess[str]:
 def test_phase_specification_converts_active_timeout_to_fixed_absolute_bound(
     tmp_path: Path,
 ) -> None:
+    destination = make_session_run_assets(
+        tmp_path,
+        session_name="phase-specification",
+    ).terminal_destination
     specification = AgentPhaseRunSpecification.from_timeout_minutes(
         work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
         fairness_group=ExecutorFairnessGroup("agent:run-1:coding-1"),
@@ -278,12 +282,9 @@ def test_phase_specification_converts_active_timeout_to_fixed_absolute_bound(
         interaction_intent=TerminalInteractionIntent.NONE,
         shell_command="run-agent --issue 42",
         cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
-            tmp_path.resolve()
+            destination.run_dir
         ),
-        destination=make_session_run_assets(
-            tmp_path,
-            session_name="phase-specification",
-        ).terminal_destination,
+        destination=destination,
     )
 
     assert specification.deadline.active_timeout_seconds == 2700.0
@@ -295,6 +296,31 @@ def test_phase_specification_converts_active_timeout_to_fixed_absolute_bound(
         ).reason
         is ExecutorDeadlineReason.ABSOLUTE
     )
+
+
+def test_phase_specification_rejects_split_cancellation_identity(
+    tmp_path: Path,
+) -> None:
+    destination = make_session_run_assets(
+        tmp_path,
+        session_name="split-cancellation",
+    ).terminal_destination
+
+    with pytest.raises(
+        ValueError,
+        match="cancellation must identify the destination run directory",
+    ):
+        AgentPhaseRunSpecification.from_timeout_minutes(
+            work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
+            fairness_group=ExecutorFairnessGroup("agent:run-1:coding-1"),
+            active_timeout_minutes=45,
+            interaction_intent=TerminalInteractionIntent.NONE,
+            shell_command="run-agent --issue 42",
+            cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
+                (tmp_path / "different-run").resolve()
+            ),
+            destination=destination,
+        )
 
 
 @pytest.mark.parametrize(
@@ -420,6 +446,10 @@ def test_launch_owner_preserves_unrestricted_agent_label_in_executor_identity(
 
 
 def test_scheduler_renders_one_shell_safe_internal_invocation(tmp_path: Path) -> None:
+    destination = make_session_run_assets(
+        tmp_path,
+        session_name="scheduler-render",
+    ).terminal_destination
     specification = AgentPhaseRunSpecification.from_timeout_minutes(
         work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
         fairness_group=ExecutorFairnessGroup("agent:run-1:coding-1"),
@@ -427,12 +457,9 @@ def test_scheduler_renders_one_shell_safe_internal_invocation(tmp_path: Path) ->
         interaction_intent=TerminalInteractionIntent.NONE,
         shell_command="printf '%s\\n' 'human readable'",
         cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
-            tmp_path.resolve()
+            destination.run_dir
         ),
-        destination=make_session_run_assets(
-            tmp_path,
-            session_name="scheduler-render",
-        ).terminal_destination,
+        destination=destination,
     )
     scheduler = HostAgentPhaseCommandScheduler(
         python_executable=Path(sys.executable),
@@ -488,6 +515,10 @@ def test_scheduler_preserves_interaction_intent_hidden_by_executor_wrapper(
     command: str,
     expected_intent: TerminalInteractionIntent,
 ) -> None:
+    destination = make_session_run_assets(
+        tmp_path,
+        session_name="scheduler-intent",
+    ).terminal_destination
     specification = AgentPhaseRunSpecification.from_timeout_minutes(
         work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
         fairness_group=ExecutorFairnessGroup("agent:run-1:coding-1"),
@@ -495,12 +526,9 @@ def test_scheduler_preserves_interaction_intent_hidden_by_executor_wrapper(
         interaction_intent=expected_intent,
         shell_command=command,
         cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
-            tmp_path.resolve()
+            destination.run_dir
         ),
-        destination=make_session_run_assets(
-            tmp_path,
-            session_name="scheduler-intent",
-        ).terminal_destination,
+        destination=destination,
     )
 
     scheduled = HostAgentPhaseCommandScheduler(
@@ -525,6 +553,10 @@ def test_scheduler_preserves_interaction_intent_hidden_by_executor_wrapper(
 def test_scheduled_phase_executes_bash_language_without_shell_drift(
     tmp_path: Path,
 ) -> None:
+    destination = make_session_run_assets(
+        tmp_path,
+        session_name="bash-language",
+    ).terminal_destination
     specification = AgentPhaseRunSpecification.from_timeout_minutes(
         work_key=ExecutorWorkKey("agent-phase:test:bash-language"),
         fairness_group=ExecutorFairnessGroup("agent:test:bash-language"),
@@ -532,12 +564,9 @@ def test_scheduled_phase_executes_bash_language_without_shell_drift(
         interaction_intent=TerminalInteractionIntent.NONE,
         shell_command="values=(alpha beta); [[ ${values[1]} == beta ]]",
         cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
-            tmp_path.resolve()
+            destination.run_dir
         ),
-        destination=make_session_run_assets(
-            tmp_path,
-            session_name="bash-language",
-        ).terminal_destination,
+        destination=destination,
     )
     scheduled = HostAgentPhaseCommandScheduler(
         python_executable=Path(sys.executable),

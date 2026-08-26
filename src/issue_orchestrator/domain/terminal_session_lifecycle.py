@@ -42,6 +42,7 @@ class TerminalSessionWatcherTimedOut:
     session_name: str
     process_id: int
     timeout_seconds: float
+    error: BaseException
 
     def __post_init__(self) -> None:
         _require_watcher_identity(self.session_name, self.process_id)
@@ -54,6 +55,7 @@ class TerminalSessionWatcherTimedOut:
                 "TerminalSessionWatcherTimedOut.timeout_seconds must be finite "
                 "and positive"
             )
+        _require_error(self.error, "TerminalSessionWatcherTimedOut.error")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +68,7 @@ class TerminalSessionWatcherFailed:
 
     def __post_init__(self) -> None:
         _require_watcher_identity(self.session_name, self.process_id)
+        _require_error(self.error, "TerminalSessionWatcherFailed.error")
 
 
 TerminalSessionWatcherOutcome = (
@@ -80,3 +83,8 @@ def _require_watcher_identity(session_name: str, process_id: int) -> None:
         raise ValueError("terminal watcher session_name must not be empty")
     if type(process_id) is not int or process_id <= 1:
         raise ValueError("terminal watcher process_id must be an integer above 1")
+
+
+def _require_error(value: object, field_name: str) -> None:
+    if not isinstance(value, BaseException):
+        raise ValueError(f"{field_name} must be a BaseException")

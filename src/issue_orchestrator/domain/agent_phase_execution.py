@@ -179,6 +179,14 @@ class AgentPhaseRunSpecification:
                 "AgentPhaseRunSpecification.destination must be "
                 "TerminalRunDestination"
             )
+        expected_cancellation = ExecutorInteractiveSessionCancellation.for_run_dir(
+            self.destination.run_dir
+        )
+        if self.cancellation != expected_cancellation:
+            raise ValueError(
+                "AgentPhaseRunSpecification.cancellation must identify the "
+                "destination run directory"
+            )
 
     @classmethod
     def from_timeout_minutes(
