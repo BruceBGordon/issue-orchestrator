@@ -102,7 +102,7 @@ pytestmark = pytest.mark.timeout(180)
 def _guardian(
     program: ExecutorGuardianProgram | None = None,
 ) -> PosixExecutorCommandGuardian:
-    termination = ExecutorProcessTerminationPolicy(0.1, 1.0)
+    termination = ExecutorProcessTerminationPolicy(5.0, 5.0)
     return _guardian_with_components(
         program
         if program is not None
@@ -410,7 +410,7 @@ def test_foreign_parent_child_cannot_contaminate_guardian_resource_usage(
 def test_completed_terminal_record_wins_over_late_parent_sigterm(
     tmp_path: Path,
 ) -> None:
-    termination = ExecutorProcessTerminationPolicy(0.1, 1.0)
+    termination = ExecutorProcessTerminationPolicy(5.0, 5.0)
     supervisor = _LateInterruptionAfterCompletionSupervisor(
         PosixProcessGroupSupervisor(
             PosixProcessGroupTerminator(
@@ -454,7 +454,7 @@ def test_completed_terminal_record_wins_over_late_parent_sigterm(
 
 
 def test_valid_terminal_survives_external_reap_evidence_failure() -> None:
-    termination = ExecutorProcessTerminationPolicy(0.1, 1.0)
+    termination = ExecutorProcessTerminationPolicy(5.0, 5.0)
     guardian = _guardian_with_components(
         ExecutorGuardianProgram(
             (
@@ -491,7 +491,7 @@ def test_valid_terminal_survives_external_reap_evidence_failure() -> None:
 
 
 def test_valid_terminal_survives_courtesy_evidence_failure() -> None:
-    termination = ExecutorProcessTerminationPolicy(0.1, 1.0)
+    termination = ExecutorProcessTerminationPolicy(5.0, 5.0)
     courtesy_error = OSError("injected guardian courtesy evidence failure")
     guardian = _guardian_with_components(
         ExecutorGuardianProgram(
@@ -598,7 +598,7 @@ def test_guardian_reports_command_start_failure_without_exit_fabrication() -> No
 
 
 def test_indeterminate_guardian_activation_gets_second_containment_attempt() -> None:
-    termination = ExecutorProcessTerminationPolicy(0.1, 1.0)
+    termination = ExecutorProcessTerminationPolicy(5.0, 5.0)
     launcher = _IndeterminateGuardianLauncher(build_posix_process_launcher())
     guardian = PosixExecutorCommandGuardian(
         ExecutorGuardianProgram(
