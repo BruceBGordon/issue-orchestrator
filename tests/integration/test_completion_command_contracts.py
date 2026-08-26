@@ -752,3 +752,127 @@ class TestEscalationIsReachableOnADirtyTree:
         )
 
         assert result.returncode != 0
+
+
+class TestEscalationRecordSurvivesTheOrchestrator:
+    """The record the CLI writes must be accepted by the consumer that reads it.
+
+    The CLI-side tests above stop at exit code and file contents. Round 4 showed
+    that is not enough: `coding-done blocked` exited 0 and wrote a record, then
+    `CompletionRecordValidator.validate_worktree_state` rejected it because
+    `STATUS_TO_ACTIONS` gives escalations `PUSH_BRANCH` and the dirty policy
+    fired. The agent believed it had escalated; the human was never told. This
+    drives the real artifact across that boundary.
+    """
+
+    @staticmethod
+    def _escalate(tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+        (repo / "operator_notes.py").write_text("pre-existing operator work\n")
+        result = _run_completion_raw(
+            [
+                "blocked",
+                "--reason",
+                "cannot classify dirty file operator_notes.py",
+                "--attempted",
+                "inspected the file and its history",
+            ],
+            cwd=repo,
+        )
+        assert result.returncode == 0, result.stderr
+        return repo
+
+    def test_the_written_record_is_accepted_with_the_tree_still_dirty(self, tmp_path):
+        from issue_orchestrator.control.completion_record_validation import (
+            CompletionRecordValidator,
+        )
+        from issue_orchestrator.infra.config import Config
+
+        repo = self._escalate(tmp_path)
+
+        class _DirtyGit:
+            """Reports exactly the state the escalation left behind."""
+
+            def get_current_branch(self, worktree):
+                return "issue-123"
+
+            def has_uncommitted_changes(self, worktree, **kwargs):
+                return True
+
+            def has_tracked_changes(self, worktree, **kwargs):
+                return True
+
+            def list_dirty_files(self, worktree, mode):
+                return ["operator_notes.py"]
+
+        config = Config()
+        config.validation.publish.dirty_check = "tracked"
+        validator = CompletionRecordValidator(config=config, git_adapter=_DirtyGit())
+
+        record = validator.read_completion_record(repo)
+        assert record is not None, "the CLI wrote no readable record"
+
+        result = validator.validate_worktree_state(repo, record)
+
+        assert result.ok, (
+            "the orchestrator rejected the escalation the CLI accepted: "
+            f"{getattr(result, 'reason', None)}"
+        )
+
+    def test_the_record_still_asks_to_publish_committed_history(self, tmp_path):
+        """Escalating must not strand whatever the agent did manage to commit."""
+        from issue_orchestrator.domain.models import RequestedAction
+
+        repo = self._escalate(tmp_path)
+        record = json.loads(
+            (repo / ".issue-orchestrator" / "completion.json").read_text()
+        )
+
+        assert RequestedAction.PUSH_BRANCH.value in record["requested_actions"]
+        assert record["outcome"] == "blocked"
+
+    def test_a_completed_record_on_a_dirty_tree_is_still_rejected(self, tmp_path):
+        """The exemption is scoped to escalations, not to dirty trees generally.
+
+        The record is produced on a clean tree so the CLI actually writes one,
+        then presented against a dirty worktree -- the temporal variance the
+        post-validation re-check exists for. It must still be rejected.
+        """
+        from issue_orchestrator.control.completion_record_validation import (
+            CompletionRecordValidator,
+        )
+        from issue_orchestrator.infra.config import Config
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        result = _run_completion_raw(
+            ["completed", "--implementation", "did it", "--problems", "None"],
+            cwd=repo,
+        )
+        assert result.returncode == 0, result.stderr
+
+        class _DirtyGit:
+            def get_current_branch(self, worktree):
+                return "issue-123"
+
+            def has_uncommitted_changes(self, worktree, **kwargs):
+                return True
+
+            def has_tracked_changes(self, worktree, **kwargs):
+                return True
+
+            def list_dirty_files(self, worktree, mode):
+                return ["src.py"]
+
+        config = Config()
+        config.validation.publish.dirty_check = "tracked"
+        validator = CompletionRecordValidator(config=config, git_adapter=_DirtyGit())
+        record = validator.read_completion_record(repo)
+        assert record is not None, "the CLI wrote no record on a clean tree"
+
+        outcome = validator.validate_worktree_state(repo, record)
+        assert not outcome.ok, "a completed record must still require a clean tree"

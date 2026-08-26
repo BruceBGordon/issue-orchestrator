@@ -185,17 +185,32 @@ class DirtyTreeDisposition(Enum):
 #: thing being reported: rejecting them would leave an agent that cannot
 #: classify a file with no legal move at all -- unable to commit it, forbidden
 #: to destroy it, and unable to hand it over -- which is the pressure that gets
-#: someone else's uncommitted work deleted. Nothing unclean reaches a push by
-#: this route: the orchestrator's own publish gate applies the dirty policy
-#: only when a record requests PUSH_BRANCH, which neither status does.
+#: someone else's uncommitted work deleted.
+#:
+#: These values are deliberately the shared vocabulary of two layers: they are
+#: both ``AgentStatus`` strings at the completion CLI and ``CompletionOutcome``
+#: values on the record the orchestrator reads. Both consult this one set, so
+#: the CLI cannot accept an escalation the orchestrator will then reject.
+#:
+#: Accepting a dirty tree here does not publish anything unclean. Both statuses
+#: do request PUSH_BRANCH (``STATUS_TO_ACTIONS``), and that is correct: a push
+#: sends committed history, so the preserved files -- which are by definition
+#: not in HEAD -- cannot ride along, while any work the agent *did* commit
+#: before hitting the unresolvable file still reaches the remote instead of
+#: being stranded in a worktree that later gets cleaned up. What the dirty gate
+#: protects against is an agent believing uncommitted work was published; an
+#: escalation says the opposite out loud, and names the files it left behind.
 ESCALATION_STATUSES: frozenset[str] = frozenset({"blocked", "needs_human"})
 
 
 def dirty_tree_disposition(status: str) -> DirtyTreeDisposition:
     """Decide how a dirty tree must be handled for ``status``.
 
-    Policy lives here rather than in the completion CLI so the rule is stated
-    once, beside the ladder whose last rung depends on it.
+    ``status`` is an ``AgentStatus`` string at the CLI boundary and a
+    ``CompletionOutcome`` value at the orchestrator boundary; the two
+    vocabularies share these spellings on purpose. Both callers ask this
+    function rather than deciding for themselves, so a tree the CLI accepts
+    cannot be rejected one boundary later.
     """
     if status in ESCALATION_STATUSES:
         return DirtyTreeDisposition.PRESERVE_AND_ESCALATE

@@ -14,8 +14,15 @@ import json
 import pytest
 
 from issue_orchestrator.domain.dirty_remediation import (
+    ESCALATION_STATUSES,
     NEVER_DESTROY_UNKNOWN,
+    DirtyTreeDisposition,
     blocked_reason,
+    dirty_tree_disposition,
+)
+from issue_orchestrator.entrypoints.cli_tools.agent_done import (
+    STATUS_TO_ACTIONS,
+    AgentStatus,
 )
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -3490,6 +3497,130 @@ class TestCompletionProcessorDirtyPolicy:
         mock_label_adapter.add_label.assert_called_once_with(123, "validation-failed")
         mock_pr_adapter.add_comment.assert_called_once()
 
+    @pytest.mark.parametrize(
+        "outcome,label",
+        [
+            (CompletionOutcome.BLOCKED, "blocked"),
+            (CompletionOutcome.NEEDS_HUMAN, "needs_human"),
+        ],
+    )
+    def test_escalation_is_routed_to_a_human_despite_a_dirty_tree(
+        self,
+        outcome,
+        label,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """The escalation must survive the orchestrator, not just the CLI.
+
+        `coding-done blocked` is rung 3 of the remediation ladder: what an agent
+        runs when it finds a dirty file it must not resolve on its own. Round 3
+        made the CLI accept it. That is only half the path -- STATUS_TO_ACTIONS
+        gives both escalation statuses PUSH_BRANCH, so the record then reached
+        `validate_worktree_state`, which applied the dirty policy and rejected
+        it. The dead end had moved one boundary downstream: the agent exited 0
+        believing it had escalated, and the human was never told.
+        """
+        config = Config()
+        config.validation.publish.dirty_check = "tracked"
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            event_bus=event_bus,
+            session_output=FileSystemSessionOutput(),
+            label_config={label: label},
+            config=config,
+        )
+        mock_git_adapter.has_tracked_changes.return_value = True
+        mock_git_adapter.list_dirty_files.return_value = ["operator_notes.py"]
+        action = (
+            RequestedAction.ADD_BLOCKED_LABEL
+            if outcome is CompletionOutcome.BLOCKED
+            else RequestedAction.ADD_NEEDS_HUMAN_LABEL
+        )
+        record = make_record(
+            outcome=outcome,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                action,
+                RequestedAction.POST_COMMENT,
+            ],
+            summary="cannot classify dirty file operator_notes.py",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert result.success, (
+            "escalation must reach the human; got "
+            f"{result.failure_kind}: {result.message}"
+        )
+        assert result.failure_kind != "validation_failed"
+        # The human-routing action actually ran.
+        mock_label_adapter.add_label.assert_any_call(123, label)
+
+    def test_escalation_publishes_only_committed_content(
+        self,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """Accepting a dirty tree must not publish the uncommitted part of it.
+
+        Pushing sends commits, so the preserved files -- which are by definition
+        not in HEAD -- cannot ride along. This pins that the push is the only
+        publishing step taken, and that nothing stages or commits the dirty
+        files on the way.
+        """
+        config = Config()
+        config.validation.publish.dirty_check = "tracked"
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            event_bus=event_bus,
+            session_output=FileSystemSessionOutput(),
+            label_config={"blocked": "blocked"},
+            config=config,
+        )
+        mock_git_adapter.has_tracked_changes.return_value = True
+        mock_git_adapter.list_dirty_files.return_value = ["operator_notes.py"]
+        record = make_record(
+            outcome=CompletionOutcome.BLOCKED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.ADD_BLOCKED_LABEL,
+            ],
+            summary="cannot classify dirty file operator_notes.py",
+        )
+        worktree = worktree_with_completion(record)
+
+        processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        # Nothing may turn the preserved file into published content.
+        for forbidden in ("stage_all", "add_all", "commit", "commit_all"):
+            call = getattr(mock_git_adapter, forbidden, None)
+            if call is not None and hasattr(call, "assert_not_called"):
+                call.assert_not_called()
+
     def test_push_rejected_when_all_mode_and_untracked_present(
         self,
         mock_label_adapter,
@@ -5253,3 +5384,63 @@ class TestRunScopedArtifacts:
 
         assert result.success is True
         assert (coding_run.run_dir / "completion-record.json").exists()
+
+
+class TestEscalationVocabularyIsShared:
+    """The disposition owner and the requested-action map must not diverge.
+
+    Round 4 found them contradicting each other on their first revision: the
+    owner's safety note asserted that escalation statuses do not request
+    PUSH_BRANCH, while STATUS_TO_ACTIONS gives it to both. The CLI therefore
+    accepted a dirty escalation that the orchestrator immediately rejected.
+    These tests make the two halves one decision, so the next edit to either
+    side has to face the other.
+    """
+
+    def test_escalation_statuses_exist_in_both_vocabularies(self):
+        """The set is read as AgentStatus at one boundary, CompletionOutcome at the other."""
+        cli_statuses = {
+            AgentStatus.COMPLETED,
+            AgentStatus.BLOCKED,
+            AgentStatus.NEEDS_HUMAN,
+            AgentStatus.APPROVED,
+            AgentStatus.CHANGES_REQUESTED,
+        }
+        outcome_values = {o.value for o in CompletionOutcome}
+        for status in ESCALATION_STATUSES:
+            assert status in cli_statuses, status
+            assert status in outcome_values, status
+
+    def test_escalation_statuses_still_request_push(self):
+        """The owner's exemption is justified by *what* a push publishes.
+
+        A push sends committed history, so preserved files cannot ride along,
+        and committed work still reaches the remote rather than being stranded
+        in a worktree that later gets cleaned. If PUSH_BRANCH is ever removed
+        from these statuses, that reasoning no longer applies and the owner's
+        exemption must be revisited -- so this pins it deliberately.
+        """
+        for status in ESCALATION_STATUSES:
+            assert RequestedAction.PUSH_BRANCH in STATUS_TO_ACTIONS[status], status
+
+    def test_the_owner_exempts_exactly_the_escalation_statuses(self):
+        for status in ESCALATION_STATUSES:
+            assert (
+                dirty_tree_disposition(status)
+                is DirtyTreeDisposition.PRESERVE_AND_ESCALATE
+            ), status
+
+        for outcome in CompletionOutcome:
+            expected = (
+                DirtyTreeDisposition.PRESERVE_AND_ESCALATE
+                if outcome.value in ESCALATION_STATUSES
+                else DirtyTreeDisposition.REJECT
+            )
+            assert dirty_tree_disposition(outcome.value) is expected, outcome
+
+    def test_completed_is_never_exempt(self):
+        """Publishing finished work still requires a clean tree."""
+        assert (
+            dirty_tree_disposition(CompletionOutcome.COMPLETED.value)
+            is DirtyTreeDisposition.REJECT
+        )

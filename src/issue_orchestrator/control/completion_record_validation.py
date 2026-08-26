@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from ..domain.models import COMPLETION_RECORD_PATH, CompletionRecord, RequestedAction, sanitize_agent_label
-from ..domain.dirty_remediation import blocked_reason
+from ..domain.dirty_remediation import (
+    DirtyTreeDisposition,
+    blocked_reason,
+    dirty_tree_disposition,
+)
 from ..infra.runtime_artifacts import filter_runtime_managed_dirty_paths
 
 if TYPE_CHECKING:
@@ -290,9 +294,17 @@ class CompletionRecordValidator:
                     f"Cannot push: on protected branch '{branch}'",
                 )
 
-            dirty_policy = self.check_dirty_policy(worktree)
-            if not dirty_policy.ok:
-                return dirty_policy
+            # The dirty gate is a publish-intent policy, not a push mechanic:
+            # it exists so an agent cannot believe uncommitted work was
+            # published. An escalation says the opposite out loud and names the
+            # files it preserved, so it is exempt -- and the same owner makes
+            # that call for the completion CLI, which must not accept a tree
+            # this boundary would then reject.
+            disposition = dirty_tree_disposition(record.outcome.value)
+            if disposition is DirtyTreeDisposition.REJECT:
+                dirty_policy = self.check_dirty_policy(worktree)
+                if not dirty_policy.ok:
+                    return dirty_policy
 
         return WorktreeValidationResult.pass_()
 
