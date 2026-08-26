@@ -3474,7 +3474,9 @@ class TestCompletionProcessorDirtyPolicy:
         assert "working tree is dirty" in result.message.lower()
         assert "dirty files: src/feature.py, readme.md." in result.message.lower()
         assert result.errors == [
-            "Validation: Working tree is dirty; commit before pushing (stashing leaves HEAD stale). "
+            "Validation: Working tree is dirty; commit the changes that belong in "
+            "this push (stashing leaves HEAD stale) and revert, remove, or ignore "
+            "the rest. "
             "Override with validation.publish.dirty_check. "
             "Dirty files: src/feature.py, README.md."
         ]

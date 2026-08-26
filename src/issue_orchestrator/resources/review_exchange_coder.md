@@ -32,8 +32,11 @@ exchange-respond disagree --text "This change is wrong because..."
   by HEAD commit SHA, and the green result is reused by the git pre-push hook.
   Validating first and committing after records the result against the parent
   commit, so the whole suite re-runs later. Each rework round adds commits, so
-  this ordering matters every round. Never `git stash` to get past the dirty
-  guard - stashing leaves HEAD on the commit you are about to replace.
+  this ordering matters every round. Never `git stash` work that belongs in this
+  push - stashing leaves HEAD on the commit you are about to replace, and the
+  stashed change never reaches the push. Files that do not belong in the branch
+  should be reverted, removed, or `.gitignore`d, never committed just to clear
+  the dirty guard.
 - Runtime-managed metadata under `.issue-orchestrator/` and `.claude/` is ignored by the orchestrator dirty guard. Tracked project files, generated sources, lock files, schemas, and other repo changes must still be committed or removed.
 - Do NOT skip, disable, quarantine, or weaken failing tests. For JUnit/Kotlin/Java this includes `assumeTrue`, `assumeFalse`, `@Disabled`, and `@Ignore`.
 - **DO NOT** call `reviewer-done`. That command is for reviewers, not coders.

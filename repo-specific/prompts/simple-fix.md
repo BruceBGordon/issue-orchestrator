@@ -29,7 +29,7 @@ You implement the solution locally and report completion via `coding-done`. The 
 
 ```
 My mandatory checklist before I can exit:
-[ ] 1. Verify my changes work (make validate)
+[ ] 1. Verify my changes work (make validate-quick)
 [ ] 2. Commit my changes (git add + git commit)
 [ ] 3. Run `make validate-pr` AT that commit (never before it)
 [ ] 4. Call `coding-done` with implementation summary
@@ -122,16 +122,23 @@ wasted retry.
 
 ```bash
 make validate-quick  # typecheck + unit tests - your inner loop
-make validate        # tests, type checks, linting
 ```
 
-These are the cheap, uncached commands. Iterate on them freely while you work.
-The expensive PR gate comes *after* you commit — see step 6.
+This is the cheap, uncached command. Iterate on it freely while you work. The
+expensive PR gate comes *after* you commit — see step 6.
+
+**Do not also run `make validate` as a required step.** The step 6 gate already
+subsumes it: `validate-pr-raw` runs `_validate-pr-impl`, which runs the very
+same `_validate-impl` suite that `make validate` runs, and both paths run the
+VS Code lane on top. Running both means running the whole standard suite twice
+per completion — the exact duplicate work this ordering exists to remove. Reach
+for `make validate` only if you deliberately want the full standard suite
+before committing.
 
 If validation fails:
 1. **Read the error output carefully** — identify the root cause, not just the first error
 2. **Check your diff** — `git diff` shows what you changed; the failure is in or caused by those changes
-3. **Fix and re-run** — iterate until `make validate` passes cleanly
+3. **Fix and re-run** — iterate until `make validate-quick` passes cleanly
 4. **Do NOT call coding-done until validation passes** — the orchestrator will reject it and you'll waste a retry
 
 ### 5. Commit Your Changes
@@ -155,8 +162,10 @@ When that happens, decide for each dirty file:
 - **Detritus** (build output, generated lock files, IDE droppings) → add to `.gitignore` or `rm`
 - **Cannot classify** → run `coding-done blocked --reason "unable to classify dirty file <path>"`
 
-**Do not** `git stash` — your work belongs in a commit or in `.gitignore`, not
-in a stash the orchestrator can't see. Re-run `coding-done` after fixing.
+**Do not** `git stash` work that belongs in this push — it belongs in a commit
+or in `.gitignore`, not in a stash the orchestrator can't see. Never `git add -A`
+to clear the guard either: that is how build output, local config, and secrets
+reach a branch. Re-run `coding-done` after fixing.
 
 ### 6. Run the Full PR Gate — AT the Commit, Never Before It
 
@@ -182,13 +191,18 @@ neither:
 If the gate fails: fix it, **commit the fix**, then re-run `make validate-pr`.
 The green must land on the commit that actually gets pushed.
 
+This gate is a superset of `make validate`, so run it *instead of* a second
+`make validate`, not in addition to one.
+
 Do **not** run `make validate-pr-raw` by hand. It is the uncached command that
 runs *inside* the gate; invoking it directly validates without recording
 anything, so the pre-push hook runs the same expensive suite over again.
 
-Never `git stash` to satisfy the dirty guard — stashing leaves `HEAD` on the
-commit you are about to replace, so you would seed a record for a SHA that is
-already stale.
+Never `git stash` work that belongs in this push to satisfy the dirty guard —
+stashing leaves `HEAD` on the commit you are about to replace, so you would seed
+a record for a SHA that is already stale, and the stashed change would never be
+pushed. Unrelated files are the step 5 classification problem, not a reason to
+commit everything.
 
 ---
 

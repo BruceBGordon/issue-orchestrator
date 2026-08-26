@@ -2,10 +2,12 @@
 
 These files are the orchestrator's only channel for telling a coding agent how
 to sequence its work. The rule under test here is the commit-before-publish-gate
-ordering: the publish suite is cached by HEAD SHA, and one green record is reused
-by the agent, by the orchestrator's publish gate, and by the git pre-push hook.
-An agent that validates before committing seeds the record against the parent
-commit, so every later consumer misses and re-runs the whole suite.
+ordering: the publish suite is cached by HEAD SHA, and the green record is reused
+by the git pre-push hook (and by the agent's own later re-runs of the gate). The
+orchestrator's publish gate is deliberately NOT a consumer -- given an AttemptKey
+it reads the attempt sidecar and never falls back to the SHA cache. An agent that
+validates before committing seeds the record against the parent commit, so the
+hook misses and re-runs the whole suite.
 """
 
 import re
@@ -62,11 +64,30 @@ class TestCommitBeforePublishGate:
             assert "pre-push hook" in text
             assert "orchestrator's publish gate" not in text
 
-    def test_coding_done_instructions_forbid_stashing_past_the_guard(self):
+    def test_coding_done_instructions_forbid_stashing_work_being_pushed(self):
+        """The stash prohibition is scoped to work that belongs in the push.
+
+        Stashing a file that is deliberately *not* part of the branch leaves
+        HEAD exactly where it will be pushed, so a blanket "never stash" would
+        be wrong. What must never be stashed is the work being published.
+        """
         text = _flat(get_coding_done_instructions())
 
-        assert "Do not `git stash` to get past the dirty guard" in text
-        assert "Commit instead." in text
+        assert "Do not `git stash` work that belongs in this push" in text
+        assert "Commit it instead." in text
+
+    def test_coding_done_routes_unrelated_files_away_from_the_commit(self):
+        """`all` mode reports untracked paths, so "just commit it" is unsafe.
+
+        Build output, local configuration, and secrets all surface as dirty
+        under `dirty_check: all`. The instructions must give them a remedy that
+        is not "add them to the commit".
+        """
+        text = _flat(get_coding_done_instructions())
+
+        assert "Never commit a file just to clear the dirty guard" in text
+        assert "Revert unrelated tracked edits" in text
+        assert "`.gitignore` untracked build output, local config, and secrets" in text
 
     def test_review_exchange_coder_carries_the_same_ordering_rule(self):
         text = _flat(get_review_exchange_coder_instructions())
@@ -75,7 +96,11 @@ class TestCommitBeforePublishGate:
         assert "cached by HEAD commit SHA" in text
         # Rework adds commits every round, so the ordering is not a one-off.
         assert "this ordering matters every round" in text
-        assert "Never `git stash` to get past the dirty guard" in text
+        assert "Never `git stash` work that belongs in this push" in text
+        assert (
+            "should be reverted, removed, or `.gitignore`d, never committed "
+            "just to clear the dirty guard" in text
+        )
 
     def test_rule_reaches_every_coding_side_task_kind(self):
         """code, rework, and exchange coders all receive the ordering rule."""
@@ -125,8 +150,34 @@ class TestRepoCodingPromptOrdering:
         assert "make validate-quick" in fast_loop
         assert "make validate-pr" not in fast_loop
 
+    def test_fast_loop_does_not_mandate_the_suite_the_gate_subsumes(self):
+        """Requiring `make validate` *and* `make validate-pr` doubles the suite.
+
+        `validate-pr-raw` runs `_validate-pr-impl`, which runs the same
+        `_validate-impl` that `make validate` runs (both also run the VS Code
+        lane). Mandating both per completion reruns the entire standard suite —
+        exactly the duplicate work this ordering exists to remove.
+        """
+        text = _flat(self._prompt())
+
+        assert "[ ] 1. Verify my changes work (make validate-quick)" in text
+        assert "[ ] 1. Verify my changes work (make validate)" not in text
+
+        fast_loop = text[
+            text.index("### 4. Validate Your Changes") : text.index(
+                "### 5. Commit Your Changes"
+            )
+        ]
+        assert "make validate-quick" in fast_loop
+        assert "Do not also run `make validate` as a required step" in fast_loop
+
+    def test_gate_section_states_it_supersedes_make_validate(self):
+        text = _flat(self._prompt())
+
+        assert "This gate is a superset of `make validate`" in text
+
     def test_gate_section_warns_off_the_two_cache_defeating_moves(self):
         text = _flat(self._prompt())
 
-        assert "Never `git stash` to satisfy the dirty guard" in text
+        assert "Never `git stash` work that belongs in this push" in text
         assert "Do **not** run `make validate-pr-raw` by hand" in text

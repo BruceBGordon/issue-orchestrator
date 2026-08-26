@@ -160,7 +160,7 @@ pytest tests/e2e/ -v           # Live e2e tests (requires gh auth)
 **Commit before you run `make validate-pr`:**
 ```bash
 make validate-quick            # inner loop - cheap, uncached
-git add -A && git commit -m "..."
+git add <files> && git commit -m "..."   # name the files; never `git add -A`
 make validate-pr               # required gate - run it AT the commit
 ```
 
@@ -172,8 +172,13 @@ the cache work:
 - Committing *after* a green run records it against the parent commit, so every
   later consumer misses and re-runs the full suite (5-20 min) at push time.
 - If the gate fails: fix, **commit the fix**, re-run `make validate-pr`.
-- Never `git stash` to get past the dirty guard — it leaves `HEAD` on the commit
-  you are about to replace. Never run `make validate-pr-raw` by hand; it records nothing.
+- Never `git stash` work that belongs in this push — it leaves `HEAD` on the
+  commit you are about to replace, and the stashed change never gets pushed.
+- Never commit a file just to clear the dirty guard. Revert unrelated tracked
+  edits; remove or `.gitignore` untracked build output, local config, and secrets.
+- `make validate-pr` is a superset of `make validate` — `validate-pr-raw` runs the
+  same `_validate-impl` suite — so run one or the other, not both.
+- Never run `make validate-pr-raw` by hand; it records nothing.
 
 ## Async E2E Runner
 

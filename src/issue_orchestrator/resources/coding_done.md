@@ -45,9 +45,16 @@ Running the publish gate before committing is wasted work, twice over:
   which on a large repo can exceed the session's time budget and strand your
   work.
 
-**Do not `git stash` to get past the dirty guard.** Stashing leaves HEAD on the
-parent commit, so the gate records a result for a SHA you are about to
-invalidate. Commit instead.
+**Do not `git stash` work that belongs in this push.** Stashing leaves HEAD on
+the parent commit, so the gate records a result for a SHA you are about to
+invalidate — and the stashed change never reaches the push at all. Commit it
+instead.
+
+Files that do *not* belong in this branch are a different case. Revert unrelated
+tracked edits, and remove or `.gitignore` untracked build output, local config,
+and secrets. Never commit a file just to clear the dirty guard — in `all` mode
+the guard reports every untracked path, and committing them blindly is how
+detritus and secrets reach a branch.
 
 ---
 

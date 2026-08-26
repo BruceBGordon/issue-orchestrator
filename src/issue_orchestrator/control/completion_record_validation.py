@@ -386,8 +386,9 @@ class CompletionRecordValidator:
                     )
                 return WorktreeValidationResult.pass_()
             reason = (
-                "Working tree is dirty; commit before pushing "
-                "(stashing leaves HEAD stale). "
+                "Working tree is dirty; commit the changes that belong in this "
+                "push (stashing leaves HEAD stale) and revert, remove, or "
+                "ignore the rest. "
                 "Override with validation.publish.dirty_check."
             )
             if blocking_files:

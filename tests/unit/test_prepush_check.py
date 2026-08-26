@@ -757,10 +757,12 @@ validation:
     def test_dirty_guard_tells_agents_to_commit_not_stash(self, temp_worktree, capsys):
         """The dirty guard must not offer stashing as a way past it.
 
-        The gate records its result against HEAD, and both the orchestrator's
-        publish gate and the git pre-push hook reuse that record only when it
-        matches the commit being pushed. Stashing hides the change without
-        moving HEAD, so it would certify a SHA that is about to be replaced.
+        The gate records its result against HEAD, and the git pre-push hook
+        reuses that record only when it matches the commit being pushed. (The
+        orchestrator's own publish gate is attempt-scoped and deliberately does
+        not consult the SHA cache.) Stashing work that belongs in this push
+        hides it without moving HEAD, so the gate would certify a SHA that is
+        about to be replaced.
         """
 
         config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
@@ -784,16 +786,30 @@ validation:
             os.chdir(orig_cwd)
 
         assert result == 1
-        assert "commit them before running this gate" in captured.out
-        assert "Do not stash" in captured.out
-        assert "matches the commit that gets pushed" in captured.out
-        # No wording anywhere may present stashing as an acceptable remedy.
+        assert "Commit the changes that belong in this push" in captured.out
+        assert "Do not stash work that belongs in this push" in captured.out
+        assert "must be recorded at the commit that gets pushed" in captured.out
+        # Unrelated tracked edits get a revert remedy, never "add it to the commit".
+        assert "should be reverted" in captured.out
+        assert "do not commit them just to clear this gate" in captured.out
+        # The guard must never issue a blanket order to commit every dirty file.
+        assert "commit them before running this gate" not in captured.out
+        # Stashing is never offered as a remedy for the work being pushed.
         assert "or stash" not in captured.out
+        # Tracked mode reports no untracked paths, so it must not talk about them.
+        assert "Untracked files that do not belong in this branch" not in captured.out
 
-    def test_dirty_guard_all_mode_also_tells_agents_to_commit(
+    def test_dirty_guard_all_mode_routes_untracked_detritus_away_from_commit(
         self, temp_worktree, capsys
     ):
-        """The commit-first hint applies to every enforcing dirty_check mode."""
+        """`all` mode lists arbitrary untracked paths, so "commit them" is unsafe.
+
+        `list_dirty_files` adds `ls-files --others --exclude-standard` for this
+        mode, which routinely surfaces build output, local configuration, and
+        secrets. A blanket instruction to commit every dirty file to clear the
+        gate is how those reach a branch, so the guard must give untracked
+        files a remove/ignore remedy instead.
+        """
 
         config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
@@ -816,8 +832,15 @@ validation:
             os.chdir(orig_cwd)
 
         assert result == 1
-        assert "commit them before running this gate" in captured.out
-        assert "Do not stash" in captured.out
+        # The commit-first rule still applies to work that belongs in the push...
+        assert "Commit the changes that belong in this push" in captured.out
+        assert "Do not stash work that belongs in this push" in captured.out
+        # ...but untracked detritus must be removed or ignored, never committed.
+        assert "Untracked files that do not belong in this branch" in captured.out
+        assert "removed or added to .gitignore" in captured.out
+        assert "never commit them just to clear this gate" in captured.out
+        # No blanket commit-everything order, and no stash escape hatch.
+        assert "commit them before running this gate" not in captured.out
         assert "or stash" not in captured.out
 
     def test_verbose_output_clips_dirty_file_list(self, temp_worktree, capsys):
