@@ -8,7 +8,9 @@ from typing import Protocol, runtime_checkable
 from ..domain.posix_process import (
     PosixDescriptorMapping,
     PosixProcessEnvironment,
+    PosixProcessGroup,
     PosixProcessGroupMode,
+    PosixProcessJoinGroup,
     PosixProcessProgram,
 )
 
@@ -19,7 +21,7 @@ class PosixSpawnPrimitiveRequest:
 
     program: PosixProcessProgram
     environment: PosixProcessEnvironment
-    group_mode: PosixProcessGroupMode
+    group_mode: PosixProcessGroup
     descriptor_mappings: tuple[PosixDescriptorMapping, ...]
 
     def __post_init__(self) -> None:
@@ -27,7 +29,10 @@ class PosixSpawnPrimitiveRequest:
             raise ValueError("PosixSpawnPrimitiveRequest.program must be typed")
         if type(self.environment) is not PosixProcessEnvironment:
             raise ValueError("PosixSpawnPrimitiveRequest.environment must be typed")
-        if type(self.group_mode) is not PosixProcessGroupMode:
+        if type(self.group_mode) not in (
+            PosixProcessGroupMode,
+            PosixProcessJoinGroup,
+        ):
             raise ValueError("PosixSpawnPrimitiveRequest.group_mode must be typed")
         if type(self.descriptor_mappings) is not tuple or any(
             type(mapping) is not PosixDescriptorMapping

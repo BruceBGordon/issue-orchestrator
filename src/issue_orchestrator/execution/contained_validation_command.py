@@ -38,6 +38,7 @@ from ..domain.validation_execution import (
 from ..infra.validation_executor_handshake import ValidationExecutorHandshakeDecoder
 from ..ports.posix_pipe import PosixPipeReader
 from ..ports.posix_process import (
+    PosixProcessExecRejected,
     PosixProcessHandle,
     PosixProcessLauncher,
     PosixProcessLaunchRecovered,
@@ -427,6 +428,16 @@ class PosixContainedValidationCommandRunner:
                     _combined_error(
                         "validation launch rejection and pipe cleanup both failed",
                         launch.error,
+                        _launch_pipe_close_error(pipes),
+                    )
+                )
+            )
+        if type(launch) is PosixProcessExecRejected:
+            return _ValidationActivationClosed(
+                self._not_started(
+                    _combined_error(
+                        "validation exec rejection and pipe cleanup both failed",
+                        launch.as_error(),
                         _launch_pipe_close_error(pipes),
                     )
                 )

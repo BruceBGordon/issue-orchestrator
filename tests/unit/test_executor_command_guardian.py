@@ -417,6 +417,59 @@ def test_indeterminate_guardian_activation_gets_second_containment_attempt() -> 
         raise AssertionError("second-chance guardian containment left a live process")
 
 
+def test_guardian_without_owner_readiness_is_contained_and_identity_is_reusable(
+    tmp_path: Path,
+) -> None:
+    cancellation_dir = (tmp_path / "cancellation").resolve()
+    cancellation_dir.mkdir()
+    descendant_path = (tmp_path / "pre-readiness-descendant.pid").resolve()
+    fault = ExitingTermResistantProcessTreeProgram(
+        descendant_path,
+        300,
+        23,
+    ).python_source()
+    before_descriptors = len(os.listdir("/dev/fd"))
+
+    with _lease_descriptor() as lease_fd:
+        with pytest.raises(
+            ExecutorGuardianLaunchError,
+            match="before publishing exact owner readiness",
+        ):
+            _guardian(
+                ExecutorGuardianProgram((str(Path(sys.executable)), "-c", fault))
+            ).run(
+                _request(
+                    lease_fd,
+                    (sys.executable, "-c", "raise AssertionError('must not run')"),
+                    budget=ExecutorGuardianUnboundedBudget(),
+                    lifecycle=ExecutorCommandLifecycle.INTERACTIVE_SESSION,
+                    cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
+                        cancellation_dir
+                    ),
+                )
+            )
+
+    descendant_pid = int(descendant_path.read_text(encoding="utf-8"))
+    ProcessTreeMember(descendant_pid).assert_contained()
+
+    with _lease_descriptor() as lease_fd:
+        terminal = _guardian().run(
+            _request(
+                lease_fd,
+                (sys.executable, "-c", "raise SystemExit(0)"),
+                budget=ExecutorGuardianUnboundedBudget(),
+                lifecycle=ExecutorCommandLifecycle.INTERACTIVE_SESSION,
+                cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
+                    cancellation_dir
+                ),
+            )
+        )
+
+    assert type(terminal) is ExecutorGuardianCommandCompleted
+    assert terminal.exit_code == 0
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+
+
 def test_missing_guardian_result_is_explicit_and_outer_contains_group(
     tmp_path: Path,
 ) -> None:

@@ -9,8 +9,10 @@ import sys
 from issue_orchestrator.domain.executor import ExecutorProcessTerminationPolicy
 from issue_orchestrator.domain.posix_process import (
     PosixDescriptorMapping,
+    PosixProcessActivationPolicy,
     PosixProcessEnvironment,
     PosixProcessGroupMode,
+    PosixProcessJoinGroup,
     PosixProcessLaunchSpec,
     PosixProcessProgram,
     PosixProcessWithoutTerminal,
@@ -22,9 +24,11 @@ from issue_orchestrator.execution.posix_process import (
 )
 from issue_orchestrator.ports.posix_process import (
     PosixProcessLaunchRecovered,
+    PosixProcessLaunchRejected,
     PosixProcessLaunchStarted,
 )
 from issue_orchestrator.ports.posix_spawn_primitive import (
+    PosixSpawnPrimitive,
     PosixSpawnPrimitiveIndeterminate,
     PosixSpawnPrimitiveRejected,
     PosixSpawnPrimitiveRequest,
@@ -62,13 +66,22 @@ class _PostSpawnFailurePrimitive:
         )
 
 
+class _ThrowingPrimitive:
+    """Violate the primitive result contract before starting a process."""
+
+    def start(self, request: PosixSpawnPrimitiveRequest) -> PosixSpawnPrimitiveResult:
+        del request
+        raise RuntimeError("injected primitive exception")
+
+
 def _launcher(
-    primitive: MaskedPosixSpawnPrimitive | _PostSpawnFailurePrimitive,
+    primitive: PosixSpawnPrimitive,
 ) -> RetainedPosixProcessLauncher:
     return RetainedPosixProcessLauncher(
         _CHILD_PROGRAM,
         primitive,
         build_process_group_supervisor(),
+        PosixProcessActivationPolicy(2.0),
         _TERMINATION_POLICY,
     )
 
@@ -77,12 +90,15 @@ def _specification(
     program: PosixProcessProgram,
     working_directory: Path,
     mappings: tuple[PosixDescriptorMapping, ...] = (),
+    group: PosixProcessGroupMode | PosixProcessJoinGroup = (
+        PosixProcessGroupMode.NEW_SESSION
+    ),
 ) -> PosixProcessLaunchSpec:
     return PosixProcessLaunchSpec(
         program=program,
         working_directory=working_directory,
         environment=PosixProcessEnvironment.from_mapping(os.environ),
-        group_mode=PosixProcessGroupMode.NEW_SESSION,
+        group_mode=group,
         descriptor_mappings=mappings,
         terminal=PosixProcessWithoutTerminal(),
     )
@@ -147,6 +163,30 @@ def test_launcher_contains_real_child_after_post_spawn_parent_failure(
         raise AssertionError("recovered post-spawn child remains executable")
 
 
+def test_joined_group_child_cannot_exec_before_parent_activation_is_retained(
+    tmp_path: Path,
+) -> None:
+    opaque_work_marker = tmp_path / "opaque-work-started"
+    outcome = _launcher(_PostSpawnFailurePrimitive()).launch(
+        _specification(
+            PosixProcessProgram(
+                (
+                    str(Path(sys.executable)),
+                    "-c",
+                    "import pathlib, sys; pathlib.Path(sys.argv[1]).touch()",
+                    str(opaque_work_marker),
+                )
+            ),
+            tmp_path,
+            group=PosixProcessJoinGroup(os.getpgrp()),
+        )
+    )
+
+    assert type(outcome) is PosixProcessLaunchRecovered
+    assert outcome.exit_code != 0
+    assert not opaque_work_marker.exists()
+
+
 def test_spawn_rejects_before_child_when_descriptor_acquisition_is_partial() -> None:
     read_descriptor, write_descriptor = os.pipe()
     before = len(os.listdir("/dev/fd"))
@@ -166,3 +206,46 @@ def test_spawn_rejects_before_child_when_descriptor_acquisition_is_partial() -> 
     finally:
         os.close(read_descriptor)
         os.close(write_descriptor)
+
+
+def test_launcher_closes_activation_gate_when_primitive_raises(
+    tmp_path: Path,
+) -> None:
+    before = len(os.listdir("/dev/fd"))
+
+    outcome = _launcher(_ThrowingPrimitive()).launch(
+        _specification(PosixProcessProgram(("/bin/true",)), tmp_path)
+    )
+
+    assert type(outcome) is PosixProcessLaunchRejected
+    assert isinstance(outcome.error, RuntimeError)
+    assert len(os.listdir("/dev/fd")) == before
+
+
+def test_exec_handshake_deadline_contains_a_wedged_wrapper(tmp_path: Path) -> None:
+    launcher = RetainedPosixProcessLauncher(
+        PosixProcessProgram(
+            (
+                str(Path(sys.executable)),
+                "-c",
+                "import signal; signal.pause()",
+            )
+        ),
+        MaskedPosixSpawnPrimitive(),
+        build_process_group_supervisor(),
+        PosixProcessActivationPolicy(0.1),
+        ExecutorProcessTerminationPolicy(0.1, 1.0),
+    )
+
+    outcome = launcher.launch(
+        _specification(PosixProcessProgram(("/bin/true",)), tmp_path)
+    )
+
+    assert type(outcome) is PosixProcessLaunchRecovered
+    assert isinstance(outcome.activation_error, TimeoutError)
+    try:
+        os.kill(outcome.process_id, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        raise AssertionError("wedged POSIX wrapper remains executable")

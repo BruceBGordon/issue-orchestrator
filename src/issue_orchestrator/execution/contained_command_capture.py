@@ -57,6 +57,7 @@ from ..ports.process_group_supervisor import (
     ProcessGroupSupervisor,
 )
 from ..ports.posix_process import (
+    PosixProcessExecRejected,
     PosixProcessHandle,
     PosixProcessLauncher,
     PosixProcessLaunchRecovered,
@@ -591,6 +592,16 @@ class PosixContainedCommandCapture:
                         "captured command activation and pipe cleanup both failed",
                         launch.error,
                         cleanup_error,
+                    )
+                )
+            )
+        if type(launch) is PosixProcessExecRejected:
+            return _CapturedCommandActivationClosed(
+                self._not_started(
+                    _combine_base_errors(
+                        "captured command exec and pipe cleanup both failed",
+                        launch.as_error(),
+                        _pipe_close_error(pipes),
                     )
                 )
             )

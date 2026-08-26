@@ -49,6 +49,7 @@ from issue_orchestrator.execution.posix_process import (
 )
 from issue_orchestrator.domain.posix_process import (
     PosixDescriptorMapping,
+    PosixProcessActivationPolicy,
     PosixProcessLaunchSpec,
     PosixProcessProgram,
 )
@@ -257,6 +258,7 @@ def _capture_with_pipe_factory(
             ),
             MaskedPosixSpawnPrimitive(),
             supervisor,
+            PosixProcessActivationPolicy(2.0),
             ExecutorProcessTerminationPolicy(
                 graceful_shutdown_seconds=0.05,
                 forceful_shutdown_seconds=1.0,

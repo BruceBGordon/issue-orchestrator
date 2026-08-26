@@ -8,6 +8,10 @@ from typing import Protocol, runtime_checkable
 from ..domain.posix_process import PosixProcessLaunchSpec
 
 
+class PosixProcessExecError(RuntimeError):
+    """The retained wrapper could not replace itself with the requested program."""
+
+
 @runtime_checkable
 class PosixProcessHandle(Protocol):
     """One exact child whose reaping authority remains with this process."""
@@ -77,6 +81,32 @@ class PosixProcessLaunchRecovered:
 
 
 @dataclass(frozen=True, slots=True)
+class PosixProcessExecRejected:
+    """The retained wrapper could not exec, and its exact child was reaped."""
+
+    process_id: int
+    exit_code: int
+    error_type: str
+    error_repr: str
+
+    def __post_init__(self) -> None:
+        if type(self.process_id) is not int or self.process_id <= 1:
+            raise ValueError("PosixProcessExecRejected.process_id must be above 1")
+        if type(self.exit_code) is not int:
+            raise ValueError("PosixProcessExecRejected.exit_code must be an int")
+        if type(self.error_type) is not str or not self.error_type:
+            raise ValueError("PosixProcessExecRejected.error_type must be non-empty")
+        if type(self.error_repr) is not str or not self.error_repr:
+            raise ValueError("PosixProcessExecRejected.error_repr must be non-empty")
+
+    def as_error(self) -> PosixProcessExecError:
+        """Materialize exact typed failure evidence for domain boundaries."""
+        return PosixProcessExecError(
+            f"child exec failed with {self.error_type}: {self.error_repr}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PosixProcessLaunchRecoveryFailed:
     """Activation produced a PID but exact containment could not be proven."""
 
@@ -103,6 +133,7 @@ PosixProcessLaunch = (
     PosixProcessLaunchStarted
     | PosixProcessLaunchRejected
     | PosixProcessLaunchRecovered
+    | PosixProcessExecRejected
     | PosixProcessLaunchRecoveryFailed
 )
 

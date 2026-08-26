@@ -46,6 +46,7 @@ from issue_orchestrator.execution.process_group_terminator import (
 )
 from issue_orchestrator.domain.posix_process import (
     PosixDescriptorMapping,
+    PosixProcessActivationPolicy,
     PosixProcessEnvironment,
     PosixProcessProgram,
 )
@@ -127,6 +128,7 @@ def _runner_with_launch_pipes(
             ),
             MaskedPosixSpawnPrimitive(),
             supervisor,
+            PosixProcessActivationPolicy(2.0),
             ExecutorProcessTerminationPolicy(
                 graceful_shutdown_seconds=0.05,
                 forceful_shutdown_seconds=1.0,

@@ -54,6 +54,7 @@ from ...ports.guardian_launch_pipes import (
     GuardianLaunchPipesFactory,
 )
 from ...ports.posix_process import (
+    PosixProcessExecRejected,
     PosixProcessHandle,
     PosixProcessLaunch,
     PosixProcessLauncher,
@@ -384,7 +385,6 @@ class PosixExecutorCommandGuardian:
                 endpoints = pipes.transfer_parent_endpoints_after_launch()
                 self._await_guardian_owner_ready(
                     endpoints.owner_ready_reader.fileno(),
-                    guardian,
                 )
                 request.lease.transfer_to_guardian()
                 cancellation_lease.activate()
@@ -444,6 +444,11 @@ class PosixExecutorCommandGuardian:
                     f"could not start executor guardian: {launch.error!r}",
                     launch.error,
                 )
+            )
+        if type(launch) is PosixProcessExecRejected:
+            error = launch.as_error()
+            return _GuardianActivationContained(
+                self._launch_error("executor guardian exec was rejected", error)
             )
         if type(launch) is PosixProcessLaunchRecovered:
             return _GuardianActivationContained(
@@ -537,7 +542,6 @@ class PosixExecutorCommandGuardian:
                 termination = self._process_group_supervisor.abort(
                     OwnedProcessGroupLeader(guardian.process_id)
                 )
-                guardian.record_external_reap(termination.leader_exit_code)
             except BaseException as cleanup_error:
                 cleanup_error.add_note(
                     "guardian group abort failed; cancellation identity retained"
@@ -547,6 +551,24 @@ class PosixExecutorCommandGuardian:
                         (CleanupFailure("guardian-group-abort", cleanup_error),)
                     ),
                     False,
+                )
+            try:
+                guardian.record_external_reap(termination.leader_exit_code)
+            except BaseException as evidence_error:
+                evidence_error.add_note(
+                    "guardian group was contained before process-handle evidence "
+                    "recording failed"
+                )
+                return (
+                    CleanupFailed(
+                        (
+                            CleanupFailure(
+                                "guardian-reap-evidence-record",
+                                evidence_error,
+                            ),
+                        )
+                    ),
+                    True,
                 )
             return CleanupSucceeded(), True
         if uncontained_process_id is None:
@@ -627,7 +649,6 @@ class PosixExecutorCommandGuardian:
     def _await_guardian_owner_ready(
         self,
         ready_read_file_descriptor: int,
-        guardian: PosixProcessHandle,
     ) -> None:
         deadline = time.monotonic() + self._sentinel_policy.startup_timeout_seconds
         with selectors.DefaultSelector() as selector:
@@ -639,7 +660,6 @@ class PosixExecutorCommandGuardian:
                 "guardian owner did not become ready before its absolute deadline"
             )
         if os.read(ready_read_file_descriptor, 1) != _OWNER_READY_SIGNAL:
-            guardian.poll()
             raise ExecutorGuardianLaunchError(
                 "guardian exited before publishing exact owner readiness"
             )

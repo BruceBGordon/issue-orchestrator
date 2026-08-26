@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+import math
 from pathlib import Path
 from typing import Mapping
 
@@ -92,6 +93,38 @@ class PosixProcessGroupMode(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class PosixProcessJoinGroup:
+    """Join one existing group whose containment authority is external."""
+
+    process_group_id: int
+
+    def __post_init__(self) -> None:
+        if type(self.process_group_id) is not int or self.process_group_id <= 1:
+            raise ValueError("PosixProcessJoinGroup.process_group_id must be above 1")
+
+
+PosixProcessGroup = PosixProcessGroupMode | PosixProcessJoinGroup
+
+
+@dataclass(frozen=True, slots=True)
+class PosixProcessActivationPolicy:
+    """Independent bound for wrapper startup and the close-on-exec handshake."""
+
+    exec_handshake_timeout_seconds: float
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.exec_handshake_timeout_seconds) is not float
+            or not math.isfinite(self.exec_handshake_timeout_seconds)
+            or self.exec_handshake_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "PosixProcessActivationPolicy.exec_handshake_timeout_seconds "
+                "must be finite and positive"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class PosixDescriptorMapping:
     """Duplicate one owned parent descriptor onto one exact child descriptor."""
 
@@ -141,7 +174,7 @@ class PosixProcessLaunchSpec:
     program: PosixProcessProgram
     working_directory: Path
     environment: PosixProcessEnvironment
-    group_mode: PosixProcessGroupMode
+    group_mode: PosixProcessGroup
     descriptor_mappings: tuple[PosixDescriptorMapping, ...]
     terminal: PosixProcessTerminal
 
@@ -156,7 +189,10 @@ class PosixProcessLaunchSpec:
             )
         if type(self.environment) is not PosixProcessEnvironment:
             raise ValueError("PosixProcessLaunchSpec.environment must be typed")
-        if type(self.group_mode) is not PosixProcessGroupMode:
+        if type(self.group_mode) not in (
+            PosixProcessGroupMode,
+            PosixProcessJoinGroup,
+        ):
             raise ValueError("PosixProcessLaunchSpec.group_mode must be typed")
         targets = self._validate_descriptor_mappings()
         self._validate_terminal(targets)

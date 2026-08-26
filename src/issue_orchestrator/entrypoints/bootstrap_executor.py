@@ -51,6 +51,7 @@ _PROCESS_TERMINATION = ExecutorProcessTerminationPolicy(
     graceful_shutdown_seconds=2.0,
     forceful_shutdown_seconds=2.0,
 )
+_POSIX_PROCESS_ACTIVATION_TIMEOUT_SECONDS = 30.0
 _TERMINAL_SESSION_RELAY_MARGIN_SECONDS = 1.0
 _TERMINAL_SESSION_GUARDIAN_RELAY_SECONDS = (
     _PROCESS_TERMINATION.graceful_shutdown_seconds
@@ -172,7 +173,10 @@ def build_process_group_supervisor() -> ProcessGroupSupervisor:
 def build_posix_process_launcher() -> PosixProcessLauncher:
     """Compose the gap-free retained child-process activation owner."""
     _require_posix_process_groups()
-    from ..domain.posix_process import PosixProcessProgram
+    from ..domain.posix_process import (
+        PosixProcessActivationPolicy,
+        PosixProcessProgram,
+    )
     from ..execution.posix_process import (
         MaskedPosixSpawnPrimitive,
         RetainedPosixProcessLauncher,
@@ -188,6 +192,7 @@ def build_posix_process_launcher() -> PosixProcessLauncher:
         ),
         MaskedPosixSpawnPrimitive(),
         build_process_group_supervisor(),
+        PosixProcessActivationPolicy(_POSIX_PROCESS_ACTIVATION_TIMEOUT_SECONDS),
         _PROCESS_TERMINATION,
     )
 

@@ -8,9 +8,9 @@ import os
 import selectors
 import signal
 import socket
-import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import Field, ValidationError
@@ -18,6 +18,23 @@ from pydantic import Field, ValidationError
 from ..domain.process_group_sentinel import (
     ProcessGroupSentinelPolicy,
     ProcessGroupSentinelProgram,
+)
+from ..domain.posix_process import (
+    PosixDescriptorMapping,
+    PosixProcessEnvironment,
+    PosixProcessJoinGroup,
+    PosixProcessLaunchSpec,
+    PosixProcessProgram,
+    PosixProcessWithoutTerminal,
+)
+from ..ports.posix_process import (
+    PosixProcessExecRejected,
+    PosixProcessHandle,
+    PosixProcessLauncher,
+    PosixProcessLaunchRecovered,
+    PosixProcessLaunchRecoveryFailed,
+    PosixProcessLaunchRejected,
+    PosixProcessLaunchStarted,
 )
 from .strict_wire_record import StrictWireRecord
 from .process_cancellation_endpoint import (
@@ -27,6 +44,7 @@ from .process_cancellation_endpoint import (
 )
 from .independent_cleanup import (
     CleanupAction,
+    CleanupOutcome,
     IndependentCleanupPlan,
     raise_cleanup_failures,
     raise_primary_with_cleanup,
@@ -79,11 +97,124 @@ class _ProcessGroupSentinelInvocation(StrictWireRecord):
     graceful_shutdown_seconds: float = Field(gt=0)
 
 
+class _SentinelLaunchResources:
+    """Incrementally own both controller sockets and the readiness pipe."""
+
+    def __init__(self) -> None:
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            readiness_reader, readiness_writer = os.pipe()
+        except BaseException as acquisition_error:
+            cleanup = IndependentCleanupPlan(
+                (
+                    CleanupAction("parent-controller-close", parent.close),
+                    CleanupAction("child-controller-close", child.close),
+                )
+            ).run()
+            raise_primary_with_cleanup(
+                "sentinel readiness acquisition and socket cleanup failed",
+                acquisition_error,
+                cleanup,
+            )
+        self._parent = parent
+        self._child = child
+        self._readiness_reader = readiness_reader
+        self._readiness_writer = readiness_writer
+        self._parent_owned = True
+        self._child_owned = True
+        self._readiness_reader_owned = True
+        self._readiness_writer_owned = True
+
+    @property
+    def child_controller_descriptor(self) -> int:
+        return self._child.fileno()
+
+    @property
+    def readiness_writer_descriptor(self) -> int:
+        return self._readiness_writer
+
+    @property
+    def readiness_reader_descriptor(self) -> int:
+        return self._readiness_reader
+
+    def close_child_endpoints_after_launch(self) -> None:
+        actions = (
+            CleanupAction("child-controller-close", self._child.close),
+            CleanupAction(
+                "readiness-writer-close",
+                lambda: os.close(self._readiness_writer),
+            ),
+        )
+        self._child_owned = False
+        self._readiness_writer_owned = False
+        raise_cleanup_failures(
+            "sentinel child endpoint transfer failed",
+            IndependentCleanupPlan(actions).run(),
+        )
+
+    def transfer_parent_after_ready(self) -> socket.socket:
+        if not self._parent_owned or not self._readiness_reader_owned:
+            raise RuntimeError("sentinel parent resources were already transferred")
+        self._readiness_reader_owned = False
+        os.close(self._readiness_reader)
+        self._parent_owned = False
+        return self._parent
+
+    def close(self) -> CleanupOutcome:
+        actions: list[CleanupAction] = []
+        if self._parent_owned:
+            actions.append(CleanupAction("parent-controller-close", self._parent.close))
+            self._parent_owned = False
+        if self._child_owned:
+            actions.append(CleanupAction("child-controller-close", self._child.close))
+            self._child_owned = False
+        if self._readiness_reader_owned:
+            actions.append(
+                CleanupAction(
+                    "readiness-reader-close",
+                    lambda: os.close(self._readiness_reader),
+                )
+            )
+            self._readiness_reader_owned = False
+        if self._readiness_writer_owned:
+            actions.append(
+                CleanupAction(
+                    "readiness-writer-close",
+                    lambda: os.close(self._readiness_writer),
+                )
+            )
+            self._readiness_writer_owned = False
+        return IndependentCleanupPlan(tuple(actions)).run()
+
+
+@dataclass(frozen=True, slots=True)
+class _SentinelActivationStarted:
+    process: PosixProcessHandle
+
+
+@dataclass(frozen=True, slots=True)
+class _SentinelActivationContained:
+    error: BaseException
+
+
+@dataclass(frozen=True, slots=True)
+class _SentinelActivationUncontained:
+    process_id: int
+    error: BaseException
+
+
+_SentinelActivation = (
+    _SentinelActivationStarted
+    | _SentinelActivationContained
+    | _SentinelActivationUncontained
+)
+
+
 @dataclass(slots=True)
 class ProcessGroupSentinelController:
     """Parent-side authority over one exact sentinel child and control channel."""
 
-    _child: subprocess.Popen[bytes]
+    _child: PosixProcessHandle
     _connection: socket.socket
     _startup_timeout_seconds: float
     _transferred_to_exec: bool = False
@@ -96,19 +227,92 @@ class ProcessGroupSentinelController:
         cancellation: ProcessGroupSentinelCancellation,
         policy: ProcessGroupSentinelPolicy,
         lifetime_file_descriptors: tuple[int, ...],
+        process_launcher: PosixProcessLauncher,
     ) -> ProcessGroupSentinelController:
         """Start a sentinel in the caller's current process group and await it."""
+        cls._validate_start_contract(
+            program,
+            cancellation,
+            policy,
+            lifetime_file_descriptors,
+            process_launcher,
+        )
+        cancellation_record, cancellation_descriptors = (
+            cls._cancellation_record(cancellation)
+        )
+        inherited_descriptors = (
+            *cancellation_descriptors,
+            *lifetime_file_descriptors,
+        )
+        if len(set(inherited_descriptors)) != len(inherited_descriptors):
+            raise ValueError("sentinel inherited descriptors must be unique")
+        resources = _SentinelLaunchResources()
+        child: PosixProcessHandle | None = None
+        uncontained_process_id: int | None = None
+        try:
+            invocation = _ProcessGroupSentinelInvocation(
+                cancellation=cancellation_record,
+                controller_file_descriptor=(resources.child_controller_descriptor),
+                ready_file_descriptor=resources.readiness_writer_descriptor,
+                process_group_id=os.getpgrp(),
+                graceful_shutdown_seconds=policy.graceful_shutdown_seconds,
+            )
+            activation = cls._activate(
+                program,
+                invocation,
+                inherited_descriptors,
+                resources,
+                process_launcher,
+            )
+            if type(activation) is _SentinelActivationContained:
+                raise activation.error
+            if type(activation) is _SentinelActivationUncontained:
+                uncontained_process_id = activation.process_id
+                raise activation.error
+            if type(activation) is not _SentinelActivationStarted:
+                raise AssertionError("sentinel activation is a closed union")
+            child = activation.process
+            resources.close_child_endpoints_after_launch()
+            cls._await_ready(
+                resources.readiness_reader_descriptor,
+                child,
+                policy.startup_timeout_seconds,
+            )
+            connection = resources.transfer_parent_after_ready()
+            return cls(child, connection, policy.startup_timeout_seconds)
+        except BaseException as primary_error:
+            raise_primary_with_cleanup(
+                "sentinel startup and cleanup failed",
+                primary_error,
+                cls._startup_cleanup(
+                    child,
+                    uncontained_process_id,
+                    resources,
+                    policy.startup_timeout_seconds,
+                ),
+            )
+
+    @staticmethod
+    def _validate_start_contract(
+        program: ProcessGroupSentinelProgram,
+        cancellation: ProcessGroupSentinelCancellation,
+        policy: ProcessGroupSentinelPolicy,
+        lifetime_file_descriptors: tuple[int, ...],
+        process_launcher: PosixProcessLauncher,
+    ) -> None:
         if type(program) is not ProcessGroupSentinelProgram:
             raise ValueError("sentinel program must be ProcessGroupSentinelProgram")
         if type(cancellation) not in (
             ProcessGroupSentinelWithoutCancellation,
             ProcessCancellationOwnerControls,
         ):
-            raise ValueError(
-                "sentinel cancellation must be an explicit typed contract"
-            )
+            raise ValueError("sentinel cancellation must be a typed contract")
         if type(policy) is not ProcessGroupSentinelPolicy:
             raise ValueError("sentinel policy must be ProcessGroupSentinelPolicy")
+        if not callable(getattr(process_launcher, "launch", None)):
+            raise ValueError(
+                "sentinel process_launcher must implement PosixProcessLauncher"
+            )
         if os.getpid() != os.getpgrp():
             raise ProcessGroupSentinelError(
                 "sentinel controller requires an isolated process-group leader"
@@ -120,104 +324,131 @@ class ProcessGroupSentinelController:
             raise ValueError(
                 "sentinel lifetime_file_descriptors must be non-negative integers"
             )
-        if type(cancellation) is ProcessGroupSentinelWithoutCancellation:
-            cancellation_record: _SentinelCancellationRecord = (
-                _SentinelWithoutCancellationRecord()
-            )
-            cancellation_descriptors: tuple[int, ...] = ()
-        elif type(cancellation) is ProcessCancellationOwnerControls:
-            cancellation_record = _SentinelCancellationEndpointRecord(
-                listener_file_descriptor=cancellation.listener_file_descriptor,
-                owner_lock_file_descriptor=cancellation.owner_lock_file_descriptor,
-            )
-            cancellation_descriptors = (
-                cancellation.listener_file_descriptor,
-                cancellation.owner_lock_file_descriptor,
-            )
-        else:
-            raise AssertionError("sentinel cancellation is a closed union")
-        inherited_descriptors = (
-            *cancellation_descriptors,
-            *lifetime_file_descriptors,
-        )
-        if len(set(inherited_descriptors)) != len(inherited_descriptors):
-            raise ValueError("sentinel inherited descriptors must be unique")
 
-        parent_connection, child_connection = socket.socketpair(
-            socket.AF_UNIX,
-            socket.SOCK_STREAM,
-        )
-        ready_read_fd, ready_write_fd = os.pipe()
-        child: subprocess.Popen[bytes] | None = None
-        child_connection_open = True
-        ready_read_open = True
-        ready_write_open = True
-        try:
-            invocation = _ProcessGroupSentinelInvocation(
-                cancellation=cancellation_record,
-                controller_file_descriptor=child_connection.fileno(),
-                ready_file_descriptor=ready_write_fd,
-                process_group_id=os.getpgrp(),
-                graceful_shutdown_seconds=policy.graceful_shutdown_seconds,
-            )
-            child = subprocess.Popen(
+    @staticmethod
+    def _cancellation_record(
+        cancellation: ProcessGroupSentinelCancellation,
+    ) -> tuple[_SentinelCancellationRecord, tuple[int, ...]]:
+        if type(cancellation) is ProcessGroupSentinelWithoutCancellation:
+            return _SentinelWithoutCancellationRecord(), ()
+        if type(cancellation) is ProcessCancellationOwnerControls:
+            return (
+                _SentinelCancellationEndpointRecord(
+                    listener_file_descriptor=cancellation.listener_file_descriptor,
+                    owner_lock_file_descriptor=cancellation.owner_lock_file_descriptor,
+                ),
                 (
-                    *program.arguments,
-                    "--request-json",
-                    invocation.model_dump_json(),
-                ),
-                pass_fds=(
-                    *inherited_descriptors,
-                    child_connection.fileno(),
-                    ready_write_fd,
+                    cancellation.listener_file_descriptor,
+                    cancellation.owner_lock_file_descriptor,
                 ),
             )
-            child_connection.close()
-            child_connection_open = False
-            os.close(ready_write_fd)
-            ready_write_open = False
-            cls._await_ready(ready_read_fd, child, policy.startup_timeout_seconds)
-            os.close(ready_read_fd)
-            ready_read_open = False
-            return cls(child, parent_connection, policy.startup_timeout_seconds)
-        except BaseException as primary_error:
-            cleanup_actions: list[CleanupAction] = []
-            if child is not None:
-                cleanup_actions.append(
-                    CleanupAction(
-                        "exact-sentinel-kill-and-reap",
-                        lambda: cls._kill_and_reap_exact_child(
-                            child,
-                            policy.startup_timeout_seconds,
-                        ),
+        raise AssertionError("sentinel cancellation is a closed union")
+
+    @staticmethod
+    def _activate(
+        program: ProcessGroupSentinelProgram,
+        invocation: _ProcessGroupSentinelInvocation,
+        inherited_descriptors: tuple[int, ...],
+        resources: _SentinelLaunchResources,
+        process_launcher: PosixProcessLauncher,
+    ) -> _SentinelActivation:
+        descriptors = (
+            *inherited_descriptors,
+            resources.child_controller_descriptor,
+            resources.readiness_writer_descriptor,
+        )
+        launch = process_launcher.launch(
+            PosixProcessLaunchSpec(
+                program=PosixProcessProgram(
+                    (
+                        *program.arguments,
+                        "--request-json",
+                        invocation.model_dump_json(),
                     )
-                )
-            if child_connection_open:
-                cleanup_actions.append(
-                    CleanupAction("child-controller-close", child_connection.close)
-                )
-            cleanup_actions.append(
-                CleanupAction("parent-controller-close", parent_connection.close)
+                ),
+                working_directory=Path.cwd().resolve(),
+                environment=PosixProcessEnvironment.from_mapping(os.environ),
+                group_mode=PosixProcessJoinGroup(os.getpgrp()),
+                descriptor_mappings=tuple(
+                    PosixDescriptorMapping(descriptor, descriptor)
+                    for descriptor in descriptors
+                ),
+                terminal=PosixProcessWithoutTerminal(),
             )
-            if ready_write_open:
-                cleanup_actions.append(
-                    CleanupAction(
-                        "readiness-writer-close",
-                        lambda: os.close(ready_write_fd),
-                    )
-                )
-            if ready_read_open:
-                cleanup_actions.append(
-                    CleanupAction(
-                        "readiness-reader-close",
-                        lambda: os.close(ready_read_fd),
-                    )
-                )
-            raise_primary_with_cleanup(
-                "sentinel startup and cleanup failed",
-                primary_error,
-                IndependentCleanupPlan(tuple(cleanup_actions)).run(),
+        )
+        if type(launch) is PosixProcessLaunchStarted:
+            return _SentinelActivationStarted(launch.process)
+        if type(launch) is PosixProcessLaunchRejected:
+            error = ProcessGroupSentinelError(
+                f"sentinel activation was rejected: {launch.error!r}"
             )
+            error.__cause__ = launch.error
+            return _SentinelActivationContained(error)
+        if type(launch) is PosixProcessExecRejected:
+            return _SentinelActivationContained(launch.as_error())
+        if type(launch) is PosixProcessLaunchRecovered:
+            error = ProcessGroupSentinelError(
+                "sentinel activation was interrupted and contained"
+            )
+            error.__cause__ = launch.activation_error
+            return _SentinelActivationContained(error)
+        if type(launch) is not PosixProcessLaunchRecoveryFailed:
+            raise AssertionError("sentinel launch is a closed union")
+        recovery = BaseExceptionGroup(
+            "sentinel activation and recovery failed",
+            (launch.activation_error, launch.recovery_error),
+        )
+        error = ProcessGroupSentinelError(
+            "sentinel activation could not prove exact-child containment"
+        )
+        error.__cause__ = recovery
+        return _SentinelActivationUncontained(launch.process_id, error)
+
+    @classmethod
+    def _startup_cleanup(
+        cls,
+        child: PosixProcessHandle | None,
+        uncontained_process_id: int | None,
+        resources: _SentinelLaunchResources,
+        timeout_seconds: float,
+    ) -> CleanupOutcome:
+        actions: list[CleanupAction] = []
+        if child is not None:
+            started_child = child
+            actions.append(
+                CleanupAction(
+                    "exact-sentinel-kill-and-reap",
+                    lambda: cls._kill_and_reap_exact_child(
+                        started_child,
+                        timeout_seconds,
+                    ),
+                )
+            )
+        elif uncontained_process_id is not None:
+            process_id = uncontained_process_id
+            actions.append(
+                CleanupAction(
+                    "uncontained-exact-sentinel-kill-and-reap",
+                    lambda: cls._kill_and_reap_exact_process_id(
+                        process_id,
+                        timeout_seconds,
+                    ),
+                )
+            )
+        actions.append(
+            CleanupAction(
+                "sentinel-launch-resources-close",
+                lambda: cls._require_resources_closed(resources),
+            )
+        )
+        return IndependentCleanupPlan(tuple(actions)).run()
+
+    @staticmethod
+    def _require_resources_closed(resources: _SentinelLaunchResources) -> None:
+        raise_cleanup_failures(
+            "sentinel launch resource cleanup failed",
+            resources.close(),
+        )
 
     def transfer_to_exec(self) -> None:
         """Keep the control lifetime open across the caller's imminent exec."""
@@ -241,7 +472,7 @@ class ProcessGroupSentinelController:
         self._closed = True
         raise ProcessGroupSentinelError(
             "process-group sentinel exited while opaque work remained active: "
-            f"pid={self._child.pid} exit_code={return_code}"
+            f"pid={self._child.process_id} exit_code={return_code}"
         )
 
     def retire_without_group(self) -> None:
@@ -273,14 +504,14 @@ class ProcessGroupSentinelController:
                 CleanupAction(
                     "sentinel-reap",
                     lambda: self._child.wait(
-                        timeout=self._startup_timeout_seconds
+                        timeout_seconds=self._startup_timeout_seconds
                     ),
                 ),
             )
         ).run()
         self._closed = True
         raise_cleanup_failures("sentinel retirement cleanup failed", cleanup)
-        if self._child.returncode != 0:
+        if self._child.return_code != 0:
             raise ProcessGroupSentinelError(
                 "sentinel did not retire cleanly before opaque work"
             )
@@ -319,7 +550,7 @@ class ProcessGroupSentinelController:
     @staticmethod
     def _await_ready(
         ready_read_file_descriptor: int,
-        child: subprocess.Popen[bytes],
+        child: PosixProcessHandle,
         timeout_seconds: float,
     ) -> None:
         deadline = time.monotonic() + timeout_seconds
@@ -339,7 +570,7 @@ class ProcessGroupSentinelController:
 
     @staticmethod
     def _kill_and_reap_exact_child(
-        child: subprocess.Popen[bytes],
+        child: PosixProcessHandle,
         timeout_seconds: float,
     ) -> None:
         actions: list[CleanupAction] = []
@@ -348,13 +579,36 @@ class ProcessGroupSentinelController:
         actions.append(
             CleanupAction(
                 "exact-sentinel-reap",
-                lambda: child.wait(timeout=timeout_seconds),
+                lambda: child.wait(timeout_seconds=timeout_seconds),
             )
         )
         raise_cleanup_failures(
             "exact sentinel kill/reap failed",
             IndependentCleanupPlan(tuple(actions)).run(),
         )
+
+    @staticmethod
+    def _kill_and_reap_exact_process_id(
+        process_id: int,
+        timeout_seconds: float,
+    ) -> None:
+        try:
+            os.kill(process_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                reaped_id, _status = os.waitpid(process_id, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if reaped_id == process_id:
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"uncontained sentinel {process_id} was not reaped"
+                )
+            time.sleep(min(0.01, deadline - time.monotonic()))
 
 
 @dataclass(slots=True)
@@ -371,12 +625,14 @@ class RedundantProcessGroupSentinelController:
         cancellation: ProcessGroupSentinelCancellation,
         policy: ProcessGroupSentinelPolicy,
         lifetime_file_descriptors: tuple[int, ...],
+        process_launcher: PosixProcessLauncher,
     ) -> RedundantProcessGroupSentinelController:
         first = ProcessGroupSentinelController.start(
             program,
             cancellation,
             policy,
             lifetime_file_descriptors,
+            process_launcher,
         )
         try:
             second = ProcessGroupSentinelController.start(
@@ -384,6 +640,7 @@ class RedundantProcessGroupSentinelController:
                 cancellation,
                 policy,
                 lifetime_file_descriptors,
+                process_launcher,
             )
         except BaseException as startup_error:
             raise_primary_with_cleanup(

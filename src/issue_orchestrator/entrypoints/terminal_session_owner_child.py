@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 
-from .bootstrap_executor import build_atomic_record_store_factory
+from .bootstrap_executor import (
+    build_atomic_record_store_factory,
+    build_posix_process_launcher,
+)
 from ..execution.terminal_session_owner import run_terminal_session_owner_child
 
 
@@ -15,6 +18,7 @@ def main() -> int:
     return run_terminal_session_owner_child(
         arguments.owner_request_json,
         build_atomic_record_store_factory(),
+        build_posix_process_launcher(),
     )
 
 

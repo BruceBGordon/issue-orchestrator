@@ -17,6 +17,7 @@ from ..domain.process_group_sentinel import (
 from ..domain.terminal_session_owner import TerminalSessionOwnerPolicy
 from ..domain.terminal_session_termination import TerminalSessionOwnerCancellation
 from ..ports.atomic_record_store import AtomicRecordStoreFactory
+from ..ports.posix_process import PosixProcessLauncher
 from .process_cancellation_endpoint import (
     ProcessCancellationEndpointLease,
     ProcessCancellationEndpointReadiness,
@@ -174,8 +175,18 @@ class PosixTerminalSessionOwner:
 class TerminalSessionOwnerChild:
     """Publish an in-group sentinel, then exec the real terminal command."""
 
-    def __init__(self, record_stores: AtomicRecordStoreFactory) -> None:
+    def __init__(
+        self,
+        record_stores: AtomicRecordStoreFactory,
+        process_launcher: PosixProcessLauncher,
+    ) -> None:
         self._record_stores = record_stores
+        if not callable(getattr(process_launcher, "launch", None)):
+            raise ValueError(
+                "TerminalSessionOwnerChild.process_launcher must implement "
+                "PosixProcessLauncher"
+            )
+        self._process_launcher = process_launcher
 
     def run(self, invocation: _TerminalSessionOwnerInvocation) -> int:
         cancellation = TerminalSessionOwnerCancellation(
@@ -202,6 +213,7 @@ class TerminalSessionOwnerChild:
                     startup_timeout_seconds=invocation.startup_timeout_seconds,
                 ),
                 (),
+                self._process_launcher,
             )
             activation.activate_for_owner()
             controller.transfer_to_exec()
@@ -225,10 +237,11 @@ class TerminalSessionOwnerChild:
 def run_terminal_session_owner_child(
     raw_request: str,
     record_stores: AtomicRecordStoreFactory,
+    process_launcher: PosixProcessLauncher,
 ) -> int:
     """Validate one child invocation and run the terminal ownership wrapper."""
     try:
         invocation = _TerminalSessionOwnerInvocation.model_validate_json(raw_request)
     except ValidationError as error:
         raise ValueError("invalid terminal owner invocation") from error
-    return TerminalSessionOwnerChild(record_stores).run(invocation)
+    return TerminalSessionOwnerChild(record_stores, process_launcher).run(invocation)

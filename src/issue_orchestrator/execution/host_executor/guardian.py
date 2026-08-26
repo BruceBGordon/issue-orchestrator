@@ -6,14 +6,21 @@ from __future__ import annotations
 import argparse
 import os
 import signal
-import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import FrameType
 
 from pydantic import ValidationError
 
 from ...domain.executor import ExecutorCommandLifecycle
+from ...domain.posix_process import (
+    PosixProcessEnvironment,
+    PosixProcessJoinGroup,
+    PosixProcessLaunchSpec,
+    PosixProcessProgram,
+    PosixProcessWithoutTerminal,
+)
 from ...domain.executor_guardian import (
     ExecutorGuardianBoundedBudget,
     ExecutorGuardianBudget,
@@ -24,6 +31,15 @@ from ...domain.executor_guardian import (
     ExecutorGuardianTerminal,
     ExecutorGuardianTerminationPolicy,
     ExecutorGuardianUnboundedBudget,
+)
+from ...ports.posix_process import (
+    PosixProcessExecRejected,
+    PosixProcessHandle,
+    PosixProcessLauncher,
+    PosixProcessLaunchRecovered,
+    PosixProcessLaunchRecoveryFailed,
+    PosixProcessLaunchRejected,
+    PosixProcessLaunchStarted,
 )
 from ..process_cancellation_endpoint import ProcessCancellationOwnerControls
 from ..process_group_sentinel import (
@@ -106,11 +122,10 @@ class _SentinelGuardianGroupOwner:
 
     def contain(
         self,
-        process: subprocess.Popen[bytes],
         terminal: ExecutorGuardianTerminal,
         termination_policy: ExecutorGuardianTerminationPolicy,
     ) -> None:
-        del process, terminal
+        del terminal
         try:
             self.controller.request_containment()
         except BaseException:
@@ -163,6 +178,7 @@ class PosixExecutorGuardianChild:
     def __init__(
         self,
         termination_policy: ExecutorGuardianTerminationPolicy,
+        process_launcher: PosixProcessLauncher,
     ) -> None:
         if type(termination_policy) is not ExecutorGuardianTerminationPolicy:
             raise ValueError(
@@ -170,6 +186,12 @@ class PosixExecutorGuardianChild:
                 "ExecutorGuardianTerminationPolicy"
             )
         self._termination_policy = termination_policy
+        if not callable(getattr(process_launcher, "launch", None)):
+            raise ValueError(
+                "PosixExecutorGuardianChild.process_launcher must implement "
+                "PosixProcessLauncher"
+            )
+        self._process_launcher = process_launcher
 
     def run(
         self,
@@ -222,8 +244,8 @@ class PosixExecutorGuardianChild:
         finally:
             os.close(file_descriptor)
 
-    @staticmethod
     def _build_group_owner(
+        self,
         invocation: GuardianInvocationRecord,
     ) -> _GuardianGroupOwner:
         cancellation = invocation.cancellation
@@ -247,6 +269,7 @@ class PosixExecutorGuardianChild:
             sentinel_cancellation,
             invocation.process_group_sentinel_policy(),
             invocation.lease_file_descriptors,
+            self._process_launcher,
         )
         cleanup_errors: list[BaseException] = []
         for descriptor in cancellation_descriptors:
@@ -274,26 +297,71 @@ class PosixExecutorGuardianChild:
         arguments = invocation.arguments
         self._require_arguments(arguments)
         try:
-            process = subprocess.Popen(list(arguments), close_fds=True)
-        except OSError as error:
-            try:
-                result_writer.write(
-                    ExecutorGuardianCommandStartFailed(
-                        type(error).__name__,
-                        f"{error!r}; executable={arguments[0]!r}",
-                    )
+            launch = self._process_launcher.launch(
+                PosixProcessLaunchSpec(
+                    program=PosixProcessProgram(arguments),
+                    working_directory=Path.cwd().resolve(),
+                    environment=PosixProcessEnvironment.from_mapping(os.environ),
+                    group_mode=PosixProcessJoinGroup(os.getpgrp()),
+                    descriptor_mappings=(),
+                    terminal=PosixProcessWithoutTerminal(),
                 )
-            finally:
-                group_owner.retire_before_opaque_work()
-            return 0
+            )
         except BaseException as error:
             try:
                 result_writer.write(
                     ExecutorGuardianInternalFailed(type(error).__name__, repr(error))
                 )
             finally:
+                group_owner.contain(
+                    ExecutorGuardianInternalFailed(type(error).__name__, repr(error)),
+                    self._termination_policy,
+                )
+            raise AssertionError("guardian containment unexpectedly returned")
+        if type(launch) is PosixProcessLaunchRejected:
+            terminal = self._rejected_launch_terminal(launch.error, arguments[0])
+            try:
+                result_writer.write(terminal)
+            finally:
+                group_owner.retire_before_opaque_work()
+            return 0 if type(terminal) is ExecutorGuardianCommandStartFailed else 1
+        if type(launch) is PosixProcessExecRejected:
+            terminal = ExecutorGuardianCommandStartFailed(
+                launch.error_type,
+                launch.error_repr,
+            )
+            try:
+                result_writer.write(terminal)
+            finally:
+                group_owner.retire_before_opaque_work()
+            return 0
+        if type(launch) is PosixProcessLaunchRecovered:
+            terminal = ExecutorGuardianInternalFailed(
+                type(launch.activation_error).__name__,
+                repr(launch.activation_error),
+            )
+            try:
+                result_writer.write(terminal)
+            finally:
                 group_owner.retire_before_opaque_work()
             return 1
+        if type(launch) is PosixProcessLaunchRecoveryFailed:
+            recovery = BaseExceptionGroup(
+                "opaque command activation and recovery failed",
+                (launch.activation_error, launch.recovery_error),
+            )
+            terminal = ExecutorGuardianInternalFailed(
+                type(recovery).__name__,
+                repr(recovery),
+            )
+            try:
+                result_writer.write(terminal)
+            finally:
+                group_owner.contain(terminal, self._termination_policy)
+            raise AssertionError("guardian containment unexpectedly returned")
+        if type(launch) is not PosixProcessLaunchStarted:
+            raise AssertionError("opaque command launch is a closed union")
+        process = launch.process
 
         outcome = self._wait_for_outcome(
             process,
@@ -304,11 +372,22 @@ class PosixExecutorGuardianChild:
             result_writer.write(outcome.terminal)
         finally:
             group_owner.contain(
-                process,
                 outcome.terminal,
                 self._termination_policy,
             )
         raise AssertionError("group containment unexpectedly returned to guardian")
+
+    @staticmethod
+    def _rejected_launch_terminal(
+        error: BaseException,
+        executable: str,
+    ) -> ExecutorGuardianCommandStartFailed | ExecutorGuardianInternalFailed:
+        if isinstance(error, OSError):
+            return ExecutorGuardianCommandStartFailed(
+                type(error).__name__,
+                f"{error!r}; executable={executable!r}",
+            )
+        return ExecutorGuardianInternalFailed(type(error).__name__, repr(error))
 
     @staticmethod
     def _require_arguments(arguments: tuple[str, ...]) -> None:
@@ -331,7 +410,7 @@ class PosixExecutorGuardianChild:
     @classmethod
     def _wait_for_outcome(
         cls,
-        process: subprocess.Popen[bytes],
+        process: PosixProcessHandle,
         budget: ExecutorGuardianBudget,
         group_owner: _GuardianGroupOwner,
     ) -> _GuardianCommandTerminal:
@@ -380,7 +459,12 @@ def main() -> int:
     parser.add_argument("--request-json", required=True)
     arguments = parser.parse_args()
     invocation = _parse_invocation(arguments.request_json)
-    return PosixExecutorGuardianChild(invocation.termination_policy()).run(
+    from ...entrypoints.bootstrap import build_posix_process_launcher
+
+    return PosixExecutorGuardianChild(
+        invocation.termination_policy(),
+        build_posix_process_launcher(),
+    ).run(
         invocation,
         _GuardianResultWriter(invocation.result_file_descriptor),
     )
