@@ -187,16 +187,49 @@ ProcessSessionObservation = (
 
 
 @dataclass(frozen=True, slots=True)
+class ProcessGroupCourtesyCompleted:
+    """The courtesy TERM observation completed before forced containment."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessGroupCourtesyFailed:
+    """Courtesy TERM observation failed, but forced containment still completed."""
+
+    error: BaseException
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.error, BaseException):
+            raise ValueError("ProcessGroupCourtesyFailed.error must be an exception")
+
+
+ProcessGroupCourtesy = ProcessGroupCourtesyCompleted | ProcessGroupCourtesyFailed
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessGroupTermination:
-    """The reaped leader result after its whole process group was contained."""
+    """Reaped leader evidence after unconditional whole-group containment."""
 
     leader_exit_code: int
+    courtesy: ProcessGroupCourtesy
 
     def __post_init__(self) -> None:
         if type(self.leader_exit_code) is not int:
             raise ValueError(
                 "ProcessGroupTermination.leader_exit_code must be an integer"
             )
+        if type(self.courtesy) not in (
+            ProcessGroupCourtesyCompleted,
+            ProcessGroupCourtesyFailed,
+        ):
+            raise ValueError("ProcessGroupTermination.courtesy must be typed")
+
+    def courtesy_failure(self) -> ProcessGroupCourtesyFailed | None:
+        """Return typed degraded-shutdown evidence, if courtesy TERM failed."""
+        if type(self.courtesy) is ProcessGroupCourtesyCompleted:
+            return None
+        if type(self.courtesy) is ProcessGroupCourtesyFailed:
+            return self.courtesy
+        raise AssertionError("process-group courtesy is a closed union")
 
 
 @dataclass(frozen=True, slots=True)

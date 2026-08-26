@@ -140,6 +140,14 @@ class ValidationPipeResourceOwner:
         self._selector.unregister(self.descriptor(role))
         self._registered.remove(role)
 
+    def is_registered(self, role: ValidationPipeRole) -> bool:
+        """Report whether one protocol role still requires an EOF observation."""
+        if type(role) is not ValidationPipeRole:
+            raise ValueError(
+                "validation pipe registration query requires ValidationPipeRole"
+            )
+        return role in self._registered
+
     def close(self) -> BaseException | None:
         """Attempt every independent cleanup action exactly once without raising."""
         if self._closed:

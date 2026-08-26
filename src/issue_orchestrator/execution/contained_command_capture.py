@@ -12,14 +12,17 @@ from typing import TextIO, cast
 
 from ..domain.contained_command import (
     ContainedCommandCaptureAborted,
+    ContainedCommandCapture,
     ContainedCommandCaptureFailed,
     ContainedCommandCaptureInterrupted,
+    ContainedCommandCaptureSucceeded,
     ContainedCommandCleanupFailed,
     ContainedCommandCleanupNotStarted,
     ContainedCommandCompleted,
     ContainedCommandExited,
     ContainedCommandExitUnknown,
     ContainedCommandFailure,
+    ContainedCommandFinalizationFailed,
     ContainedCommandMetrics,
     ContainedCommandNotStarted,
     ContainedCommandOutputPolicy,
@@ -33,7 +36,7 @@ from ..domain.process_group import (
     OwnedProcessGroupLeader,
     ProcessGroupCompleted,
     ProcessGroupInterrupted,
-    ProcessGroupSupervision,
+    ProcessGroupTermination,
     ProcessGroupUnboundedWait,
 )
 from ..domain.posix_process import (
@@ -401,14 +404,21 @@ class _CapturedOutputPump(ProcessGroupInterruption):
             )
         return _OutputPumpFinalizationFailed(failure)
 
-    def stop_without_waiting(self) -> None:
-        """Close every collector resource when group containment itself failed."""
+    def stop_without_waiting(
+        self,
+        output: ContainedCommandOutput,
+        line_observer: ContainedCommandLineObserver,
+    ) -> ContainedCommandFailure | None:
+        """Close collectors and publish retained output after failed containment."""
         close_failure = self._close_capture_resources()
-        if close_failure is not None:
-            self._record_failure(close_failure.error)
-        journal_failure = self._journal.close()
-        if journal_failure is not None:
-            self._record_failure(journal_failure.error)
+        publication_failure = self._journal.publish_and_close(output, line_observer)
+        if close_failure is None:
+            return publication_failure
+        return _combine_failures(
+            close_failure,
+            publication_failure,
+            "collector close and retained-output publication both failed",
+        )
 
     def publish_after_finalization(
         self,
@@ -486,6 +496,196 @@ class _CapturedOutputPump(ProcessGroupInterruption):
         return ContainedCommandFailure(
             BaseExceptionGroup("output collector resource close failed", failures)
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedCommandCaptureClosed:
+    """Capture and caller publication completed without failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedCommandCaptureCloseFailed:
+    failure: ContainedCommandFailure
+
+    def __post_init__(self) -> None:
+        if type(self.failure) is not ContainedCommandFailure:
+            raise ValueError("capture close failure must be typed")
+
+
+_CapturedCommandCaptureClosure = (
+    _CapturedCommandCaptureClosed | _CapturedCommandCaptureCloseFailed
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ContainedCommandLifecycleClosed:
+    """Retained-handle and courtesy-shutdown evidence completed."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ContainedCommandLifecycleCloseFailed:
+    failure: ContainedCommandFailure
+
+    def __post_init__(self) -> None:
+        if type(self.failure) is not ContainedCommandFailure:
+            raise ValueError("contained-command lifecycle failure must be typed")
+
+
+_ContainedCommandLifecycleClosure = (
+    _ContainedCommandLifecycleClosed | _ContainedCommandLifecycleCloseFailed
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ContainedCommandPostContainmentEvidence:
+    capture: _CapturedCommandCaptureClosure
+    lifecycle: _ContainedCommandLifecycleClosure
+    metrics: ContainedCommandMetrics
+
+    def __post_init__(self) -> None:
+        if type(self.capture) not in (
+            _CapturedCommandCaptureClosed,
+            _CapturedCommandCaptureCloseFailed,
+        ):
+            raise ValueError("post-containment capture evidence must be typed")
+        if type(self.lifecycle) not in (
+            _ContainedCommandLifecycleClosed,
+            _ContainedCommandLifecycleCloseFailed,
+        ):
+            raise ValueError("post-containment lifecycle evidence must be typed")
+        if type(self.metrics) is not ContainedCommandMetrics:
+            raise ValueError("post-containment metrics must be typed")
+
+
+class _ContainedCommandPostContainmentOwner:
+    """Independently close capture, publication, and retained process evidence."""
+
+    def __init__(
+        self,
+        process: PosixProcessHandle,
+        pump: _CapturedOutputPump,
+        output: ContainedCommandOutput,
+        line_observer: ContainedCommandLineObserver,
+    ) -> None:
+        if not isinstance(process, PosixProcessHandle):
+            raise ValueError("post-containment process must implement its port")
+        if type(pump) is not _CapturedOutputPump:
+            raise ValueError("post-containment pump must be typed")
+        if not isinstance(output, ContainedCommandOutput):
+            raise ValueError("post-containment output must implement its port")
+        if not isinstance(line_observer, ContainedCommandLineObserver):
+            raise ValueError("post-containment observer must implement its port")
+        self._process = process
+        self._pump = pump
+        self._output = output
+        self._line_observer = line_observer
+
+    def close(
+        self,
+        termination: ProcessGroupTermination,
+        preceding_capture_failures: tuple[ContainedCommandFailure, ...],
+    ) -> _ContainedCommandPostContainmentEvidence:
+        if type(termination) is not ProcessGroupTermination:
+            raise ValueError("post-containment termination must be typed")
+        if any(
+            type(failure) is not ContainedCommandFailure
+            for failure in preceding_capture_failures
+        ):
+            raise ValueError("preceding capture failures must all be typed")
+        return _ContainedCommandPostContainmentEvidence(
+            capture=self._close_capture(preceding_capture_failures),
+            lifecycle=self._close_lifecycle(termination),
+            metrics=self._pump.metrics,
+        )
+
+    def _close_capture(
+        self,
+        preceding_failures: tuple[ContainedCommandFailure, ...],
+    ) -> _CapturedCommandCaptureClosure:
+        capture_failures = list(preceding_failures)
+        pump_failure = self._pump.failure
+        if pump_failure is not None:
+            capture_failures.append(pump_failure)
+        finalization_failure = self._finalize_pump()
+        if finalization_failure is not None:
+            capture_failures.append(finalization_failure)
+        publication_failure = self._publish_output()
+        if publication_failure is not None:
+            capture_failures.append(publication_failure)
+        return _capture_closure(tuple(capture_failures))
+
+    def _finalize_pump(self) -> ContainedCommandFailure | None:
+        try:
+            finalization = self._pump.finalize_after_containment()
+        except BaseException as error:
+            return ContainedCommandFailure(error)
+        if type(finalization) is _OutputPumpFinalizationFailed:
+            return finalization.failure
+        if type(finalization) is _OutputPumpFinalized:
+            return None
+        raise AssertionError("output pump finalization is a closed union")
+
+    def _publish_output(self) -> ContainedCommandFailure | None:
+        try:
+            return self._pump.publish_after_finalization(
+                self._output,
+                self._line_observer,
+            )
+        except BaseException as error:
+            return ContainedCommandFailure(error)
+
+    def _close_lifecycle(
+        self,
+        termination: ProcessGroupTermination,
+    ) -> _ContainedCommandLifecycleClosure:
+        lifecycle_failures: list[ContainedCommandFailure] = []
+        try:
+            self._process.record_external_reap(termination.leader_exit_code)
+        except BaseException as error:
+            lifecycle_failures.append(ContainedCommandFailure(error))
+        courtesy_failure = termination.courtesy_failure()
+        if courtesy_failure is not None:
+            lifecycle_failures.append(ContainedCommandFailure(courtesy_failure.error))
+        return _lifecycle_closure(tuple(lifecycle_failures))
+
+
+def _capture_closure(
+    failures: tuple[ContainedCommandFailure, ...],
+) -> _CapturedCommandCaptureClosure:
+    if not failures:
+        return _CapturedCommandCaptureClosed()
+    return _CapturedCommandCaptureCloseFailed(
+        _combine_failure_sequence(
+            failures,
+            "contained command capture failed more than once",
+        )
+    )
+
+
+def _lifecycle_closure(
+    failures: tuple[ContainedCommandFailure, ...],
+) -> _ContainedCommandLifecycleClosure:
+    if not failures:
+        return _ContainedCommandLifecycleClosed()
+    return _ContainedCommandLifecycleCloseFailed(
+        _combine_failure_sequence(
+            failures,
+            "contained command post-containment finalization failed more than once",
+        )
+    )
+
+
+def _combine_failure_sequence(
+    failures: tuple[ContainedCommandFailure, ...],
+    message: str,
+) -> ContainedCommandFailure:
+    if not failures:
+        raise ValueError("cannot combine an empty failure sequence")
+    if len(failures) == 1:
+        return failures[0]
+    return ContainedCommandFailure(
+        BaseExceptionGroup(message, tuple(failure.error for failure in failures))
+    )
 
 
 class PosixContainedCommandCapture:
@@ -691,15 +891,19 @@ class PosixContainedCommandCapture:
                 cleanup_failure=ContainedCommandFailure(recovery_error),
                 metrics=ContainedCommandMetrics(line_count=0, byte_count=0),
             )
-        process.record_external_reap(termination.leader_exit_code)
-        return ContainedCommandCaptureFailed(
-            child=ContainedCommandExited(
-                process.process_id,
-                termination.leader_exit_code,
-            ),
-            cleanup=ContainedCommandCaptureAborted(),
-            failure=ContainedCommandFailure(capture_error),
+        child = ContainedCommandExited(
+            process.process_id,
+            termination.leader_exit_code,
+        )
+        evidence = _ContainedCommandPostContainmentEvidence(
+            capture=_capture_closure((ContainedCommandFailure(capture_error),)),
+            lifecycle=_record_reap_and_courtesy(process, termination),
             metrics=ContainedCommandMetrics(line_count=0, byte_count=0),
+        )
+        return self._closed_result_after_containment(
+            child,
+            ContainedCommandCaptureAborted(),
+            evidence,
         )
 
     @staticmethod
@@ -757,84 +961,74 @@ class PosixContainedCommandCapture:
                 ContainedCommandFailure(supervision_error),
             )
 
-        process.record_external_reap(supervision.termination.leader_exit_code)
-        finalization = pump.finalize_after_containment()
-        publication_failure = pump.publish_after_finalization(output, line_observer)
         child = ContainedCommandExited(
             process.process_id,
             supervision.termination.leader_exit_code,
         )
-        return self._closed_result_after_supervision(
-            supervision,
-            child,
+        evidence = _ContainedCommandPostContainmentOwner(
+            process,
             pump,
-            finalization,
-            publication_failure,
+            output,
+            line_observer,
+        ).close(supervision.termination, ())
+        if type(supervision) is ProcessGroupInterrupted:
+            cleanup = ContainedCommandCaptureAborted()
+        elif type(supervision) is ProcessGroupCompleted:
+            cleanup = ContainedCommandSupervised()
+        else:
+            raise AssertionError("an unbounded contained command cannot time out")
+        return self._closed_result_after_containment(
+            child,
+            cleanup,
+            evidence,
         )
 
     @staticmethod
-    def _closed_result_after_supervision(
-        supervision: ProcessGroupSupervision,
+    def _closed_result_after_containment(
         child: ContainedCommandExited,
-        pump: _CapturedOutputPump,
-        finalization: _OutputPumpFinalization,
-        publication_failure: ContainedCommandFailure | None,
+        cleanup: ContainedCommandSupervised | ContainedCommandCaptureAborted,
+        evidence: _ContainedCommandPostContainmentEvidence,
     ) -> ContainedCommandResult:
-        """Interpret terminal supervision and pump evidence after containment."""
-        if type(supervision) is ProcessGroupInterrupted:
-            if pump.failure is None:
+        """Interpret independent capture and lifecycle evidence after containment."""
+        capture = evidence.capture
+        lifecycle = evidence.lifecycle
+        if type(cleanup) is ContainedCommandCaptureAborted:
+            if type(capture) is not _CapturedCommandCaptureCloseFailed:
                 raise AssertionError(
                     "process-group interruption requires captured failure evidence"
                 )
-            failure = pump.failure
-            if type(finalization) is _OutputPumpFinalizationFailed:
-                failure = _combine_failures(
-                    failure,
-                    finalization.failure,
-                    "output capture and pump finalization both failed",
-                )
-            failure = _combine_failures(
-                failure,
-                publication_failure,
-                "output capture and synchronous publication both failed",
+            capture_fact: ContainedCommandCapture = ContainedCommandCaptureInterrupted(
+                capture.failure
             )
+        elif type(cleanup) is ContainedCommandSupervised:
+            if type(capture) is _CapturedCommandCaptureClosed:
+                capture_fact = ContainedCommandCaptureSucceeded()
+            elif type(capture) is _CapturedCommandCaptureCloseFailed:
+                capture_fact = ContainedCommandCaptureInterrupted(capture.failure)
+            else:
+                raise AssertionError("contained-command capture is a closed union")
+        else:
+            raise AssertionError("contained cleanup is a closed union")
+        if type(lifecycle) is _ContainedCommandLifecycleCloseFailed:
+            return ContainedCommandFinalizationFailed(
+                child=child,
+                capture=capture_fact,
+                cleanup=cleanup,
+                finalization_failure=lifecycle.failure,
+                metrics=evidence.metrics,
+            )
+        if type(lifecycle) is not _ContainedCommandLifecycleClosed:
+            raise AssertionError("contained-command lifecycle is a closed union")
+        if type(capture) is _CapturedCommandCaptureCloseFailed:
             return ContainedCommandCaptureFailed(
                 child=child,
-                cleanup=ContainedCommandCaptureAborted(),
-                failure=failure,
-                metrics=pump.metrics,
+                cleanup=cleanup,
+                failure=capture.failure,
+                metrics=evidence.metrics,
             )
-        if type(supervision) is not ProcessGroupCompleted:
-            raise AssertionError("an unbounded contained command cannot time out")
-        failure = pump.failure
-        if type(finalization) is _OutputPumpFinalizationFailed:
-            failure = (
-                finalization.failure
-                if failure is None
-                else _combine_failures(
-                    failure,
-                    finalization.failure,
-                    "output capture and pump finalization both failed",
-                )
-            )
-        if publication_failure is not None:
-            failure = (
-                publication_failure
-                if failure is None
-                else _combine_failures(
-                    failure,
-                    publication_failure,
-                    "output capture and synchronous publication both failed",
-                )
-            )
-        if failure is not None:
-            return ContainedCommandCaptureFailed(
-                child=child,
-                cleanup=ContainedCommandSupervised(),
-                failure=failure,
-                metrics=pump.metrics,
-            )
-        return ContainedCommandCompleted(child=child, metrics=pump.metrics)
+        if type(capture) is not _CapturedCommandCaptureClosed:
+            raise AssertionError("contained-command capture is a closed union")
+        return ContainedCommandCompleted(child=child, metrics=evidence.metrics)
 
     def _abort_without_pump(
         self,
@@ -857,20 +1051,23 @@ class PosixContainedCommandCapture:
                 ),
                 metrics=ContainedCommandMetrics(line_count=0, byte_count=0),
             )
-        process.record_external_reap(termination.leader_exit_code)
         stdout_close_failure = self._close_unpumped_stdout(stdout)
-        return ContainedCommandCaptureFailed(
-            child=ContainedCommandExited(
-                process.process_id,
-                termination.leader_exit_code,
-            ),
-            cleanup=ContainedCommandCaptureAborted(),
-            failure=_combine_failures(
-                capture_failure,
-                stdout_close_failure,
-                "contained command capture and stdout close both failed",
-            ),
+        failures = [capture_failure]
+        if stdout_close_failure is not None:
+            failures.append(stdout_close_failure)
+        child = ContainedCommandExited(
+            process.process_id,
+            termination.leader_exit_code,
+        )
+        evidence = _ContainedCommandPostContainmentEvidence(
+            capture=_capture_closure(tuple(failures)),
+            lifecycle=_record_reap_and_courtesy(process, termination),
             metrics=ContainedCommandMetrics(line_count=0, byte_count=0),
+        )
+        return self._closed_result_after_containment(
+            child,
+            ContainedCommandCaptureAborted(),
+            evidence,
         )
 
     @staticmethod
@@ -904,43 +1101,46 @@ class PosixContainedCommandCapture:
         try:
             termination = self._process_group_supervisor.abort(leader)
         except BaseException as cleanup_error:
-            pump.stop_without_waiting()
+            emergency_close_failure = pump.stop_without_waiting(
+                output,
+                line_observer,
+            )
             return ContainedCommandCleanupFailed(
                 child=ContainedCommandExitUnknown(process.process_id),
                 capture=ContainedCommandCaptureInterrupted(failure),
-                cleanup_failure=ContainedCommandFailure(cleanup_error),
+                cleanup_failure=_combine_failures(
+                    ContainedCommandFailure(cleanup_error),
+                    emergency_close_failure,
+                    "group abort and emergency capture finalization both failed",
+                ),
                 metrics=pump.metrics,
             )
-        process.record_external_reap(termination.leader_exit_code)
-        finalization = pump.finalize_after_containment()
-        if type(finalization) is _OutputPumpFinalizationFailed:
-            failure = _combine_failures(
-                failure,
-                finalization.failure,
-                "command supervision and pump finalization both failed",
-            )
-        elif type(finalization) is _OutputPumpFinalized:
-            final_pump_failure = pump.failure
-            if (
-                final_pump_failure is not None
-                and final_pump_failure is not initial_pump_failure
-            ):
-                failure = _combine_failures(
-                    failure,
-                    final_pump_failure,
-                    "command supervision and output pumping both failed",
-                )
-        failure = _combine_failures(
-            failure,
-            pump.publish_after_finalization(output, line_observer),
-            "command supervision and synchronous publication both failed",
-        )
-        return ContainedCommandCaptureFailed(
-            child=ContainedCommandExited(
+        evidence = _ContainedCommandPostContainmentOwner(
+            process,
+            pump,
+            output,
+            line_observer,
+        ).close(termination, (failure,))
+        return self._closed_result_after_containment(
+            ContainedCommandExited(
                 process.process_id,
                 termination.leader_exit_code,
             ),
-            cleanup=ContainedCommandCaptureAborted(),
-            failure=failure,
-            metrics=pump.metrics,
+            ContainedCommandCaptureAborted(),
+            evidence,
         )
+
+
+def _record_reap_and_courtesy(
+    process: PosixProcessHandle,
+    termination: ProcessGroupTermination,
+) -> _ContainedCommandLifecycleClosure:
+    failures: list[ContainedCommandFailure] = []
+    try:
+        process.record_external_reap(termination.leader_exit_code)
+    except BaseException as error:
+        failures.append(ContainedCommandFailure(error))
+    courtesy_failure = termination.courtesy_failure()
+    if courtesy_failure is not None:
+        failures.append(ContainedCommandFailure(courtesy_failure.error))
+    return _lifecycle_closure(tuple(failures))

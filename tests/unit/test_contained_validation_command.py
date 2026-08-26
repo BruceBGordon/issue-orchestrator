@@ -66,6 +66,7 @@ from issue_orchestrator.ports.process_group_supervisor import (
     ProcessGroupSupervisor,
 )
 from issue_orchestrator.ports.posix_pipe import PosixPipeReader
+from issue_orchestrator.ports.posix_process import PosixProcessLauncher
 from issue_orchestrator.ports.validation_pipe_capture import (
     ValidationPipeCapture,
     ValidationPipeCaptureFactory,
@@ -86,6 +87,7 @@ from tests.process_tree_fixture import (
     ProcessTreeMember,
 )
 from tests.process_completion_fixture import build_test_process_group_observer
+from tests.posix_process_fixture import ReapEvidenceFailingProcessLauncher
 
 
 def _runner() -> PosixContainedValidationCommandRunner:
@@ -118,22 +120,7 @@ def _runner_with_launch_pipes(
     launch_pipes_factory: ValidationLaunchPipesFactory,
 ) -> PosixContainedValidationCommandRunner:
     return PosixContainedValidationCommandRunner(
-        RetainedPosixProcessLauncher(
-            PosixProcessProgram(
-                (
-                    str(Path(sys.executable)),
-                    "-m",
-                    "issue_orchestrator.entrypoints.posix_process_child",
-                )
-            ),
-            MaskedPosixSpawnPrimitive(),
-            supervisor,
-            PosixProcessActivationPolicy(2.0),
-            ExecutorProcessTerminationPolicy(
-                graceful_shutdown_seconds=0.05,
-                forceful_shutdown_seconds=1.0,
-            ),
-        ),
+        _validation_process_launcher(supervisor),
         supervisor,
         ContainedCommandOutputPolicy(
             poll_interval_seconds=0.01,
@@ -142,6 +129,40 @@ def _runner_with_launch_pipes(
         ),
         capture_factory,
         launch_pipes_factory,
+    )
+
+
+def _validation_process_launcher(
+    supervisor: ProcessGroupSupervisor,
+) -> RetainedPosixProcessLauncher:
+    return RetainedPosixProcessLauncher(
+        PosixProcessProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.entrypoints.posix_process_child",
+            )
+        ),
+        MaskedPosixSpawnPrimitive(),
+        supervisor,
+        PosixProcessActivationPolicy(2.0),
+        ExecutorProcessTerminationPolicy(
+            graceful_shutdown_seconds=0.05,
+            forceful_shutdown_seconds=1.0,
+        ),
+    )
+
+
+def _runner_with_process_launcher(
+    process_launcher: PosixProcessLauncher,
+    supervisor: ProcessGroupSupervisor,
+) -> PosixContainedValidationCommandRunner:
+    return PosixContainedValidationCommandRunner(
+        process_launcher,
+        supervisor,
+        ContainedCommandOutputPolicy(0.01, 1.0, 1_048_576),
+        PosixValidationPipeCaptureFactory(default_validation_pipe_selector),
+        PosixValidationLaunchPipesFactory(OsPosixPipeFactory()),
     )
 
 
@@ -579,4 +600,66 @@ def test_non_finite_executor_acknowledgement_fails_and_contains_child(
         "positive finite float" in message
         for message in _exception_messages(result.cleanup.error)
     )
+    ProcessTreeMember(result.child.process_id).assert_contained()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX descriptor inheritance")
+@pytest.mark.timeout(10)
+def test_partial_executor_handshake_is_rejected_after_fast_child_exit(
+    tmp_path: Path,
+) -> None:
+    descriptor_variable = VALIDATION_EXECUTOR_HANDSHAKE_ENVIRONMENT.descriptor_variable
+    program = (
+        "import os; "
+        f"fd=int(os.environ.pop({descriptor_variable!r})); "
+        "os.write(fd,b'\\x01'); "
+        "os.close(fd)"
+    )
+
+    result = _runner().run(
+        ContainedValidationCommand(
+            command=f"exec {shlex.quote(sys.executable)} -c {shlex.quote(program)}",
+            working_directory=tmp_path.resolve(),
+            environment=os.environ,
+            deadline=ValidationExecutionDeadline.for_active_timeout(5),
+        )
+    )
+
+    assert type(result.child) is ValidationCommandExited
+    assert type(result.cleanup) is ValidationCommandCleanupFailed
+    assert any(
+        "handshake payload is malformed" in message
+        for message in _exception_messages(result.cleanup.error)
+    )
+    ProcessTreeMember(result.child.process_id).assert_contained()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process ownership")
+@pytest.mark.timeout(10)
+def test_reap_evidence_failure_does_not_skip_validation_output_finalization(
+    tmp_path: Path,
+) -> None:
+    evidence_failure = RuntimeError("injected validation reap-evidence failure")
+    supervisor = _production_supervisor()
+    runner = _runner_with_process_launcher(
+        ReapEvidenceFailingProcessLauncher(
+            _validation_process_launcher(supervisor),
+            evidence_failure,
+        ),
+        supervisor,
+    )
+
+    result = runner.run(
+        ContainedValidationCommand(
+            command="printf 'retained-validation-output\\n'",
+            working_directory=tmp_path.resolve(),
+            environment=os.environ,
+            deadline=ValidationExecutionDeadline.for_active_timeout(5),
+        )
+    )
+
+    assert type(result.child) is ValidationCommandExited
+    assert type(result.cleanup) is ValidationCommandCleanupFailed
+    assert result.cleanup.error is evidence_failure
+    assert result.output.stdout == "retained-validation-output\n"
     ProcessTreeMember(result.child.process_id).assert_contained()

@@ -295,12 +295,35 @@ class ValidationCommandCleanupFailed:
 
     error: BaseException
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.error, BaseException):
+            raise ValueError("ValidationCommandCleanupFailed.error must be an exception")
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationCommandTimedOutCleanupFailed:
+    """A typed deadline expired and subsequent cleanup diagnostics failed."""
+
+    phase: ValidationCommandTimeoutPhase
+    error: BaseException
+
+    def __post_init__(self) -> None:
+        if type(self.phase) is not ValidationCommandTimeoutPhase:
+            raise ValueError(
+                "ValidationCommandTimedOutCleanupFailed.phase must be typed"
+            )
+        if not isinstance(self.error, BaseException):
+            raise ValueError(
+                "ValidationCommandTimedOutCleanupFailed.error must be an exception"
+            )
+
 
 ValidationCommandCleanup = (
     ValidationCommandCompleted
     | ValidationCommandTimedOut
     | ValidationCommandCleanupNotStarted
     | ValidationCommandCleanupFailed
+    | ValidationCommandTimedOutCleanupFailed
 )
 
 
@@ -309,19 +332,58 @@ def validation_cleanup_from_supervision(
     deadline_status: ValidationCommandDeadlineStatus,
 ) -> ValidationCommandCleanup:
     """Map the closed process-group result to validation cleanup evidence."""
+    cleanup: ValidationCommandCleanup
     if type(supervision) is ProcessGroupCompleted:
         if type(deadline_status) is not ValidationCommandDeadlinePending:
             raise AssertionError("completed validation cannot have a timeout phase")
-        return ValidationCommandCompleted()
-    if type(supervision) is ProcessGroupTimedOut:
+        cleanup = ValidationCommandCompleted()
+    elif type(supervision) is ProcessGroupTimedOut:
         raise AssertionError("validation supervision uses cooperative typed deadlines")
-    if type(supervision) is ProcessGroupInterrupted:
+    elif type(supervision) is ProcessGroupInterrupted:
         if type(deadline_status) is not ValidationCommandDeadlineExceeded:
-            return ValidationCommandCleanupFailed(
+            cleanup = ValidationCommandCleanupFailed(
                 AssertionError("validation interruption requires a timeout phase")
             )
-        return ValidationCommandTimedOut(deadline_status.phase)
-    raise AssertionError("process-group supervision is a closed union")
+        else:
+            cleanup = ValidationCommandTimedOut(deadline_status.phase)
+    else:
+        raise AssertionError("process-group supervision is a closed union")
+    courtesy_failure = supervision.termination.courtesy_failure()
+    if courtesy_failure is None:
+        return cleanup
+    return validation_cleanup_with_failure(
+        cleanup,
+        courtesy_failure.error,
+        "validation deadline and courtesy shutdown observation both failed",
+    )
+
+
+def validation_cleanup_with_failure(
+    cleanup: ValidationCommandCleanup,
+    error: BaseException,
+    message: str,
+) -> ValidationCommandCleanup:
+    """Add cleanup failure evidence without discarding a typed timeout fact."""
+    if not isinstance(error, BaseException):
+        raise ValueError("validation cleanup failure must be an exception")
+    if type(message) is not str or not message:
+        raise ValueError("validation cleanup failure message must not be empty")
+    if type(cleanup) is ValidationCommandCompleted:
+        return ValidationCommandCleanupFailed(error)
+    if type(cleanup) is ValidationCommandTimedOut:
+        return ValidationCommandTimedOutCleanupFailed(cleanup.phase, error)
+    if type(cleanup) is ValidationCommandCleanupFailed:
+        return ValidationCommandCleanupFailed(
+            BaseExceptionGroup(message, (cleanup.error, error))
+        )
+    if type(cleanup) is ValidationCommandTimedOutCleanupFailed:
+        return ValidationCommandTimedOutCleanupFailed(
+            cleanup.phase,
+            BaseExceptionGroup(message, (cleanup.error, error)),
+        )
+    if type(cleanup) is ValidationCommandCleanupNotStarted:
+        raise ValueError("an unstarted validation cannot acquire cleanup failure")
+    raise AssertionError("validation cleanup is a closed union")
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,6 +436,7 @@ class ValidationCommandExecution:
             ValidationCommandTimedOut,
             ValidationCommandCleanupNotStarted,
             ValidationCommandCleanupFailed,
+            ValidationCommandTimedOutCleanupFailed,
         ):
             raise ValueError("ValidationCommandExecution.cleanup is not closed")
         if type(self.output) is not ValidationCommandOutput:
@@ -390,6 +453,7 @@ class ValidationCommandExecution:
     def exit_code(self) -> int:
         if type(self.cleanup) in (
             ValidationCommandTimedOut,
+            ValidationCommandTimedOutCleanupFailed,
             ValidationCommandCleanupFailed,
             ValidationCommandCleanupNotStarted,
         ):
@@ -400,12 +464,18 @@ class ValidationCommandExecution:
 
     @property
     def timed_out(self) -> bool:
-        return type(self.cleanup) is ValidationCommandTimedOut
+        return type(self.cleanup) in (
+            ValidationCommandTimedOut,
+            ValidationCommandTimedOutCleanupFailed,
+        )
 
     @property
     def timeout_phase(self) -> ValidationCommandTimeoutPhase:
         """Return the exact expired clock or reject a non-timeout caller."""
-        if type(self.cleanup) is not ValidationCommandTimedOut:
+        if type(self.cleanup) not in (
+            ValidationCommandTimedOut,
+            ValidationCommandTimedOutCleanupFailed,
+        ):
             raise AssertionError("non-timeout validation has no timeout phase")
         return self.cleanup.phase
 
@@ -420,7 +490,10 @@ class ValidationCommandExecution:
         stderr = self.output.stderr
         if type(self.child) is ValidationCommandNotStarted:
             stderr += f"\n\n[VALIDATION START FAILED: {self.child.error!r}]"
-        if type(self.cleanup) is ValidationCommandCleanupFailed:
+        if type(self.cleanup) in (
+            ValidationCommandCleanupFailed,
+            ValidationCommandTimedOutCleanupFailed,
+        ):
             stderr += (
                 f"\n\n[VALIDATION PROCESS-TREE CLEANUP FAILED: {self.cleanup.error!r}]"
             )

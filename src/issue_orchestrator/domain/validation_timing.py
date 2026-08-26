@@ -18,6 +18,8 @@ from .contained_command import (
     ContainedCommandCleanupFailed,
     ContainedCommandCleanupNotStarted,
     ContainedCommandCompleted,
+    ContainedCommandFinalizationFailed,
+    ContainedCommandOutcomeUnavailable,
     ContainedCommandExited,
     ContainedCommandExitUnknown,
     ContainedCommandNotStarted,
@@ -396,6 +398,7 @@ class ValidationProcessGroupCleanup(StrEnum):
     CAPTURE_ABORTED = "capture-aborted"
     NOT_STARTED = "not-started"
     CLEANUP_FAILED = "cleanup-failed"
+    UNKNOWN = "unknown"
 
 
 class ValidationChildOutcome(StrEnum):
@@ -404,6 +407,7 @@ class ValidationChildOutcome(StrEnum):
     EXITED = "exited"
     NOT_STARTED = "not-started"
     EXIT_UNKNOWN = "exit-unknown"
+    UNAVAILABLE = "unavailable"
 
 
 class ValidationCaptureStatus(StrEnum):
@@ -486,6 +490,47 @@ def _validation_command_fields(
             },
             _validation_child_fields(result.child),
         )
+    if type(result) is ContainedCommandFinalizationFailed:
+        capture_fields: SerializedValidationTiming
+        if type(result.capture) is ContainedCommandCaptureSucceeded:
+            capture_fields = {
+                "capture_status": ValidationCaptureStatus.SUCCEEDED.value,
+                "capture_error_type": None,
+                "capture_error_repr": None,
+            }
+        elif type(result.capture) is ContainedCommandCaptureInterrupted:
+            capture_fields = {
+                "capture_status": ValidationCaptureStatus.FAILED.value,
+                "capture_error_type": result.capture.failure.error_type,
+                "capture_error_repr": result.capture.failure.error_repr,
+            }
+        else:
+            raise ValueError("finalization failure requires a typed capture fact")
+        return merge_validation_timing_fields(
+            {
+                "lifecycle": ValidationRunLifecycle.CAPTURE_FAILED.value,
+                "exit_code": 1,
+                "process_group_cleanup": _validation_cleanup_value(result.cleanup),
+                "cleanup_error_type": result.finalization_failure.error_type,
+                "cleanup_error_repr": result.finalization_failure.error_repr,
+            },
+            capture_fields,
+            _validation_child_fields(result.child),
+        )
+    if type(result) is ContainedCommandOutcomeUnavailable:
+        return {
+            "lifecycle": ValidationRunLifecycle.CAPTURE_FAILED.value,
+            "exit_code": 1,
+            "process_group_cleanup": ValidationProcessGroupCleanup.UNKNOWN.value,
+            "capture_status": ValidationCaptureStatus.FAILED.value,
+            "capture_error_type": result.failure.error_type,
+            "capture_error_repr": result.failure.error_repr,
+            "cleanup_error_type": None,
+            "cleanup_error_repr": None,
+            "child_process_id": None,
+            "child_outcome": ValidationChildOutcome.UNAVAILABLE.value,
+            "child_exit_code": None,
+        }
     if type(result) is ContainedCommandCleanupFailed:
         capture_fields: SerializedValidationTiming
         if type(result.capture) is ContainedCommandCaptureSucceeded:
@@ -542,6 +587,8 @@ class ValidationRunTimingSummary:
         if type(self.command_result) not in (
             ContainedCommandCompleted,
             ContainedCommandCaptureFailed,
+            ContainedCommandFinalizationFailed,
+            ContainedCommandOutcomeUnavailable,
             ContainedCommandCleanupFailed,
         ):
             raise ValueError(

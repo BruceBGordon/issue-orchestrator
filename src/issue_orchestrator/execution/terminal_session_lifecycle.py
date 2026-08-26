@@ -8,7 +8,9 @@ import threading
 from dataclasses import dataclass
 from typing import NoReturn, Protocol, runtime_checkable
 
-from ..domain.process_group import OwnedProcessGroupLeader
+from ..domain.process_group import (
+    OwnedProcessGroupLeader,
+)
 from ..domain.retained_thread import (
     RetainedThreadActivation,
     RetainedThreadFinalized,
@@ -86,10 +88,13 @@ class PendingTerminalSession:
         cleanup_errors: list[BaseException] = []
         group_contained = False
         try:
-            self._process_group_supervisor.abort(
+            termination = self._process_group_supervisor.abort(
                 OwnedProcessGroupLeader(self.process_id)
             )
             group_contained = True
+            courtesy_failure = termination.courtesy_failure()
+            if courtesy_failure is not None:
+                cleanup_errors.append(courtesy_failure.error)
         except BaseException as cleanup_error:
             cleanup_errors.append(cleanup_error)
         if group_contained:

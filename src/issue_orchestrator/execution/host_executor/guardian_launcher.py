@@ -34,6 +34,7 @@ from ...domain.process_group import (
     ProcessGroupCompleted,
     ProcessGroupInterrupted,
     ProcessGroupSupervision,
+    ProcessGroupTermination,
     ProcessGroupUnboundedWait,
 )
 from ...domain.posix_process import (
@@ -570,11 +571,17 @@ class PosixExecutorCommandGuardian:
                     ),
                     True,
                 )
-            return CleanupSucceeded(), True
+            return (
+                self._courtesy_cleanup(
+                    termination,
+                    "guardian-courtesy-shutdown",
+                ),
+                True,
+            )
         if uncontained_process_id is None:
             return CleanupSucceeded(), True
         try:
-            self._process_group_supervisor.abort(
+            termination = self._process_group_supervisor.abort(
                 OwnedProcessGroupLeader(uncontained_process_id)
             )
         except BaseException as cleanup_error:
@@ -593,7 +600,23 @@ class PosixExecutorCommandGuardian:
                 ),
                 False,
             )
-        return CleanupSucceeded(), True
+        return (
+            self._courtesy_cleanup(
+                termination,
+                "indeterminate-guardian-courtesy-shutdown",
+            ),
+            True,
+        )
+
+    @staticmethod
+    def _courtesy_cleanup(
+        termination: ProcessGroupTermination,
+        action: str,
+    ) -> CleanupOutcome:
+        courtesy_failure = termination.courtesy_failure()
+        if courtesy_failure is None:
+            return CleanupSucceeded()
+        return CleanupFailed((CleanupFailure(action, courtesy_failure.error),))
 
     @staticmethod
     def _cleanup_errors(
@@ -723,6 +746,9 @@ class PosixExecutorCommandGuardian:
     ) -> ExecutorGuardianTerminal:
         """Interpret one fully contained guardian supervision outcome."""
         guardian.record_external_reap(supervision.termination.leader_exit_code)
+        courtesy_failure = supervision.termination.courtesy_failure()
+        if courtesy_failure is not None:
+            raise courtesy_failure.error
         if type(supervision) is ProcessGroupInterrupted:
             return ExecutorGuardianCommandCompleted(-signal.SIGTERM)
         if type(supervision) is not ProcessGroupCompleted:

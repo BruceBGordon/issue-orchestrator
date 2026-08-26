@@ -25,7 +25,6 @@ from issue_orchestrator.execution.process_group_supervisor import (
     PosixProcessGroupSupervisor,
 )
 from issue_orchestrator.execution.process_group_terminator import (
-    ProcessGroupTerminationError,
     PosixProcessGroupTerminator,
 )
 from tests.process_tree_fixture import (
@@ -169,6 +168,78 @@ def test_natural_leader_exit_contains_descendant_before_reaping(
                 pass
 
 
+def test_courtesy_observation_failure_is_typed_after_forced_containment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = subprocess.Popen(
+        ["/bin/sh", "-c", "exec /bin/sleep 300"],
+        start_new_session=True,
+    )
+    courtesy_failure = OSError("injected courtesy wait observation failure")
+    terminator = PosixProcessGroupTerminator(
+        ExecutorProcessTerminationPolicy(0.1, 1.0),
+        build_test_process_group_observer(),
+    )
+
+    def fail_courtesy_observation(
+        leader: OwnedProcessGroupLeader,
+        *,
+        timeout_seconds: float,
+    ) -> None:
+        del leader, timeout_seconds
+        raise courtesy_failure
+
+    monkeypatch.setattr(
+        terminator,
+        "_await_leader_exit_without_reaping",
+        fail_courtesy_observation,
+    )
+
+    termination = terminator.terminate(OwnedProcessGroupLeader(process.pid))
+    process.returncode = termination.leader_exit_code
+
+    degraded = termination.courtesy_failure()
+    assert degraded is not None
+    assert degraded.error is courtesy_failure
+    ProcessTreeMember(process.pid).assert_contained()
+
+
+def test_reaped_leader_observation_failure_still_forces_descendant_containment(
+    tmp_path: Path,
+) -> None:
+    descendant_pid_path = (tmp_path / "pre-reaped-descendant.pid").resolve()
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            ExitingTermResistantProcessTreeProgram(
+                descendant_pid_path,
+                300,
+                0,
+            ).python_source(),
+        ],
+        start_new_session=True,
+    )
+    PROCESS_COMPLETION_WATCHDOG.wait(
+        process,
+        operation="pre-reaped process-group leader",
+    )
+    assert process.returncode == 0
+    descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
+    terminator = PosixProcessGroupTerminator(
+        ExecutorProcessTerminationPolicy(0.1, 1.0),
+        build_test_process_group_observer(),
+    )
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        terminator.terminate(OwnedProcessGroupLeader(process.pid))
+
+    assert len(caught.value.exceptions) == 2
+    assert "reaped outside" in str(caught.value.exceptions[0])
+    assert "reaped outside" in str(caught.value.exceptions[1])
+    ProcessTreeMember(descendant_pid).assert_contained()
+
+
 def test_supervisor_accepts_macos_eperm_only_after_zombie_only_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -254,10 +325,14 @@ def test_supervisor_fails_fast_when_eperm_does_not_prove_containment(
                 raise PermissionError("injected executable-group EPERM")
 
             patcher.setattr(os, "killpg", deny_group_signal)
-            with pytest.raises(ProcessGroupTerminationError) as caught:
+            with pytest.raises(BaseExceptionGroup) as caught:
                 supervisor.abort(OwnedProcessGroupLeader(process.pid))
 
-        assert expected_detail in str(caught.value)
+        failures = caught.value.exceptions
+        assert len(failures) == 3
+        assert expected_detail in str(failures[0])
+        assert "SIGKILL" in str(failures[1])
+        assert "did not reap" in str(failures[2])
     finally:
         ProcessCleanupPlan(
             "EPERM process-group fixture cleanup",

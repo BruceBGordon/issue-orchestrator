@@ -17,8 +17,10 @@ import pytest
 from issue_orchestrator.domain.contained_command import (
     ContainedCommandCaptureAborted,
     ContainedCommandCaptureFailed,
+    ContainedCommandCaptureSucceeded,
     ContainedCommandCleanupNotStarted,
     ContainedCommandCompleted,
+    ContainedCommandFinalizationFailed,
     ContainedCommandNotStarted,
     ContainedCommandOutputPolicy,
     ContainedCommandOutputPipeClose,
@@ -73,6 +75,7 @@ from tests.process_completion_fixture import (
     PROCESS_COMPLETION_WATCHDOG,
     build_test_process_group_observer,
 )
+from tests.posix_process_fixture import ReapEvidenceFailingProcessLauncher
 from tests.process_tree_fixture import ProcessTreeMember
 
 
@@ -248,25 +251,31 @@ def _capture_with_pipe_factory(
     output_pipe_factory: ContainedCommandOutputPipeFactory,
 ) -> PosixContainedCommandCapture:
     return PosixContainedCommandCapture(
-        RetainedPosixProcessLauncher(
-            PosixProcessProgram(
-                (
-                    str(Path(sys.executable)),
-                    "-m",
-                    "issue_orchestrator.entrypoints.posix_process_child",
-                )
-            ),
-            MaskedPosixSpawnPrimitive(),
-            supervisor,
-            PosixProcessActivationPolicy(2.0),
-            ExecutorProcessTerminationPolicy(
-                graceful_shutdown_seconds=0.05,
-                forceful_shutdown_seconds=1.0,
-            ),
-        ),
+        _process_launcher(supervisor),
         supervisor,
         _OUTPUT_POLICY,
         output_pipe_factory,
+    )
+
+
+def _process_launcher(
+    supervisor: ProcessGroupSupervisor,
+) -> RetainedPosixProcessLauncher:
+    return RetainedPosixProcessLauncher(
+        PosixProcessProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.entrypoints.posix_process_child",
+            )
+        ),
+        MaskedPosixSpawnPrimitive(),
+        supervisor,
+        PosixProcessActivationPolicy(2.0),
+        ExecutorProcessTerminationPolicy(
+            graceful_shutdown_seconds=0.05,
+            forceful_shutdown_seconds=1.0,
+        ),
     )
 
 
@@ -579,3 +588,41 @@ def test_capture_does_not_return_while_caller_output_is_in_flight(
         )
 
     assert type(result) is ContainedCommandCompleted
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process ownership")
+@pytest.mark.timeout(10)
+def test_reap_evidence_failure_does_not_skip_capture_finalization(
+    tmp_path: Path,
+) -> None:
+    evidence_failure = RuntimeError("injected retained-handle evidence failure")
+    supervisor = PosixProcessGroupSupervisor(
+        PosixProcessGroupTerminator(
+            ExecutorProcessTerminationPolicy(0.01, 1.0),
+            build_test_process_group_observer(),
+        )
+    )
+    output_lines: list[str] = []
+    process_id_path = (tmp_path / "evidence-failure.pid").resolve()
+    capture = _capture_with_launcher_and_pipe(
+        ReapEvidenceFailingProcessLauncher(
+            _process_launcher(supervisor),
+            evidence_failure,
+        ),
+        supervisor,
+        OsContainedCommandOutputPipeFactory(),
+    )
+
+    result = capture.capture(
+        ContainedShellCommand("printf 'retained-line\\n'", tmp_path.resolve()),
+        _RecordingOutput(process_id_path, output_lines),
+        _IgnoreLines(),
+    )
+
+    assert type(result) is ContainedCommandFinalizationFailed
+    assert type(result.capture) is ContainedCommandCaptureSucceeded
+    assert result.finalization_failure.error is evidence_failure
+    assert output_lines == ["retained-line\n"]
+    ProcessTreeMember(
+        int(process_id_path.read_text(encoding="utf-8"))
+    ).assert_contained()

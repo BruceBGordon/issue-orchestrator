@@ -12,12 +12,32 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from issue_orchestrator.domain.contained_command import ContainedCommandCleanupError
+from issue_orchestrator.domain.contained_command import (
+    ContainedCommandCaptureSucceeded,
+    ContainedCommandCleanupError,
+    ContainedCommandExited,
+    ContainedCommandFailure,
+    ContainedCommandFinalizationFailed,
+    ContainedCommandMetrics,
+    ContainedCommandResult,
+    ContainedCommandSupervised,
+)
+from issue_orchestrator.domain.retained_thread import (
+    RetainedThreadActivated,
+    RetainedThreadActivation,
+    RetainedThreadFinalization,
+    RetainedThreadFinalizedAfterFailure,
+    RetainedThreadShutdownPolicy,
+    RetainedThreadSpec,
+    RetainedThreadState,
+)
 from issue_orchestrator.domain.process_group import (
     OwnedProcessGroupLeader,
     ProcessGroupSupervision,
@@ -47,6 +67,16 @@ from issue_orchestrator.entrypoints.bootstrap_executor import (
 from issue_orchestrator.ports.process_group_supervisor import (
     ProcessGroupInterruption,
     ProcessGroupSupervisor,
+)
+from issue_orchestrator.ports.contained_command import (
+    ContainedCommandCapture,
+    ContainedCommandLineObserver,
+    ContainedCommandOutput,
+    ContainedShellCommand,
+)
+from issue_orchestrator.ports.retained_thread import (
+    RetainedThreadFactory,
+    RetainedThreadLease,
 )
 from tests.process_tree_fixture import (
     CooperativeTermResistantProcessTreeProgram,
@@ -120,6 +150,83 @@ class _ContainThenReportCleanupFailureSupervisor(ProcessGroupSupervisor):
     def abort(self, leader: OwnedProcessGroupLeader) -> ProcessGroupTermination:
         self._delegate.abort(leader)
         raise RuntimeError("injected cleanup failure")
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticContainedCommandCapture(ContainedCommandCapture):
+    result: ContainedCommandResult
+
+    def capture(
+        self,
+        command: ContainedShellCommand,
+        output: ContainedCommandOutput,
+        line_observer: ContainedCommandLineObserver,
+    ) -> ContainedCommandResult:
+        del command, output, line_observer
+        return self.result
+
+
+@dataclass(frozen=True, slots=True)
+class _RaisingContainedCommandCapture(ContainedCommandCapture):
+    failure: RuntimeError
+
+    def capture(
+        self,
+        command: ContainedShellCommand,
+        output: ContainedCommandOutput,
+        line_observer: ContainedCommandLineObserver,
+    ) -> ContainedCommandResult:
+        del command, output, line_observer
+        raise self.failure
+
+
+@dataclass(slots=True)
+class _FinalizationFailingRetainedThreadLease(RetainedThreadLease):
+    failure: RuntimeError
+    _state: RetainedThreadState = field(
+        default=RetainedThreadState.CREATED,
+        init=False,
+    )
+
+    @property
+    def state(self) -> RetainedThreadState:
+        return self._state
+
+    def activate(self) -> RetainedThreadActivation:
+        self._state = RetainedThreadState.ACTIVATED
+        return RetainedThreadActivated()
+
+    def finalize(
+        self,
+        policy: RetainedThreadShutdownPolicy,
+    ) -> RetainedThreadFinalization:
+        del policy
+        return RetainedThreadFinalizedAfterFailure(self.failure)
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalizationFailingRetainedThreadFactory(RetainedThreadFactory):
+    failure: RuntimeError
+
+    def prepare(
+        self,
+        spec: RetainedThreadSpec,
+        target: Callable[[], None],
+    ) -> RetainedThreadLease:
+        del spec, target
+        return _FinalizationFailingRetainedThreadLease(self.failure)
+
+
+def _contained_finalization_failure(
+    failure: RuntimeError,
+) -> ContainedCommandFinalizationFailed:
+    return ContainedCommandFinalizationFailed(
+        child=ContainedCommandExited(42_424, 0),
+        capture=ContainedCommandCaptureSucceeded(),
+        cleanup=ContainedCommandSupervised(),
+        finalization_failure=ContainedCommandFailure(failure),
+        metrics=ContainedCommandMetrics(2, 20),
+    )
 
 
 class TestValidateRunner:
@@ -648,6 +755,138 @@ class TestValidateRunner:
         assert summary["child_exit_code"] is None
         assert isinstance(summary["child_process_id"], int)
         assert summary["timing_protocol_status"] == "complete"
+
+    def test_finalization_failure_records_summary_and_terminal_marker(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        failure = RuntimeError("injected command finalization failure")
+        output_dir = (tmp_path / "finalization-output").resolve()
+
+        with pytest.raises(RuntimeError) as caught:
+            run_validation(
+                "true",
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(
+                    lambda: datetime.now(timezone.utc),
+                    time.monotonic,
+                ),
+                contained_command_capture=_StaticContainedCommandCapture(
+                    _contained_finalization_failure(failure)
+                ),
+                retained_thread_factory=build_retained_thread_factory(),
+            )
+
+        assert caught.value is failure
+        records = [
+            json.loads(line)
+            for line in (
+                fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        summary = next(record for record in records if record["kind"] == "run_summary")
+        assert summary["process_group_cleanup"] == "supervised"
+        assert summary["capture_status"] == "succeeded"
+        assert summary["cleanup_error_repr"] == repr(failure)
+        output = (output_dir / "validation-output.log").read_text(encoding="utf-8")
+        assert "[validate_runner] child_exited" in output
+        assert "process_group_cleanup=supervised" in output
+
+    def test_sampler_failure_combines_with_exact_finalization_provenance(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        command_failure = RuntimeError("injected command finalization failure")
+        sampler_failure = RuntimeError("injected sampler finalization failure")
+        output_dir = (tmp_path / "combined-finalization-output").resolve()
+
+        with pytest.raises(BaseExceptionGroup) as caught:
+            run_validation(
+                "true",
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(
+                    lambda: datetime.now(timezone.utc),
+                    time.monotonic,
+                ),
+                contained_command_capture=_StaticContainedCommandCapture(
+                    _contained_finalization_failure(command_failure)
+                ),
+                retained_thread_factory=_FinalizationFailingRetainedThreadFactory(
+                    sampler_failure
+                ),
+            )
+
+        assert caught.value.exceptions == (command_failure, sampler_failure)
+        records = [
+            json.loads(line)
+            for line in (
+                fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        summary = next(record for record in records if record["kind"] == "run_summary")
+        assert summary["cleanup_error_type"] == "ExceptionGroup"
+        assert "command finalization failure" in summary["cleanup_error_repr"]
+        assert "sampler finalization failure" in summary["cleanup_error_repr"]
+        assert "[validate_runner] child_exited" in (
+            output_dir / "validation-output.log"
+        ).read_text(encoding="utf-8")
+
+    def test_raising_capture_stops_sampler_and_records_unavailable_terminal_fact(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        failure = RuntimeError("injected contained-capture port failure")
+        output_dir = (tmp_path / "raising-capture-output").resolve()
+        sampler_threads_before = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name == "validate-resource-sampler"
+        }
+
+        with pytest.raises(RuntimeError) as caught:
+            run_validation(
+                "true",
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(
+                    lambda: datetime.now(timezone.utc),
+                    time.monotonic,
+                ),
+                contained_command_capture=_RaisingContainedCommandCapture(failure),
+                retained_thread_factory=build_retained_thread_factory(),
+            )
+
+        assert caught.value is failure
+        sampler_threads_after = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name == "validate-resource-sampler"
+        }
+        assert sampler_threads_after == sampler_threads_before
+        records = [
+            json.loads(line)
+            for line in (
+                fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        summary = next(record for record in records if record["kind"] == "run_summary")
+        assert summary["child_outcome"] == "unavailable"
+        assert summary["process_group_cleanup"] == "unknown"
+        assert summary["capture_error_repr"] == repr(failure)
+        output = (output_dir / "validation-output.log").read_text(encoding="utf-8")
+        assert "[validate_runner] command_terminal" in output
+        assert "pid=unavailable" in output
 
     def test_appends_run_summary_record_to_shared_git_dir(self, fake_git_repo: Path):
         """Each validate run should append a run summary record."""

@@ -11,6 +11,7 @@ from typing import TypeVar, cast
 from ..domain.contained_command import ContainedCommandOutputPolicy
 from ..domain.process_group import (
     OwnedProcessGroupLeader,
+    ProcessGroupTermination,
     ProcessGroupUnboundedWait,
 )
 from ..domain.posix_process import (
@@ -26,6 +27,7 @@ from ..domain.validation_execution import (
     ValidationCommandDeadlineStatus,
     ValidationCommandDeadlineTracker,
     ValidationCommandCleanupFailed,
+    ValidationCommandCleanup,
     ValidationCommandCleanupNotStarted,
     ValidationCommandExecution,
     ValidationCommandExited,
@@ -34,6 +36,7 @@ from ..domain.validation_execution import (
     ValidationCommandOutput,
     ValidationExecutionDeadline,
     validation_cleanup_from_supervision,
+    validation_cleanup_with_failure,
 )
 from ..infra.validation_executor_handshake import ValidationExecutorHandshakeDecoder
 from ..ports.posix_pipe import PosixPipeReader
@@ -115,6 +118,48 @@ class _StartedValidationCommand:
             raise ValueError("started validation monotonic time must be positive")
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidationCaptureFinalized:
+    result: ValidationPipeCaptureResult
+
+    def __post_init__(self) -> None:
+        if type(self.result) is not ValidationPipeCaptureResult:
+            raise ValueError("validation capture finalization result must be typed")
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationCaptureFinalizationFailed:
+    error: BaseException
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.error, BaseException):
+            raise ValueError("validation capture finalization error must be typed")
+
+
+_ValidationCaptureFinalization = (
+    _ValidationCaptureFinalized | _ValidationCaptureFinalizationFailed
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationReapEvidenceRecorded:
+    """The retained process handle accepted its external reap evidence."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationReapEvidenceFailed:
+    error: BaseException
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.error, BaseException):
+            raise ValueError("validation reap evidence error must be typed")
+
+
+_ValidationReapEvidence = (
+    _ValidationReapEvidenceRecorded | _ValidationReapEvidenceFailed
+)
+
+
 class _ValidationPipeCapture(ProcessGroupInterruption):
     """Drain both pipes while the supervisor keeps the leader unreaped."""
 
@@ -185,7 +230,12 @@ class _ValidationPipeCapture(ProcessGroupInterruption):
         deadline = time.monotonic() + self._policy.shutdown_timeout_seconds
         remaining_bytes = self._policy.final_drain_byte_limit
         try:
-            while self._streams and remaining_bytes > 0:
+            while (
+                self._streams
+                or self._resources.is_registered(
+                    ValidationPipeRole.EXECUTOR_HANDSHAKE
+                )
+            ) and remaining_bytes > 0:
                 remaining_seconds = deadline - time.monotonic()
                 if remaining_seconds <= 0:
                     raise TimeoutError(
@@ -196,7 +246,12 @@ class _ValidationPipeCapture(ProcessGroupInterruption):
                     min(self._policy.poll_interval_seconds, remaining_seconds),
                     maximum_bytes=remaining_bytes,
                 )
-            if self._streams and remaining_bytes <= 0:
+            if (
+                self._streams
+                or self._resources.is_registered(
+                    ValidationPipeRole.EXECUTOR_HANDSHAKE
+                )
+            ) and remaining_bytes <= 0:
                 raise RuntimeError(
                     "validation final output drain exceeded "
                     f"{self._policy.final_drain_byte_limit} bytes"
@@ -537,23 +592,45 @@ class PosixContainedValidationCommandRunner:
                 capture,
                 supervision_error,
             )
-        process.record_external_reap(supervision.termination.leader_exit_code)
-        captured = capture.finalize()
+        finalization = self._finalize_capture(capture)
+        reap_evidence = self._record_reap_evidence(
+            process,
+            supervision.termination,
+        )
         child = ValidationCommandExited(
             process.process_id,
             supervision.termination.leader_exit_code,
         )
-        if captured.failure is not None:
-            return ValidationCommandExecution(
-                child=child,
-                cleanup=ValidationCommandCleanupFailed(captured.failure),
-                output=captured.output,
-            )
         cleanup = validation_cleanup_from_supervision(
             supervision,
             capture.deadline_status,
         )
-        return ValidationCommandExecution(child, cleanup, captured.output)
+        output = ValidationCommandOutput("", "")
+        if type(finalization) is _ValidationCaptureFinalized:
+            output = finalization.result.output
+            if finalization.result.failure is not None:
+                cleanup = validation_cleanup_with_failure(
+                    cleanup,
+                    finalization.result.failure,
+                    "validation execution and output finalization both failed",
+                )
+        elif type(finalization) is _ValidationCaptureFinalizationFailed:
+            cleanup = validation_cleanup_with_failure(
+                cleanup,
+                finalization.error,
+                "validation execution and output finalization both failed",
+            )
+        else:
+            raise AssertionError("validation capture finalization is a closed union")
+        if type(reap_evidence) is _ValidationReapEvidenceFailed:
+            cleanup = validation_cleanup_with_failure(
+                cleanup,
+                reap_evidence.error,
+                "validation output and retained-handle finalization both failed",
+            )
+        elif type(reap_evidence) is not _ValidationReapEvidenceRecorded:
+            raise AssertionError("validation reap evidence is a closed union")
+        return ValidationCommandExecution(child, cleanup, output)
 
     def _abort_without_capture(
         self,
@@ -575,13 +652,25 @@ class PosixContainedValidationCommandRunner:
                 ),
                 output=ValidationCommandOutput("", ""),
             )
-        process.record_external_reap(termination.leader_exit_code)
+        cleanup: ValidationCommandCleanup = ValidationCommandCleanupFailed(
+            original_error
+        )
+        cleanup = self._add_termination_failures(cleanup, termination)
+        reap_evidence = self._record_reap_evidence(process, termination)
+        if type(reap_evidence) is _ValidationReapEvidenceFailed:
+            cleanup = validation_cleanup_with_failure(
+                cleanup,
+                reap_evidence.error,
+                "validation setup and retained-handle finalization both failed",
+            )
+        elif type(reap_evidence) is not _ValidationReapEvidenceRecorded:
+            raise AssertionError("validation reap evidence is a closed union")
         return ValidationCommandExecution(
             child=ValidationCommandExited(
                 process.process_id,
                 termination.leader_exit_code,
             ),
-            cleanup=ValidationCommandCleanupFailed(original_error),
+            cleanup=cleanup,
             output=ValidationCommandOutput("", ""),
         )
 
@@ -595,7 +684,8 @@ class PosixContainedValidationCommandRunner:
         try:
             termination = self._supervisor.abort(leader)
         except BaseException as cleanup_error:
-            captured = capture.finalize()
+            finalization = self._finalize_capture(capture)
+            capture_error, output = self._capture_failure_and_output(finalization)
             return ValidationCommandExecution(
                 child=ValidationCommandExitUnknown(process.process_id),
                 cleanup=ValidationCommandCleanupFailed(
@@ -605,25 +695,80 @@ class PosixContainedValidationCommandRunner:
                         _combined_error(
                             "validation containment and output finalization both failed",
                             cleanup_error,
-                            captured.failure,
+                            capture_error,
                         ),
                     )
                 ),
-                output=captured.output,
+                output=output,
             )
-        process.record_external_reap(termination.leader_exit_code)
-        captured = capture.finalize()
+        finalization = self._finalize_capture(capture)
+        capture_error, output = self._capture_failure_and_output(finalization)
+        cleanup: ValidationCommandCleanup = ValidationCommandCleanupFailed(
+            _combined_error(
+                "validation supervision and output finalization both failed",
+                supervision_error,
+                capture_error,
+            )
+        )
+        cleanup = self._add_termination_failures(cleanup, termination)
+        reap_evidence = self._record_reap_evidence(process, termination)
+        if type(reap_evidence) is _ValidationReapEvidenceFailed:
+            cleanup = validation_cleanup_with_failure(
+                cleanup,
+                reap_evidence.error,
+                "validation recovery and retained-handle finalization both failed",
+            )
+        elif type(reap_evidence) is not _ValidationReapEvidenceRecorded:
+            raise AssertionError("validation reap evidence is a closed union")
         return ValidationCommandExecution(
             child=ValidationCommandExited(
                 process.process_id,
                 termination.leader_exit_code,
             ),
-            cleanup=ValidationCommandCleanupFailed(
-                _combined_error(
-                    "validation supervision and output finalization both failed",
-                    supervision_error,
-                    captured.failure,
-                )
-            ),
-            output=captured.output,
+            cleanup=cleanup,
+            output=output,
+        )
+
+    @staticmethod
+    def _finalize_capture(
+        capture: ValidationPipeCapture,
+    ) -> _ValidationCaptureFinalization:
+        try:
+            return _ValidationCaptureFinalized(capture.finalize())
+        except BaseException as error:
+            return _ValidationCaptureFinalizationFailed(error)
+
+    @staticmethod
+    def _capture_failure_and_output(
+        finalization: _ValidationCaptureFinalization,
+    ) -> tuple[BaseException | None, ValidationCommandOutput]:
+        if type(finalization) is _ValidationCaptureFinalized:
+            return finalization.result.failure, finalization.result.output
+        if type(finalization) is _ValidationCaptureFinalizationFailed:
+            return finalization.error, ValidationCommandOutput("", "")
+        raise AssertionError("validation capture finalization is a closed union")
+
+    @staticmethod
+    def _record_reap_evidence(
+        process: PosixProcessHandle,
+        termination: ProcessGroupTermination,
+    ) -> _ValidationReapEvidence:
+        try:
+            process.record_external_reap(termination.leader_exit_code)
+        except BaseException as error:
+            return _ValidationReapEvidenceFailed(error)
+        return _ValidationReapEvidenceRecorded()
+
+    @staticmethod
+    def _add_termination_failures(
+        cleanup: ValidationCommandCleanup,
+        termination: ProcessGroupTermination,
+    ) -> ValidationCommandCleanup:
+        courtesy_failure = termination.courtesy_failure()
+        if courtesy_failure is None:
+            return cleanup
+        return validation_cleanup_with_failure(
+            cleanup,
+            courtesy_failure.error,
+            "validation failure and courtesy shutdown observation both failed",
         )

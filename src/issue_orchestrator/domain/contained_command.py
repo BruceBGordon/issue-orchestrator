@@ -247,6 +247,53 @@ class ContainedCommandCaptureFailed:
 
 
 @dataclass(frozen=True, slots=True)
+class ContainedCommandFinalizationFailed:
+    """A contained group whose post-containment ownership did not close cleanly."""
+
+    child: ContainedCommandExited
+    capture: ContainedCommandCapture
+    cleanup: ContainedCommandSupervised | ContainedCommandCaptureAborted
+    finalization_failure: ContainedCommandFailure
+    metrics: ContainedCommandMetrics
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_exact(owner, "child", self.child, ContainedCommandExited)
+        if type(self.capture) not in (
+            ContainedCommandCaptureSucceeded,
+            ContainedCommandCaptureInterrupted,
+        ):
+            raise ValueError(f"{owner}.capture must be a typed capture fact")
+        if type(self.cleanup) not in (
+            ContainedCommandSupervised,
+            ContainedCommandCaptureAborted,
+        ):
+            raise ValueError(f"{owner}.cleanup must be a contained cleanup fact")
+        _require_exact(
+            owner,
+            "finalization_failure",
+            self.finalization_failure,
+            ContainedCommandFailure,
+        )
+        _require_exact(owner, "metrics", self.metrics, ContainedCommandMetrics)
+
+
+@dataclass(frozen=True, slots=True)
+class ContainedCommandOutcomeUnavailable:
+    """The capture boundary failed before publishing any child/containment fact."""
+
+    failure: ContainedCommandFailure
+
+    def __post_init__(self) -> None:
+        _require_exact(
+            type(self).__name__,
+            "failure",
+            self.failure,
+            ContainedCommandFailure,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ContainedCommandCleanupFailed:
     """Containment failed; preserve capture and cleanup evidence without guessing."""
 
@@ -275,6 +322,8 @@ class ContainedCommandCleanupFailed:
 ContainedCommandResult = (
     ContainedCommandCompleted
     | ContainedCommandCaptureFailed
+    | ContainedCommandFinalizationFailed
+    | ContainedCommandOutcomeUnavailable
     | ContainedCommandCleanupFailed
 )
 

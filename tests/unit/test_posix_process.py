@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import sys
+
+import pytest
 
 from issue_orchestrator.domain.executor import ExecutorProcessTerminationPolicy
 from issue_orchestrator.domain.posix_process import (
@@ -21,6 +24,7 @@ from issue_orchestrator.entrypoints.bootstrap import build_process_group_supervi
 from issue_orchestrator.execution.posix_process import (
     MaskedPosixSpawnPrimitive,
     RetainedPosixProcessLauncher,
+    run_posix_process_child,
 )
 from issue_orchestrator.ports.posix_process import (
     PosixProcessLaunchRecovered,
@@ -249,3 +253,33 @@ def test_exec_handshake_deadline_contains_a_wedged_wrapper(tmp_path: Path) -> No
         pass
     else:
         raise AssertionError("wedged POSIX wrapper remains executable")
+
+
+@pytest.mark.parametrize(
+    "arguments,inherited_descriptors",
+    (
+        ((), ()),
+        (("/bin/true",), (-1,)),
+        (("/bin/true",), (9, 9)),
+        (("/bin/true\0hidden",), ()),
+    ),
+)
+def test_child_entrypoint_rejects_malformed_exec_contract_before_activation(
+    tmp_path: Path,
+    arguments: tuple[str, ...],
+    inherited_descriptors: tuple[int, ...],
+) -> None:
+    request = json.dumps(
+        {
+            "schema_version": 3,
+            "arguments": arguments,
+            "working_directory": str(tmp_path.resolve()),
+            "inherited_file_descriptors": inherited_descriptors,
+            "activation_gate_file_descriptor": 10,
+            "exec_status_file_descriptor": 11,
+            "terminal": {"kind": "without-terminal"},
+        }
+    )
+
+    with pytest.raises(ValueError, match="invalid retained POSIX child invocation"):
+        run_posix_process_child(request)

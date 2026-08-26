@@ -5,9 +5,15 @@ from __future__ import annotations
 import os
 import signal
 import time
+from dataclasses import dataclass
 
 from ..domain.executor import ExecutorProcessTerminationPolicy
-from ..domain.process_group import OwnedProcessGroupLeader, ProcessGroupTermination
+from ..domain.process_group import (
+    OwnedProcessGroupLeader,
+    ProcessGroupCourtesyCompleted,
+    ProcessGroupCourtesyFailed,
+    ProcessGroupTermination,
+)
 from ..domain.process_group import (
     ProcessGroupAbsent,
     ProcessGroupExecutable,
@@ -19,6 +25,38 @@ from ..ports.process_group_observer import ProcessGroupObserver
 
 class ProcessGroupTerminationError(RuntimeError):
     """Raised when an owned process group cannot be reaped after SIGKILL."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ForceSignalCompleted:
+    """The mandatory group SIGKILL did not report an error."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ForceSignalFailed:
+    """The mandatory group SIGKILL reported an error."""
+
+    error: BaseException
+
+
+_ForceSignal = _ForceSignalCompleted | _ForceSignalFailed
+
+
+@dataclass(frozen=True, slots=True)
+class _LeaderReaped:
+    """The exact group leader was reaped after mandatory containment."""
+
+    exit_code: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LeaderReapFailed:
+    """The exact group leader could not be reaped."""
+
+    error: BaseException
+
+
+_LeaderReap = _LeaderReaped | _LeaderReapFailed
 
 
 class PosixProcessGroupTerminator:
@@ -61,21 +99,79 @@ class PosixProcessGroupTerminator:
             )
 
         process_group_id = leader.process_id
-        self._signal_group(process_group_id, signal.SIGTERM)
-        self._await_leader_exit_without_reaping(
-            leader,
-            timeout_seconds=self._policy.graceful_shutdown_seconds,
-        )
+        courtesy = self._attempt_courtesy_shutdown(leader)
 
         # Never infer an empty group from the leader's exit.  A descendant can
         # ignore TERM and close inherited pipes.  SIGKILL while the unreaped
         # leader still reserves the pgid is the containment guarantee.
-        self._signal_group(process_group_id, signal.SIGKILL)
+        force_signal = self._attempt_force_signal(process_group_id)
+        leader_reap = self._attempt_leader_reap(leader)
+        self._require_forced_containment(courtesy, force_signal, leader_reap)
+        if type(leader_reap) is not _LeaderReaped:
+            raise AssertionError("successful containment requires typed reap evidence")
         return ProcessGroupTermination(
-            self._reap_leader(
+            leader_reap.exit_code,
+            courtesy,
+        )
+
+    def _attempt_courtesy_shutdown(
+        self,
+        leader: OwnedProcessGroupLeader,
+    ) -> ProcessGroupCourtesyCompleted | ProcessGroupCourtesyFailed:
+        try:
+            self._signal_group(leader.process_id, signal.SIGTERM)
+            self._await_leader_exit_without_reaping(
                 leader,
-                timeout_seconds=self._policy.forceful_shutdown_seconds,
+                timeout_seconds=self._policy.graceful_shutdown_seconds,
             )
+        except BaseException as error:
+            return ProcessGroupCourtesyFailed(error)
+        return ProcessGroupCourtesyCompleted()
+
+    def _attempt_force_signal(self, process_group_id: int) -> _ForceSignal:
+        try:
+            self._signal_group(process_group_id, signal.SIGKILL)
+        except BaseException as error:
+            return _ForceSignalFailed(error)
+        return _ForceSignalCompleted()
+
+    def _attempt_leader_reap(self, leader: OwnedProcessGroupLeader) -> _LeaderReap:
+        try:
+            return _LeaderReaped(
+                self._reap_leader(
+                    leader,
+                    timeout_seconds=self._policy.forceful_shutdown_seconds,
+                )
+            )
+        except BaseException as error:
+            return _LeaderReapFailed(error)
+
+    @staticmethod
+    def _require_forced_containment(
+        courtesy: ProcessGroupCourtesyCompleted | ProcessGroupCourtesyFailed,
+        force_signal: _ForceSignal,
+        leader_reap: _LeaderReap,
+    ) -> None:
+        errors: list[BaseException] = []
+        if type(courtesy) is ProcessGroupCourtesyFailed:
+            errors.append(courtesy.error)
+        elif type(courtesy) is not ProcessGroupCourtesyCompleted:
+            raise AssertionError("process-group courtesy result is a closed union")
+        if type(force_signal) is _ForceSignalFailed:
+            errors.append(force_signal.error)
+        elif type(force_signal) is not _ForceSignalCompleted:
+            raise AssertionError("process-group force signal is a closed union")
+        if type(leader_reap) is _LeaderReapFailed:
+            errors.append(leader_reap.error)
+        elif type(leader_reap) is not _LeaderReaped:
+            raise AssertionError("process-group leader reap is a closed union")
+        if type(force_signal) is _ForceSignalCompleted and type(leader_reap) is _LeaderReaped:
+            return
+        if len(errors) == 1:
+            raise errors[0]
+        raise BaseExceptionGroup(
+            "process-group courtesy observation and forced containment failed",
+            errors,
         )
 
     def _signal_group(

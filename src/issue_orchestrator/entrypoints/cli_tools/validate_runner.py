@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO
+from typing import TextIO, cast
 
 from ...domain.contained_command import (
     ContainedCommandCaptureAborted,
@@ -38,8 +38,10 @@ from ...domain.contained_command import (
     ContainedCommandExited,
     ContainedCommandExitUnknown,
     ContainedCommandFailure,
+    ContainedCommandFinalizationFailed,
     ContainedCommandMetrics,
     ContainedCommandNotStarted,
+    ContainedCommandOutcomeUnavailable,
     ContainedCommandResult,
     ContainedCommandStarted,
     ContainedCommandSupervised,
@@ -152,6 +154,8 @@ class _TimedValidationCommandResult:
         if type(self.command_result) not in (
             ContainedCommandCompleted,
             ContainedCommandCaptureFailed,
+            ContainedCommandFinalizationFailed,
+            ContainedCommandOutcomeUnavailable,
             ContainedCommandCleanupFailed,
         ):
             raise ValueError(
@@ -225,18 +229,40 @@ def _command_result_cleanup(result: ContainedCommandResult) -> str:
         return "supervised"
     if type(result) is ContainedCommandCleanupFailed:
         return "cleanup-failed"
+    if type(result) is ContainedCommandOutcomeUnavailable:
+        return "unknown"
+    if type(result) is ContainedCommandFinalizationFailed:
+        return _contained_cleanup_value(result.cleanup)
     if type(result) is ContainedCommandCaptureFailed:
-        if type(result.cleanup) is ContainedCommandSupervised:
-            return "supervised"
-        if type(result.cleanup) is ContainedCommandCaptureAborted:
-            return "capture-aborted"
-        if type(result.cleanup) is ContainedCommandCleanupNotStarted:
-            return "not-started"
+        return _contained_cleanup_value(result.cleanup)
     raise AssertionError("closed command result has unknown cleanup fact")
 
 
+def _contained_cleanup_value(
+    cleanup: ContainedCommandSupervised
+    | ContainedCommandCaptureAborted
+    | ContainedCommandCleanupNotStarted,
+) -> str:
+    if type(cleanup) is ContainedCommandSupervised:
+        return "supervised"
+    if type(cleanup) is ContainedCommandCaptureAborted:
+        return "capture-aborted"
+    if type(cleanup) is ContainedCommandCleanupNotStarted:
+        return "not-started"
+    raise AssertionError("contained cleanup is a closed union")
+
+
 def _command_result_child_exit(result: ContainedCommandResult) -> str:
-    child = result.child
+    if type(result) is ContainedCommandOutcomeUnavailable:
+        return "unavailable"
+    closed_result = cast(
+        ContainedCommandCompleted
+        | ContainedCommandCaptureFailed
+        | ContainedCommandFinalizationFailed
+        | ContainedCommandCleanupFailed,
+        result,
+    )
+    child = closed_result.child
     if type(child) is ContainedCommandExited:
         return str(child.exit_code)
     if type(child) is ContainedCommandNotStarted:
@@ -247,7 +273,16 @@ def _command_result_child_exit(result: ContainedCommandResult) -> str:
 
 
 def _command_result_process_id(result: ContainedCommandResult) -> str:
-    child = result.child
+    if type(result) is ContainedCommandOutcomeUnavailable:
+        return "unavailable"
+    closed_result = cast(
+        ContainedCommandCompleted
+        | ContainedCommandCaptureFailed
+        | ContainedCommandFinalizationFailed
+        | ContainedCommandCleanupFailed,
+        result,
+    )
+    child = closed_result.child
     if type(child) is ContainedCommandNotStarted:
         return "not-started"
     if type(child) is ContainedCommandExited:
@@ -267,11 +302,8 @@ def _record_terminal_marker(
         if type(command_result) is ContainedCommandCompleted
         else "capture-failed"
     )
-    terminal_marker = (
-        "child_exited"
-        if type(command_result.child) is ContainedCommandExited
-        else "command_terminal"
-    )
+    terminal_marker = _command_result_terminal_marker(command_result)
+    metrics = _command_result_metrics(command_result)
     marker = (
         f"[validate_runner] {terminal_marker} "
         f"pid={_command_result_process_id(command_result)} "
@@ -280,14 +312,12 @@ def _record_terminal_marker(
         f"lifecycle={lifecycle} "
         f"process_group_cleanup={_command_result_cleanup(command_result)} "
         f"elapsed={result.duration_seconds:.1f}s "
-        f"lines={command_result.metrics.line_count} "
-        f"bytes={command_result.metrics.byte_count}\n"
+        f"{metrics}\n"
     )
     eof_marker = (
         "[validate_runner] stdout_eof "
         f"pid={_command_result_process_id(command_result)} "
-        f"lines={command_result.metrics.line_count} "
-        f"bytes={command_result.metrics.byte_count} "
+        f"{metrics} "
         f"elapsed={result.duration_seconds:.1f}s\n"
     )
     with open(output_file, "a", encoding="utf-8") as output_handle:
@@ -296,6 +326,39 @@ def _record_terminal_marker(
     sys.stdout.write(eof_marker)
     sys.stdout.write(marker)
     sys.stdout.flush()
+
+
+def _command_result_terminal_marker(result: ContainedCommandResult) -> str:
+    if type(result) is ContainedCommandOutcomeUnavailable:
+        return "command_terminal"
+    closed_result = cast(
+        ContainedCommandCompleted
+        | ContainedCommandCaptureFailed
+        | ContainedCommandFinalizationFailed
+        | ContainedCommandCleanupFailed,
+        result,
+    )
+    return (
+        "child_exited"
+        if type(closed_result.child) is ContainedCommandExited
+        else "command_terminal"
+    )
+
+
+def _command_result_metrics(result: ContainedCommandResult) -> str:
+    if type(result) is ContainedCommandOutcomeUnavailable:
+        return "lines=unknown bytes=unknown"
+    closed_result = cast(
+        ContainedCommandCompleted
+        | ContainedCommandCaptureFailed
+        | ContainedCommandFinalizationFailed
+        | ContainedCommandCleanupFailed,
+        result,
+    )
+    return (
+        f"lines={closed_result.metrics.line_count} "
+        f"bytes={closed_result.metrics.byte_count}"
+    )
 
 
 def _not_started_capture_failure(
@@ -323,7 +386,12 @@ def _finalize_validation_evidence(
         ValidationResourceSamplerStarted,
         ValidationResourceSamplerStartIndeterminate,
     ):
-        shutdown_failure = validation_resource_sampler_shutdown_failure(sampler.stop())
+        try:
+            shutdown = sampler.stop()
+        except BaseException as error:
+            shutdown_failure = error
+        else:
+            shutdown_failure = validation_resource_sampler_shutdown_failure(shutdown)
         if shutdown_failure is not None:
             finalized_result = _with_sampler_shutdown_failure(
                 result,
@@ -346,49 +414,85 @@ def _with_sampler_shutdown_failure(
     result: _TimedValidationCommandResult,
     sampler_failure: ContainedCommandFailure,
 ) -> _TimedValidationCommandResult:
+    return _with_post_execution_failure(
+        result,
+        sampler_failure,
+        "validation execution and resource sampler shutdown both failed",
+    )
+
+
+def _with_post_execution_failure(
+    result: _TimedValidationCommandResult,
+    finalization_failure: ContainedCommandFailure,
+    message: str,
+) -> _TimedValidationCommandResult:
     command_result = result.command_result
     if type(command_result) is ContainedCommandCompleted:
-        failed_result: ContainedCommandResult = ContainedCommandCaptureFailed(
+        failed_result: ContainedCommandResult = ContainedCommandFinalizationFailed(
             child=command_result.child,
+            capture=ContainedCommandCaptureSucceeded(),
             cleanup=ContainedCommandSupervised(),
-            failure=sampler_failure,
+            finalization_failure=finalization_failure,
             metrics=command_result.metrics,
         )
     elif type(command_result) is ContainedCommandCaptureFailed:
-        failed_result = ContainedCommandCaptureFailed(
+        cleanup = command_result.cleanup
+        if type(command_result.child) is ContainedCommandExited and type(cleanup) in (
+            ContainedCommandSupervised,
+            ContainedCommandCaptureAborted,
+        ):
+            contained_cleanup = cast(
+                ContainedCommandSupervised | ContainedCommandCaptureAborted,
+                cleanup,
+            )
+            failed_result = ContainedCommandFinalizationFailed(
+                child=command_result.child,
+                capture=ContainedCommandCaptureInterrupted(command_result.failure),
+                cleanup=contained_cleanup,
+                finalization_failure=finalization_failure,
+                metrics=command_result.metrics,
+            )
+        else:
+            failed_result = ContainedCommandCaptureFailed(
+                child=command_result.child,
+                cleanup=command_result.cleanup,
+                failure=_combine_command_failures(
+                    command_result.failure,
+                    finalization_failure,
+                    message,
+                ),
+                metrics=command_result.metrics,
+            )
+    elif type(command_result) is ContainedCommandFinalizationFailed:
+        failed_result = ContainedCommandFinalizationFailed(
             child=command_result.child,
+            capture=command_result.capture,
             cleanup=command_result.cleanup,
-            failure=ContainedCommandFailure(
-                BaseExceptionGroup(
-                    "validation capture and resource sampler shutdown both failed",
-                    (command_result.failure.error, sampler_failure.error),
-                )
+            finalization_failure=_combine_command_failures(
+                command_result.finalization_failure,
+                finalization_failure,
+                message,
             ),
             metrics=command_result.metrics,
         )
     elif type(command_result) is ContainedCommandCleanupFailed:
-        if type(command_result.capture) is ContainedCommandCaptureInterrupted:
-            capture_failure = ContainedCommandFailure(
-                BaseExceptionGroup(
-                    "validation capture and resource sampler shutdown both failed",
-                    (command_result.capture.failure.error, sampler_failure.error),
-                )
-            )
-        elif type(command_result.capture) is ContainedCommandCaptureSucceeded:
-            capture_failure = sampler_failure
-        else:
-            raise AssertionError("contained command capture is a closed union")
         failed_result = ContainedCommandCleanupFailed(
             child=command_result.child,
-            capture=ContainedCommandCaptureInterrupted(capture_failure),
-            cleanup_failure=ContainedCommandFailure(
-                BaseExceptionGroup(
-                    "validation process cleanup and resource sampler shutdown "
-                    "both failed",
-                    (command_result.cleanup_failure.error, sampler_failure.error),
-                )
+            capture=command_result.capture,
+            cleanup_failure=_combine_command_failures(
+                command_result.cleanup_failure,
+                finalization_failure,
+                message,
             ),
             metrics=command_result.metrics,
+        )
+    elif type(command_result) is ContainedCommandOutcomeUnavailable:
+        failed_result = ContainedCommandOutcomeUnavailable(
+            _combine_command_failures(
+                command_result.failure,
+                finalization_failure,
+                message,
+            )
         )
     else:
         raise AssertionError("contained command result is a closed union")
@@ -397,6 +501,110 @@ def _with_sampler_shutdown_failure(
         duration_seconds=result.duration_seconds,
         wall_ended_at=result.wall_ended_at,
         monotonic_ended_at=result.monotonic_ended_at,
+    )
+
+
+def _combine_command_failures(
+    primary: ContainedCommandFailure,
+    secondary: ContainedCommandFailure,
+    message: str,
+) -> ContainedCommandFailure:
+    return ContainedCommandFailure(
+        BaseExceptionGroup(message, (primary.error, secondary.error))
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationCapturePhase:
+    command_result: ContainedCommandResult
+    sampler_start: ValidationResourceSamplerStart
+    output_close_failure: ContainedCommandFailure | None
+
+    def __post_init__(self) -> None:
+        if type(self.command_result) not in (
+            ContainedCommandCompleted,
+            ContainedCommandCaptureFailed,
+            ContainedCommandFinalizationFailed,
+            ContainedCommandOutcomeUnavailable,
+            ContainedCommandCleanupFailed,
+        ):
+            raise ValueError("validation capture phase command result must be closed")
+        if type(self.sampler_start) not in (
+            ValidationResourceSamplerStarted,
+            ValidationResourceSamplerStartIndeterminate,
+            ValidationResourceSamplerStartRejected,
+        ):
+            raise ValueError("validation capture phase sampler start must be closed")
+        if self.output_close_failure is not None and type(
+            self.output_close_failure
+        ) is not ContainedCommandFailure:
+            raise ValueError("validation output close failure must be typed")
+
+
+def _capture_validation_phase(
+    *,
+    command: str,
+    worktree: Path,
+    output_file: Path,
+    is_orchestrated_run: bool,
+    resource_sampler: ValidationResourceSampler,
+    timing_recorder: ValidateTimingRecorder,
+    contained_command_capture: ContainedCommandCapture,
+) -> _ValidationCapturePhase:
+    output_handle = open(output_file, "w", buffering=1)
+    output_close_failure: ContainedCommandFailure | None = None
+    try:
+        sampler_start = resource_sampler.start()
+        try:
+            output_handle.write(
+                f"[validate_runner] start pid={os.getpid()} cwd={worktree} "
+                f"command={command}\n"
+            )
+            output_handle.flush()
+            command_result = _capture_after_sampler_start(
+                sampler_start,
+                command,
+                worktree,
+                output_handle,
+                is_orchestrated_run,
+                timing_recorder,
+                contained_command_capture,
+            )
+        except BaseException as error:
+            command_result = ContainedCommandOutcomeUnavailable(
+                ContainedCommandFailure(error)
+            )
+    finally:
+        try:
+            output_handle.close()
+        except BaseException as error:
+            output_close_failure = ContainedCommandFailure(error)
+    return _ValidationCapturePhase(
+        command_result,
+        sampler_start,
+        output_close_failure,
+    )
+
+
+def _capture_after_sampler_start(
+    sampler_start: ValidationResourceSamplerStart,
+    command: str,
+    worktree: Path,
+    output_handle: TextIO,
+    is_orchestrated_run: bool,
+    timing_recorder: ValidateTimingRecorder,
+    contained_command_capture: ContainedCommandCapture,
+) -> ContainedCommandResult:
+    if type(sampler_start) is ValidationResourceSamplerStartRejected:
+        return _not_started_capture_failure(sampler_start.error)
+    if type(sampler_start) is ValidationResourceSamplerStartIndeterminate:
+        return _not_started_capture_failure(sampler_start.error)
+    if type(sampler_start) is not ValidationResourceSamplerStarted:
+        raise AssertionError("validation resource sampler start is a closed union")
+    return contained_command_capture.capture(
+        ContainedShellCommand(command=command, working_directory=worktree),
+        _ValidationCommandOutput(output_handle, is_orchestrated_run),
+        _ValidationTimingLineObserver(timing_recorder),
     )
 
 
@@ -444,42 +652,33 @@ def run_validation(
 
     wall_start = clock.wall_now()
     start = clock.monotonic_now()
-    with open(output_file, "w", buffering=1) as output_handle:
-        output_handle.write(
-            f"[validate_runner] start pid={os.getpid()} cwd={worktree} "
-            f"command={command}\n"
-        )
-        output_handle.flush()
-        sampler_start = resource_sampler.start()
-        if type(sampler_start) is ValidationResourceSamplerStartRejected:
-            command_result: ContainedCommandResult = _not_started_capture_failure(
-                sampler_start.error
-            )
-        elif type(sampler_start) is ValidationResourceSamplerStartIndeterminate:
-            command_result = _not_started_capture_failure(sampler_start.error)
-        elif type(sampler_start) is ValidationResourceSamplerStarted:
-            command_result = contained_command_capture.capture(
-                ContainedShellCommand(command=command, working_directory=worktree),
-                _ValidationCommandOutput(
-                    output_handle=output_handle,
-                    is_orchestrated_run=is_orchestrated_run,
-                ),
-                _ValidationTimingLineObserver(timing_recorder),
-            )
-        else:
-            raise AssertionError("validation resource sampler start is a closed union")
+    capture_phase = _capture_validation_phase(
+        command=command,
+        worktree=worktree,
+        output_file=output_file,
+        is_orchestrated_run=is_orchestrated_run,
+        resource_sampler=resource_sampler,
+        timing_recorder=timing_recorder,
+        contained_command_capture=contained_command_capture,
+    )
 
     wall_end = clock.wall_now()
     monotonic_end = clock.monotonic_now()
     result = _TimedValidationCommandResult(
-        command_result=command_result,
+        command_result=capture_phase.command_result,
         duration_seconds=monotonic_end - start,
         wall_ended_at=wall_end,
         monotonic_ended_at=monotonic_end,
     )
+    if capture_phase.output_close_failure is not None:
+        result = _with_post_execution_failure(
+            result,
+            capture_phase.output_close_failure,
+            "validation execution and output-handle close both failed",
+        )
     result = _finalize_validation_evidence(
         sampler=resource_sampler,
-        sampler_start=sampler_start,
+        sampler_start=capture_phase.sampler_start,
         recorder=timing_recorder,
         result=result,
         wall_started_at=wall_start,
@@ -493,6 +692,10 @@ def run_validation(
     if type(finalized_command_result) is ContainedCommandCleanupFailed:
         cleanup_error = ContainedCommandCleanupError(finalized_command_result)
         raise cleanup_error from finalized_command_result.cleanup_failure.error
+    if type(finalized_command_result) is ContainedCommandFinalizationFailed:
+        raise finalized_command_result.finalization_failure.error
+    if type(finalized_command_result) is ContainedCommandOutcomeUnavailable:
+        raise finalized_command_result.failure.error
 
     print()
     if result.passed:

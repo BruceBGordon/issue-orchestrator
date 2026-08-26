@@ -11,9 +11,9 @@ import signal
 import termios
 import time
 from dataclasses import dataclass
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from ..domain.executor import ExecutorProcessTerminationPolicy
 from ..domain.posix_process import (
@@ -27,7 +27,10 @@ from ..domain.posix_process import (
     PosixProcessProgram,
     PosixProcessWithoutTerminal,
 )
-from ..domain.process_group import OwnedProcessGroupLeader
+from ..domain.process_group import (
+    OwnedProcessGroupLeader,
+    ProcessGroupTermination,
+)
 from ..ports.posix_process import (
     PosixProcessExecRejected,
     PosixProcessLaunch,
@@ -80,12 +83,45 @@ _TerminalRecord = Annotated[
 
 class _PosixProcessChildInvocation(StrictWireRecord):
     schema_version: Literal[3] = 3
-    arguments: tuple[str, ...]
+    arguments: tuple[str, ...] = Field(min_length=1)
     working_directory: str = Field(min_length=1)
     inherited_file_descriptors: tuple[int, ...]
     activation_gate_file_descriptor: int = Field(ge=0)
     exec_status_file_descriptor: int = Field(ge=0)
     terminal: _TerminalRecord
+
+    @field_validator("arguments")
+    @classmethod
+    def _validate_arguments(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not argument or "\0" in argument for argument in value):
+            raise ValueError(
+                "retained POSIX child arguments must be non-empty and NUL-free"
+            )
+        if not value[0].startswith("/"):
+            raise ValueError("retained POSIX child executable must be absolute")
+        return value
+
+    @field_validator("inherited_file_descriptors")
+    @classmethod
+    def _validate_inherited_descriptors(
+        cls,
+        value: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        if any(descriptor < 0 for descriptor in value):
+            raise ValueError("inherited file descriptors must be non-negative")
+        if len(set(value)) != len(value):
+            raise ValueError("inherited file descriptors must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_control_descriptors(self) -> Self:
+        if self.activation_gate_file_descriptor == self.exec_status_file_descriptor:
+            raise ValueError("activation and exec-status descriptors must be distinct")
+        if self.activation_gate_file_descriptor in self.inherited_file_descriptors:
+            raise ValueError("activation descriptor must not be inherited by opaque work")
+        if self.exec_status_file_descriptor in self.inherited_file_descriptors:
+            raise ValueError("exec-status descriptor must not be inherited by opaque work")
+        return self
 
 
 class _PosixExecRejectedRecord(StrictWireRecord):
@@ -796,6 +832,16 @@ class RetainedPosixProcessLauncher:
                 self._recovery_policy.forceful_shutdown_seconds
             )
         except BaseException as recovery_error:
+            if process.return_code is not None:
+                exec_rejection = RuntimeError("retained POSIX wrapper rejected exec")
+                return PosixProcessLaunchRecovered(
+                    process.process_id,
+                    process.return_code,
+                    BaseExceptionGroup(
+                        "process activation and contained-handle cleanup failed",
+                        (exec_rejection, recovery_error),
+                    ),
+                )
             return PosixProcessLaunchRecoveryFailed(
                 process.process_id,
                 RuntimeError("retained POSIX wrapper rejected exec"),
@@ -823,6 +869,10 @@ class RetainedPosixProcessLauncher:
                     OwnedProcessGroupLeader(process.process_id)
                 )
                 exit_code = termination.leader_exit_code
+                activation_error = _with_courtesy_failure(
+                    activation_error,
+                    termination,
+                )
                 try:
                     process.record_external_reap(exit_code)
                 except BaseException as evidence_error:
@@ -838,6 +888,15 @@ class RetainedPosixProcessLauncher:
             else:
                 raise AssertionError("PosixProcessGroup is a closed union")
         except BaseException as recovery_error:
+            if process.return_code is not None:
+                return PosixProcessLaunchRecovered(
+                    process.process_id,
+                    process.return_code,
+                    BaseExceptionGroup(
+                        "process activation and contained-handle cleanup failed",
+                        (activation_error, recovery_error),
+                    ),
+                )
             return PosixProcessLaunchRecoveryFailed(
                 process.process_id,
                 activation_error,
@@ -864,6 +923,10 @@ class RetainedPosixProcessLauncher:
                     OwnedProcessGroupLeader(process.process_id)
                 )
                 exit_code = termination.leader_exit_code
+                activation_error = _with_courtesy_failure(
+                    activation_error,
+                    termination,
+                )
             elif type(group_mode) is PosixProcessJoinGroup:
                 process.kill()
                 exit_code = process.wait(
@@ -882,6 +945,19 @@ class RetainedPosixProcessLauncher:
             exit_code,
             activation_error,
         )
+
+
+def _with_courtesy_failure(
+    activation_error: BaseException,
+    termination: ProcessGroupTermination,
+) -> BaseException:
+    courtesy_failure = termination.courtesy_failure()
+    if courtesy_failure is None:
+        return activation_error
+    return BaseExceptionGroup(
+        "process activation and courtesy shutdown observation both failed",
+        (activation_error, courtesy_failure.error),
+    )
 
 
 def run_posix_process_child(raw_request: str) -> int:
