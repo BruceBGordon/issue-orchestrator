@@ -140,6 +140,22 @@ def _executor_launch(
     )
 
 
+
+def _no_live_leases(pool_dir: Path) -> bool:
+    """True when every remaining lease file is stale (its flock is free)."""
+    import fcntl
+
+    for lease in (pool_dir / "leases").glob("*.json"):
+        try:
+            with lease.open("r+b") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except BlockingIOError:
+            return False
+        except FileNotFoundError:
+            continue
+    return True
+
 def _await(requirement: Callable[[], bool]) -> None:
     """Bound one real process/PTY integration boundary against deadlock."""
     deadline = time.monotonic() + 45.0
@@ -355,7 +371,9 @@ def test_session_stop_contains_executor_guardian_and_opaque_command(
         stopping_runner.kill_session(7017, session_name)
 
         ProcessTreeMember(opaque_process_id).assert_contained()
-        assert not tuple((pool_dir / "leases").glob("*.json"))
+        # Capacity is provably released once every lease flock is free; the
+        # stale files themselves are pruned by the next admission scan.
+        _await(lambda: _no_live_leases(pool_dir))
         assert not (run_dir / EXECUTOR_SESSION_CANCELLATION_FILENAME).exists()
         assert not stopping_runner.session_exists(7017, session_name)
     finally:

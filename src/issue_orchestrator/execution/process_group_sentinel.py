@@ -909,15 +909,17 @@ class _ProcessGroupSentinelChild:
         cls._contain_group(invocation, None)
         raise AssertionError("sentinel containment unexpectedly returned")
 
+
     @staticmethod
-    def _contain_group(
+    def _retire_endpoint_artifacts(
         invocation: _ProcessGroupSentinelInvocation,
-        request: ProcessCancellationRequest | None,
     ) -> None:
-        errors: list[BaseException] = []
-        # The group dies unconditionally from here; retiring the endpoint
-        # record first lets later stop requests observe this containment as
-        # ABSENT instead of an unproven stale owner.
+        """Best-effort retirement of record, socket, and per-command lease.
+
+        The lease file is deliberately untouched: capacity must stay
+        charged until this group is actually dead, which only the flock
+        release at process death can prove.
+        """
         cancellation_record = invocation.cancellation
         if type(cancellation_record) is _SentinelCancellationEndpointRecord:
             record_file = Path(cancellation_record.record_path)
@@ -932,19 +934,18 @@ class _ProcessGroupSentinelChild:
                 record_file.unlink(missing_ok=True)
             except OSError:
                 pass
-        # The lease charge also ends with this group; only per-command
-        # records under leases/ are retired, never shared capacity locks.
-        for descriptor in invocation.lease_file_descriptors:
-            try:
-                lease_path = descriptor_path(descriptor)
-            except OSError:
-                continue
-            if lease_path.parent.name != "leases":
-                continue
-            try:
-                lease_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+
+    @classmethod
+    def _contain_group(
+        cls,
+        invocation: _ProcessGroupSentinelInvocation,
+        request: ProcessCancellationRequest | None,
+    ) -> None:
+        errors: list[BaseException] = []
+        # The group dies unconditionally from here; retiring the endpoint
+        # artifacts first lets later stop requests observe this containment
+        # as ABSENT instead of an unproven stale owner.
+        cls._retire_endpoint_artifacts(invocation)
         try:
             try:
                 os.killpg(invocation.process_group_id, signal.SIGTERM)

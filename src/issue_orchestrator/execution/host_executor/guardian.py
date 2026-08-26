@@ -223,17 +223,6 @@ class _SentinelGuardianGroupOwner:
         # the charge ends here, so the lease record must not outlive it.
         # Only per-command records under leases/ are retired; shared capacity
         # locks travel on the same descriptors and must survive.
-        for descriptor in self.lease_file_descriptors:
-            try:
-                record_path = descriptor_path(descriptor)
-            except OSError:
-                continue
-            if record_path.parent.name != "leases":
-                continue
-            try:
-                record_path.unlink(missing_ok=True)
-            except OSError:
-                pass
         try:
             self.controller.request_containment()
         except BaseException:
