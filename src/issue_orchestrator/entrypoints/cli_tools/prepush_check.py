@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from ...control.dirty_remediation import guard_hint_lines
 from ...control.validation import PublishGate
 from ...execution import GitWorkingCopy, LocalCommandRunner
 from ...infra.runtime_artifacts import filter_runtime_managed_dirty_paths
@@ -40,35 +41,6 @@ def find_worktree_root() -> Path:
 
 DIRTY_CHECK_MODES = {"tracked", "unstaged", "all", "off"}
 DIRTY_FILE_LIST_LIMIT = 20
-
-# Why "commit, never stash" -- but only for work that belongs in this push: the
-# publish gate records its result against HEAD, and the git pre-push hook reuses
-# that record only when it matches the commit being pushed. Stashing such work
-# hides it without moving HEAD, so the gate would certify a SHA that is about to
-# be replaced -- and the stashed change never reaches the push at all.
-#
-# Files that do NOT belong in this branch are a different case entirely. In
-# "all" mode the dirty list includes arbitrary untracked paths, which routinely
-# means build output, local configuration, or secrets. Telling an agent to
-# "commit them" to clear the gate would be actively harmful, so the remediation
-# hint is split by file class rather than issued as one blanket instruction.
-DIRTY_GUARD_COMMIT_FIRST_HINT = (
-    "Commit the changes that belong in this push before running this gate: the "
-    "gate records its result against HEAD and the pre-push hook reuses that "
-    "record, so it must be recorded at the commit that gets pushed. Do not "
-    "stash work that belongs in this push -- stashing leaves HEAD on the "
-    "commit you are about to replace, and the stashed change never reaches "
-    "the push."
-)
-DIRTY_GUARD_UNRELATED_TRACKED_HINT = (
-    "Tracked changes that do not belong in this branch should be reverted "
-    "(git restore) -- do not commit them just to clear this gate."
-)
-DIRTY_GUARD_UNTRACKED_FILES_HINT = (
-    "Untracked files that do not belong in this branch (build output, local "
-    "config, secrets) should be removed or added to .gitignore -- never commit "
-    "them just to clear this gate."
-)
 
 
 @dataclass(frozen=True)
@@ -163,10 +135,8 @@ def _run_dirty_guard(worktree: Path, mode: str, verbose: bool) -> Optional[int]:
                     "this gate. Ignored files are allowed. "
                     "Override with validation.publish.dirty_check."
                 )
-            print(DIRTY_GUARD_COMMIT_FIRST_HINT)
-            print(DIRTY_GUARD_UNRELATED_TRACKED_HINT)
-            if mode == "all":
-                print(DIRTY_GUARD_UNTRACKED_FILES_HINT)
+            for hint in guard_hint_lines(mode):
+                print(hint)
             _print_dirty_files(dirty_files)
         return 1
     return None

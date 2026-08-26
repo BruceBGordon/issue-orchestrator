@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from ..domain.models import COMPLETION_RECORD_PATH, CompletionRecord, RequestedAction, sanitize_agent_label
+from .dirty_remediation import blocked_reason
 from ..infra.runtime_artifacts import filter_runtime_managed_dirty_paths
 
 if TYPE_CHECKING:
@@ -385,10 +386,7 @@ class CompletionRecordValidator:
                         worktree,
                     )
                 return WorktreeValidationResult.pass_()
-            reason = (
-                "Working tree is dirty; commit the changes that belong in this "
-                "push (stashing leaves HEAD stale) and revert, remove, or "
-                "ignore the rest. "
+            reason = blocked_reason(
                 "Override with validation.publish.dirty_check."
             )
             if blocking_files:

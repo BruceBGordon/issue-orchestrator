@@ -13,6 +13,14 @@ hook misses and re-runs the whole suite.
 import re
 from pathlib import Path
 
+from issue_orchestrator.control.dirty_remediation import (
+    CLASSIFY_BEFORE_STAGING,
+    NEVER_DESTROY_UNKNOWN,
+    REMEDIATION_LADDER,
+    blocked_reason,
+    guard_hint_lines,
+    retry_prompt_steps,
+)
 from issue_orchestrator.resources import (
     get_coding_done_instructions,
     get_completion_instructions,
@@ -86,8 +94,14 @@ class TestCommitBeforePublishGate:
         text = _flat(get_coding_done_instructions())
 
         assert "Never commit a file just to clear the dirty guard" in text
-        assert "Revert unrelated tracked edits" in text
-        assert "`.gitignore` untracked build output, local config, and secrets" in text
+        # Unrelated is not disposable: the remedy preserves, it does not destroy.
+        assert NEVER_DESTROY_UNKNOWN in text
+        assert "It may be operator or user work that cannot be recovered" in text
+        # A file may only be deleted when the agent made it and knows it is junk.
+        assert "A disposable artifact you created yourself" in text
+        assert (
+            "Only take this path when you created the file during this session" in text
+        )
 
     def test_review_exchange_coder_carries_the_same_ordering_rule(self):
         text = _flat(get_review_exchange_coder_instructions())
@@ -97,10 +111,9 @@ class TestCommitBeforePublishGate:
         # Rework adds commits every round, so the ordering is not a one-off.
         assert "this ordering matters every round" in text
         assert "Never `git stash` work that belongs in this push" in text
-        assert (
-            "should be reverted, removed, or `.gitignore`d, never committed "
-            "just to clear the dirty guard" in text
-        )
+        assert CLASSIFY_BEFORE_STAGING in text
+        assert NEVER_DESTROY_UNKNOWN in text
+        assert "never stage every changed file at once" in text.lower()
 
     def test_rule_reaches_every_coding_side_task_kind(self):
         """code, rework, and exchange coders all receive the ordering rule."""
@@ -134,7 +147,9 @@ class TestRepoCodingPromptOrdering:
     def test_checklist_puts_validate_pr_after_the_commit(self):
         text = _flat(self._prompt())
 
-        commit_item = text.index("[ ] 2. Commit my changes")
+        commit_item = text.index(
+            "[ ] 2. Classify each dirty file, then stage by name and commit"
+        )
         gate_item = text.index("[ ] 3. Run `make validate-pr` AT that commit")
         assert commit_item < gate_item
 
@@ -181,3 +196,113 @@ class TestRepoCodingPromptOrdering:
 
         assert "Never `git stash` work that belongs in this push" in text
         assert "Do **not** run `make validate-pr-raw` by hand" in text
+
+
+class TestDirtyRemediationContract:
+    """One table over every surface that tells a coding agent to clear the guard.
+
+    The policy had to be rescoped across eight sites by hand once already, and
+    that pass still left `git add -A` demonstrated sixteen lines above a
+    paragraph forbidding it, and "remove the file" standing as advice for files
+    the agent never created. Asserting only that the *safe* paragraph exists
+    lets a contradictory earlier command pass, so this table asserts the unsafe
+    forms are absent from the whole surface and that classification is stated
+    before any staging instruction.
+
+    Runtime messages are rendered from `control.dirty_remediation`; the markdown
+    surfaces cannot import it, so they are held to the same contract here.
+    """
+
+    #: Commands that destroy or bulk-stage. These must not appear in an agent
+    #: instruction surface *at all* -- not even inside a prohibition, because a
+    #: literal command in the text is something an agent can copy out of it.
+    FORBIDDEN_COMMANDS = (
+        (r"git\s+add\s+-A", "bulk staging"),
+        (r"git\s+add\s+\.(?!\w)", "bulk staging"),
+        (r"git\s+restore", "destructive cleanup of possibly-unowned work"),
+        (r"git\s+checkout\s+--", "destructive cleanup of possibly-unowned work"),
+        (r"\brm\s+-rf\b", "destructive cleanup of possibly-unowned work"),
+        (r"commit\s+(?:them\s+)?all\b", "blanket commit-all"),
+        (r"commit\s+everything", "blanket commit-all"),
+    )
+
+    @staticmethod
+    def _repo_file(*parts: str) -> str:
+        repo_root = Path(__file__).resolve().parents[2]
+        return repo_root.joinpath(*parts).read_text()
+
+    @classmethod
+    def _injected_surfaces(cls) -> dict[str, str]:
+        """Everything injected into a coding-side agent session."""
+        return {
+            "resources/coding_done.md": get_coding_done_instructions(),
+            "resources/review_exchange_coder.md": (
+                get_review_exchange_coder_instructions()
+            ),
+            "completion:code": get_completion_instructions("code"),
+            "completion:rework": get_completion_instructions("rework"),
+            "completion:review_exchange_coder": get_completion_instructions(
+                "review_exchange_coder"
+            ),
+            "repo-specific/prompts/simple-fix.md": cls._repo_file(
+                "repo-specific", "prompts", "simple-fix.md"
+            ),
+            "session_controller:dirty-retry": retry_prompt_steps(),
+            "prepush_check:tracked": "\n".join(guard_hint_lines("tracked")),
+            "prepush_check:all": "\n".join(guard_hint_lines("all")),
+            "coding-done:blocked-reason": blocked_reason("Override with x."),
+        }
+
+    @classmethod
+    def _human_docs(cls) -> dict[str, str]:
+        return {
+            "AGENTS.md": cls._repo_file("AGENTS.md"),
+            "docs/journeys/developing.md": cls._repo_file(
+                "docs", "journeys", "developing.md"
+            ),
+        }
+
+    def test_no_surface_carries_a_bulk_or_destructive_command(self):
+        surfaces = {**self._injected_surfaces(), **self._human_docs()}
+        offenders = []
+        for name, text in surfaces.items():
+            for pattern, why in self.FORBIDDEN_COMMANDS:
+                match = re.search(pattern, text)
+                if match:
+                    offenders.append(f"{name}: {match.group(0)!r} ({why})")
+        assert not offenders, "unsafe instruction(s):\n" + "\n".join(offenders)
+
+    def test_every_injected_surface_preserves_files_the_agent_did_not_create(self):
+        """Unrelated is not disposable; the preservation rule must be explicit."""
+        for name, text in self._injected_surfaces().items():
+            assert NEVER_DESTROY_UNKNOWN in _flat(text), name
+
+    def test_classification_is_stated_before_any_staging_instruction(self):
+        """A safe paragraph after a bulk `git add` does not undo the bulk add."""
+        for name, text in self._injected_surfaces().items():
+            flat = _flat(text)
+            assert CLASSIFY_BEFORE_STAGING in flat, name
+            first_stage = flat.find("git add")
+            if first_stage == -1:
+                continue
+            assert flat.index(CLASSIFY_BEFORE_STAGING) < first_stage, (
+                f"{name}: staging is demonstrated before classification is required"
+            )
+
+    def test_runtime_surfaces_render_from_the_single_owner(self):
+        """Runtime wording is generated, not copied, so it cannot drift.
+
+        Each rung's classification text must appear verbatim in the guard hint,
+        the retry prompt, and nowhere as a hand-maintained duplicate.
+        """
+        guard = "\n".join(guard_hint_lines("all"))
+        prompt = retry_prompt_steps()
+        for rung in REMEDIATION_LADDER:
+            assert rung.classification in guard
+            assert rung.classification in prompt
+
+    def test_untracked_wording_is_scoped_to_the_mode_that_lists_them(self):
+        tracked = "\n".join(guard_hint_lines("tracked"))
+        every = "\n".join(guard_hint_lines("all"))
+        assert "also lists untracked paths" in every
+        assert "also lists untracked paths" not in tracked

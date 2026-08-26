@@ -160,7 +160,8 @@ pytest tests/e2e/ -v           # Live e2e tests (requires gh auth)
 **Commit before you run `make validate-pr`:**
 ```bash
 make validate-quick            # inner loop - cheap, uncached
-git add <files> && git commit -m "..."   # name the files; never `git add -A`
+git add path/to/file.py ...    # name the paths; never stage every file at once
+git commit -m "..."
 make validate-pr               # required gate - run it AT the commit
 ```
 
@@ -174,8 +175,12 @@ the cache work:
 - If the gate fails: fix, **commit the fix**, re-run `make validate-pr`.
 - Never `git stash` work that belongs in this push — it leaves `HEAD` on the
   commit you are about to replace, and the stashed change never gets pushed.
-- Never commit a file just to clear the dirty guard. Revert unrelated tracked
-  edits; remove or `.gitignore` untracked build output, local config, and secrets.
+- Classify each dirty file before staging anything. Commit what belongs in the
+  push; delete or `.gitignore` only artifacts you created and can positively
+  identify as disposable. Never delete or revert a file you did not create — it
+  may be operator work that cannot be recovered. Add an untracked path to
+  `.gitignore` to clear the guard without touching it, or stop and report
+  blocked. Never commit a file just to clear the guard.
 - `make validate-pr` is a superset of `make validate` — `validate-pr-raw` runs the
   same `_validate-impl` suite — so run one or the other, not both.
 - Never run `make validate-pr-raw` by hand; it records nothing.

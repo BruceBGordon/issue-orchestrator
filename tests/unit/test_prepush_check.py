@@ -7,6 +7,12 @@ import tempfile
 import subprocess
 from pathlib import Path
 
+from issue_orchestrator.control.dirty_remediation import (
+    CLASSIFY_BEFORE_STAGING,
+    COMMIT_WHAT_BELONGS,
+    NEVER_DESTROY_UNKNOWN,
+    NEVER_STASH_WHAT_BELONGS,
+)
 from issue_orchestrator.entrypoints.cli_tools.prepush_check import (
     _prepush_output_dir,
     load_validation_cmd,
@@ -786,18 +792,19 @@ validation:
             os.chdir(orig_cwd)
 
         assert result == 1
-        assert "Commit the changes that belong in this push" in captured.out
-        assert "Do not stash work that belongs in this push" in captured.out
+        assert COMMIT_WHAT_BELONGS in captured.out
+        assert NEVER_STASH_WHAT_BELONGS in captured.out
         assert "must be recorded at the commit that gets pushed" in captured.out
-        # Unrelated tracked edits get a revert remedy, never "add it to the commit".
-        assert "should be reverted" in captured.out
-        assert "do not commit them just to clear this gate" in captured.out
-        # The guard must never issue a blanket order to commit every dirty file.
+        # Classification comes first, and unknown files are preserved, never
+        # reverted -- "unrelated" is not proof that a file is disposable.
+        assert CLASSIFY_BEFORE_STAGING in captured.out
+        assert NEVER_DESTROY_UNKNOWN in captured.out
+        # No blanket commit order, no stash escape hatch, no destructive remedy.
         assert "commit them before running this gate" not in captured.out
-        # Stashing is never offered as a remedy for the work being pushed.
         assert "or stash" not in captured.out
-        # Tracked mode reports no untracked paths, so it must not talk about them.
-        assert "Untracked files that do not belong in this branch" not in captured.out
+        assert "git restore" not in captured.out
+        # Tracked mode lists no untracked paths, so it must not talk about them.
+        assert "also lists untracked paths" not in captured.out
 
     def test_dirty_guard_all_mode_routes_untracked_detritus_away_from_commit(
         self, temp_worktree, capsys
@@ -833,15 +840,19 @@ validation:
 
         assert result == 1
         # The commit-first rule still applies to work that belongs in the push...
-        assert "Commit the changes that belong in this push" in captured.out
-        assert "Do not stash work that belongs in this push" in captured.out
-        # ...but untracked detritus must be removed or ignored, never committed.
-        assert "Untracked files that do not belong in this branch" in captured.out
-        assert "removed or added to .gitignore" in captured.out
-        assert "never commit them just to clear this gate" in captured.out
-        # No blanket commit-everything order, and no stash escape hatch.
+        assert COMMIT_WHAT_BELONGS in captured.out
+        assert NEVER_STASH_WHAT_BELONGS in captured.out
+        assert CLASSIFY_BEFORE_STAGING in captured.out
+        # ...but untracked paths are called out only in the mode that lists them,
+        # and the remedy preserves rather than destroys.
+        assert "also lists untracked paths" in captured.out
+        assert "Never commit one just to clear this gate" in captured.out
+        assert NEVER_DESTROY_UNKNOWN in captured.out
+        assert "add its path to .gitignore" in captured.out
+        # No blanket commit-everything order, stash escape, or destructive remedy.
         assert "commit them before running this gate" not in captured.out
         assert "or stash" not in captured.out
+        assert "git restore" not in captured.out
 
     def test_verbose_output_clips_dirty_file_list(self, temp_worktree, capsys):
         """Dirty file listing should be clipped with ellipsis for long lists."""

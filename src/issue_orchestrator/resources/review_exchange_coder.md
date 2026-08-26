@@ -34,10 +34,17 @@ exchange-respond disagree --text "This change is wrong because..."
   commit, so the whole suite re-runs later. Each rework round adds commits, so
   this ordering matters every round. Never `git stash` work that belongs in this
   push - stashing leaves HEAD on the commit you are about to replace, and the
-  stashed change never reaches the push. Files that do not belong in the branch
-  should be reverted, removed, or `.gitignore`d, never committed just to clear
-  the dirty guard.
-- Runtime-managed metadata under `.issue-orchestrator/` and `.claude/` is ignored by the orchestrator dirty guard. Tracked project files, generated sources, lock files, schemas, and other repo changes must still be committed or removed.
+  stashed change never reaches the push.
+- **Classify each dirty file before staging anything.** Stage the paths that
+  belong in this push explicitly by name; never stage every changed file at
+  once. A file you created yourself and can positively identify as disposable
+  may be deleted or added to `.gitignore`. For anything else - pre-existing
+  edits, files you did not create, anything you cannot positively classify -
+  preserve it. Never delete or revert a file you did not create. It may be
+  operator or user work that cannot be recovered; add an untracked path to
+  `.gitignore` to clear the guard without touching it, or report
+  `coding-done blocked --reason "cannot classify dirty file <path>" --attempted "inspected the file and its history"`.
+- Runtime-managed metadata under `.issue-orchestrator/` and `.claude/` is ignored by the orchestrator dirty guard. Tracked project files, generated sources, lock files, and schemas that belong to this push must still be committed.
 - Do NOT skip, disable, quarantine, or weaken failing tests. For JUnit/Kotlin/Java this includes `assumeTrue`, `assumeFalse`, `@Disabled`, and `@Ignore`.
 - **DO NOT** call `reviewer-done`. That command is for reviewers, not coders.
 - Both steps are required. Missing either one will cause a protocol error.

@@ -12,6 +12,11 @@ Architecture reminder:
 
 import json
 import pytest
+
+from issue_orchestrator.control.dirty_remediation import (
+    NEVER_DESTROY_UNKNOWN,
+    blocked_reason,
+)
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -3473,13 +3478,14 @@ class TestCompletionProcessorDirtyPolicy:
         assert result.failure_kind == "validation_failed"
         assert "working tree is dirty" in result.message.lower()
         assert "dirty files: src/feature.py, readme.md." in result.message.lower()
+        # Built from the remediation owner so the reason cannot drift from the
+        # policy the agent-facing surfaces render.
         assert result.errors == [
-            "Validation: Working tree is dirty; commit the changes that belong in "
-            "this push (stashing leaves HEAD stale) and revert, remove, or ignore "
-            "the rest. "
-            "Override with validation.publish.dirty_check. "
-            "Dirty files: src/feature.py, README.md."
+            "Validation: "
+            + blocked_reason("Override with validation.publish.dirty_check.")
+            + " Dirty files: src/feature.py, README.md."
         ]
+        assert NEVER_DESTROY_UNKNOWN in result.errors[0]
         mock_git_adapter.push.assert_not_called()
         mock_label_adapter.add_label.assert_called_once_with(123, "validation-failed")
         mock_pr_adapter.add_comment.assert_called_once()

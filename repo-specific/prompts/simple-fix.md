@@ -30,7 +30,7 @@ You implement the solution locally and report completion via `coding-done`. The 
 ```
 My mandatory checklist before I can exit:
 [ ] 1. Verify my changes work (make validate-quick)
-[ ] 2. Commit my changes (git add + git commit)
+[ ] 2. Classify each dirty file, then stage by name and commit
 [ ] 3. Run `make validate-pr` AT that commit (never before it)
 [ ] 4. Call `coding-done` with implementation summary
 [ ] 5. Exit only AFTER coding-done succeeds
@@ -145,10 +145,18 @@ If validation fails:
 
 **You MUST commit your changes before calling `coding-done`.** The orchestrator does NOT commit for you.
 
+Classify each dirty file before staging anything. Then stage the paths that
+belong in this change explicitly by name:
+
 ```bash
-git add -A
+git status --short
+git add path/to/changed_file.py path/to/other_file.py
 git commit -m "Brief description of what you implemented"
 ```
+
+Never stage every changed file at once. The dirty list can include build
+output, local configuration, and secrets, and a bulk stage sweeps them into
+the branch.
 
 **If you skip this step, your work will be lost.** The orchestrator only pushes existing commits - it does not create them.
 
@@ -157,15 +165,23 @@ files BEFORE running validation AND AGAIN AFTER. If validation modifies the
 tree (auto-formatter, generated artifacts, integration-test side effects),
 the second check fails and `coding-done` exits non-zero.
 
-When that happens, decide for each dirty file:
-- **Part of your change** → `git add` + `git commit`
-- **Detritus** (build output, generated lock files, IDE droppings) → add to `.gitignore` or `rm`
-- **Cannot classify** → run `coding-done blocked --reason "unable to classify dirty file <path>"`
+When that happens, classify each dirty file again:
 
-**Do not** `git stash` work that belongs in this push — it belongs in a commit
-or in `.gitignore`, not in a stash the orchestrator can't see. Never `git add -A`
-to clear the guard either: that is how build output, local config, and secrets
-reach a branch. Re-run `coding-done` after fixing.
+- **Part of your change** → stage that path by name and commit it
+- **A disposable artifact you created yourself** (build output, a lock file or
+  generated source your change produced) → delete it, or add its path to
+  `.gitignore`. Only take this path when you created the file during this
+  session and can positively identify it as disposable.
+- **Anything else** — pre-existing edits, files you did not create, anything you
+  cannot positively classify → preserve it. Never delete or revert a file you
+  did not create. It may be operator or user work that cannot be recovered. Add
+  an untracked path to `.gitignore` to clear the guard without touching the
+  file, or run `coding-done blocked --reason "cannot classify dirty file <path>" --attempted "inspected the file and its history"`
+
+**Do not** `git stash` work that belongs in this push — it belongs in a commit,
+not in a stash the orchestrator can't see. Never stage every changed file at
+once either: that is how build output, local config, and secrets reach a
+branch. Re-run `coding-done` after fixing.
 
 ### 6. Run the Full PR Gate — AT the Commit, Never Before It
 
@@ -201,8 +217,8 @@ anything, so the pre-push hook runs the same expensive suite over again.
 Never `git stash` work that belongs in this push to satisfy the dirty guard —
 stashing leaves `HEAD` on the commit you are about to replace, so you would seed
 a record for a SHA that is already stale, and the stashed change would never be
-pushed. Unrelated files are the step 5 classification problem, not a reason to
-commit everything.
+pushed. Unrelated files are the step 5 classification problem: preserve them,
+never destroy them, and never sweep them into the commit.
 
 ---
 
