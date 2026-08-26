@@ -88,9 +88,7 @@ class ValidationRunner:
         """
         self.store = store
         self.command_runner = command_runner
-        if type(timing_clock) is not timings.ValidationTimingClock:
-            raise ValueError("ValidationRunner.timing_clock must be exact")
-        self.timing_clock = timing_clock
+        self.timing_clock = timings.ValidationTimingClock.required(timing_clock)
 
     def run(
         self,

@@ -86,6 +86,13 @@ class ValidationTimingClock:
         if not callable(self.monotonic_now):
             raise ValueError("validation timing monotonic clock must be callable")
 
+    @classmethod
+    def required(cls, value: ValidationTimingClock) -> ValidationTimingClock:
+        """Reject untyped clock injection at the owner of the contract."""
+        if type(value) is not cls:
+            raise ValueError("validation timing clock must be exact")
+        return value
+
 
 SYSTEM_VALIDATION_TIMING_CLOCK = ValidationTimingClock(
     wall_now=lambda: datetime.now(timezone.utc),
