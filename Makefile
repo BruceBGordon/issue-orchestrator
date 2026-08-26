@@ -332,11 +332,18 @@ endef
 # Two-pass typecheck: strict for core (domain/ports/control), standard for rest
 # --warnings ensures 0 warnings required (exit code 1 if warnings reported)
 typecheck:
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,typecheck,\
+		$(LANE_RUN) --backend condor --work-key typecheck --request-cpus $(LANE_CPUS_TYPECHECK) \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) typecheck LANE_EXECUTOR=direct)
+else
 	$(call TIMED_RUN,typecheck,\
 		echo "Running pyright (standard mode, excluding core)..." && \
 		$(PYRIGHT) --project pyrightconfig.json --warnings && \
 		echo "Running pyright (strict mode, core only)..." && \
 		$(PYRIGHT) --project pyrightconfig.strict.json --warnings)
+endif
 
 LINT_IMPORTS ?= .venv/bin/lint-imports
 RUFF ?= .venv/bin/ruff
@@ -366,6 +373,19 @@ lint-complexity:
 # Parallel test execution with pytest-xdist (-n auto uses all CPU cores)
 # Use PARALLEL=0 to disable: make test-unit PARALLEL=0
 PARALLEL ?= auto
+
+# Opt-in lane execution backend. `direct` preserves historical behavior;
+# `condor` submits wired lanes to a personal HTCondor pool through the
+# LaneExecutor port (see docs/user/condor_lanes.md). Selection is one
+# composition decision here — lane recipes and callers are identical in
+# both modes, and a configured-but-missing pool fails loudly (exit 78).
+LANE_EXECUTOR := $(or $(LANE_EXECUTOR),$(ISSUE_ORCHESTRATOR_LANE_EXECUTOR),direct)
+LANE_RUN = $(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_run
+LANE_CPUS_TYPECHECK ?= 4
+LANE_CPUS_UNIT ?= 12
+LANE_CPUS_SIMULATED ?= 4
+LANE_CPUS_INTEGRATION ?= 4
+LANE_TIMEOUT_SECONDS ?= 1800
 UNIT_PARALLEL ?= $(PARALLEL)
 SIMULATED_PARALLEL ?= $(PARALLEL)
 INTEGRATION_PARALLEL ?= $(PARALLEL)
@@ -403,7 +423,12 @@ sync-deps:
 	fi
 
 test-unit: sync-deps
-ifeq ($(UNIT_PARALLEL),0)
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,test-unit,\
+		$(LANE_RUN) --backend condor --work-key test-unit --request-cpus $(LANE_CPUS_UNIT) \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) test-unit LANE_EXECUTOR=direct)
+else ifeq ($(UNIT_PARALLEL),0)
 	$(call TIMED_RUN,test-unit,\
 		$(PYTEST) tests/unit packages/agent_runner/tests -x -q --tb=short $(PYTEST_TIMINGS))
 else
@@ -419,7 +444,12 @@ else
 endif
 
 test-simulated-core: sync-deps
-ifeq ($(SIMULATED_PARALLEL),0)
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,test-simulated-core,\
+		$(LANE_RUN) --backend condor --work-key test-simulated-core --request-cpus $(LANE_CPUS_SIMULATED) \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) test-simulated-core LANE_EXECUTOR=direct)
+else ifeq ($(SIMULATED_PARALLEL),0)
 	$(call TIMED_RUN,test-simulated-core,\
 		$(PYTEST) tests/simulated_scenarios -x -q --tb=short \
 			--ignore=tests/simulated_scenarios/test_foreign_repo_lifecycle.py \
@@ -461,7 +491,12 @@ test-integration: sync-deps
 test-integration-core: test-integration-core-local test-integration-core-live-codex
 
 test-integration-core-local: sync-deps
-ifeq ($(INTEGRATION_PARALLEL),0)
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,test-integration-core-local,\
+		$(LANE_RUN) --backend condor --work-key test-integration-core-local --request-cpus $(LANE_CPUS_INTEGRATION) \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) test-integration-core-local LANE_EXECUTOR=direct)
+else ifeq ($(INTEGRATION_PARALLEL),0)
 	$(call TIMED_RUN,test-integration-core,\
 		$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex" \
 			--ignore=tests/integration/test_claude_execution.py \
