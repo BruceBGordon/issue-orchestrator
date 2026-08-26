@@ -63,6 +63,7 @@ from ...domain.posix_process import (
     PosixProcessGroupMode,
     PosixProcessLaunchSpec,
     PosixProcessProgram,
+    PosixProcessInheritedStandardStreams,
     PosixProcessWithoutTerminal,
     classify_posix_process_activation_deadline,
 )
@@ -408,6 +409,9 @@ class PosixExecutorCommandGuardian:
                 owner_ready_file_descriptor=child_descriptors.owner_ready_writer,
                 parent_lifetime_read_file_descriptor=(
                     child_descriptors.parent_lifetime_reader
+                ),
+                parent_lifetime_write_file_descriptor=(
+                    child_descriptors.parent_lifetime_writer
                 ),
                 lifecycle=request.lifecycle,
                 budget=request.budget,
@@ -859,6 +863,7 @@ class PosixExecutorCommandGuardian:
                 group_mode=group_mode,
                 descriptor_mappings=descriptor_mappings,
                 terminal=PosixProcessWithoutTerminal(),
+                standard_streams=PosixProcessInheritedStandardStreams(),
                 activation_deadline=activation_deadline,
             )
         )

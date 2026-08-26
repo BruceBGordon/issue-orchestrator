@@ -27,6 +27,7 @@ from ...domain.posix_process import (
     PosixProcessJoinGroup,
     PosixProcessLaunchSpec,
     PosixProcessProgram,
+    PosixProcessInheritedStandardStreams,
     PosixProcessWithoutTerminal,
     classify_posix_process_activation_deadline,
 )
@@ -58,7 +59,6 @@ from ...ports.posix_process import (
 )
 from ...ports.executor_child_resources import ExecutorChildResourceObserver
 from ..process_cancellation_endpoint import ProcessCancellationOwnerControls
-from ..posix_process import descriptor_path
 from ..process_group_sentinel import (
     ProcessGroupSentinelController,
     ProcessGroupSentinelWithoutCancellation,
@@ -187,7 +187,6 @@ class _SentinelGuardianGroupOwner:
 
     controller: ProcessGroupSentinelController
     cancellation_record_path: Path | None = None
-    lease_file_descriptors: tuple[int, ...] = ()
 
     def retire_before_opaque_work(self) -> None:
         self.controller.retire_without_group()
@@ -384,6 +383,11 @@ class PosixExecutorGuardianChild:
             )
         else:
             raise AssertionError("guardian cancellation is a closed union")
+        # The guardian co-holds the parent-lifetime write end for its whole
+        # life (invocation.parent_lifetime_write_file_descriptor): the
+        # sentinel's EOF sweep must fire only when the launcher AND this
+        # guardian are both gone, so an outer crash alone cannot contain
+        # work that must survive to its deadline.
         controller = ProcessGroupSentinelController.start_with_parent_lifetime(
             invocation.process_group_sentinel_program(),
             sentinel_cancellation,
@@ -412,11 +416,7 @@ class PosixExecutorGuardianChild:
                 "guardian could not transfer cancellation ownership to sentinel",
                 cleanup_errors,
             )
-        return _SentinelGuardianGroupOwner(
-            controller,
-            cancellation_record_path,
-            invocation.lease_file_descriptors,
-        )
+        return _SentinelGuardianGroupOwner(controller, cancellation_record_path)
 
     def _run_started_command(
         self,
@@ -496,6 +496,7 @@ class PosixExecutorGuardianChild:
                     group_mode=PosixProcessJoinGroup(os.getpgrp()),
                     descriptor_mappings=(),
                     terminal=PosixProcessWithoutTerminal(),
+                    standard_streams=PosixProcessInheritedStandardStreams(),
                     activation_deadline=activation_deadline,
                 )
             )

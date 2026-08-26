@@ -17,6 +17,7 @@ from typing import IO, Any, TypeVar
 
 from issue_orchestrator.domain.executor import ExecutorInteractiveSessionCancellation
 from issue_orchestrator.adapters.ps_process_group_observer import (
+    GetsidProcessSessionResolver,
     PsProcessGroupObserver,
     PsProcessObservationPolicy,
 )
@@ -46,6 +47,7 @@ def build_test_process_group_observer() -> PsProcessGroupObserver:
         Path("/bin/ps"),
         PsProcessObservationPolicy(command_timeout_seconds=2.0),
         build_kernel_process_identity_observer(),
+        GetsidProcessSessionResolver(),
     )
 
 

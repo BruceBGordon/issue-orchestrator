@@ -93,12 +93,13 @@ def guardian_budget_record(budget: ExecutorGuardianBudget) -> GuardianBudgetReco
 
 
 class GuardianInvocationRecord(ExecutorStrictRecord):
-    schema_version: Literal[5] = 5
+    schema_version: Literal[6] = 6
     arguments: tuple[str, ...]
     result_file_descriptor: int = Field(ge=0)
     start_file_descriptor: int = Field(ge=0)
     owner_ready_file_descriptor: int = Field(ge=0)
     parent_lifetime_read_file_descriptor: int = Field(ge=0)
+    parent_lifetime_write_file_descriptor: int = Field(ge=0)
     lifecycle: ExecutorCommandLifecycle
     budget: GuardianBudgetRecord
     cancellation: GuardianCancellationControlRecord
@@ -116,6 +117,7 @@ class GuardianInvocationRecord(ExecutorStrictRecord):
         start_file_descriptor: int,
         owner_ready_file_descriptor: int,
         parent_lifetime_read_file_descriptor: int,
+        parent_lifetime_write_file_descriptor: int,
         lifecycle: ExecutorCommandLifecycle,
         budget: ExecutorGuardianBudget,
         cancellation: GuardianCancellationControlRecord,
@@ -130,6 +132,9 @@ class GuardianInvocationRecord(ExecutorStrictRecord):
             start_file_descriptor=start_file_descriptor,
             owner_ready_file_descriptor=owner_ready_file_descriptor,
             parent_lifetime_read_file_descriptor=(parent_lifetime_read_file_descriptor),
+            parent_lifetime_write_file_descriptor=(
+                parent_lifetime_write_file_descriptor
+            ),
             lifecycle=lifecycle,
             budget=guardian_budget_record(budget),
             cancellation=cancellation,

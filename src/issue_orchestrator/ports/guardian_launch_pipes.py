@@ -17,10 +17,12 @@ class GuardianChildPipeDescriptors:
     start_reader: int
     owner_ready_writer: int
     parent_lifetime_reader: int
+    parent_lifetime_writer: int
 
     def __post_init__(self) -> None:
         values = (
             self.result_writer,
+            self.parent_lifetime_writer,
             self.start_reader,
             self.owner_ready_writer,
             self.parent_lifetime_reader,

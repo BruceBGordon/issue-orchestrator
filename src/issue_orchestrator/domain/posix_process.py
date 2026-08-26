@@ -255,6 +255,27 @@ PosixProcessTerminal = PosixProcessWithoutTerminal | PosixProcessControllingTerm
 
 
 @dataclass(frozen=True, slots=True)
+class PosixProcessInheritedStandardStreams:
+    """The child keeps the parent's stdin/stdout/stderr."""
+
+
+@dataclass(frozen=True, slots=True)
+class PosixProcessDetachedStandardStreams:
+    """Standard descriptors the caller did not map go to /dev/null.
+
+    A long-lived helper that retained an inherited PTY slave would keep
+    the master from ever reaching EOF, stranding the session's
+    completion watcher; helpers that are not terminal citizens must
+    declare this mode.
+    """
+
+
+PosixProcessStandardStreams = (
+    PosixProcessInheritedStandardStreams | PosixProcessDetachedStandardStreams
+)
+
+
+@dataclass(frozen=True, slots=True)
 class PosixProcessLaunchSpec:
     """Complete caller-facing process activation specification."""
 
@@ -264,6 +285,7 @@ class PosixProcessLaunchSpec:
     group_mode: PosixProcessGroup
     descriptor_mappings: tuple[PosixDescriptorMapping, ...]
     terminal: PosixProcessTerminal
+    standard_streams: PosixProcessStandardStreams
     activation_deadline: PosixProcessActivationDeadline
 
     def __post_init__(self) -> None:
@@ -289,6 +311,14 @@ class PosixProcessLaunchSpec:
             raise ValueError("PosixProcessLaunchSpec.activation_deadline must be typed")
         targets = self._validate_descriptor_mappings()
         self._validate_terminal(targets)
+        if type(self.standard_streams) is PosixProcessDetachedStandardStreams:
+            if type(self.terminal) is PosixProcessControllingTerminal:
+                raise ValueError(
+                    "a controlling-terminal child is a terminal citizen and "
+                    "cannot detach its standard streams"
+                )
+        elif type(self.standard_streams) is not PosixProcessInheritedStandardStreams:
+            raise ValueError("PosixProcessLaunchSpec.standard_streams must be typed")
 
     def _validate_descriptor_mappings(self) -> tuple[int, ...]:
         if type(self.descriptor_mappings) is not tuple or any(

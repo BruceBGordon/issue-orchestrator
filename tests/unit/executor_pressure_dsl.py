@@ -482,7 +482,14 @@ class _ControlledPressureProcess:
     def release_orphaned_child(self) -> None:
         if self._process.returncode is None:
             raise RuntimeError("executor parent must be killed before orphan release")
-        self.signal_release()
+        try:
+            self.signal_release()
+        except BrokenPipeError:
+            # A close-fds orphan holds no stdin, and helper processes are
+            # detached from the parent's pipe, so with the parent dead this
+            # poke can have no reader left. Containment authority for such
+            # an orphan is the sentinel sweep, not this release signal.
+            self._release_signalled = True
 
     def cleanup(self, *, abort: bool) -> None:
         if type(abort) is not bool:
@@ -619,7 +626,12 @@ class _ControlledPressureProcess:
     @staticmethod
     def _close_stream(stream: TextIO | None) -> None:
         if stream is not None and not stream.closed:
-            stream.close()
+            try:
+                stream.close()
+            except BrokenPipeError:
+                # close() flushes any buffered release poke; a reaped
+                # process tree may legitimately have no reader left.
+                pass
 
     def _close_admission_attempt_fd(self) -> None:
         if not self._admission_attempt_fd_open:

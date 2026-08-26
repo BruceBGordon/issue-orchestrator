@@ -26,6 +26,7 @@ from ..domain.posix_process import (
     PosixProcessActivationPolicy,
     PosixProcessConfiguredActivationDeadline,
     PosixProcessControllingTerminal,
+    PosixProcessDetachedStandardStreams,
     PosixProcessGroup,
     PosixProcessGroupMode,
     PosixProcessJoinedGroupContainmentRequiredError,
@@ -91,10 +92,12 @@ _TerminalRecord = Annotated[
 
 
 class _PosixProcessChildInvocation(StrictWireRecord):
-    schema_version: Literal[3] = 3
+    schema_version: Literal[4] = 4
     arguments: tuple[str, ...] = Field(min_length=1)
     working_directory: str = Field(min_length=1)
     inherited_file_descriptors: tuple[int, ...]
+    standard_descriptor_mappings: tuple[int, ...]
+    detach_standard_streams: bool
     activation_gate_file_descriptor: int = Field(ge=0)
     exec_status_file_descriptor: int = Field(ge=0)
     terminal: _TerminalRecord
@@ -120,6 +123,20 @@ class _PosixProcessChildInvocation(StrictWireRecord):
             raise ValueError("inherited file descriptors must be non-negative")
         if len(set(value)) != len(value):
             raise ValueError("inherited file descriptors must be unique")
+        return value
+
+    @field_validator("standard_descriptor_mappings")
+    @classmethod
+    def _validate_standard_descriptor_mappings(
+        cls,
+        value: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        if any(descriptor not in (0, 1, 2) for descriptor in value):
+            raise ValueError(
+                "standard descriptor mappings must target stdin/stdout/stderr"
+            )
+        if len(set(value)) != len(value):
+            raise ValueError("standard descriptor mappings must be unique")
         return value
 
     @model_validator(mode="after")
@@ -868,6 +885,19 @@ class RetainedPosixProcessLauncher:
                 for mapping in specification.descriptor_mappings
                 if mapping.child_file_descriptor > 2
             ),
+            standard_descriptor_mappings=tuple(
+                sorted(
+                    {
+                        mapping.child_file_descriptor
+                        for mapping in specification.descriptor_mappings
+                        if mapping.child_file_descriptor <= 2
+                    }
+                )
+            ),
+            detach_standard_streams=(
+                type(specification.standard_streams)
+                is PosixProcessDetachedStandardStreams
+            ),
             activation_gate_file_descriptor=activation_gate_file_descriptor,
             exec_status_file_descriptor=exec_status_file_descriptor,
             terminal=terminal_record,
@@ -1108,11 +1138,25 @@ def run_posix_process_child(raw_request: str) -> int:
     _await_activation_grant(invocation.activation_gate_file_descriptor)
     try:
         _mark_close_on_exec(invocation.exec_status_file_descriptor)
+        # The controlling session's leader may die while this command must
+        # keep running to its executor deadline (crash-survival contract).
+        # SIG_IGN survives exec, giving nohup semantics unless the command
+        # installs its own handler.
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         terminal = invocation.terminal
         if type(terminal) is _ControllingTerminalRecord:
             fcntl.ioctl(terminal.child_file_descriptor, termios.TIOCSCTTY, 0)
             os.tcsetpgrp(terminal.child_file_descriptor, os.getpgrp())
-        elif type(terminal) is not _WithoutTerminalRecord:
+        elif type(terminal) is _WithoutTerminalRecord:
+            if invocation.detach_standard_streams:
+                # A helper that declined terminal citizenship must not retain
+                # the parent's terminal descriptors: one leaked descendant
+                # holding a PTY slave keeps the master from ever reaching
+                # EOF, stranding the session's completion watcher.
+                _detach_unmapped_standard_descriptors(
+                    invocation.standard_descriptor_mappings
+                )
+        else:
             raise AssertionError("terminal record is a closed union")
         os.chdir(invocation.working_directory)
         _close_unmapped_descriptors(
@@ -1166,6 +1210,20 @@ def _publish_exec_rejection(
             raise RuntimeError("POSIX exec status performed a short write")
     finally:
         os.close(file_descriptor)
+
+
+def _detach_unmapped_standard_descriptors(explicit: tuple[int, ...]) -> None:
+    targets = tuple(
+        descriptor for descriptor in (0, 1, 2) if descriptor not in explicit
+    )
+    if not targets:
+        return
+    null_descriptor = os.open(os.devnull, os.O_RDWR)
+    for descriptor in targets:
+        if descriptor != null_descriptor:
+            os.dup2(null_descriptor, descriptor)
+    if null_descriptor not in targets:
+        os.close(null_descriptor)
 
 
 def _close_unmapped_descriptors(inherited: tuple[int, ...]) -> None:

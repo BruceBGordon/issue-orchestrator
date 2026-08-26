@@ -109,6 +109,7 @@ def build_process_group_observer() -> ProcessGroupObserver:
         build_kernel_process_identity_observer,
     )
     from ..adapters.ps_process_group_observer import (
+        GetsidProcessSessionResolver,
         PsProcessGroupObserver,
         PsProcessObservationPolicy,
     )
@@ -117,6 +118,7 @@ def build_process_group_observer() -> ProcessGroupObserver:
         Path("/bin/ps"),
         PsProcessObservationPolicy(command_timeout_seconds=2.0),
         build_kernel_process_identity_observer(),
+        GetsidProcessSessionResolver(),
     )
 
 

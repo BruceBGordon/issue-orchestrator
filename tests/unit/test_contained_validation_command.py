@@ -67,6 +67,7 @@ from issue_orchestrator.domain.posix_process import (
     PosixProcessGroupMode,
     PosixProcessLaunchSpec,
     PosixProcessProgram,
+    PosixProcessInheritedStandardStreams,
     PosixProcessWithoutTerminal,
 )
 from issue_orchestrator.execution.posix_pipe import OsPosixPipeFactory
@@ -1241,6 +1242,7 @@ def test_outer_crash_contains_nested_executor_and_releases_exclusive_slot(
             PosixProcessGroupMode.NEW_SESSION,
             (),
             PosixProcessWithoutTerminal(),
+            PosixProcessInheritedStandardStreams(),
             PosixProcessConfiguredActivationDeadline(),
         )
     )

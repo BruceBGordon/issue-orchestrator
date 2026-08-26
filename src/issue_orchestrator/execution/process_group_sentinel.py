@@ -28,6 +28,7 @@ from ..domain.posix_process import (
     PosixProcessJoinGroup,
     PosixProcessLaunchSpec,
     PosixProcessProgram,
+    PosixProcessDetachedStandardStreams,
     PosixProcessWithoutTerminal,
 )
 from ..ports.posix_process import (
@@ -45,7 +46,6 @@ from .process_cancellation_endpoint import (
     ProcessCancellationOwnerControls,
     ProcessCancellationRequest,
 )
-from .posix_process import descriptor_path
 from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupOutcome,
@@ -117,7 +117,6 @@ class _ProcessGroupSentinelInvocation(StrictWireRecord):
     process_group_id: int = Field(gt=1)
     graceful_shutdown_seconds: float = Field(gt=0)
     parent_lifetime: _SentinelParentLifetimeRecordUnion
-    lease_file_descriptors: tuple[int, ...] = ()
 
 
 class _SentinelLaunchResources:
@@ -325,7 +324,6 @@ class ProcessGroupSentinelController:
                 process_group_id=os.getpgrp(),
                 graceful_shutdown_seconds=policy.graceful_shutdown_seconds,
                 parent_lifetime=parent_lifetime,
-                lease_file_descriptors=lifetime_file_descriptors,
             )
             activation = cls._activate(
                 program,
@@ -455,6 +453,7 @@ class ProcessGroupSentinelController:
                     for descriptor in descriptors
                 ),
                 terminal=PosixProcessWithoutTerminal(),
+                standard_streams=PosixProcessDetachedStandardStreams(),
                 activation_deadline=PosixProcessConfiguredActivationDeadline(),
             )
         )

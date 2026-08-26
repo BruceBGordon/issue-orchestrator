@@ -19,8 +19,10 @@ from issue_orchestrator.domain.posix_process import (
     PosixProcessActivationDeadlinePresent,
     PosixProcessActivationPolicy,
     PosixProcessConfiguredActivationDeadline,
+    PosixProcessDetachedStandardStreams,
     PosixProcessEnvironment,
     PosixProcessGroupMode,
+    PosixProcessInheritedStandardStreams,
     PosixProcessJoinedGroupContainmentRequiredError,
     PosixProcessJoinGroup,
     PosixProcessLaunchSpec,
@@ -126,6 +128,7 @@ def _specification(
         group_mode=group,
         descriptor_mappings=mappings,
         terminal=PosixProcessWithoutTerminal(),
+        standard_streams=PosixProcessInheritedStandardStreams(),
         activation_deadline=activation_deadline,
     )
 
@@ -195,6 +198,7 @@ from issue_orchestrator.domain.posix_process import (
     PosixProcessAbsoluteActivationDeadline,
     PosixProcessActivationPolicy,
     PosixProcessEnvironment,
+    PosixProcessInheritedStandardStreams,
     PosixProcessJoinGroup,
     PosixProcessLaunchSpec,
     PosixProcessProgram,
@@ -264,6 +268,7 @@ outcome = launcher.launch(
         group_mode=PosixProcessJoinGroup(os.getpgrp()),
         descriptor_mappings=(),
         terminal=PosixProcessWithoutTerminal(),
+        standard_streams=PosixProcessInheritedStandardStreams(),
         activation_deadline=PosixProcessAbsoluteActivationDeadline(100.0),
     )
 )
@@ -348,6 +353,45 @@ def test_launcher_retains_exact_pid_session_working_directory_and_output(
         os.close(read_descriptor)
         os.close(release_read_descriptor)
         os.close(release_write_descriptor)
+        if write_descriptor >= 0:
+            os.close(write_descriptor)
+
+
+def test_terminal_free_child_detaches_unmapped_standard_descriptors(
+    tmp_path: Path,
+) -> None:
+    """A WithoutTerminal child must not retain the parent's stdio: one
+    leaked descendant holding a PTY slave would strand the master's
+    EOF-based completion watcher forever."""
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        outcome = _launcher(MaskedPosixSpawnPrimitive()).launch(
+            PosixProcessLaunchSpec(
+                program=PosixProcessProgram(
+                    (
+                        "/bin/sh",
+                        "-c",
+                        'for fd in 0 1 2; do if [ ! "/dev/fd/$fd" -ef /dev/null ];'
+                        ' then echo "fd$fd:retained" >&3; exit 1; fi; done;'
+                        " echo detached >&3",
+                    )
+                ),
+                working_directory=tmp_path,
+                environment=PosixProcessEnvironment.from_mapping(os.environ),
+                group_mode=PosixProcessGroupMode.NEW_SESSION,
+                descriptor_mappings=(PosixDescriptorMapping(write_descriptor, 3),),
+                terminal=PosixProcessWithoutTerminal(),
+                standard_streams=PosixProcessDetachedStandardStreams(),
+                activation_deadline=PosixProcessConfiguredActivationDeadline(),
+            )
+        )
+        assert type(outcome) is PosixProcessLaunchStarted
+        os.close(write_descriptor)
+        write_descriptor = -1
+        assert os.read(read_descriptor, 16_384).decode().strip() == "detached"
+        assert outcome.process.wait(2.0) == 0
+    finally:
+        os.close(read_descriptor)
         if write_descriptor >= 0:
             os.close(write_descriptor)
 
@@ -478,10 +522,12 @@ def test_child_entrypoint_rejects_malformed_exec_contract_before_activation(
 ) -> None:
     request = json.dumps(
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "arguments": arguments,
             "working_directory": str(tmp_path.resolve()),
             "inherited_file_descriptors": inherited_descriptors,
+            "standard_descriptor_mappings": [],
+            "detach_standard_streams": True,
             "activation_gate_file_descriptor": 10,
             "exec_status_file_descriptor": 11,
             "terminal": {"kind": "without-terminal"},

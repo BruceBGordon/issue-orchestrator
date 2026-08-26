@@ -49,6 +49,7 @@ from ..domain.posix_process import (
     PosixProcessGroupMode,
     PosixProcessLaunchSpec,
     PosixProcessProgram,
+    PosixProcessInheritedStandardStreams,
     PosixProcessWithoutTerminal,
 )
 from ..ports.contained_command import (
@@ -781,6 +782,7 @@ class PosixContainedCommandCapture:
                     group_mode=PosixProcessGroupMode.NEW_SESSION,
                     descriptor_mappings=pipes.descriptor_mappings,
                     terminal=PosixProcessWithoutTerminal(),
+                    standard_streams=PosixProcessInheritedStandardStreams(),
                     activation_deadline=(PosixProcessConfiguredActivationDeadline()),
                 )
             )

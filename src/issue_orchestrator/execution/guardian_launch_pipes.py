@@ -85,6 +85,7 @@ class OwnedGuardianLaunchPipes:
             start_reader=self._start.read_descriptor,
             owner_ready_writer=self._owner_ready.write_descriptor,
             parent_lifetime_reader=self._parent_lifetime.read_descriptor,
+            parent_lifetime_writer=self._parent_lifetime.write_descriptor,
         )
 
     def descriptor_mappings(
@@ -99,6 +100,7 @@ class OwnedGuardianLaunchPipes:
             child.start_reader,
             child.owner_ready_writer,
             child.parent_lifetime_reader,
+            child.parent_lifetime_writer,
         )
         if len(all_descriptors) != len(set(all_descriptors)):
             raise ValueError("guardian inherited descriptors must be unique")

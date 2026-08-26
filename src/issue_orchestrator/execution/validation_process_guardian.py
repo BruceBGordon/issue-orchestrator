@@ -23,6 +23,7 @@ from ..domain.posix_process import (
     PosixProcessGroupMode,
     PosixProcessLaunchSpec,
     PosixProcessProgram,
+    PosixProcessInheritedStandardStreams,
     PosixProcessWithoutTerminal,
 )
 from ..domain.process_group import OwnedProcessGroupLeader
@@ -485,6 +486,7 @@ class SentinelValidationProcessGuardian:
                     *resources.descriptor_mappings,
                 ),
                 terminal=PosixProcessWithoutTerminal(),
+                standard_streams=PosixProcessInheritedStandardStreams(),
                 activation_deadline=PosixProcessConfiguredActivationDeadline(),
             )
         except BaseException as error:

@@ -26,7 +26,10 @@ from ..domain.process_group import (
     ProcessSessionLeaderStale,
     ProcessSessionObservation,
 )
-from ..ports.process_identity_observer import ProcessIdentityObserver
+from ..ports.process_identity_observer import (
+    ProcessIdentityObserver,
+    ProcessSessionResolver,
+)
 
 
 class ProcessGroupObservationError(RuntimeError):
@@ -38,6 +41,14 @@ def _require_identity_observer(value: object) -> None:
         raise ValueError(
             "PsProcessGroupObserver.process_identity_observer must implement "
             "ProcessIdentityObserver"
+        )
+
+
+def _require_session_resolver(value: object) -> None:
+    if not isinstance(value, ProcessSessionResolver):
+        raise ValueError(
+            "PsProcessGroupObserver.process_session_resolver must implement "
+            "ProcessSessionResolver"
         )
 
 
@@ -67,6 +78,16 @@ class _ProcessTableEntry:
     state: str
 
 
+class GetsidProcessSessionResolver:
+    """Answer session membership from the kernel, not the ps table."""
+
+    def resolve_session(self, process_id: int) -> int | None:
+        try:
+            return os.getsid(process_id)
+        except (PermissionError, ProcessLookupError):
+            return None
+
+
 class PsProcessGroupObserver:
     """Read one portable process-table snapshot per observation."""
 
@@ -75,6 +96,7 @@ class PsProcessGroupObserver:
         ps_executable: Path,
         policy: PsProcessObservationPolicy,
         process_identity_observer: ProcessIdentityObserver,
+        process_session_resolver: ProcessSessionResolver,
     ) -> None:
         if not ps_executable.is_absolute():
             raise ValueError("PsProcessGroupObserver.ps_executable must be absolute")
@@ -86,6 +108,8 @@ class PsProcessGroupObserver:
         self._policy = policy
         _require_identity_observer(process_identity_observer)
         self._process_identity_observer = process_identity_observer
+        _require_session_resolver(process_session_resolver)
+        self._process_session_resolver = process_session_resolver
 
     def observe_process(self, process_id: int) -> ProcessIdentityObservation:
         _require_process_identifier(process_id)
@@ -136,19 +160,56 @@ class PsProcessGroupObserver:
             sorted(
                 {
                     entry.process_group_id
-                    for entry in snapshot
-                    if entry.session_id == session_id
+                    for entry in self._session_members(snapshot, session_id)
                 }
             )
         )
+
+    def _session_members(
+        self,
+        snapshot: tuple[_ProcessTableEntry, ...],
+        session_id: int,
+    ) -> tuple[_ProcessTableEntry, ...]:
+        """Session membership that survives macOS ``ps`` reporting sess=0.
+
+        Linux reports the true session id in the sess column, but macOS
+        prints 0 for every process, which would make a session full of
+        live processes observe as absent. Entries the table cannot vouch
+        for are confirmed against the kernel via ``getsid(2)``. Zombies
+        never answer ``getsid``, so they are admitted through their
+        process group instead: POSIX guarantees a process group never
+        spans sessions, so a zombie in a confirmed group is a member. A
+        group made only of zombies stays unobservable here, which is
+        containment-safe: nothing in it can run or hold a descriptor.
+        """
+        members: dict[int, _ProcessTableEntry] = {}
+        for entry in snapshot:
+            if entry.session_id == session_id:
+                members[entry.process_id] = entry
+            elif entry.session_id == 0 and not entry.state.startswith("Z"):
+                resolved = self._process_session_resolver.resolve_session(
+                    entry.process_id
+                )
+                if resolved == session_id:
+                    members[entry.process_id] = entry
+        confirmed_groups = {
+            entry.process_group_id for entry in members.values()
+        }
+        for entry in snapshot:
+            if (
+                entry.process_id not in members
+                and entry.session_id == 0
+                and entry.state.startswith("Z")
+                and entry.process_group_id in confirmed_groups
+            ):
+                members[entry.process_id] = entry
+        return tuple(members.values())
 
     def _observe_session_members(self, session_id: int) -> ProcessGroupObservation:
         snapshot = self._snapshot()
         if isinstance(snapshot, ProcessGroupPermissionDenied):
             return snapshot
-        members = tuple(
-            entry for entry in snapshot if entry.session_id == session_id
-        )
+        members = self._session_members(snapshot, session_id)
         if not members:
             return ProcessGroupAbsent()
         if all(entry.state.startswith("Z") for entry in members):

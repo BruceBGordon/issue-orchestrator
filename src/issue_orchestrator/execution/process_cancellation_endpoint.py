@@ -92,7 +92,7 @@ class ProcessCancellationOwnerControls:
                     f"ProcessCancellationOwnerControls.{field_name} must be "
                     "a non-negative integer"
                 )
-        if not isinstance(self.record_path, Path) or not self.record_path.is_absolute():
+        if not isinstance(cast(object, self.record_path), Path) or not self.record_path.is_absolute():
             raise ValueError(
                 "ProcessCancellationOwnerControls.record_path must be an "
                 "absolute Path"
