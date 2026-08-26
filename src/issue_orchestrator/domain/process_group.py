@@ -258,6 +258,21 @@ ProcessGroupWait = ProcessGroupUnboundedWait | ProcessGroupBoundedWait
 
 
 @dataclass(frozen=True, slots=True)
+class ProcessGroupTerminalCompletionAccepted:
+    """The interruption owner accepted natural completion at observation time."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessGroupTerminalInterruptionRequested:
+    """The interruption owner requested containment at terminal observation."""
+
+
+ProcessGroupTerminalDecision = (
+    ProcessGroupTerminalCompletionAccepted | ProcessGroupTerminalInterruptionRequested
+)
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessGroupCompleted:
     """Natural leader exit followed by whole-group containment and reaping."""
 

@@ -36,11 +36,15 @@ from ..domain.process_group import (
     OwnedProcessGroupLeader,
     ProcessGroupCompleted,
     ProcessGroupInterrupted,
+    ProcessGroupTerminalCompletionAccepted,
+    ProcessGroupTerminalDecision,
+    ProcessGroupTerminalInterruptionRequested,
     ProcessGroupTermination,
     ProcessGroupUnboundedWait,
 )
 from ..domain.posix_process import (
     PosixDescriptorMapping,
+    PosixProcessConfiguredActivationDeadline,
     PosixProcessEnvironment,
     PosixProcessGroupMode,
     PosixProcessLaunchSpec,
@@ -369,6 +373,11 @@ class _CapturedOutputPump(ProcessGroupInterruption):
         except BaseException as error:
             self._record_failure(error)
         return self._failure is not None
+
+    def decide_terminal_observation(self) -> ProcessGroupTerminalDecision:
+        if self._failure is None:
+            return ProcessGroupTerminalCompletionAccepted()
+        return ProcessGroupTerminalInterruptionRequested()
 
     def finalize_after_containment(self) -> _OutputPumpFinalization:
         finalization_failure: ContainedCommandFailure | None = None
@@ -772,6 +781,7 @@ class PosixContainedCommandCapture:
                     group_mode=PosixProcessGroupMode.NEW_SESSION,
                     descriptor_mappings=pipes.descriptor_mappings,
                     terminal=PosixProcessWithoutTerminal(),
+                    activation_deadline=(PosixProcessConfiguredActivationDeadline()),
                 )
             )
         except BaseException as activation_error:

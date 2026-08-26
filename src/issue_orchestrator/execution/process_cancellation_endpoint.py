@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import BinaryIO, Literal, Protocol, cast, runtime_checkable
 
 from pydantic import Field, ValidationError
 
@@ -89,6 +89,32 @@ class ProcessCancellationOwnerControls:
                 )
 
 
+@runtime_checkable
+class ProcessCancellationEndpointLeaseContract(Protocol):
+    """Parent-side cancellation endpoint ownership used by launch transactions."""
+
+    def controls(self) -> ProcessCancellationOwnerControls: ...
+
+    def transfer_after_inherited_activation(self) -> None: ...
+
+    def release_parent_after_spawn_uncertainty(self) -> None: ...
+
+    def retire(self) -> None: ...
+
+
+@runtime_checkable
+class ProcessCancellationEndpointLeaseFactory(Protocol):
+    """Acquire one typed cancellation endpoint lease for a launch."""
+
+    def create(
+        self,
+        record_path: Path,
+        record_stores: AtomicRecordStoreFactory,
+    ) -> ProcessCancellationEndpointLeaseContract:
+        """Return complete ownership or raise only after retiring partial state."""
+        ...
+
+
 class ProcessCancellationOwnerLifetime:
     """Explicit child-side owner of an inherited shared lock reference."""
 
@@ -139,6 +165,50 @@ class ProcessCancellationRequest:
         self._closed = True
 
 
+class ProcessCancellationAcceptedConnection:
+    """Own one accepted socket until nonblocking setup succeeds."""
+
+    def __init__(self, connection: socket.socket) -> None:
+        if not isinstance(cast(object, connection), socket.socket):
+            raise ValueError(
+                "ProcessCancellationAcceptedConnection.connection must be a socket"
+            )
+        try:
+            connection.setblocking(False)
+        except BaseException as primary_error:
+            raise_primary_with_cleanup(
+                "accepted cancellation connection setup and cleanup failed",
+                primary_error,
+                IndependentCleanupPlan(
+                    (
+                        CleanupAction(
+                            "accepted-connection-close",
+                            connection.close,
+                        ),
+                    )
+                ).run(),
+            )
+        self._connection = connection
+        self._transferred = False
+
+    @property
+    def connection(self) -> socket.socket:
+        if self._transferred:
+            raise RuntimeError("accepted cancellation connection was transferred")
+        return self._connection
+
+    def transfer_to_owner(self) -> socket.socket:
+        if self._transferred:
+            raise RuntimeError("accepted cancellation connection was transferred twice")
+        self._transferred = True
+        return self._connection
+
+    def close_before_transfer(self) -> None:
+        if self._transferred:
+            raise RuntimeError("transferred cancellation connection is owner-managed")
+        self._connection.close()
+
+
 class ProcessCancellationOwner:
     """Child-side listener/lifetime owner integrated into any selector loop."""
 
@@ -187,9 +257,46 @@ class ProcessCancellationOwner:
     ) -> ProcessCancellationRequest | None:
         if selectable is self._listener:
             connection, _address = self._listener.accept()
-            connection.setblocking(False)
-            self._connections.add(connection)
-            selector.register(connection, selectors.EVENT_READ, marker)
+            accepted = ProcessCancellationAcceptedConnection(connection)
+            try:
+                selector.register(
+                    accepted.connection,
+                    selectors.EVENT_READ,
+                    marker,
+                )
+            except BaseException as primary_error:
+                raise_primary_with_cleanup(
+                    "accepted cancellation connection registration and cleanup failed",
+                    primary_error,
+                    IndependentCleanupPlan(
+                        (
+                            CleanupAction(
+                                "accepted-connection-close",
+                                accepted.close_before_transfer,
+                            ),
+                        )
+                    ).run(),
+                )
+            try:
+                self._connections.add(accepted.connection)
+            except BaseException as primary_error:
+                raise_primary_with_cleanup(
+                    "accepted cancellation connection retention and cleanup failed",
+                    primary_error,
+                    IndependentCleanupPlan(
+                        (
+                            CleanupAction(
+                                "accepted-connection-unregister",
+                                lambda: selector.unregister(accepted.connection),
+                            ),
+                            CleanupAction(
+                                "accepted-connection-close",
+                                accepted.close_before_transfer,
+                            ),
+                        )
+                    ).run(),
+                )
+            accepted.transfer_to_owner()
             return None
         if not isinstance(selectable, socket.socket):
             raise ProcessCancellationEndpointError(
@@ -531,6 +638,17 @@ class ProcessCancellationEndpointLease:
         if self._endpoint is None:
             raise RuntimeError("cancellation endpoint was not created")
         return self._endpoint
+
+
+class PosixProcessCancellationEndpointLeaseFactory:
+    """Production factory for local POSIX cancellation endpoint leases."""
+
+    def create(
+        self,
+        record_path: Path,
+        record_stores: AtomicRecordStoreFactory,
+    ) -> ProcessCancellationEndpointLeaseContract:
+        return ProcessCancellationEndpointLease(record_path, record_stores)
 
 
 class ProcessCancellationInheritedEndpointActivator:

@@ -18,15 +18,21 @@ from types import FrameType
 from pydantic import ValidationError
 
 from ...domain.executor_guardian import (
+    ExecutorGuardianActivationTimedOut,
+    ExecutorGuardianBoundedBudget,
+    ExecutorGuardianBudget,
+    ExecutorGuardianCommandCompleted,
     ExecutorGuardianCommandInterrupted,
     ExecutorGuardianCommandStartFailed,
+    ExecutorGuardianCommandTimedOut,
     ExecutorGuardianInternalFailed,
     ExecutorGuardianPostContainmentError,
     ExecutorGuardianPostContainmentFailure,
     ExecutorGuardianTerminal,
     ExecutorGuardianTerminationPolicy,
+    ExecutorGuardianUnboundedBudget,
 )
-from ...domain.executor import ExecutorCommandLifecycle
+from ...domain.executor import ExecutorCommandLifecycle, ExecutorDeadlineReason
 from ...domain.process_group_sentinel import (
     ProcessGroupSentinelPolicy,
     ProcessGroupSentinelProgram,
@@ -36,16 +42,24 @@ from ...domain.process_group import (
     ProcessGroupCompleted,
     ProcessGroupInterrupted,
     ProcessGroupSupervision,
+    ProcessGroupTerminalCompletionAccepted,
+    ProcessGroupTerminalDecision,
+    ProcessGroupTerminalInterruptionRequested,
     ProcessGroupTermination,
     ProcessGroupUnboundedWait,
 )
 from ...domain.posix_process import (
+    PosixProcessActivationDeadlineAbsent,
+    PosixProcessActivationDeadlinePresent,
     PosixDescriptorMapping,
+    PosixProcessAbsoluteActivationDeadline,
+    PosixProcessConfiguredActivationDeadline,
     PosixProcessEnvironment,
     PosixProcessGroupMode,
     PosixProcessLaunchSpec,
     PosixProcessProgram,
     PosixProcessWithoutTerminal,
+    classify_posix_process_activation_deadline,
 )
 from ...ports.executor_command_guardian import ExecutorGuardianRequest
 from ...ports.atomic_record_store import AtomicRecordStoreFactory
@@ -128,10 +142,26 @@ class _GuardianActivationUncontained:
     error: BaseException
 
 
+@dataclass(frozen=True, slots=True)
+class _GuardianActivationTimedOut:
+    reason: ExecutorDeadlineReason
+    recovery_failures: tuple[ExecutorGuardianPostContainmentFailure, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.reason) is not ExecutorDeadlineReason:
+            raise ValueError("guardian activation timeout reason must be typed")
+        if type(self.recovery_failures) is not tuple or any(
+            type(failure) is not ExecutorGuardianPostContainmentFailure
+            for failure in self.recovery_failures
+        ):
+            raise ValueError("guardian activation recovery failures must be typed")
+
+
 _GuardianActivation = (
     _GuardianActivationStarted
     | _GuardianActivationContained
     | _GuardianActivationUncontained
+    | _GuardianActivationTimedOut
 )
 
 
@@ -147,6 +177,9 @@ class _NoParentInterruption:
 
     def wait_for_request(self, timeout_seconds: float) -> bool:
         return self._waiter.wait_for_request(timeout_seconds)
+
+    def decide_terminal_observation(self) -> ProcessGroupTerminalDecision:
+        return ProcessGroupTerminalCompletionAccepted()
 
 
 class _SigtermParentInterruption:
@@ -171,6 +204,11 @@ class _SigtermParentInterruption:
 
     def wait_for_request(self, timeout_seconds: float) -> bool:
         return self._requested.wait(timeout_seconds)
+
+    def decide_terminal_observation(self) -> ProcessGroupTerminalDecision:
+        if self._requested.is_set():
+            return ProcessGroupTerminalInterruptionRequested()
+        return ProcessGroupTerminalCompletionAccepted()
 
 
 _ParentInterruption = _NoParentInterruption | _SigtermParentInterruption
@@ -332,11 +370,23 @@ class PosixExecutorCommandGuardian:
         self._termination_policy = termination_policy
 
     def run(self, request: ExecutorGuardianRequest) -> ExecutorGuardianTerminal:
+        self._require_request(request)
+
+        terminal_foreground = _controlling_terminal(request.lifecycle)
+        return self._run_validated(request, terminal_foreground)
+
+    @staticmethod
+    def _require_request(request: object) -> None:
         if type(request) is not ExecutorGuardianRequest:
             raise ValueError(
                 "PosixExecutorCommandGuardian.run requires ExecutorGuardianRequest"
             )
-        terminal_foreground = _controlling_terminal(request.lifecycle)
+
+    def _run_validated(
+        self,
+        request: ExecutorGuardianRequest,
+        terminal_foreground: _ControllingTerminal,
+    ) -> ExecutorGuardianTerminal:
         pipes = self._launch_pipes_factory.create()
         cancellation_lease = self._prepare_cancellation(request, pipes)
         cancellation_controls = cancellation_lease.controls()
@@ -382,6 +432,8 @@ class PosixExecutorCommandGuardian:
                 if type(activation) is _GuardianActivationUncontained:
                     uncontained_process_id = activation.process_id
                     raise activation.error
+                if type(activation) is _GuardianActivationTimedOut:
+                    return self._activation_timeout_terminal(activation)
                 if type(activation) is not _GuardianActivationStarted:
                     raise AssertionError("guardian activation is a closed union")
                 guardian = activation.process
@@ -389,14 +441,33 @@ class PosixExecutorCommandGuardian:
                 # executor's references before publishing or starting work so
                 # a stopped outer process cannot retain machine capacity.
                 endpoints = pipes.transfer_parent_endpoints_after_launch()
-                self._await_guardian_owner_ready(
+                owner_ready = self._await_guardian_owner_ready(
                     endpoints.owner_ready_reader.fileno(),
+                    request.budget,
                 )
+                if not owner_ready:
+                    if type(request.budget) is not ExecutorGuardianBoundedBudget:
+                        raise AssertionError(
+                            "only a bounded guardian can expire before readiness"
+                        )
+                    return ExecutorGuardianActivationTimedOut(
+                        request.budget.reason,
+                        (),
+                    )
                 request.lease.transfer_to_guardian()
                 cancellation_lease.activate()
                 cancellation_lease.transfer_to_owner()
                 if interruption.requested:
                     return ExecutorGuardianCommandInterrupted(int(signal.SIGTERM))
+                if type(
+                    request.budget
+                ) is ExecutorGuardianBoundedBudget and request.budget.is_expired_at(
+                    time.monotonic()
+                ):
+                    return ExecutorGuardianActivationTimedOut(
+                        request.budget.reason,
+                        (),
+                    )
                 terminal_foreground.grant(guardian.process_id)
                 if os.write(
                     endpoints.start_writer.fileno(),
@@ -431,6 +502,18 @@ class PosixExecutorCommandGuardian:
                 primary_error,
             )
 
+    @staticmethod
+    def _activation_timeout_terminal(
+        activation: _GuardianActivationTimedOut,
+    ) -> ExecutorGuardianActivationTimedOut:
+        terminal = ExecutorGuardianActivationTimedOut(activation.reason, ())
+        if activation.recovery_failures:
+            raise ExecutorGuardianPostContainmentError(
+                terminal,
+                activation.recovery_failures,
+            )
+        return terminal
+
     def _activate_guardian(
         self,
         guardian_arguments: tuple[str, ...],
@@ -445,6 +528,12 @@ class PosixExecutorCommandGuardian:
         if type(launch) is PosixProcessLaunchStarted:
             return _GuardianActivationStarted(launch.process)
         if type(launch) is PosixProcessLaunchRejected:
+            deadline_timeout = self._activation_timeout(
+                launch.error,
+                request.budget,
+            )
+            if deadline_timeout is not None:
+                return deadline_timeout
             return _GuardianActivationContained(
                 self._launch_error(
                     f"could not start executor guardian: {launch.error!r}",
@@ -457,6 +546,12 @@ class PosixExecutorCommandGuardian:
                 self._launch_error("executor guardian exec was rejected", error)
             )
         if type(launch) is PosixProcessLaunchRecovered:
+            deadline_timeout = self._activation_timeout(
+                launch.activation_error,
+                request.budget,
+            )
+            if deadline_timeout is not None:
+                return deadline_timeout
             return _GuardianActivationContained(
                 self._launch_error(
                     "executor guardian activation was interrupted and contained",
@@ -476,6 +571,31 @@ class PosixExecutorCommandGuardian:
                 ),
             )
         raise AssertionError("POSIX process launch is a closed union")
+
+    @staticmethod
+    def _activation_timeout(
+        error: BaseException,
+        budget: ExecutorGuardianBudget,
+    ) -> _GuardianActivationTimedOut | None:
+        if type(budget) is ExecutorGuardianUnboundedBudget:
+            return None
+        if type(budget) is not ExecutorGuardianBoundedBudget:
+            raise AssertionError("guardian budget is a closed union")
+        evidence = classify_posix_process_activation_deadline(error)
+        if type(evidence) is PosixProcessActivationDeadlineAbsent:
+            return None
+        if type(evidence) is not PosixProcessActivationDeadlinePresent:
+            raise AssertionError("activation deadline evidence is a closed union")
+        return _GuardianActivationTimedOut(
+            budget.reason,
+            tuple(
+                ExecutorGuardianPostContainmentFailure(
+                    "retain guardian activation recovery failure",
+                    failure,
+                )
+                for failure in evidence.recovery_failures
+            ),
+        )
 
     @staticmethod
     def _launch_error(
@@ -677,13 +797,23 @@ class PosixExecutorCommandGuardian:
     def _await_guardian_owner_ready(
         self,
         ready_read_file_descriptor: int,
-    ) -> None:
+        budget: ExecutorGuardianBudget,
+    ) -> bool:
         deadline = time.monotonic() + self._sentinel_policy.startup_timeout_seconds
+        if type(budget) is ExecutorGuardianBoundedBudget:
+            deadline = min(deadline, budget.expires_at_monotonic)
+        elif type(budget) is not ExecutorGuardianUnboundedBudget:
+            raise AssertionError("guardian budget is a closed union")
         with selectors.DefaultSelector() as selector:
             selector.register(ready_read_file_descriptor, selectors.EVENT_READ)
             remaining = deadline - time.monotonic()
             ready = selector.select(max(0.0, remaining))
-        if not ready or time.monotonic() >= deadline:
+        observed_at_monotonic = time.monotonic()
+        if not ready or observed_at_monotonic >= deadline:
+            if type(budget) is ExecutorGuardianBoundedBudget and budget.is_expired_at(
+                observed_at_monotonic
+            ):
+                return False
             raise ExecutorGuardianLaunchError(
                 "guardian owner did not become ready before its absolute deadline"
             )
@@ -691,6 +821,7 @@ class PosixExecutorCommandGuardian:
             raise ExecutorGuardianLaunchError(
                 "guardian exited before publishing exact owner readiness"
             )
+        return True
 
     def _spawn_guardian(
         self,
@@ -704,6 +835,14 @@ class PosixExecutorCommandGuardian:
             group_mode = PosixProcessGroupMode.NEW_PROCESS_GROUP
         else:
             raise AssertionError("ExecutorCommandLifecycle is a closed enum")
+        if type(request.budget) is ExecutorGuardianUnboundedBudget:
+            activation_deadline = PosixProcessConfiguredActivationDeadline()
+        elif type(request.budget) is ExecutorGuardianBoundedBudget:
+            activation_deadline = PosixProcessAbsoluteActivationDeadline(
+                request.budget.expires_at_monotonic
+            )
+        else:
+            raise AssertionError("guardian budget is a closed union")
         return self._process_launcher.launch(
             PosixProcessLaunchSpec(
                 program=PosixProcessProgram(guardian_arguments),
@@ -712,6 +851,7 @@ class PosixExecutorCommandGuardian:
                 group_mode=group_mode,
                 descriptor_mappings=descriptor_mappings,
                 terminal=PosixProcessWithoutTerminal(),
+                activation_deadline=activation_deadline,
             )
         )
 
@@ -752,25 +892,17 @@ class PosixExecutorCommandGuardian:
         """Interpret one fully contained guardian supervision outcome."""
         terminal: ExecutorGuardianTerminal | None = None
         terminal_error: BaseException | None = None
-        if type(supervision) is ProcessGroupInterrupted:
-            terminal = ExecutorGuardianCommandInterrupted(int(signal.SIGTERM))
-        elif type(supervision) is ProcessGroupCompleted:
-            try:
-                terminal = cls._read_terminal(result_read_fd)
-                cls._require_expected_guardian_exit(
-                    supervision.termination.leader_exit_code,
-                    terminal,
-                )
-            except BaseException as error:
-                terminal_error = error
-        else:
-            raise AssertionError("an unbounded guardian wait cannot time out")
+        try:
+            terminal = cls._terminal_observed_after_supervision(
+                supervision,
+                result_read_fd,
+            )
+        except BaseException as error:
+            terminal_error = error
 
         evidence_failures: list[ExecutorGuardianPostContainmentFailure] = []
         try:
-            guardian.record_external_reap(
-                supervision.termination.leader_exit_code
-            )
+            guardian.record_external_reap(supervision.termination.leader_exit_code)
         except BaseException as error:
             evidence_failures.append(
                 ExecutorGuardianPostContainmentFailure(
@@ -805,36 +937,84 @@ class PosixExecutorCommandGuardian:
             )
         return terminal
 
-    @staticmethod
+    @classmethod
+    def _terminal_observed_after_supervision(
+        cls,
+        supervision: ProcessGroupSupervision,
+        result_read_fd: int,
+    ) -> ExecutorGuardianTerminal:
+        """Prefer a durable child fact over a racing parent interruption."""
+        if type(supervision) is ProcessGroupInterrupted:
+            terminal = cls._read_terminal_if_published(result_read_fd)
+            if terminal is None:
+                return ExecutorGuardianCommandInterrupted(int(signal.SIGTERM))
+            cls._require_expected_guardian_exit(
+                supervision.termination.leader_exit_code,
+                terminal,
+                interrupted=True,
+            )
+            return terminal
+        if type(supervision) is not ProcessGroupCompleted:
+            raise AssertionError("an unbounded guardian wait cannot time out")
+        terminal = cls._read_terminal_if_published(result_read_fd)
+        if terminal is None:
+            raise ExecutorGuardianProtocolError(
+                "executor guardian exited without a terminal record"
+            )
+        cls._require_expected_guardian_exit(
+            supervision.termination.leader_exit_code,
+            terminal,
+            interrupted=False,
+        )
+        return terminal
+
+    @classmethod
     def _require_expected_guardian_exit(
+        cls,
         guardian_exit_code: int,
         terminal: ExecutorGuardianTerminal,
+        *,
+        interrupted: bool,
     ) -> None:
-        if type(terminal) is ExecutorGuardianCommandStartFailed:
-            if guardian_exit_code != 0:
+        if interrupted and guardian_exit_code == -signal.SIGKILL:
+            if type(terminal) is ExecutorGuardianCommandInterrupted:
                 raise ExecutorGuardianProtocolError(
-                    "executor guardian command-start record requires exit code 0"
+                    "executor guardian cannot publish a synthesized interruption record"
                 )
             return
         if type(terminal) is ExecutorGuardianCommandInterrupted:
             raise ExecutorGuardianProtocolError(
                 "executor guardian cannot publish a synthesized interruption record"
             )
-        if type(terminal) is ExecutorGuardianInternalFailed:
-            if guardian_exit_code not in (1, -signal.SIGKILL):
-                raise ExecutorGuardianProtocolError(
-                    "executor guardian internal-failure record requires exit "
-                    "code 1 or a contained SIGKILL exit"
-                )
-            return
-        if guardian_exit_code != -signal.SIGKILL:
+        expected_exit_codes = cls._expected_guardian_exit_codes(terminal)
+        if guardian_exit_code not in expected_exit_codes:
             raise ExecutorGuardianProtocolError(
-                "executor guardian started-command record requires a contained "
-                "SIGKILL exit"
+                "executor guardian exit code contradicts its terminal record: "
+                f"exit={guardian_exit_code} expected={expected_exit_codes!r}"
             )
 
     @staticmethod
-    def _read_terminal(result_read_fd: int) -> ExecutorGuardianTerminal:
+    def _expected_guardian_exit_codes(
+        terminal: ExecutorGuardianTerminal,
+    ) -> tuple[int, ...]:
+        if type(terminal) in (
+            ExecutorGuardianActivationTimedOut,
+            ExecutorGuardianCommandStartFailed,
+        ):
+            return (0,)
+        if type(terminal) is ExecutorGuardianInternalFailed:
+            return (1, -signal.SIGKILL)
+        if type(terminal) in (
+            ExecutorGuardianCommandCompleted,
+            ExecutorGuardianCommandTimedOut,
+        ):
+            return (-signal.SIGKILL,)
+        raise AssertionError("guardian terminal is a closed union")
+
+    @staticmethod
+    def _read_terminal_if_published(
+        result_read_fd: int,
+    ) -> ExecutorGuardianTerminal | None:
         chunks: list[bytes] = []
         total_bytes = 0
         while True:
@@ -849,9 +1029,7 @@ class PosixExecutorCommandGuardian:
                 )
         payload = b"".join(chunks)
         if not payload:
-            raise ExecutorGuardianProtocolError(
-                "executor guardian exited without a terminal record"
-            )
+            return None
         try:
             record = GUARDIAN_TERMINAL_ADAPTER.validate_json(payload, strict=True)
         except ValidationError as error:

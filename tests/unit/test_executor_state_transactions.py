@@ -5,10 +5,11 @@ from __future__ import annotations
 import fcntl
 import os
 from pathlib import Path
-from typing import BinaryIO
+from typing import IO, Any, BinaryIO, cast
 
 import pytest
 from pydantic import BaseModel
+import issue_orchestrator.execution.posix_file_lock as posix_file_lock
 
 from issue_orchestrator.control.executor_admission import (
     ExecutorAdmissionGrant,
@@ -32,6 +33,49 @@ from issue_orchestrator.execution.host_executor._state import (
 )
 
 
+class _AtomicRecordProbe(BaseModel):
+    value: int
+
+
+class _FailingAtomicPathReplacement:
+    def replace(self, source: Path, destination: Path) -> None:
+        del source, destination
+        raise OSError("injected atomic replacement failure")
+
+
+class _CloseFailingLockHandle:
+    def __init__(self, delegate: BinaryIO) -> None:
+        self._delegate = delegate
+
+    def fileno(self) -> int:
+        return self._delegate.fileno()
+
+    def close(self) -> None:
+        self._delegate.close()
+        raise OSError("injected atomic-record lock close failure")
+
+
+class _FailOnceLeaseCloseHandle:
+    """Leave the descriptor open on the first close, then allow recovery."""
+
+    def __init__(self, delegate: BinaryIO) -> None:
+        self._delegate = delegate
+        self._close_attempts = 0
+
+    @property
+    def closed(self) -> bool:
+        return self._delegate.closed
+
+    def fileno(self) -> int:
+        return self._delegate.fileno()
+
+    def close(self) -> None:
+        self._close_attempts += 1
+        if self._close_attempts == 1:
+            raise OSError("injected lease transfer close failure")
+        self._delegate.close()
+
+
 def _work() -> QueuedExecutorWork:
     return QueuedExecutorWork(
         request_id=ExecutorRequestId("publish-once"),
@@ -43,6 +87,59 @@ def _work() -> QueuedExecutorWork:
         aggressiveness=ExecutorAggressiveness(100),
         exclusive_resources=(),
     )
+
+
+def test_atomic_record_operation_and_lock_close_failures_are_both_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = (tmp_path / "records").resolve()
+    directory.mkdir()
+    original_fdopen = posix_file_lock.os.fdopen
+    fdopen_count = 0
+
+    def fdopen_with_lock_close_failure(
+        descriptor: int,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+        closefd: bool = True,
+        opener: Any = None,
+    ) -> IO[Any]:
+        nonlocal fdopen_count
+        opened = original_fdopen(
+            descriptor,
+            mode,
+            buffering,
+            encoding,
+            errors,
+            newline,
+            closefd,
+            opener,
+        )
+        fdopen_count += 1
+        if fdopen_count != 1:
+            return opened
+        return cast(
+            BinaryIO,
+            _CloseFailingLockHandle(cast(BinaryIO, opened)),
+        )
+
+    monkeypatch.setattr(posix_file_lock.os, "fdopen", fdopen_with_lock_close_failure)
+    store = AtomicRecordStore(directory, _FailingAtomicPathReplacement())
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        store.write(
+            directory / "record.json",
+            _AtomicRecordProbe(value=1),
+        )
+
+    assert [str(error) for error in raised.value.exceptions] == [
+        "injected atomic replacement failure",
+        "injected atomic-record lock close failure",
+    ]
 
 
 def test_failed_enqueue_publication_unlinks_and_unlocks_partial_record(
@@ -155,4 +252,37 @@ def test_lease_transfer_closes_local_owner_without_unlocking_guardian_copy(
         fcntl.flock(competitor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     lease.release()
+    assert not lease_path.exists()
+
+
+def test_failed_lease_transfer_retains_local_handle_until_guardian_cleanup(
+    tmp_path: Path,
+) -> None:
+    lease_path = tmp_path / "lease-close-failure.json"
+    lease_path.write_text("{}\n", encoding="utf-8")
+    delegate = lease_path.open("r+b")
+    fcntl.flock(delegate.fileno(), fcntl.LOCK_EX)
+    guardian_descriptor = os.dup(delegate.fileno())
+    failing_handle = _FailOnceLeaseCloseHandle(delegate)
+    lease = HostExecutorLease(
+        ExecutorAdmissionGrant(concurrency=1, cpu_slots=1),
+        lease_path,
+        [cast(BinaryIO, failing_handle)],
+    )
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        lease.transfer_to_guardian()
+
+    assert [str(error) for error in raised.value.exceptions] == [
+        "injected lease transfer close failure"
+    ]
+    assert not failing_handle.closed
+    os.close(guardian_descriptor)
+    with lease_path.open("r+b") as competitor:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(competitor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lease.release()
+        fcntl.flock(competitor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    assert failing_handle.closed
     assert not lease_path.exists()

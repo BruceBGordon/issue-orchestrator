@@ -422,7 +422,11 @@ class ScriptSessionRunner:
 
     def __init__(self) -> None:
         self._last_output: dict[str, str] = {}
-        self._runner = AgentRunner()
+        from issue_orchestrator.entrypoints.bootstrap_executor import (
+            build_process_group_supervisor,
+        )
+
+        self._runner = AgentRunner(build_process_group_supervisor())
 
     def create_session(
         self,

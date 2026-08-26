@@ -245,19 +245,20 @@ class ExecutorHistoryRetentionPolicy:
 
 @dataclass(frozen=True, slots=True)
 class ExecutorCommandBudget:
-    """Finite post-admission wait and the deadline that limits it."""
+    """One absolute post-admission expiry and the deadline that selected it."""
 
-    timeout_seconds: float
+    expires_at_monotonic: float
     reason: ExecutorDeadlineReason
 
     def __post_init__(self) -> None:
         if (
-            type(self.timeout_seconds) is not float
-            or not math.isfinite(self.timeout_seconds)
-            or self.timeout_seconds <= 0
+            type(self.expires_at_monotonic) is not float
+            or not math.isfinite(self.expires_at_monotonic)
+            or self.expires_at_monotonic < 0
         ):
             raise ValueError(
-                "ExecutorCommandBudget.timeout_seconds must be finite and positive"
+                "ExecutorCommandBudget.expires_at_monotonic must be finite and "
+                "non-negative"
             )
         _require_exact_type(
             type(self).__name__, "reason", self.reason, ExecutorDeadlineReason
@@ -324,19 +325,20 @@ class ExecutorBoundedDeadline:
             submitted_at_monotonic=submitted_at_monotonic,
             observed_at_monotonic=admitted_at_monotonic,
         )
-        absolute_remaining = self.absolute_timeout_seconds - elapsed
-        if absolute_remaining <= 0:
+        absolute_expires_at = submitted_at_monotonic + self.absolute_timeout_seconds
+        if admitted_at_monotonic >= absolute_expires_at:
             raise ExecutorDeadlineExceededError(
                 ExecutorDeadlineReason.ABSOLUTE,
                 "executor absolute deadline expired at admission",
             )
-        if absolute_remaining < self.active_timeout_seconds:
+        active_expires_at = admitted_at_monotonic + self.active_timeout_seconds
+        if absolute_expires_at < active_expires_at:
             return ExecutorCommandBudget(
-                timeout_seconds=absolute_remaining,
+                expires_at_monotonic=absolute_expires_at,
                 reason=ExecutorDeadlineReason.ABSOLUTE,
             )
         return ExecutorCommandBudget(
-            timeout_seconds=self.active_timeout_seconds,
+            expires_at_monotonic=active_expires_at,
             reason=ExecutorDeadlineReason.ACTIVE,
         )
 
@@ -369,7 +371,6 @@ class ExecutorCommandLifecycle(StrEnum):
 
     DETACHED = "detached"
     INTERACTIVE_SESSION = "interactive-session"
-
 
     def require_cancellation_contract(self, cancellation: object, owner: str) -> None:
         """Enforce the one valid cancellation contract for this lifecycle."""

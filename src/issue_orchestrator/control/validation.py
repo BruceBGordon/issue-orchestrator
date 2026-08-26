@@ -19,6 +19,7 @@ from typing import Optional
 from ..domain.attempt import Attempt, AttemptKey
 from ..domain.validation_execution import (
     ContainedValidationCommand,
+    ValidationCommandOutputCapture,
     ValidationExecutionDeadline,
 )
 from ..infra.executor_deadline_environment import EXECUTOR_DEADLINE_ENVIRONMENT
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 # Schema version for validation records
 VALIDATION_SCHEMA_VERSION = VALIDATION_RECORD_SCHEMA_VERSION
+_VALIDATION_RETAINED_TAIL_BYTES = 4_194_304
 
 
 def _normalize_head_sha(head_sha: str | None) -> str | None:
@@ -76,6 +78,7 @@ class ValidationRunner:
         self,
         store: ValidationRecordStore,
         command_runner: ValidationCommandRunner,
+        timing_clock: timings.ValidationTimingClock,
     ):
         """Initialize runner with a record store.
 
@@ -85,6 +88,9 @@ class ValidationRunner:
         """
         self.store = store
         self.command_runner = command_runner
+        if type(timing_clock) is not timings.ValidationTimingClock:
+            raise ValueError("ValidationRunner.timing_clock must be exact")
+        self.timing_clock = timing_clock
 
     def run(
         self,
@@ -114,7 +120,8 @@ class ValidationRunner:
         if session_output_dir is None:
             raise ValueError("session_output_dir is required")
         cwd = (cwd or self.store.worktree).resolve()
-        started_at = datetime.now(timezone.utc)
+        started_at = self.timing_clock.wall_now()
+        monotonic_started_at = self.timing_clock.monotonic_now()
         execution_deadline = ValidationExecutionDeadline.for_active_timeout(
             timeout_seconds
         )
@@ -150,12 +157,21 @@ class ValidationRunner:
             build_runtime_tool_env(self.store.worktree),
             execution_deadline.executor_deadline,
         )
+        session_output_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = (session_output_dir / "validation-stdout.log").resolve()
+        stderr_path = (session_output_dir / "validation-stderr.log").resolve()
+        output_capture = ValidationCommandOutputCapture(
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            retained_tail_bytes=_VALIDATION_RETAINED_TAIL_BYTES,
+        )
         execution = self.command_runner.run(
             ContainedValidationCommand(
                 command=command,
                 working_directory=cwd,
                 environment=command_environment,
                 deadline=execution_deadline,
+                output_capture=output_capture,
             )
         )
         evidence = execution.evidence(execution_deadline)
@@ -165,23 +181,26 @@ class ValidationRunner:
         timed_out = evidence.timed_out
         if timed_out:
             logger.warning(
-                "Validation timed out: phase=%s active=%ds absolute=%ss outer=%ds",
+                "Validation timed out: phase=%s active=%ds absolute=%ss outer=%ss",
                 execution.timeout_phase.value,
                 timeout_seconds,
                 execution_deadline.executor_deadline.absolute_timeout_seconds,
                 execution_deadline.outer_timeout_seconds,
             )
 
-        ended_at = datetime.now(timezone.utc)
+        ended_at = self.timing_clock.wall_now()
+        monotonic_ended_at = self.timing_clock.monotonic_now()
+        timing_envelope = timings.build_timing_envelope(
+            wall_started_at=started_at,
+            monotonic_started_at=monotonic_started_at,
+            wall_ended_at=ended_at,
+            monotonic_ended_at=monotonic_ended_at,
+        )
         passed = exit_code == 0
 
-        # Write stdout/stderr files to session output dir
-        session_output_dir.mkdir(parents=True, exist_ok=True)
-        stdout_path = session_output_dir / "validation-stdout.log"
-        stderr_path = session_output_dir / "validation-stderr.log"
-        stdout_path.write_text(stdout)
-        stderr_path.write_text(stderr)
-        logger.debug("Wrote validation output to session dir: %s", session_output_dir)
+        logger.debug(
+            "Validation output journaled to session dir: %s", session_output_dir
+        )
 
         # Store paths - relative to worktree if possible, otherwise absolute
         # (prepush_check uses a temp dir outside the worktree)
@@ -225,7 +244,7 @@ class ValidationRunner:
         )
 
         # Emit validation completed event
-        duration_seconds = (ended_at - started_at).total_seconds()
+        duration_seconds = timing_envelope.monotonic_elapsed_seconds
         emit_event(
             "validation.completed",
             {
@@ -237,7 +256,12 @@ class ValidationRunner:
                 "duration_seconds": duration_seconds,
             },
         )
-        timings.record_gate_timings(suite, self.store.worktree, command, stdout, stderr)
+        timings.record_gate_timing_journals(
+            suite,
+            self.store.worktree,
+            command,
+            output_capture,
+        )
 
         return record
 
@@ -394,7 +418,7 @@ class PublishGate:
         self.timing_clock = timing_clock
         self.store = ValidationRecordStore(worktree)
         self.cache = ValidationCache(self.store)
-        self.runner = ValidationRunner(self.store, command_runner)
+        self.runner = ValidationRunner(self.store, command_runner, timing_clock)
 
     def _get_head_sha(self) -> Optional[str]:
         """Get the current HEAD SHA."""
@@ -722,6 +746,7 @@ class AgentGate:
         working_copy: WorkingCopy,
         command: Optional[str] = None,
         timeout_seconds: int = 1800,
+        timing_clock: timings.ValidationTimingClock = timings.SYSTEM_VALIDATION_TIMING_CLOCK,
     ):
         """Initialize agent gate for a worktree.
 
@@ -736,7 +761,7 @@ class AgentGate:
         self.command = command
         self.timeout_seconds = timeout_seconds
         self.store = ValidationRecordStore(worktree)
-        self.runner = ValidationRunner(self.store, command_runner)
+        self.runner = ValidationRunner(self.store, command_runner, timing_clock)
 
     def _get_head_sha(self) -> Optional[str]:
         """Get the current HEAD SHA."""

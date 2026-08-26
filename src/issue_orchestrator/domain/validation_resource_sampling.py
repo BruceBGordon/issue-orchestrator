@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
+
+from .validation_execution import ValidationCommandExecution
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +68,70 @@ class ValidationResourceSamplingPolicy:
                 "ValidationResourceSamplingPolicy.shutdown_timeout_seconds must "
                 "exceed the three sequential host-probe bounds"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationHostProbeRequest:
+    """One argv-safe host observation bounded by an active deadline."""
+
+    arguments: tuple[str, ...]
+    working_directory: Path
+    timeout_seconds: float
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.arguments) is not tuple
+            or not self.arguments
+            or type(self.arguments[0]) is not str
+            or not self.arguments[0]
+            or any(
+                type(argument) is not str or "\0" in argument
+                for argument in self.arguments
+            )
+        ):
+            raise ValueError(
+                "ValidationHostProbeRequest.arguments must be a non-empty argv tuple"
+            )
+        if (
+            not isinstance(self.working_directory, Path)
+            or not self.working_directory.is_absolute()
+        ):
+            raise ValueError(
+                "ValidationHostProbeRequest.working_directory must be absolute"
+            )
+        if (
+            type(self.timeout_seconds) is not float
+            or not math.isfinite(self.timeout_seconds)
+            or self.timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "ValidationHostProbeRequest.timeout_seconds must be finite and positive"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationHostProbeObserved:
+    """A contained host probe exited successfully with complete text evidence."""
+
+    output: str
+
+    def __post_init__(self) -> None:
+        if type(self.output) is not str:
+            raise ValueError("ValidationHostProbeObserved.output must be text")
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationHostProbeUnavailable:
+    """A contained host probe retained its exact non-success lifecycle."""
+
+    execution: ValidationCommandExecution
+
+    def __post_init__(self) -> None:
+        if type(self.execution) is not ValidationCommandExecution:
+            raise ValueError("ValidationHostProbeUnavailable.execution must be exact")
+
+
+ValidationHostProbeResult = ValidationHostProbeObserved | ValidationHostProbeUnavailable
 
 
 @dataclass(frozen=True, slots=True)

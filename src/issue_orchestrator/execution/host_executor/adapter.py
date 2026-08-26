@@ -33,6 +33,7 @@ from ...domain.executor import (
     ExecutorUnboundedDeadline,
 )
 from ...domain.executor_guardian import (
+    ExecutorGuardianActivationTimedOut,
     ExecutorGuardianBoundedBudget,
     ExecutorGuardianBudget,
     ExecutorGuardianCommandCompleted,
@@ -46,6 +47,7 @@ from ...domain.executor_guardian import (
     ExecutorGuardianPostContainmentError,
     ExecutorGuardianResourceObservationError,
     ExecutorGuardianResourceObservationFailed,
+    ExecutorGuardianSerializedFailureError,
     ExecutorGuardianTerminal,
     ExecutorGuardianUnboundedBudget,
 )
@@ -60,6 +62,7 @@ from ...ports.host_cpu_utilization import HostCpuUtilizationObserver
 from ._history import ExecutorWorkHistoryStore
 from ._host_observation import observe_host_load
 from ._journal import ExecutorEventStore
+from ._deadline import ExecutorDeadlineOwner, ExecutorDeadlineReport
 from ._repository import ExecutorRepositoryResolver
 from ._state import (
     HostAdmissionGranted,
@@ -110,6 +113,14 @@ def _require_command_guardian(value: object) -> None:
         )
 
 
+def _require_deadline_owner(value: object) -> ExecutorDeadlineOwner:
+    if not isinstance(value, ExecutorDeadlineOwner):
+        raise ValueError(
+            "HostExecutor.deadline_owner must implement ExecutorDeadlineOwner"
+        )
+    return value
+
+
 def _require_history_retention_lock(value: object) -> None:
     if not isinstance(value, ExecutorHistoryRetentionLock):
         raise ValueError(
@@ -138,6 +149,7 @@ class HostExecutor(Executor):
         host_cpu_observer: HostCpuUtilizationObserver,
         request_identity_factory: ExecutorRequestIdentityFactory,
         command_guardian: ExecutorCommandGuardian,
+        deadline_owner: ExecutorDeadlineOwner,
         atomic_path_replacement: AtomicPathReplacement,
         history_retention_lock: ExecutorHistoryRetentionLock,
         history_retention_policy: ExecutorHistoryRetentionPolicy,
@@ -175,6 +187,7 @@ class HostExecutor(Executor):
         self._request_identity_factory = request_identity_factory
         _require_command_guardian(command_guardian)
         self._command_guardian = command_guardian
+        self._deadline_owner = _require_deadline_owner(deadline_owner)
         if type(history_retention_policy) is not ExecutorHistoryRetentionPolicy:
             raise ValueError(
                 "HostExecutor.history_retention_policy must be an "
@@ -283,20 +296,17 @@ class HostExecutor(Executor):
                         "an unbounded executor command cannot exceed admission deadline"
                     ) from exc
                 elapsed = time.monotonic() - submitted_at_monotonic
-                self._events.admission_deadline_exceeded(
-                    identity,
-                    work,
-                    deadline,
-                    elapsed,
+                self._deadline_owner.admission_exceeded(
+                    ExecutorDeadlineReport(
+                        identity=identity,
+                        work=work,
+                        deadline=deadline,
+                        reason=exc.reason,
+                        phase=ExecutorDeadlinePhase.ADMISSION,
+                        elapsed_seconds=elapsed,
+                    ),
+                    exc,
                 )
-                self._report_deadline_exceeded(
-                    identity=identity,
-                    work=work,
-                    deadline=deadline,
-                    reason=exc.reason,
-                    phase=ExecutorDeadlinePhase.ADMISSION,
-                )
-                raise
         except BaseException as queue_body_error:
             owned_request.release_after_failure(queue_body_error)
         owned_request.release_after_grant(lease)
@@ -485,13 +495,11 @@ class HostExecutor(Executor):
             ExecutorGuardianUnboundedBudget()
             if command_budget is None
             else ExecutorGuardianBoundedBudget(
-                command_budget.timeout_seconds,
+                command_budget.expires_at_monotonic,
                 command_budget.reason,
             )
         )
-        post_containment_failures: tuple[
-            ExecutorCommandFinalizationFailure, ...
-        ] = ()
+        post_containment_failures: tuple[ExecutorCommandFinalizationFailure, ...] = ()
         try:
             terminal = self._command_guardian.run(
                 ExecutorGuardianRequest(
@@ -551,9 +559,7 @@ class HostExecutor(Executor):
         guardian_budget: ExecutorGuardianBudget,
         terminal: ExecutorGuardianTerminal,
         started_at_monotonic: float,
-        post_containment_failures: tuple[
-            ExecutorCommandFinalizationFailure, ...
-        ],
+        post_containment_failures: tuple[ExecutorCommandFinalizationFailure, ...],
     ) -> FinalizableExecutorCommand:
         """Translate one contained guardian outcome into executor semantics."""
         if type(terminal) is ExecutorGuardianCommandCompleted:
@@ -590,30 +596,37 @@ class HostExecutor(Executor):
                     *self._finalization_failures(publication),
                 ),
             )
-        if type(terminal) is ExecutorGuardianCommandTimedOut:
-            if type(guardian_budget) is not ExecutorGuardianBoundedBudget:
-                raise AssertionError("an unbounded executor command cannot time out")
-            if not isinstance(command.deadline, ExecutorBoundedDeadline):
-                raise AssertionError(
-                    "a timed-out executor command must have a bounded deadline"
+        if type(terminal) is ExecutorGuardianActivationTimedOut:
+            activation_recovery_failures = tuple(
+                ExecutorCommandFinalizationFailure(
+                    failure.operation,
+                    ExecutorGuardianSerializedFailureError(failure),
                 )
-            failures = self._record_command_deadline(
-                identity,
-                work,
-                lease,
-                command.deadline,
-                terminal.reason,
-                time.monotonic() - started_at_monotonic,
+                for failure in terminal.recovery_failures
             )
-            return FinalizableExecutorCommand(
-                ExecutorCommandWithoutResourceObservation(
-                    124,
-                    lease.grant,
-                    ExecutorCommandResourceObservationNotApplicable(
-                        ExecutorResourceObservationOmissionReason.DEADLINE
-                    ),
+            return self._timed_out_guardian_command(
+                identity=identity,
+                work=work,
+                lease=lease,
+                command=command,
+                guardian_budget=guardian_budget,
+                reason=terminal.reason,
+                started_at_monotonic=started_at_monotonic,
+                post_containment_failures=(
+                    *post_containment_failures,
+                    *activation_recovery_failures,
                 ),
-                (*post_containment_failures, *failures),
+            )
+        if type(terminal) is ExecutorGuardianCommandTimedOut:
+            return self._timed_out_guardian_command(
+                identity=identity,
+                work=work,
+                lease=lease,
+                command=command,
+                guardian_budget=guardian_budget,
+                reason=terminal.reason,
+                started_at_monotonic=started_at_monotonic,
+                post_containment_failures=post_containment_failures,
             )
         if type(terminal) is ExecutorGuardianCommandStartFailed:
             error: RuntimeError = ExecutorGuardianCommandStartError(terminal)
@@ -645,6 +658,44 @@ class HostExecutor(Executor):
             )
         raise error
 
+    def _timed_out_guardian_command(
+        self,
+        *,
+        identity: ExecutorWorkIdentity,
+        work: QueuedExecutorWork,
+        lease: HostExecutorLease,
+        command: ExecutorCommand,
+        guardian_budget: ExecutorGuardianBudget,
+        reason: ExecutorDeadlineReason,
+        started_at_monotonic: float,
+        post_containment_failures: tuple[ExecutorCommandFinalizationFailure, ...],
+    ) -> FinalizableExecutorCommand:
+        """Finalize either pre-activation or active-command deadline expiry."""
+        if type(guardian_budget) is not ExecutorGuardianBoundedBudget:
+            raise AssertionError("an unbounded executor command cannot time out")
+        if not isinstance(command.deadline, ExecutorBoundedDeadline):
+            raise AssertionError(
+                "a timed-out executor command must have a bounded deadline"
+            )
+        failures = self._record_command_deadline(
+            identity,
+            work,
+            lease,
+            command.deadline,
+            reason,
+            time.monotonic() - started_at_monotonic,
+        )
+        return FinalizableExecutorCommand(
+            ExecutorCommandWithoutResourceObservation(
+                124,
+                lease.grant,
+                ExecutorCommandResourceObservationNotApplicable(
+                    ExecutorResourceObservationOmissionReason.DEADLINE
+                ),
+            ),
+            (*post_containment_failures, *failures),
+        )
+
     @staticmethod
     def _completed_guardian_command(
         terminal: ExecutorGuardianCommandCompleted,
@@ -653,21 +704,21 @@ class HostExecutor(Executor):
     ) -> FinalizableExecutorCommand:
         resources = terminal.resources
         if type(resources) is ExecutorGuardianCommandResourceUsage:
-            command: ExecutedExecutorCommand | ExecutorCommandWithoutResourceObservation = (
-                ExecutedExecutorCommand(
-                    terminal.exit_code,
-                    grant,
-                    ExecutorResourceObservation(
-                        concurrency=grant.concurrency,
-                        wall_seconds=resources.wall_seconds,
-                        cpu_seconds=resources.cpu_seconds,
-                        guardian_process_lifetime_children_max_rss_bytes=(
-                            resources.guardian_process_lifetime_children_max_rss_bytes
-                        ),
-                        input_blocks=resources.input_blocks,
-                        output_blocks=resources.output_blocks,
+            command: (
+                ExecutedExecutorCommand | ExecutorCommandWithoutResourceObservation
+            ) = ExecutedExecutorCommand(
+                terminal.exit_code,
+                grant,
+                ExecutorResourceObservation(
+                    concurrency=grant.concurrency,
+                    wall_seconds=resources.wall_seconds,
+                    cpu_seconds=resources.cpu_seconds,
+                    guardian_process_lifetime_children_max_rss_bytes=(
+                        resources.guardian_process_lifetime_children_max_rss_bytes
                     ),
-                )
+                    input_blocks=resources.input_blocks,
+                    output_blocks=resources.output_blocks,
+                ),
             )
         elif type(resources) is ExecutorGuardianResourceObservationFailed:
             command = ExecutorCommandWithoutResourceObservation(
@@ -707,12 +758,15 @@ class HostExecutor(Executor):
                     ),
                     CleanupAction(
                         "report executor command deadline",
-                        lambda: self._report_deadline_exceeded(
-                            identity=identity,
-                            work=work,
-                            deadline=deadline,
-                            reason=reason,
-                            phase=ExecutorDeadlinePhase.COMMAND,
+                        lambda: self._deadline_owner.report(
+                            ExecutorDeadlineReport(
+                                identity=identity,
+                                work=work,
+                                deadline=deadline,
+                                reason=reason,
+                                phase=ExecutorDeadlinePhase.COMMAND,
+                                elapsed_seconds=elapsed_seconds,
+                            )
                         ),
                     ),
                 )
@@ -758,27 +812,6 @@ class HostExecutor(Executor):
         return deadline.command_budget(
             submitted_at_monotonic=submitted_at_monotonic,
             admitted_at_monotonic=time.monotonic(),
-        )
-
-    @staticmethod
-    def _report_deadline_exceeded(
-        *,
-        identity: ExecutorWorkIdentity,
-        work: QueuedExecutorWork,
-        deadline: ExecutorBoundedDeadline,
-        reason: ExecutorDeadlineReason,
-        phase: ExecutorDeadlinePhase,
-    ) -> None:
-        print(
-            "[executor] deadline-exceeded "
-            f"work={identity.work_key.value} "
-            f"group={work.fairness_group.value} "
-            f"phase={phase.value} "
-            f"reason={reason.value} "
-            f"active_timeout={deadline.active_timeout_seconds:.3f}s "
-            f"absolute_timeout={deadline.absolute_timeout_seconds:.3f}s",
-            file=sys.stderr,
-            flush=True,
         )
 
     def _report_admission(

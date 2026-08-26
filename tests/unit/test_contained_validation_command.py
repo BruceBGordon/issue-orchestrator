@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import signal
 import sys
+import threading
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from shlex import join as shell_join
 from shlex import quote as shell_quote
@@ -23,6 +24,9 @@ from issue_orchestrator.domain.executor import (
 from issue_orchestrator.domain.process_group import (
     OwnedProcessGroupLeader,
     ProcessGroupSupervision,
+    ProcessGroupTerminalCompletionAccepted,
+    ProcessGroupTerminalDecision,
+    ProcessGroupTerminalInterruptionRequested,
     ProcessGroupTermination,
     ProcessGroupWait,
 )
@@ -37,10 +41,11 @@ from issue_orchestrator.domain.validation_execution import (
     ValidationCommandDeadlineTracker,
     ValidationCommandCleanupFailed,
     ValidationCommandExited,
-    ValidationCommandOutput,
+    ValidationCommandOutputCapture,
     ValidationCommandNotStarted,
     ValidationCommandTimedOut,
     ValidationCommandTimeoutPhase,
+    ValidationDeadlineObservationClock,
     ValidationExecutionDeadline,
     ValidationGuardianClock,
 )
@@ -57,6 +62,7 @@ from issue_orchestrator.execution.process_group_terminator import (
 from issue_orchestrator.domain.posix_process import (
     PosixDescriptorMapping,
     PosixProcessActivationPolicy,
+    PosixProcessConfiguredActivationDeadline,
     PosixProcessEnvironment,
     PosixProcessGroupMode,
     PosixProcessLaunchSpec,
@@ -67,6 +73,7 @@ from issue_orchestrator.execution.posix_pipe import OsPosixPipeFactory
 from issue_orchestrator.execution.posix_process import (
     MaskedPosixSpawnPrimitive,
     RetainedPosixProcessLauncher,
+    SystemPosixProcessActivationClock,
 )
 from issue_orchestrator.execution.validation_launch_pipes import (
     PosixValidationLaunchPipesFactory,
@@ -74,8 +81,13 @@ from issue_orchestrator.execution.validation_launch_pipes import (
 from issue_orchestrator.execution.validation_pipe_resources import (
     default_validation_pipe_selector,
 )
+from issue_orchestrator.execution.validation_output_journal import (
+    PosixValidationOutputJournalFactory,
+)
 from issue_orchestrator.execution.validation_process_guardian import (
     SentinelValidationProcessGuardian,
+    ValidationGuardianStartupDeadlineOwner,
+    ValidationGuardianStartupPhase,
     ValidationProcessGuardianProgram,
 )
 from issue_orchestrator.ports.process_group_supervisor import (
@@ -89,6 +101,12 @@ from issue_orchestrator.ports.validation_pipe_capture import (
     ValidationPipeCapture,
     ValidationPipeCaptureFactory,
     ValidationPipeCaptureResult,
+)
+from issue_orchestrator.ports.validation_output_journal import (
+    ValidationOutputJournal,
+    ValidationOutputJournalFactory,
+    ValidationOutputJournalResult,
+    ValidationOutputStream,
 )
 from issue_orchestrator.ports.validation_launch_pipes import (
     ValidationLaunchPipes,
@@ -118,6 +136,7 @@ from tests.process_completion_fixture import (
     TextProcessInvocation,
     build_test_process_group_observer,
 )
+from tests.unit.threading_helpers import run_in_thread, wait_for_event
 from tests.posix_process_fixture import ReapEvidenceFailingProcessLauncher
 
 
@@ -126,10 +145,23 @@ def test_not_started_terminal_requires_exact_exception_evidence() -> None:
         ValidationCommandNotStarted(cast(BaseException, None))
 
 
+def _output_capture(
+    root: Path, retained_tail_bytes: int = 4096
+) -> ValidationCommandOutputCapture:
+    return ValidationCommandOutputCapture(
+        (root / "validation-stdout.log").resolve(),
+        (root / "validation-stderr.log").resolve(),
+        retained_tail_bytes,
+    )
+
+
 def _runner() -> PosixContainedValidationCommandRunner:
     return _runner_with(
         _production_supervisor(),
-        PosixValidationPipeCaptureFactory(default_validation_pipe_selector),
+        PosixValidationPipeCaptureFactory(
+            default_validation_pipe_selector,
+            ValidationDeadlineObservationClock(time.monotonic),
+        ),
     )
 
 
@@ -166,6 +198,7 @@ def _runner_with_launch_pipes(
         ),
         capture_factory,
         launch_pipes_factory,
+        PosixValidationOutputJournalFactory(),
     )
 
 
@@ -187,6 +220,7 @@ def _validation_process_launcher(
             graceful_shutdown_seconds=0.05,
             forceful_shutdown_seconds=1.0,
         ),
+        SystemPosixProcessActivationClock(),
     )
 
 
@@ -198,8 +232,30 @@ def _runner_with_process_launcher(
         _validation_process_guardian(process_launcher, supervisor),
         supervisor,
         ContainedCommandOutputPolicy(0.01, 1.0, 1_048_576),
-        PosixValidationPipeCaptureFactory(default_validation_pipe_selector),
+        PosixValidationPipeCaptureFactory(
+            default_validation_pipe_selector,
+            ValidationDeadlineObservationClock(time.monotonic),
+        ),
         PosixValidationLaunchPipesFactory(OsPosixPipeFactory()),
+        PosixValidationOutputJournalFactory(),
+    )
+
+
+def _runner_with_output_journal(
+    output_journal_factory: ValidationOutputJournalFactory,
+) -> PosixContainedValidationCommandRunner:
+    supervisor = _production_supervisor()
+    process_launcher = _validation_process_launcher(supervisor)
+    return PosixContainedValidationCommandRunner(
+        _validation_process_guardian(process_launcher, supervisor),
+        supervisor,
+        ContainedCommandOutputPolicy(0.01, 1.0, 1_048_576),
+        PosixValidationPipeCaptureFactory(
+            default_validation_pipe_selector,
+            ValidationDeadlineObservationClock(time.monotonic),
+        ),
+        PosixValidationLaunchPipesFactory(OsPosixPipeFactory()),
+        output_journal_factory,
     )
 
 
@@ -242,6 +298,59 @@ def _production_supervisor() -> PosixProcessGroupSupervisor:
     )
 
 
+@dataclass(slots=True)
+class _SequenceValidationGuardianClock:
+    observations: tuple[float, ...]
+    _index: int = field(default=0, init=False)
+
+    def monotonic_now(self) -> float:
+        if self._index >= len(self.observations):
+            raise AssertionError("validation guardian clock was observed too often")
+        observation = self.observations[self._index]
+        self._index += 1
+        return observation
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (
+        ValidationGuardianStartupPhase.READINESS,
+        ValidationGuardianStartupPhase.EXEC_STATUS,
+    ),
+)
+@pytest.mark.parametrize(
+    ("observations", "select_succeeds", "read_succeeds"),
+    (
+        ((99.998, 99.999), True, True),
+        ((99.999, 100.0), True, False),
+        ((100.001,), False, False),
+    ),
+)
+def test_guardian_startup_deadline_owns_select_to_read_boundary(
+    phase: ValidationGuardianStartupPhase,
+    observations: tuple[float, ...],
+    select_succeeds: bool,
+    read_succeeds: bool,
+) -> None:
+    clock = _SequenceValidationGuardianClock(observations)
+    owner = ValidationGuardianStartupDeadlineOwner(
+        ValidationGuardianClock(clock.monotonic_now),
+        100.0,
+    )
+
+    if not select_succeeds:
+        with pytest.raises(TimeoutError, match=phase.value):
+            owner.remaining_before_select(phase)
+        return
+
+    assert owner.remaining_before_select(phase) > 0
+    if read_succeeds:
+        owner.accept_after_read(phase)
+    else:
+        with pytest.raises(TimeoutError, match=phase.value):
+            owner.accept_after_read(phase)
+
+
 def _exception_messages(error: BaseException) -> tuple[str, ...]:
     if isinstance(error, BaseExceptionGroup):
         return tuple(
@@ -257,13 +366,18 @@ class _FailingCapture:
         self,
         streams: tuple[PosixPipeReader, PosixPipeReader, PosixPipeReader],
         failure: BaseException,
+        output_journal: ValidationOutputJournal,
     ) -> None:
         self._streams = streams
         self._failure = failure
+        self._output_journal = output_journal
 
     def wait_for_request(self, timeout_seconds: float) -> bool:
         del timeout_seconds
         return False
+
+    def decide_terminal_observation(self) -> ProcessGroupTerminalDecision:
+        return ProcessGroupTerminalCompletionAccepted()
 
     @property
     def deadline_status(self) -> ValidationCommandDeadlinePending:
@@ -272,10 +386,14 @@ class _FailingCapture:
     def finalize(self) -> ValidationPipeCaptureResult:
         for stream in self._streams:
             stream.close()
-        return ValidationPipeCaptureResult(
-            ValidationCommandOutput("", ""),
-            self._failure,
-        )
+        journal_result = self._output_journal.finalize()
+        failure = self._failure
+        if journal_result.failure is not None:
+            failure = BaseExceptionGroup(
+                "injected capture and journal finalization both failed",
+                (failure, journal_result.failure),
+            )
+        return ValidationPipeCaptureResult(journal_result.output, failure)
 
 
 class _FailingCaptureFactory:
@@ -290,15 +408,20 @@ class _FailingCaptureFactory:
         policy: ContainedCommandOutputPolicy,
         deadline: ValidationExecutionDeadline,
         started_at_monotonic: float,
+        output_journal: ValidationOutputJournal,
     ) -> ValidationPipeCapture:
         del policy, deadline, started_at_monotonic
         return _FailingCapture(
             (stdout, stderr, handshake_reader),
             self._failure,
+            output_journal,
         )
 
 
+@dataclass(slots=True)
 class _SetupFailingCaptureFactory:
+    transferred_descriptors: list[int]
+
     def create(
         self,
         stdout: PosixPipeReader,
@@ -307,11 +430,72 @@ class _SetupFailingCaptureFactory:
         policy: ContainedCommandOutputPolicy,
         deadline: ValidationExecutionDeadline,
         started_at_monotonic: float,
+        output_journal: ValidationOutputJournal,
     ) -> ValidationPipeCapture:
-        del policy, deadline, started_at_monotonic
+        del policy, deadline, started_at_monotonic, output_journal
         for stream in (stdout, stderr, handshake_reader):
-            stream.close()
+            self.transferred_descriptors.append(stream.fileno())
         raise RuntimeError("injected validation capture setup failure")
+
+
+@dataclass(frozen=True, slots=True)
+class _CloseFailingPipeReader(PosixPipeReader):
+    delegate: PosixPipeReader
+    failure: RuntimeError
+
+    def fileno(self) -> int:
+        return self.delegate.fileno()
+
+    def close(self) -> None:
+        self.delegate.close()
+        raise self.failure
+
+
+@dataclass(frozen=True, slots=True)
+class _ReaderCloseFailingValidationLaunchPipes(ValidationLaunchPipes):
+    delegate: ValidationLaunchPipes
+    failures: tuple[RuntimeError, RuntimeError, RuntimeError]
+    transferred_descriptors: list[int]
+
+    @property
+    def descriptor_mappings(self) -> tuple[PosixDescriptorMapping, ...]:
+        return self.delegate.descriptor_mappings
+
+    def child_environment(
+        self,
+        base_environment: Mapping[str, str],
+    ) -> PosixProcessEnvironment:
+        return self.delegate.child_environment(base_environment)
+
+    def transfer_readers_after_launch(self) -> ValidationLaunchReaders:
+        readers = self.delegate.transfer_readers_after_launch()
+        raw_readers = (
+            readers.stdout,
+            readers.stderr,
+            readers.executor_handshake,
+        )
+        self.transferred_descriptors.extend(reader.fileno() for reader in raw_readers)
+        wrapped = tuple(
+            _CloseFailingPipeReader(reader, failure)
+            for reader, failure in zip(raw_readers, self.failures, strict=True)
+        )
+        return ValidationLaunchReaders(*wrapped)
+
+    def close(self) -> ValidationLaunchPipesClose:
+        return self.delegate.close()
+
+
+@dataclass(frozen=True, slots=True)
+class _ReaderCloseFailingValidationLaunchPipesFactory(ValidationLaunchPipesFactory):
+    failures: tuple[RuntimeError, RuntimeError, RuntimeError]
+    transferred_descriptors: list[int]
+
+    def create(self) -> ValidationLaunchPipes:
+        return _ReaderCloseFailingValidationLaunchPipes(
+            PosixValidationLaunchPipesFactory(OsPosixPipeFactory()).create(),
+            self.failures,
+            self.transferred_descriptors,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +551,136 @@ class _SupervisionFailingOwner(ProcessGroupSupervisor):
         return self._delegate.abort(leader)
 
 
+@dataclass(frozen=True, slots=True)
+class _ObservingValidationOutputJournal(ValidationOutputJournal):
+    delegate: ValidationOutputJournal
+    append_observed: threading.Event
+
+    def append(self, stream: ValidationOutputStream, payload: bytes) -> None:
+        self.delegate.append(stream, payload)
+        self.append_observed.set()
+
+    def finalize(self) -> ValidationOutputJournalResult:
+        return self.delegate.finalize()
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservingValidationOutputJournalFactory(ValidationOutputJournalFactory):
+    append_observed: threading.Event
+
+    def create(
+        self,
+        capture: ValidationCommandOutputCapture,
+    ) -> ValidationOutputJournal:
+        return _ObservingValidationOutputJournal(
+            PosixValidationOutputJournalFactory().create(capture),
+            self.append_observed,
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX streaming output")
+@pytest.mark.timeout(10)
+def test_output_prefix_is_journaled_before_delayed_child_is_released(
+    tmp_path: Path,
+) -> None:
+    child_pid_path = (tmp_path / "streaming-child.pid").resolve()
+    output_capture = _output_capture(tmp_path)
+    append_observed = threading.Event()
+    program = (
+        "import os,signal\n"
+        "from pathlib import Path\n"
+        "released=False\n"
+        "def release(signum, frame):\n"
+        "    global released\n"
+        "    released=True\n"
+        "signal.signal(signal.SIGUSR1, release)\n"
+        f"Path({str(child_pid_path)!r}).write_text(str(os.getpid()))\n"
+        "os.write(1, b'prefix-before-release\\n')\n"
+        "while not released:\n"
+        "    signal.pause()\n"
+        "os.write(1, b'suffix-after-release\\n')\n"
+    )
+    runner = _runner_with_output_journal(
+        _ObservingValidationOutputJournalFactory(append_observed)
+    )
+    validation_thread, validation_result = run_in_thread(
+        runner.run,
+        ContainedValidationCommand(
+            command=f"exec {shell_quote(sys.executable)} -c {shell_quote(program)}",
+            working_directory=tmp_path.resolve(),
+            environment=os.environ,
+            deadline=ValidationExecutionDeadline.for_active_timeout(5),
+            output_capture=output_capture,
+        ),
+    )
+    try:
+        wait_for_event(
+            append_observed,
+            PROCESS_COMPLETION_WATCHDOG.timeout_seconds,
+            label="validation output append",
+        )
+        assert validation_thread.is_alive()
+        assert output_capture.stdout_path.read_text(encoding="utf-8") == (
+            "prefix-before-release\n"
+        )
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        os.kill(child_pid, signal.SIGUSR1)
+        PROCESS_COMPLETION_WATCHDOG.join_thread(
+            validation_thread,
+            operation="released streaming validation",
+        )
+    finally:
+        if validation_thread.is_alive() and child_pid_path.exists():
+            os.kill(int(child_pid_path.read_text(encoding="utf-8")), signal.SIGKILL)
+            PROCESS_COMPLETION_WATCHDOG.join_thread(
+                validation_thread,
+                operation="streaming validation cleanup",
+            )
+
+    result = validation_result.unwrap()
+    assert type(result.child) is ValidationCommandExited
+    assert result.child.exit_code == 0
+    assert result.output.stdout == "prefix-before-release\nsuffix-after-release\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX streaming output")
+@pytest.mark.timeout(10)
+def test_noisy_output_is_complete_on_disk_and_bounded_in_memory(tmp_path: Path) -> None:
+    retained_tail_bytes = 1024
+    output_capture = _output_capture(tmp_path, retained_tail_bytes)
+    noisy_bytes = 2_000_000
+    program = (
+        "import os; "
+        f"os.write(1,b'a'*{noisy_bytes}); "
+        "os.write(1,b'OUT-END'); "
+        f"os.write(2,b'b'*{noisy_bytes}); "
+        "os.write(2,b'ERR-END')"
+    )
+
+    result = _runner().run(
+        ContainedValidationCommand(
+            command=f"exec {shell_quote(sys.executable)} -c {shell_quote(program)}",
+            working_directory=tmp_path.resolve(),
+            environment=os.environ,
+            deadline=ValidationExecutionDeadline.for_active_timeout(5),
+            output_capture=output_capture,
+        )
+    )
+
+    assert type(result.child) is ValidationCommandExited
+    assert result.child.exit_code == 0
+    assert output_capture.stdout_path.stat().st_size == noisy_bytes + len(b"OUT-END")
+    assert output_capture.stderr_path.stat().st_size == noisy_bytes + len(b"ERR-END")
+    assert output_capture.stdout_path.read_bytes().endswith(b"OUT-END")
+    assert output_capture.stderr_path.read_bytes().endswith(b"ERR-END")
+    assert result.output.stdout.startswith("[VALIDATION OUTPUT TRUNCATED:")
+    assert result.output.stderr.startswith("[VALIDATION OUTPUT TRUNCATED:")
+    assert result.output.stdout.endswith("OUT-END")
+    assert result.output.stderr.endswith("ERR-END")
+    assert len(result.output.stdout.encode()) < retained_tail_bytes + 128
+    assert len(result.output.stderr.encode()) < retained_tail_bytes + 128
+
+
 @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process containment")
 @pytest.mark.timeout(10)
 def test_timeout_contains_term_resistant_descendant_before_return(
@@ -385,6 +699,7 @@ def test_timeout_contains_term_resistant_descendant_before_return(
             command=command,
             working_directory=tmp_path.resolve(),
             environment=os.environ,
+            output_capture=_output_capture(tmp_path),
             deadline=ValidationExecutionDeadline.for_active_timeout(1),
         )
     )
@@ -419,9 +734,10 @@ def test_nested_executor_handshake_yields_to_outer_deadline(tmp_path: Path) -> N
             command=command,
             working_directory=tmp_path.resolve(),
             environment=os.environ,
+            output_capture=_output_capture(tmp_path),
             deadline=ValidationExecutionDeadline(
                 ExecutorBoundedDeadline(1.0, 2.0),
-                outer_timeout_seconds=3,
+                outer_timeout_seconds=3.0,
             ),
         )
     )
@@ -453,9 +769,10 @@ def test_nested_executor_outer_deadline_starts_at_handshake(tmp_path: Path) -> N
             command=command,
             working_directory=tmp_path.resolve(),
             environment=os.environ,
+            output_capture=_output_capture(tmp_path),
             deadline=ValidationExecutionDeadline(
                 ExecutorBoundedDeadline(2.0, 2.1),
-                outer_timeout_seconds=3,
+                outer_timeout_seconds=3.0,
             ),
         )
     )
@@ -480,7 +797,7 @@ def test_executor_acknowledgement_respects_exact_active_deadline_boundary(
 ) -> None:
     deadline = ValidationExecutionDeadline(
         ExecutorBoundedDeadline(2.0, 4.0),
-        outer_timeout_seconds=5,
+        outer_timeout_seconds=5.0,
     )
     tracker = ValidationCommandDeadlineTracker(deadline, 100.0)
 
@@ -494,10 +811,70 @@ def test_executor_acknowledgement_respects_exact_active_deadline_boundary(
     assert status.phase is expected_phase
 
 
+@pytest.mark.parametrize(
+    ("observed_at", "expected_decision", "expected_status"),
+    (
+        (
+            101.999,
+            ProcessGroupTerminalCompletionAccepted,
+            ValidationCommandDeadlinePending,
+        ),
+        (
+            102.0,
+            ProcessGroupTerminalInterruptionRequested,
+            ValidationCommandDeadlineExceeded,
+        ),
+        (
+            102.001,
+            ProcessGroupTerminalInterruptionRequested,
+            ValidationCommandDeadlineExceeded,
+        ),
+    ),
+)
+def test_terminal_observation_rechecks_exact_validation_deadline_boundary(
+    tmp_path: Path,
+    observed_at: float,
+    expected_decision: type[
+        ProcessGroupTerminalCompletionAccepted
+        | ProcessGroupTerminalInterruptionRequested
+    ],
+    expected_status: type[
+        ValidationCommandDeadlinePending | ValidationCommandDeadlineExceeded
+    ],
+) -> None:
+    launch_pipes = PosixValidationLaunchPipesFactory(OsPosixPipeFactory()).create()
+    readers = launch_pipes.transfer_readers_after_launch()
+    output_journal = PosixValidationOutputJournalFactory().create(
+        _output_capture(tmp_path)
+    )
+    capture = PosixValidationPipeCaptureFactory(
+        default_validation_pipe_selector,
+        ValidationDeadlineObservationClock(lambda: observed_at),
+    ).create(
+        readers.stdout,
+        readers.stderr,
+        readers.executor_handshake,
+        ContainedCommandOutputPolicy(0.01, 1.0, 1_048_576),
+        ValidationExecutionDeadline(
+            ExecutorBoundedDeadline(2.0, 4.0),
+            outer_timeout_seconds=5.0,
+        ),
+        100.0,
+        output_journal,
+    )
+    try:
+        decision = capture.decide_terminal_observation()
+        assert type(decision) is expected_decision
+        assert type(capture.deadline_status) is expected_status
+    finally:
+        finalization = capture.finalize()
+        assert finalization.failure is None
+
+
 def test_timely_acknowledgement_anchors_complete_outer_deadline() -> None:
     deadline = ValidationExecutionDeadline(
         ExecutorBoundedDeadline(2.0, 4.0),
-        outer_timeout_seconds=5,
+        outer_timeout_seconds=5.0,
     )
     tracker = ValidationCommandDeadlineTracker(deadline, 100.0)
     tracker.acknowledge_executor(101.5)
@@ -527,9 +904,10 @@ def test_nested_executor_remains_bounded_by_outer_deadline(tmp_path: Path) -> No
             command=command,
             working_directory=tmp_path.resolve(),
             environment=os.environ,
+            output_capture=_output_capture(tmp_path),
             deadline=ValidationExecutionDeadline(
                 ExecutorBoundedDeadline(1.0, 2.0),
-                outer_timeout_seconds=3,
+                outer_timeout_seconds=3.0,
             ),
         )
     )
@@ -551,6 +929,7 @@ def test_natural_completion_returns_typed_capture_finalization_failure(
             command=f"exec {shell_quote(sys.executable)} -c pass",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
+            output_capture=_output_capture(tmp_path),
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
         )
     )
@@ -576,6 +955,7 @@ def test_supervision_recovery_aggregates_typed_capture_finalization_failure(
             command=f"exec {shell_quote(sys.executable)} -c 'import time; time.sleep(300)'",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
+            output_capture=_output_capture(tmp_path),
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
         )
     )
@@ -594,11 +974,15 @@ def test_supervision_recovery_aggregates_typed_capture_finalization_failure(
 def test_capture_setup_failure_contains_and_reaps_started_child(
     tmp_path: Path,
 ) -> None:
-    result = _runner_with_capture(_SetupFailingCaptureFactory()).run(
+    transferred_descriptors: list[int] = []
+    result = _runner_with_capture(
+        _SetupFailingCaptureFactory(transferred_descriptors)
+    ).run(
         ContainedValidationCommand(
             command=f"exec {shell_quote(sys.executable)} -c 'import time; time.sleep(300)'",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
+            output_capture=_output_capture(tmp_path),
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
         )
     )
@@ -608,6 +992,53 @@ def test_capture_setup_failure_contains_and_reaps_started_child(
     assert _exception_messages(result.cleanup.error) == (
         "injected validation capture setup failure",
     )
+    assert len(transferred_descriptors) == 3
+    for descriptor in transferred_descriptors:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(descriptor)
+    ProcessTreeMember(result.child.process_id).assert_contained()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process containment")
+@pytest.mark.timeout(10)
+def test_capture_rejection_preserves_every_reader_cleanup_failure(
+    tmp_path: Path,
+) -> None:
+    descriptors_seen_by_capture: list[int] = []
+    transferred_descriptors: list[int] = []
+    reader_failures = (
+        RuntimeError("injected stdout reader close failure"),
+        RuntimeError("injected stderr reader close failure"),
+        RuntimeError("injected handshake reader close failure"),
+    )
+    result = _runner_with_launch_pipes(
+        _production_supervisor(),
+        _SetupFailingCaptureFactory(descriptors_seen_by_capture),
+        _ReaderCloseFailingValidationLaunchPipesFactory(
+            reader_failures,
+            transferred_descriptors,
+        ),
+    ).run(
+        ContainedValidationCommand(
+            command=f"exec {shell_quote(sys.executable)} -c 'import time; time.sleep(300)'",
+            working_directory=tmp_path.resolve(),
+            environment=os.environ,
+            output_capture=_output_capture(tmp_path),
+            deadline=ValidationExecutionDeadline.for_active_timeout(5),
+        )
+    )
+
+    assert type(result.child) is ValidationCommandExited
+    assert type(result.cleanup) is ValidationCommandCleanupFailed
+    assert _exception_messages(result.cleanup.error) == (
+        "injected validation capture setup failure",
+        *(str(failure) for failure in reader_failures),
+    )
+    assert descriptors_seen_by_capture == transferred_descriptors
+    assert len(transferred_descriptors) == 3
+    for descriptor in transferred_descriptors:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(descriptor)
     ProcessTreeMember(result.child.process_id).assert_contained()
 
 
@@ -619,13 +1050,17 @@ def test_post_spawn_reader_transfer_failure_contains_and_reaps_started_child(
     transfer_failure = RuntimeError("injected validation reader transfer failure")
     result = _runner_with_launch_pipes(
         _production_supervisor(),
-        PosixValidationPipeCaptureFactory(default_validation_pipe_selector),
+        PosixValidationPipeCaptureFactory(
+            default_validation_pipe_selector,
+            ValidationDeadlineObservationClock(time.monotonic),
+        ),
         _TransferFailingValidationLaunchPipesFactory(transfer_failure),
     ).run(
         ContainedValidationCommand(
             command=f"exec {shell_quote(sys.executable)} -c 'import time; time.sleep(300)'",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
+            output_capture=_output_capture(tmp_path),
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
         )
     )
@@ -654,6 +1089,7 @@ def test_non_finite_executor_acknowledgement_fails_and_contains_child(
             command=f"exec {shell_quote(sys.executable)} -c {shell_quote(program)}",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
+            output_capture=_output_capture(tmp_path),
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
         )
     )
@@ -685,6 +1121,7 @@ def test_partial_executor_handshake_is_rejected_after_fast_child_exit(
             command=f"exec {shell_quote(sys.executable)} -c {shell_quote(program)}",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
+            output_capture=_output_capture(tmp_path),
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
         )
     )
@@ -718,6 +1155,7 @@ def test_reap_evidence_failure_does_not_skip_validation_output_finalization(
             command="printf 'retained-validation-output\\n'",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
+            output_capture=_output_capture(tmp_path),
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
         )
     )
@@ -776,7 +1214,8 @@ def test_outer_crash_contains_nested_executor_and_releases_exclusive_slot(
         "import os\n"
         "from pathlib import Path\n"
         "from issue_orchestrator.domain.validation_execution import "
-        "ContainedValidationCommand, ValidationExecutionDeadline\n"
+        "ContainedValidationCommand, ValidationCommandOutputCapture, "
+        "ValidationExecutionDeadline\n"
         "from issue_orchestrator.entrypoints.bootstrap import "
         "build_validation_command_runner\n"
         "result = build_validation_command_runner().run(\n"
@@ -784,6 +1223,11 @@ def test_outer_crash_contains_nested_executor_and_releases_exclusive_slot(
         f"        command={executor_command!r},\n"
         f"        working_directory=Path({str(repo_root)!r}),\n"
         "        environment=os.environ,\n"
+        "        output_capture=ValidationCommandOutputCapture(\n"
+        f"            Path({str((tmp_path / 'outer-stdout.log').resolve())!r}),\n"
+        f"            Path({str((tmp_path / 'outer-stderr.log').resolve())!r}),\n"
+        "            4096,\n"
+        "        ),\n"
         "        deadline=ValidationExecutionDeadline.for_active_timeout(30),\n"
         "    )\n"
         ")\n"
@@ -797,6 +1241,7 @@ def test_outer_crash_contains_nested_executor_and_releases_exclusive_slot(
             PosixProcessGroupMode.NEW_SESSION,
             (),
             PosixProcessWithoutTerminal(),
+            PosixProcessConfiguredActivationDeadline(),
         )
     )
     assert type(launch) is PosixProcessLaunchStarted
@@ -808,18 +1253,19 @@ def test_outer_crash_contains_nested_executor_and_releases_exclusive_slot(
         descendant_pid_path,
         operation="nested executor descendant readiness",
     )
-    nested_leader = ProcessTreeMember(
-        int(leader_pid_path.read_text(encoding="utf-8"))
-    )
+    nested_leader = ProcessTreeMember(int(leader_pid_path.read_text(encoding="utf-8")))
     nested_descendant = ProcessTreeMember(
         int(descendant_pid_path.read_text(encoding="utf-8"))
     )
 
     launch.process.kill()
-    assert PROCESS_COMPLETION_WATCHDOG.wait_posix_process(
-        launch.process,
-        operation="hard-killed outer validation parent",
-    ) == -signal.SIGKILL
+    assert (
+        PROCESS_COMPLETION_WATCHDOG.wait_posix_process(
+            launch.process,
+            operation="hard-killed outer validation parent",
+        )
+        == -signal.SIGKILL
+    )
     nested_leader.assert_contained()
     nested_descendant.assert_contained()
 

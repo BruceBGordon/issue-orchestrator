@@ -16,7 +16,11 @@ from issue_orchestrator.domain.process_group import (
     OwnedProcessGroupLeader,
     ProcessGroupCompleted,
     ProcessGroupExecutable,
+    ProcessGroupInterrupted,
     ProcessGroupPermissionDenied,
+    ProcessGroupTerminalCompletionAccepted,
+    ProcessGroupTerminalDecision,
+    ProcessGroupTerminalInterruptionRequested,
     ProcessGroupUnboundedWait,
     ProcessGroupZombiesOnly,
 )
@@ -42,6 +46,52 @@ from tests.process_completion_fixture import (
 
 
 pytestmark = pytest.mark.timeout(45)
+
+
+class _StaticTerminalDecision:
+    def __init__(self, decision: ProcessGroupTerminalDecision) -> None:
+        self._decision = decision
+        self.terminal_observations = 0
+
+    def wait_for_request(self, timeout_seconds: float) -> bool:
+        if type(timeout_seconds) is not float or timeout_seconds <= 0:
+            raise ValueError("terminal decision wait must be positive")
+        return False
+
+    def decide_terminal_observation(self) -> ProcessGroupTerminalDecision:
+        self.terminal_observations += 1
+        return self._decision
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_supervision"),
+    (
+        (ProcessGroupTerminalCompletionAccepted(), ProcessGroupCompleted),
+        (ProcessGroupTerminalInterruptionRequested(), ProcessGroupInterrupted),
+    ),
+)
+def test_terminal_observation_decision_owns_natural_completion_classification(
+    decision: ProcessGroupTerminalDecision,
+    expected_supervision: type[ProcessGroupCompleted | ProcessGroupInterrupted],
+) -> None:
+    process = subprocess.Popen(["/usr/bin/true"], start_new_session=True)
+    interruption = _StaticTerminalDecision(decision)
+    supervisor = PosixProcessGroupSupervisor(
+        PosixProcessGroupTerminator(
+            ExecutorProcessTerminationPolicy(0.1, 1.0),
+            build_test_process_group_observer(),
+        )
+    )
+
+    supervision = supervisor.supervise(
+        OwnedProcessGroupLeader(process.pid),
+        ProcessGroupUnboundedWait(),
+        interruption,
+    )
+    process.returncode = supervision.termination.leader_exit_code
+
+    assert type(supervision) is expected_supervision
+    assert interruption.terminal_observations == 1
 
 
 def test_term_resistant_descendant_dies_when_cooperative_leader_exits(

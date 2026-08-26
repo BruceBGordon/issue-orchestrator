@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -73,11 +73,47 @@ from ._types import (
     RecordedExecutorObservation,
 )
 from ...domain.executor import ExecutorCommandFinalizationError
+from ..independent_cleanup import (
+    CleanupAction,
+    CleanupOutcome,
+    IndependentCleanupPlan,
+    raise_cleanup_failures,
+    raise_primary_with_cleanup,
+)
+from ..posix_file_lock import (
+    PosixFileLockAcquisition,
+    PosixFileLockFilePresence,
+    PosixFileLockMode,
+    PosixFileLockOwner,
+    PosixFileLockSpecification,
+)
 from ._host_observation import ExecutorHostLoadObservation
 
 
 _MAX_LOG_BYTES = 10 * 1024 * 1024
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutorEventJournalFramed:
+    """The active event journal ends at a complete record boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutorEventJournalTail:
+    """One unterminated active record and its absolute byte boundary."""
+
+    boundary: int
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.boundary) is not int or self.boundary < 0:
+            raise ValueError("_ExecutorEventJournalTail.boundary must be non-negative")
+        if type(self.payload) is not bytes or not self.payload:
+            raise ValueError("_ExecutorEventJournalTail.payload must not be empty")
+
+
+_ExecutorEventJournalFraming = _ExecutorEventJournalFramed | _ExecutorEventJournalTail
 
 
 class _EventRecord(ExecutorStrictRecord):
@@ -247,20 +283,35 @@ class ExecutorEventStore:
     """Collect and query bounded, cross-process executor events."""
 
     def __init__(self, pool_dir: Path) -> None:
+        if not pool_dir.is_absolute():
+            raise ValueError("ExecutorEventStore.pool_dir must be absolute")
         self._pool_dir = pool_dir
         self.path = pool_dir / "executor-events-v4.jsonl"
+        self._file_locks = PosixFileLockOwner()
+        lock_path = (pool_dir / "executor-events.lock").resolve()
+        self._exclusive_lock = PosixFileLockSpecification(
+            lock_path,
+            PosixFileLockMode.EXCLUSIVE,
+            PosixFileLockAcquisition.BLOCKING,
+            PosixFileLockFilePresence.CREATE_IF_MISSING,
+        )
+        self._shared_lock = PosixFileLockSpecification(
+            lock_path,
+            PosixFileLockMode.SHARED,
+            PosixFileLockAcquisition.BLOCKING,
+            PosixFileLockFilePresence.CREATE_IF_MISSING,
+        )
 
     def append(self, event: StoredExecutorEvent) -> None:
-        self._pool_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = self._pool_dir / "executor-events.lock"
-        with lock_path.open("a+b") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        self._ensure_pool_directory()
+        with self._file_locks.hold(self._exclusive_lock):
             self._repair_torn_active_tail()
             self._rotate_if_needed()
             payload = (event.model_dump_json() + "\n").encode("utf-8")
+            active_existed = self.path.exists()
             descriptor = os.open(
                 self.path,
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC,
                 0o600,
             )
             try:
@@ -271,8 +322,22 @@ class ExecutorEventStore:
                         raise OSError("executor event append made no progress")
                     remaining = remaining[written:]
                 os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+            except BaseException as append_error:
+                raise_primary_with_cleanup(
+                    "executor event append and finalization failures",
+                    append_error,
+                    self._finalize_append_descriptor(
+                        descriptor,
+                        sync_directory=not active_existed,
+                    ),
+                )
+            raise_cleanup_failures(
+                "executor event append finalization failures",
+                self._finalize_append_descriptor(
+                    descriptor,
+                    sync_directory=not active_existed,
+                ),
+            )
 
     def enqueued(
         self,
@@ -522,10 +587,8 @@ class ExecutorEventStore:
         query: ExecutorRecentEventsQuery,
     ) -> ExecutorEventTimeline:
         """Read and validate the newest collected events."""
-        lock_path = self._pool_dir / "executor-events.lock"
-        self._pool_dir.mkdir(parents=True, exist_ok=True)
-        with lock_path.open("a+b") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
+        self._ensure_pool_directory()
+        with self._file_locks.hold(self._shared_lock):
             records = self._read_records()
         return ExecutorEventTimeline(
             tuple(_to_domain_event(record) for record in records[-query.limit :])
@@ -536,10 +599,8 @@ class ExecutorEventStore:
         query: ExecutorFairnessGroupEventsQuery,
     ) -> ExecutorEventPage:
         """Read an exact fairness-group suffix without wall-clock slicing."""
-        lock_path = self._pool_dir / "executor-events.lock"
-        self._pool_dir.mkdir(parents=True, exist_ok=True)
-        with lock_path.open("a+b") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
+        self._ensure_pool_directory()
+        with self._file_locks.hold(self._shared_lock):
             records = self._read_records()
         matching = tuple(
             event
@@ -587,36 +648,226 @@ class ExecutorEventStore:
         """Truncate only an invalid unterminated tail before the next append."""
         if not self.path.exists():
             return
-        payload = self.path.read_bytes()
-        if not payload or payload.endswith(b"\n"):
+        framing = self._inspect_active_tail()
+        if type(framing) is _ExecutorEventJournalFramed:
             return
-        boundary = payload.rfind(b"\n") + 1
-        tail = payload[boundary:]
+        if type(framing) is not _ExecutorEventJournalTail:
+            raise AssertionError("executor event journal framing is a closed union")
         try:
-            _STORED_EVENT_ADAPTER.validate_json(tail)
+            _STORED_EVENT_ADAPTER.validate_json(framing.payload)
         except ValidationError:
-            with self.path.open("r+b") as handle:
-                handle.truncate(boundary)
-                handle.flush()
-                os.fsync(handle.fileno())
+            descriptor = os.open(
+                self.path,
+                os.O_RDWR | os.O_CLOEXEC,
+            )
+            try:
+                os.ftruncate(descriptor, framing.boundary)
+                os.fsync(descriptor)
+            except BaseException as repair_error:
+                raise_primary_with_cleanup(
+                    "executor event tail repair and finalization failures",
+                    repair_error,
+                    self._finalize_append_descriptor(
+                        descriptor,
+                        sync_directory=True,
+                    ),
+                )
+            raise_cleanup_failures(
+                "executor event tail repair finalization failures",
+                self._finalize_append_descriptor(
+                    descriptor,
+                    sync_directory=True,
+                ),
+            )
             logger.warning(
                 "Truncated torn final executor event record before append: path=%s "
                 "removed_bytes=%d",
                 self.path,
-                len(tail),
+                len(framing.payload),
             )
             return
-        with self.path.open("ab") as handle:
-            handle.write(b"\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        descriptor = os.open(
+            self.path,
+            os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC,
+        )
+        try:
+            written = os.write(descriptor, b"\n")
+            if written != 1:
+                raise OSError("executor event tail repair made no progress")
+            os.fsync(descriptor)
+        except BaseException as repair_error:
+            raise_primary_with_cleanup(
+                "executor event tail completion and finalization failures",
+                repair_error,
+                self._finalize_append_descriptor(
+                    descriptor,
+                    sync_directory=True,
+                ),
+            )
+        raise_cleanup_failures(
+            "executor event tail completion finalization failures",
+            self._finalize_append_descriptor(
+                descriptor,
+                sync_directory=True,
+            ),
+        )
+
+    def _inspect_active_tail(self) -> _ExecutorEventJournalFraming:
+        descriptor = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            size = os.fstat(descriptor).st_size
+            if size == 0 or self._pread_exact(descriptor, 1, size - 1) == b"\n":
+                result: _ExecutorEventJournalFraming = _ExecutorEventJournalFramed()
+            else:
+                chunks: list[bytes] = []
+                cursor = size
+                boundary = 0
+                while cursor > 0:
+                    read_size = min(64 * 1024, cursor)
+                    cursor -= read_size
+                    chunk = self._pread_exact(descriptor, read_size, cursor)
+                    separator = chunk.rfind(b"\n")
+                    if separator >= 0:
+                        boundary = cursor + separator + 1
+                        chunks.append(chunk[separator + 1 :])
+                        break
+                    chunks.append(chunk)
+                result = _ExecutorEventJournalTail(
+                    boundary,
+                    b"".join(reversed(chunks)),
+                )
+        except BaseException as inspection_error:
+            raise_primary_with_cleanup(
+                "executor event tail inspection and cleanup failures",
+                inspection_error,
+                self._close_descriptor(
+                    descriptor,
+                    "close executor event inspection descriptor",
+                ),
+            )
+        raise_cleanup_failures(
+            "executor event inspection descriptor cleanup failures",
+            self._close_descriptor(
+                descriptor,
+                "close executor event inspection descriptor",
+            ),
+        )
+        return result
+
+    @staticmethod
+    def _pread_exact(descriptor: int, size: int, offset: int) -> bytes:
+        chunks: list[bytes] = []
+        remaining = size
+        current_offset = offset
+        while remaining:
+            chunk = os.pread(descriptor, remaining, current_offset)
+            if not chunk:
+                raise OSError("executor event tail read made no progress")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+            current_offset += len(chunk)
+        return b"".join(chunks)
 
     def _rotate_if_needed(self) -> None:
         if not self.path.exists() or self.path.stat().st_size < _MAX_LOG_BYTES:
             return
         rotated = self.path.with_suffix(".jsonl.1")
-        rotated.unlink(missing_ok=True)
-        os.replace(self.path, rotated)
+        try:
+            os.replace(self.path, rotated)
+        except BaseException as rotation_error:
+            raise_primary_with_cleanup(
+                "executor event rotation and directory sync failures",
+                rotation_error,
+                IndependentCleanupPlan(
+                    (
+                        CleanupAction(
+                            "sync executor event directory after partial rotation",
+                            self._sync_pool_directory,
+                        ),
+                    )
+                ).run(),
+            )
+        self._sync_pool_directory()
+
+    def _ensure_pool_directory(self) -> None:
+        missing_directories: list[Path] = []
+        candidate = self._pool_dir
+        while not candidate.exists():
+            missing_directories.append(candidate)
+            parent = candidate.parent
+            if parent == candidate:
+                raise RuntimeError(
+                    f"cannot find existing ancestor for executor pool: {self._pool_dir}"
+                )
+            candidate = parent
+        if not candidate.is_dir():
+            raise NotADirectoryError(candidate)
+        self._pool_dir.mkdir(parents=True, exist_ok=True)
+        for created_directory in reversed(missing_directories):
+            self._sync_directory(created_directory.parent)
+
+    def _finalize_append_descriptor(
+        self,
+        descriptor: int,
+        *,
+        sync_directory: bool,
+    ) -> CleanupOutcome:
+        actions = [
+            CleanupAction(
+                "close executor event descriptor",
+                lambda: os.close(descriptor),
+            )
+        ]
+        if sync_directory:
+            actions.append(
+                CleanupAction(
+                    "sync executor event directory after durable mutation",
+                    self._sync_pool_directory,
+                )
+            )
+        return IndependentCleanupPlan(tuple(actions)).run()
+
+    def _sync_pool_directory(self) -> None:
+        self._sync_directory(self._pool_dir)
+
+    @staticmethod
+    def _close_descriptor(descriptor: int, action_name: str) -> CleanupOutcome:
+        return IndependentCleanupPlan(
+            (CleanupAction(action_name, lambda: os.close(descriptor)),)
+        ).run()
+
+    @staticmethod
+    def _sync_directory(directory: Path) -> None:
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+        try:
+            os.fsync(descriptor)
+        except BaseException as sync_error:
+            raise_primary_with_cleanup(
+                "executor event directory sync and cleanup failures",
+                sync_error,
+                IndependentCleanupPlan(
+                    (
+                        CleanupAction(
+                            "close executor event directory descriptor",
+                            lambda: os.close(descriptor),
+                        ),
+                    )
+                ).run(),
+            )
+        raise_cleanup_failures(
+            "executor event directory descriptor cleanup failures",
+            IndependentCleanupPlan(
+                (
+                    CleanupAction(
+                        "close executor event directory descriptor",
+                        lambda: os.close(descriptor),
+                    ),
+                )
+            ).run(),
+        )
 
 
 def _event_metadata(record: _EventRecord) -> ExecutorEventMetadata:

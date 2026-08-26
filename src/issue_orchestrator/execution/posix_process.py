@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import math
 import os
 import resource
 import selectors
@@ -18,10 +19,15 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 from ..domain.executor import ExecutorProcessTerminationPolicy
 from ..domain.posix_process import (
     PosixDescriptorMapping,
+    PosixProcessAbsoluteActivationDeadline,
+    PosixProcessActivationDeadline,
+    PosixProcessActivationDeadlineExceededError,
     PosixProcessActivationPolicy,
+    PosixProcessConfiguredActivationDeadline,
     PosixProcessControllingTerminal,
     PosixProcessGroup,
     PosixProcessGroupMode,
+    PosixProcessJoinedGroupContainmentRequiredError,
     PosixProcessJoinGroup,
     PosixProcessLaunchSpec,
     PosixProcessProgram,
@@ -32,6 +38,7 @@ from ..domain.process_group import (
     ProcessGroupTermination,
 )
 from ..ports.posix_process import (
+    PosixProcessActivationClock,
     PosixProcessExecRejected,
     PosixProcessLaunch,
     PosixProcessLaunchRecovered,
@@ -44,6 +51,7 @@ from ..ports.posix_spawn_primitive import (
     PosixSpawnPrimitiveIndeterminate,
     PosixSpawnPrimitiveRejected,
     PosixSpawnPrimitiveRequest,
+    PosixSpawnPrimitiveResult,
     PosixSpawnPrimitiveStarted,
 )
 from ..ports.process_group_supervisor import ProcessGroupSupervisor
@@ -118,9 +126,13 @@ class _PosixProcessChildInvocation(StrictWireRecord):
         if self.activation_gate_file_descriptor == self.exec_status_file_descriptor:
             raise ValueError("activation and exec-status descriptors must be distinct")
         if self.activation_gate_file_descriptor in self.inherited_file_descriptors:
-            raise ValueError("activation descriptor must not be inherited by opaque work")
+            raise ValueError(
+                "activation descriptor must not be inherited by opaque work"
+            )
         if self.exec_status_file_descriptor in self.inherited_file_descriptors:
-            raise ValueError("exec-status descriptor must not be inherited by opaque work")
+            raise ValueError(
+                "exec-status descriptor must not be inherited by opaque work"
+            )
         return self
 
 
@@ -676,6 +688,7 @@ class RetainedPosixProcessLauncher:
         process_group_supervisor: ProcessGroupSupervisor,
         activation_policy: PosixProcessActivationPolicy,
         recovery_policy: ExecutorProcessTerminationPolicy,
+        activation_clock: PosixProcessActivationClock,
     ) -> None:
         if type(child_program) is not PosixProcessProgram:
             raise ValueError("retained launcher child_program must be typed")
@@ -687,15 +700,31 @@ class RetainedPosixProcessLauncher:
             raise ValueError("retained launcher primitive must implement its port")
         if not callable(getattr(process_group_supervisor, "abort", None)):
             raise ValueError("retained launcher supervisor must implement its port")
+        if not callable(getattr(activation_clock, "monotonic", None)):
+            raise ValueError(
+                "retained launcher activation_clock must implement its port"
+            )
         self._child_program = child_program
         self._primitive = primitive
         self._supervisor = process_group_supervisor
         self._activation_policy = activation_policy
         self._recovery_policy = recovery_policy
+        self._activation_clock = activation_clock
 
     def launch(self, specification: PosixProcessLaunchSpec) -> PosixProcessLaunch:
+        self._require_specification(specification)
+
+        return self._launch_validated(specification)
+
+    @staticmethod
+    def _require_specification(specification: object) -> None:
         if type(specification) is not PosixProcessLaunchSpec:
             raise ValueError("retained process launcher requires a typed spec")
+
+    def _launch_validated(
+        self,
+        specification: PosixProcessLaunchSpec,
+    ) -> PosixProcessLaunch:
         try:
             gate = _ProcessActivationGate(
                 tuple(
@@ -736,29 +765,38 @@ class RetainedPosixProcessLauncher:
                 )
             )
         try:
-            activation = self._primitive.start(primitive_request)
-        except BaseException as primitive_error:
+            self._require_activation_pending(specification.activation_deadline)
+        except BaseException as deadline_error:
             return PosixProcessLaunchRejected(
                 _error_with_cleanup(
-                    "process activation primitive and gate cleanup failed",
-                    primitive_error,
+                    "process activation deadline and gate cleanup failed",
+                    deadline_error,
                     gate.close(),
                 )
             )
-        if type(activation) is PosixSpawnPrimitiveRejected:
-            return PosixProcessLaunchRejected(
-                _error_with_cleanup(
-                    "process activation rejection and gate cleanup failed",
-                    activation.error,
-                    gate.close(),
-                )
-            )
+        activation = self._start_primitive(primitive_request, gate)
+        if type(activation) is PosixProcessLaunchRejected:
+            return activation
         if type(activation) is PosixSpawnPrimitiveStarted:
+            try:
+                self._require_activation_pending(specification.activation_deadline)
+            except BaseException as deadline_error:
+                activation_error = _error_with_cleanup(
+                    "process activation deadline and gate cleanup failed",
+                    deadline_error,
+                    gate.close(),
+                )
+                return self._recover_indeterminate(
+                    _OwnedUnreleasedPosixProcess(activation.process_id),
+                    specification.group_mode,
+                    activation_error,
+                )
             released = gate.release(activation.process_id)
             if type(released) is _ActivationGateReleased:
                 return self._complete_exec_handshake(
                     released.process,
                     specification.group_mode,
+                    specification.activation_deadline,
                 )
             if type(released) is not _ActivationGateReleaseFailed:
                 raise AssertionError("activation gate release is a closed union")
@@ -778,6 +816,32 @@ class RetainedPosixProcessLauncher:
             _OwnedUnreleasedPosixProcess(activation.process_id),
             specification.group_mode,
             activation_error,
+        )
+
+    def _start_primitive(
+        self,
+        request: PosixSpawnPrimitiveRequest,
+        gate: _ProcessActivationGate,
+    ) -> PosixSpawnPrimitiveResult | PosixProcessLaunchRejected:
+        """Start the retained wrapper or close its untransferred gate."""
+        try:
+            activation = self._primitive.start(request)
+        except BaseException as primitive_error:
+            return PosixProcessLaunchRejected(
+                _error_with_cleanup(
+                    "process activation primitive and gate cleanup failed",
+                    primitive_error,
+                    gate.close(),
+                )
+            )
+        if type(activation) is not PosixSpawnPrimitiveRejected:
+            return activation
+        return PosixProcessLaunchRejected(
+            _error_with_cleanup(
+                "process activation rejection and gate cleanup failed",
+                activation.error,
+                gate.close(),
+            )
         )
 
     @staticmethod
@@ -812,25 +876,28 @@ class RetainedPosixProcessLauncher:
         self,
         process: OwnedPosixProcess,
         group_mode: PosixProcessGroup,
+        activation_deadline: PosixProcessActivationDeadline,
     ) -> PosixProcessLaunch:
         try:
             status = process.await_exec_status(
-                self._activation_policy.exec_handshake_timeout_seconds
+                self._activation_timeout_seconds(activation_deadline)
             )
+            self._require_activation_pending(activation_deadline)
         except BaseException as handshake_error:
             return self._recover_started_process(
                 process,
                 group_mode,
-                handshake_error,
+                self._authoritative_handshake_error(
+                    handshake_error,
+                    activation_deadline,
+                ),
             )
         if type(status) is _PosixExecSucceeded:
             return PosixProcessLaunchStarted(process)
         if type(status) is not _PosixExecRejected:
             raise AssertionError("POSIX exec status is a closed union")
         try:
-            exit_code = process.wait(
-                self._recovery_policy.forceful_shutdown_seconds
-            )
+            exit_code = process.wait(self._recovery_policy.forceful_shutdown_seconds)
         except BaseException as recovery_error:
             if process.return_code is not None:
                 exec_rejection = RuntimeError("retained POSIX wrapper rejected exec")
@@ -853,6 +920,65 @@ class RetainedPosixProcessLauncher:
             status.record.error_type,
             status.record.error_repr,
         )
+
+    def _activation_timeout_seconds(
+        self,
+        deadline: PosixProcessActivationDeadline,
+    ) -> float:
+        if type(deadline) is PosixProcessConfiguredActivationDeadline:
+            return self._activation_policy.exec_handshake_timeout_seconds
+        if type(deadline) is not PosixProcessAbsoluteActivationDeadline:
+            raise AssertionError("process activation deadline is a closed union")
+        remaining = deadline.expires_at_monotonic - self._monotonic()
+        if remaining <= 0.0:
+            raise PosixProcessActivationDeadlineExceededError(
+                "absolute process activation deadline expired"
+            )
+        return min(
+            remaining,
+            self._activation_policy.exec_handshake_timeout_seconds,
+        )
+
+    def _authoritative_handshake_error(
+        self,
+        error: BaseException,
+        deadline: PosixProcessActivationDeadline,
+    ) -> BaseException:
+        if isinstance(error, PosixProcessActivationDeadlineExceededError):
+            return error
+        if type(deadline) is PosixProcessConfiguredActivationDeadline:
+            return error
+        if type(deadline) is not PosixProcessAbsoluteActivationDeadline:
+            raise AssertionError("process activation deadline is a closed union")
+        if self._monotonic() < deadline.expires_at_monotonic:
+            return error
+        deadline_error = PosixProcessActivationDeadlineExceededError(
+            "absolute process activation deadline expired"
+        )
+        deadline_error.__cause__ = error
+        return deadline_error
+
+    def _require_activation_pending(
+        self,
+        deadline: PosixProcessActivationDeadline,
+    ) -> None:
+        if type(deadline) is PosixProcessConfiguredActivationDeadline:
+            return
+        if type(deadline) is not PosixProcessAbsoluteActivationDeadline:
+            raise AssertionError("process activation deadline is a closed union")
+        if self._monotonic() >= deadline.expires_at_monotonic:
+            raise PosixProcessActivationDeadlineExceededError(
+                "absolute process activation deadline expired"
+            )
+
+    def _monotonic(self) -> float:
+        observed = self._activation_clock.monotonic()
+        if type(observed) is not float or not math.isfinite(observed) or observed < 0.0:
+            raise ValueError(
+                "PosixProcessActivationClock.monotonic must return a finite, "
+                "non-negative float"
+            )
+        return observed
 
     def _recover_started_process(
         self,
@@ -881,9 +1007,14 @@ class RetainedPosixProcessLauncher:
                         (activation_error, evidence_error),
                     )
             elif type(group_mode) is PosixProcessJoinGroup:
-                process.kill()
-                exit_code = process.wait(
-                    self._recovery_policy.forceful_shutdown_seconds
+                return PosixProcessLaunchRecoveryFailed(
+                    process.process_id,
+                    activation_error,
+                    PosixProcessJoinedGroupContainmentRequiredError(
+                        "a process released past its activation gate joined an "
+                        "externally owned group; exact-child recovery cannot prove "
+                        "descendant containment"
+                    ),
                 )
             else:
                 raise AssertionError("PosixProcessGroup is a closed union")
@@ -945,6 +1076,13 @@ class RetainedPosixProcessLauncher:
             exit_code,
             activation_error,
         )
+
+
+class SystemPosixProcessActivationClock:
+    """Production adapter for the shared host-boot monotonic clock."""
+
+    def monotonic(self) -> float:
+        return time.monotonic()
 
 
 def _with_courtesy_failure(

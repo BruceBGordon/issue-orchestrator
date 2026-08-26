@@ -19,6 +19,7 @@ validate-profile:
 	if [ "$(DRY_RUN)" = "1" ]; then args="$$args --dry-run"; fi; \
 	if [ -n "$(TARGETS)" ]; then args="$$args --targets $(TARGETS)"; fi; \
 	if [ -n "$(OUTPUT)" ]; then args="$$args --output $(OUTPUT)"; fi; \
+	if [ -n "$(COMMAND_TIMEOUT_SECONDS)" ]; then args="$$args --command-timeout-seconds $(COMMAND_TIMEOUT_SECONDS)"; fi; \
 	GMAKE="$${GMAKE:-$$(command -v gmake 2>/dev/null || command -v make)}" \
 	.venv/bin/python repo-specific/scripts/validate_profile.py $$args
 

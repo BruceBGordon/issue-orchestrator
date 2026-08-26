@@ -13,6 +13,15 @@ class PosixProcessExecError(RuntimeError):
 
 
 @runtime_checkable
+class PosixProcessActivationClock(Protocol):
+    """Observe the host monotonic clock used by absolute activation deadlines."""
+
+    def monotonic(self) -> float:
+        """Return one finite, non-negative host-boot monotonic instant."""
+        ...
+
+
+@runtime_checkable
 class PosixProcessHandle(Protocol):
     """One exact child whose reaping authority remains with this process."""
 

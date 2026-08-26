@@ -11,6 +11,10 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.domain.validation_resource_sampling import (
+    ValidationHostProbeObserved,
+    ValidationHostProbeRequest,
+    ValidationHostProbeResult,
+    ValidationHostProbeUnavailable,
     ValidationResourceSamplerFailed,
     ValidationResourceSamplerStartIndeterminate,
     ValidationResourceSamplerStartRejected,
@@ -19,20 +23,30 @@ from issue_orchestrator.domain.validation_resource_sampling import (
     ValidationResourceSamplerStarted,
     ValidationResourceSamplingPolicy,
 )
+from issue_orchestrator.domain.validation_execution import ValidationCommandTimedOut
+from issue_orchestrator.domain.validation_timing import ValidationDiskDeltaStatus
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_validation_command_runner,
+)
 from issue_orchestrator.execution.retained_thread import (
     ImmediateThreadNativeExitPrimitive,
     MaskedThreadStartPrimitive,
     ThreadingRetainedThreadFactory,
 )
 from issue_orchestrator.execution.validation_resource_sampling import (
+    ContainedValidationHostProbe,
+    SystemValidationResourceProbe,
     ValidationResourceSampler,
-    run_bounded_host_probe,
 )
 from issue_orchestrator.infra.validation_timings import (
     ValidateTimingRecorder,
     ValidationResourceSample,
 )
 from tests.process_completion_fixture import PROCESS_COMPLETION_WATCHDOG
+from tests.process_tree_fixture import (
+    CooperativeTermResistantProcessTreeProgram,
+    ProcessTreeMember,
+)
 
 
 def _retained_thread_factory() -> ThreadingRetainedThreadFactory:
@@ -105,17 +119,101 @@ class _FailingPeriodicResourceProbe:
         return _sample()
 
 
-def test_host_probe_timeout_bounds_an_unresponsive_command(tmp_path: Path) -> None:
-    started_at = datetime.now(timezone.utc)
-
-    output = run_bounded_host_probe(
-        (sys.executable, "-c", "import time; time.sleep(30)"),
-        working_directory=tmp_path.resolve(),
-        timeout_seconds=0.05,
+@pytest.mark.skipif(sys.platform == "win32", reason="asserts POSIX group containment")
+@pytest.mark.timeout(10)
+def test_host_probe_timeout_contains_term_resistant_descendant(
+    tmp_path: Path,
+) -> None:
+    descendant_pid_path = (tmp_path / "host-probe-descendant.pid").resolve()
+    source = CooperativeTermResistantProcessTreeProgram(
+        descendant_pid_path,
+        300,
+        ("host-probe-ready",),
+    ).python_source()
+    result = ContainedValidationHostProbe(build_validation_command_runner()).run(
+        ValidationHostProbeRequest(
+            (sys.executable, "-c", source),
+            tmp_path.resolve(),
+            1.0,
+        )
     )
 
-    assert output is None
-    assert (datetime.now(timezone.utc) - started_at).total_seconds() < 2.0
+    assert type(result) is ValidationHostProbeUnavailable
+    assert type(result.execution.cleanup) is ValidationCommandTimedOut
+    descendant = ProcessTreeMember(int(descendant_pid_path.read_text(encoding="utf-8")))
+    descendant.assert_contained()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="asserts POSIX group containment")
+@pytest.mark.timeout(10)
+def test_host_probe_returns_output_only_after_contained_success(tmp_path: Path) -> None:
+    result = ContainedValidationHostProbe(build_validation_command_runner()).run(
+        ValidationHostProbeRequest(
+            (sys.executable, "-c", "print('host-probe-ok')"),
+            tmp_path.resolve(),
+            1.0,
+        )
+    )
+
+    assert type(result) is ValidationHostProbeObserved
+    assert result.output == "host-probe-ok"
+
+
+@dataclass(slots=True)
+class _DiskCounterHostProbe:
+    disk_outputs: tuple[str, ...]
+    disk_index: int = 0
+
+    def run(self, request: ValidationHostProbeRequest) -> ValidationHostProbeResult:
+        if request.arguments[:1] != ("iostat",):
+            return ValidationHostProbeObserved("")
+        output = self.disk_outputs[self.disk_index]
+        self.disk_index += 1
+        return ValidationHostProbeObserved(output)
+
+
+def test_iostat_counters_reset_independently_without_negative_usage(
+    tmp_path: Path,
+) -> None:
+    host_probe = _DiskCounterHostProbe(
+        (
+            "device xfrs MB\ndisk0 totals\ndisk0 100 50",
+            "device xfrs MB\ndisk0 totals\ndisk0 90 55",
+            "device xfrs MB\ndisk0 totals\ndisk0 95 54",
+        )
+    )
+    probe = SystemValidationResourceProbe(
+        tmp_path.resolve(),
+        ValidationResourceSamplingPolicy(1.0, 1.0, 4.0),
+        host_probe,
+    )
+
+    baseline = probe.collect().disk
+    transfers_reset = probe.collect().disk
+    megabytes_reset = probe.collect().disk
+
+    assert baseline is not None
+    assert baseline.transfers_delta is None
+    assert baseline.megabytes_delta is None
+    assert (
+        baseline.transfers_delta_status
+        is ValidationDiskDeltaStatus.BASELINE_UNAVAILABLE
+    )
+    assert transfers_reset is not None
+    assert transfers_reset.transfers_delta is None
+    assert (
+        transfers_reset.transfers_delta_status
+        is ValidationDiskDeltaStatus.COUNTER_RESET
+    )
+    assert transfers_reset.megabytes_delta == 5.0
+    assert transfers_reset.megabytes_delta_status is ValidationDiskDeltaStatus.AVAILABLE
+    assert megabytes_reset is not None
+    assert megabytes_reset.transfers_delta == 5.0
+    assert megabytes_reset.megabytes_delta is None
+    assert (
+        megabytes_reset.megabytes_delta_status
+        is ValidationDiskDeltaStatus.COUNTER_RESET
+    )
 
 
 def test_blocked_sampler_reports_typed_shutdown_and_cannot_append_late(

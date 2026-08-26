@@ -10,6 +10,7 @@ import pytest
 from issue_orchestrator.domain.validation_timing import (
     PrepushGateTimingSummary,
     ValidationConfiguration,
+    ValidationDiskDeltaStatus,
     ValidationDiskObservation,
     ValidationHostContext,
     ValidationResourceSample,
@@ -88,7 +89,14 @@ def test_host_and_disk_measurements_reject_boolean_numbers() -> None:
     with pytest.raises(ValueError, match="cpu_count must be an integer"):
         ValidationHostContext("host", "Darwin", "25", "arm64", True, 64)
     with pytest.raises(ValueError, match="transfers_total must be finite"):
-        ValidationDiskObservation(True, 1.0, None, None)
+        ValidationDiskObservation(
+            True,
+            1.0,
+            None,
+            None,
+            ValidationDiskDeltaStatus.BASELINE_UNAVAILABLE,
+            ValidationDiskDeltaStatus.BASELINE_UNAVAILABLE,
+        )
 
 
 def test_timing_envelope_preserves_signed_wall_clock_adjustment() -> None:

@@ -17,13 +17,19 @@ from pydantic import ValidationError
 from ...domain.executor import ExecutorCommandLifecycle
 from ...domain.executor_child_resources import ExecutorChildResourceSnapshot
 from ...domain.posix_process import (
+    PosixProcessAbsoluteActivationDeadline,
+    PosixProcessActivationDeadlineAbsent,
+    PosixProcessActivationDeadlinePresent,
+    PosixProcessConfiguredActivationDeadline,
     PosixProcessEnvironment,
     PosixProcessJoinGroup,
     PosixProcessLaunchSpec,
     PosixProcessProgram,
     PosixProcessWithoutTerminal,
+    classify_posix_process_activation_deadline,
 )
 from ...domain.executor_guardian import (
+    ExecutorGuardianActivationTimedOut,
     ExecutorGuardianBoundedBudget,
     ExecutorGuardianBudget,
     ExecutorGuardianCommandCompleted,
@@ -32,6 +38,7 @@ from ...domain.executor_guardian import (
     ExecutorGuardianCommandTimedOut,
     ExecutorGuardianInternalFailed,
     ExecutorGuardianResourceObservationFailed,
+    ExecutorGuardianSerializedFailure,
     ExecutorGuardianTerminal,
     ExecutorGuardianTerminationPolicy,
     ExecutorGuardianUnboundedBudget,
@@ -40,6 +47,7 @@ from ...domain.process_group_sentinel import ProcessGroupSentinelParentLifetime
 from ...ports.posix_process import (
     PosixProcessExecRejected,
     PosixProcessHandle,
+    PosixProcessLaunch,
     PosixProcessLauncher,
     PosixProcessLaunchRecovered,
     PosixProcessLaunchRecoveryFailed,
@@ -58,6 +66,13 @@ from ._guardian_contracts import (
     GuardianInteractiveCancellationControlRecord,
     GuardianInvocationRecord,
     guardian_terminal_record,
+)
+from .guardian_terminal_observation import (
+    ExecutorGuardianCommandDeadlineObserved,
+    ExecutorGuardianCommandExitObserved,
+    ExecutorGuardianCommandObservationFailed,
+    ExecutorGuardianTerminalObservationOwner,
+    SystemExecutorGuardianObservationClock,
 )
 
 
@@ -199,10 +214,7 @@ class _SentinelGuardianGroupOwner:
             os.killpg(os.getpgrp(), signal.SIGTERM)
         except BaseException as error:
             errors.append(error)
-        deadline = (
-            time.monotonic()
-            + termination_policy.graceful_shutdown_seconds
-        )
+        deadline = time.monotonic() + termination_policy.graceful_shutdown_seconds
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -235,6 +247,7 @@ class PosixExecutorGuardianChild:
         termination_policy: ExecutorGuardianTerminationPolicy,
         process_launcher: PosixProcessLauncher,
         child_resource_observer: ExecutorChildResourceObserver,
+        terminal_observation_owner: ExecutorGuardianTerminalObservationOwner,
     ) -> None:
         if type(termination_policy) is not ExecutorGuardianTerminationPolicy:
             raise ValueError(
@@ -251,6 +264,14 @@ class PosixExecutorGuardianChild:
         self._child_resource_observer = _require_child_resource_observer(
             child_resource_observer
         )
+        if type(terminal_observation_owner) is not (
+            ExecutorGuardianTerminalObservationOwner
+        ):
+            raise ValueError(
+                "PosixExecutorGuardianChild.terminal_observation_owner must be an "
+                "ExecutorGuardianTerminalObservationOwner"
+            )
+        self._terminal_observation_owner = terminal_observation_owner
 
     def run(
         self,
@@ -289,6 +310,16 @@ class PosixExecutorGuardianChild:
             finally:
                 group_owner.retire_before_opaque_work()
             return 1
+        budget = invocation.domain_budget()
+        if type(budget) is ExecutorGuardianBoundedBudget and budget.is_expired_at(
+            time.monotonic()
+        ):
+            terminal = ExecutorGuardianActivationTimedOut(budget.reason, ())
+            try:
+                result_writer.write(terminal)
+            finally:
+                group_owner.retire_before_opaque_work()
+            return 0
         return self._run_started_command(invocation, result_writer, group_owner)
 
     @staticmethod
@@ -359,6 +390,7 @@ class PosixExecutorGuardianChild:
         result_writer: _GuardianResultWriter,
         group_owner: _GuardianGroupOwner,
     ) -> int:
+        budget = invocation.domain_budget()
         resolution = self._resolve_command(
             invocation.arguments,
             result_writer,
@@ -369,9 +401,19 @@ class PosixExecutorGuardianChild:
         if type(resolution) is not _ResolvedCommandArguments:
             raise AssertionError("command resolution is a closed union")
         arguments = resolution.arguments
+        if type(budget) is ExecutorGuardianBoundedBudget and budget.is_expired_at(
+            time.monotonic()
+        ):
+            terminal = ExecutorGuardianActivationTimedOut(budget.reason, ())
+            try:
+                result_writer.write(terminal)
+            finally:
+                group_owner.retire_before_opaque_work()
+            return 0
         resource_measurement = self._start_resource_measurement()
         activation = self._activate_resolved_command(
             arguments,
+            budget,
             result_writer,
             group_owner,
         )
@@ -383,7 +425,7 @@ class PosixExecutorGuardianChild:
 
         outcome = self._wait_for_outcome(
             process,
-            invocation.domain_budget(),
+            budget,
             group_owner,
             resource_measurement,
         )
@@ -399,9 +441,18 @@ class PosixExecutorGuardianChild:
     def _activate_resolved_command(
         self,
         arguments: tuple[str, ...],
+        budget: ExecutorGuardianBudget,
         result_writer: _GuardianResultWriter,
         group_owner: _GuardianGroupOwner,
     ) -> _CommandActivation:
+        if type(budget) is ExecutorGuardianUnboundedBudget:
+            activation_deadline = PosixProcessConfiguredActivationDeadline()
+        elif type(budget) is ExecutorGuardianBoundedBudget:
+            activation_deadline = PosixProcessAbsoluteActivationDeadline(
+                budget.expires_at_monotonic
+            )
+        else:
+            raise AssertionError("guardian budget is a closed union")
         try:
             launch = self._process_launcher.launch(
                 PosixProcessLaunchSpec(
@@ -411,6 +462,7 @@ class PosixExecutorGuardianChild:
                     group_mode=PosixProcessJoinGroup(os.getpgrp()),
                     descriptor_mappings=(),
                     terminal=PosixProcessWithoutTerminal(),
+                    activation_deadline=activation_deadline,
                 )
             )
         except BaseException as error:
@@ -424,35 +476,6 @@ class PosixExecutorGuardianChild:
                     self._termination_policy,
                 )
             raise AssertionError("guardian containment unexpectedly returned")
-        if type(launch) is PosixProcessLaunchRejected:
-            terminal = self._rejected_launch_terminal(launch.error, arguments[0])
-            try:
-                result_writer.write(terminal)
-            finally:
-                group_owner.retire_before_opaque_work()
-            return _RejectedCommandResolution(
-                0 if type(terminal) is ExecutorGuardianCommandStartFailed else 1
-            )
-        if type(launch) is PosixProcessExecRejected:
-            terminal = ExecutorGuardianCommandStartFailed(
-                launch.error_type,
-                launch.error_repr,
-            )
-            try:
-                result_writer.write(terminal)
-            finally:
-                group_owner.retire_before_opaque_work()
-            return _RejectedCommandResolution(0)
-        if type(launch) is PosixProcessLaunchRecovered:
-            terminal = ExecutorGuardianInternalFailed(
-                type(launch.activation_error).__name__,
-                repr(launch.activation_error),
-            )
-            try:
-                result_writer.write(terminal)
-            finally:
-                group_owner.retire_before_opaque_work()
-            return _RejectedCommandResolution(1)
         if type(launch) is PosixProcessLaunchRecoveryFailed:
             recovery = BaseExceptionGroup(
                 "opaque command activation and recovery failed",
@@ -467,9 +490,100 @@ class PosixExecutorGuardianChild:
             finally:
                 group_owner.contain(terminal, self._termination_policy)
             raise AssertionError("guardian containment unexpectedly returned")
-        if type(launch) is not PosixProcessLaunchStarted:
-            raise AssertionError("opaque command launch is a closed union")
-        return _StartedCommandProcess(launch.process)
+        if type(launch) in (
+            PosixProcessLaunchRejected,
+            PosixProcessExecRejected,
+            PosixProcessLaunchRecovered,
+        ):
+            terminal = self._contained_activation_terminal(
+                launch,
+                arguments[0],
+                budget,
+            )
+            try:
+                result_writer.write(terminal)
+            finally:
+                group_owner.retire_before_opaque_work()
+            return _RejectedCommandResolution(
+                self._activation_terminal_exit_code(terminal)
+            )
+        if type(launch) is PosixProcessLaunchStarted:
+            return _StartedCommandProcess(launch.process)
+        raise AssertionError("opaque command launch is a closed union")
+
+    @classmethod
+    def _contained_activation_terminal(
+        cls,
+        launch: PosixProcessLaunch,
+        executable: str,
+        budget: ExecutorGuardianBudget,
+    ) -> (
+        ExecutorGuardianActivationTimedOut
+        | ExecutorGuardianCommandStartFailed
+        | ExecutorGuardianInternalFailed
+    ):
+        if type(launch) is PosixProcessLaunchRejected:
+            return cls._activation_terminal(launch.error, executable, budget)
+        if type(launch) is PosixProcessExecRejected:
+            return ExecutorGuardianCommandStartFailed(
+                launch.error_type,
+                launch.error_repr,
+            )
+        if type(launch) is PosixProcessLaunchRecovered:
+            return cls._activation_terminal(
+                launch.activation_error,
+                executable,
+                budget,
+            )
+        raise AssertionError("contained command activation is a closed union")
+
+    @staticmethod
+    def _activation_terminal_exit_code(
+        terminal: (
+            ExecutorGuardianActivationTimedOut
+            | ExecutorGuardianCommandStartFailed
+            | ExecutorGuardianInternalFailed
+        ),
+    ) -> int:
+        if type(terminal) in (
+            ExecutorGuardianActivationTimedOut,
+            ExecutorGuardianCommandStartFailed,
+        ):
+            return 0
+        if type(terminal) is ExecutorGuardianInternalFailed:
+            return 1
+        raise AssertionError("activation terminal is a closed union")
+
+    @classmethod
+    def _activation_terminal(
+        cls,
+        error: BaseException,
+        executable: str,
+        budget: ExecutorGuardianBudget,
+    ) -> (
+        ExecutorGuardianActivationTimedOut
+        | ExecutorGuardianCommandStartFailed
+        | ExecutorGuardianInternalFailed
+    ):
+        if type(budget) is ExecutorGuardianBoundedBudget:
+            evidence = classify_posix_process_activation_deadline(error)
+            if type(evidence) is PosixProcessActivationDeadlinePresent:
+                return ExecutorGuardianActivationTimedOut(
+                    budget.reason,
+                    tuple(
+                        ExecutorGuardianSerializedFailure(
+                            "opaque command activation recovery",
+                            type(failure).__name__,
+                            repr(failure),
+                        )
+                        for failure in evidence.recovery_failures
+                    ),
+                )
+            if type(evidence) is not PosixProcessActivationDeadlineAbsent:
+                raise AssertionError("activation deadline evidence is a closed union")
+        elif type(budget) is not ExecutorGuardianUnboundedBudget:
+            raise AssertionError("guardian budget is a closed union")
+        return cls._rejected_launch_terminal(error, executable)
 
     @staticmethod
     def _rejected_launch_terminal(
@@ -613,40 +727,30 @@ class PosixExecutorGuardianChild:
         group_owner: _GuardianGroupOwner,
         resource_measurement: _GuardianResourceMeasurement,
     ) -> _GuardianCommandTerminal:
-        if type(budget) is ExecutorGuardianUnboundedBudget:
-            deadline: float | None = None
-        elif type(budget) is ExecutorGuardianBoundedBudget:
-            deadline = time.monotonic() + budget.timeout_seconds
-        else:
-            raise AssertionError("guardian budget is a closed union")
-        try:
-            while True:
-                group_owner.require_sentinel_alive()
-                return_code = process.poll()
-                if return_code is not None:
-                    return _GuardianCommandTerminal(
-                        self._completed_terminal(
-                            return_code,
-                            resource_measurement,
-                        )
-                    )
-                sleep_seconds = _COMMAND_POLL_SECONDS
-                if deadline is not None:
-                    remaining_seconds = deadline - time.monotonic()
-                    if remaining_seconds <= 0:
-                        if type(budget) is not ExecutorGuardianBoundedBudget:
-                            raise AssertionError(
-                                "only a bounded budget can reach its deadline"
-                            )
-                        return _GuardianCommandTerminal(
-                            ExecutorGuardianCommandTimedOut(budget.reason)
-                        )
-                    sleep_seconds = min(sleep_seconds, remaining_seconds)
-                time.sleep(sleep_seconds)
-        except BaseException as error:
+        observation = self._terminal_observation_owner.observe(
+            process,
+            budget,
+            group_owner,
+        )
+        if type(observation) is ExecutorGuardianCommandExitObserved:
             return _GuardianCommandTerminal(
-                ExecutorGuardianInternalFailed(type(error).__name__, repr(error))
+                self._completed_terminal(
+                    observation.exit_code,
+                    resource_measurement,
+                )
             )
+        if type(observation) is ExecutorGuardianCommandDeadlineObserved:
+            return _GuardianCommandTerminal(
+                ExecutorGuardianCommandTimedOut(observation.reason)
+            )
+        if type(observation) is ExecutorGuardianCommandObservationFailed:
+            return _GuardianCommandTerminal(
+                ExecutorGuardianInternalFailed(
+                    observation.error_type,
+                    observation.error_repr,
+                )
+            )
+        raise AssertionError("guardian command observation is a closed union")
 
 
 def _parse_invocation(raw_request: str) -> GuardianInvocationRecord:
@@ -670,6 +774,10 @@ def main() -> int:
         invocation.termination_policy(),
         build_posix_process_launcher(),
         build_executor_child_resource_observer(),
+        ExecutorGuardianTerminalObservationOwner(
+            SystemExecutorGuardianObservationClock(),
+            _COMMAND_POLL_SECONDS,
+        ),
     ).run(
         invocation,
         _GuardianResultWriter(invocation.result_file_descriptor),

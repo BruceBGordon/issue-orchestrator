@@ -7,6 +7,7 @@ from typing import Protocol, runtime_checkable
 from ..domain.process_group import (
     OwnedProcessGroupLeader,
     ProcessGroupSupervision,
+    ProcessGroupTerminalDecision,
     ProcessGroupTermination,
     ProcessGroupWait,
 )
@@ -18,6 +19,10 @@ class ProcessGroupInterruption(Protocol):
 
     def wait_for_request(self, timeout_seconds: float) -> bool:
         """Wait up to the polling interval and report an interruption request."""
+        ...
+
+    def decide_terminal_observation(self) -> ProcessGroupTerminalDecision:
+        """Re-observe policy exactly when the leader is seen as terminal."""
         ...
 
 

@@ -218,7 +218,7 @@ def test_bounded_deadline_excludes_queue_time_from_active_budget() -> None:
         admitted_at_monotonic=130.0,
     )
 
-    assert budget.timeout_seconds == 60.0
+    assert budget.expires_at_monotonic == 190.0
     assert budget.reason is ExecutorDeadlineReason.ACTIVE
 
 
@@ -233,7 +233,7 @@ def test_bounded_deadline_uses_independent_absolute_escape_valve() -> None:
         admitted_at_monotonic=180.0,
     )
 
-    assert budget.timeout_seconds == 40.0
+    assert budget.expires_at_monotonic == 220.0
     assert budget.reason is ExecutorDeadlineReason.ABSOLUTE
 
 

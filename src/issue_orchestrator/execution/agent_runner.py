@@ -21,24 +21,32 @@ import signal
 import time
 from functools import partial
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, NoReturn, Protocol, cast
 
 import pexpect
 from ptyprocess import PtyProcess
 
+from issue_orchestrator.domain.process_group import OwnedProcessGroupLeader
 from issue_orchestrator.execution.agent_runner_base import (
     BaseAgentRunner,
     _pty_preexec,
 )
 from issue_orchestrator.execution.agent_runner_env import build_filtered_env
-from issue_orchestrator.execution.session_interactions import SessionInteractionHandler
 from issue_orchestrator.execution.agent_runner_types import (
     AgentResult,
     AgentSpec,
     RetryPolicy,
     _format_command_for_log,
 )
+from issue_orchestrator.execution.independent_cleanup import (
+    CleanupAction,
+    IndependentCleanupPlan,
+    raise_cleanup_failures,
+    raise_primary_with_cleanup,
+)
+from issue_orchestrator.execution.session_interactions import SessionInteractionHandler
 from issue_orchestrator.infra.terminal_recording import MirroredTerminalRecordingWriter
+from issue_orchestrator.ports.process_group_supervisor import ProcessGroupSupervisor
 
 logger = logging.getLogger(__name__)
 _DEFAULT_PTY_COLS = 120
@@ -104,6 +112,129 @@ def _pty_preexec_with_file_descriptors(
     for descriptor in inherited_file_descriptors:
         os.set_inheritable(descriptor, True)
     _pty_preexec()
+
+
+def _spawned_agent_group_leader(child: pexpect.spawn) -> OwnedProcessGroupLeader:
+    """Return the exact still-owned leader without querying a live PID."""
+    process_id = child.pid
+    if type(process_id) is not int or process_id <= 1:
+        raise RuntimeError(
+            "spawned agent PTY did not provide a process id above 1"
+        )
+    return OwnedProcessGroupLeader(process_id)
+
+
+def _finalize_pty_after_owned_group_reap(child: pexpect.spawn) -> None:
+    """Close PTY descriptors without asking pexpect to reap a second time."""
+    close_errors: list[BaseException] = []
+    try:
+        child.flush()
+    except BaseException as error:
+        close_errors.append(error)
+    pty_process = cast(_PexpectSpawnInternals, child).ptyproc
+    try:
+        pty_process.fileobj.close()
+    except BaseException as error:
+        close_errors.append(error)
+    finally:
+        pty_process.fd = -1
+        pty_process.closed = True
+        child.child_fd = -1
+        child.closed = True
+    if close_errors:
+        raise BaseExceptionGroup(
+            "could not finalize externally reaped agent PTY",
+            close_errors,
+        )
+
+
+class _SpawnedAgentPtyRollback:
+    """Retain containment evidence across independent startup cleanup steps."""
+
+    def __init__(
+        self,
+        child: pexpect.spawn,
+        process_group_supervisor: ProcessGroupSupervisor,
+    ) -> None:
+        self._child = child
+        self._process_group_supervisor = process_group_supervisor
+        self._group_reaped = False
+
+    def contain_and_reap_group(self) -> None:
+        self._process_group_supervisor.abort(
+            _spawned_agent_group_leader(self._child)
+        )
+        self._group_reaped = True
+
+    def close_pty(self) -> None:
+        if self._group_reaped:
+            _finalize_pty_after_owned_group_reap(self._child)
+            return
+        try:
+            self._child.close(force=True)
+        except BaseException as primary_error:
+            raise_primary_with_cleanup(
+                "agent PTY close and descriptor finalization failed",
+                primary_error,
+                IndependentCleanupPlan(
+                    (
+                        CleanupAction(
+                            "spawned-pty-descriptor-finalization",
+                            partial(
+                                _finalize_pty_after_owned_group_reap,
+                                self._child,
+                            ),
+                        ),
+                    )
+                ).run(),
+            )
+
+
+def _raise_spawn_failure_after_recording_cleanup(
+    primary_error: BaseException,
+    log_writer: MirroredTerminalRecordingWriter | None,
+) -> NoReturn:
+    actions = (
+        ()
+        if log_writer is None
+        else (CleanupAction("terminal-recording-close", log_writer.close),)
+    )
+    raise_primary_with_cleanup(
+        "agent PTY spawn and recording cleanup failed",
+        primary_error,
+        IndependentCleanupPlan(actions).run(),
+    )
+
+
+def _raise_session_construction_failure_after_spawn_cleanup(
+    primary_error: BaseException,
+    child: pexpect.spawn,
+    log_writer: MirroredTerminalRecordingWriter | None,
+    process_group_supervisor: ProcessGroupSupervisor,
+) -> NoReturn:
+    rollback = _SpawnedAgentPtyRollback(child, process_group_supervisor)
+    recording_actions = (
+        ()
+        if log_writer is None
+        else (CleanupAction("terminal-recording-close", log_writer.close),)
+    )
+    raise_primary_with_cleanup(
+        "agent session construction and spawned-resource cleanup failed",
+        primary_error,
+        IndependentCleanupPlan(
+            (
+                CleanupAction(
+                    "spawned-process-group-containment",
+                    rollback.contain_and_reap_group,
+                ),
+                CleanupAction(
+                    "spawned-pty-close",
+                    rollback.close_pty,
+                ),
+                *recording_actions,
+            )
+        ).run(),
+    )
 
 
 class AgentSession:
@@ -224,31 +355,28 @@ class AgentSession:
         if self._closed:
             raise RuntimeError("AgentSession is already finalized")
         self._closed = True
-        close_errors: list[BaseException] = []
-        try:
-            self._child.flush()
-        except BaseException as error:
-            close_errors.append(error)
-        pty_process = cast(_PexpectSpawnInternals, self._child).ptyproc
-        try:
-            pty_process.fileobj.close()
-        except BaseException as error:
-            close_errors.append(error)
-        finally:
-            pty_process.fd = -1
-            pty_process.closed = True
-            self._child.child_fd = -1
-            self._child.closed = True
-        if self._log_writer is not None:
-            try:
-                self._log_writer.close()
-            except BaseException as error:
-                close_errors.append(error)
-        if close_errors:
-            raise BaseExceptionGroup(
-                "could not finalize externally reaped agent session",
-                close_errors,
+        recording_actions = (
+            ()
+            if self._log_writer is None
+            else (
+                CleanupAction("terminal-recording-close", self._log_writer.close),
             )
+        )
+        raise_cleanup_failures(
+            "could not finalize externally reaped agent session",
+            IndependentCleanupPlan(
+                (
+                    CleanupAction(
+                        "externally-reaped-pty-finalization",
+                        partial(
+                            _finalize_pty_after_owned_group_reap,
+                            self._child,
+                        ),
+                    ),
+                    *recording_actions,
+                )
+            ).run(),
+        )
 
     def _close(self, *, timed_out: bool) -> AgentResult:
         """Close the PTY, flush the log, return the result."""
@@ -322,6 +450,17 @@ class AgentRunner(BaseAgentRunner):
         result = runner.run(spec)  # blocks until done
     """
 
+    def __init__(self, process_group_supervisor: ProcessGroupSupervisor) -> None:
+        if not isinstance(
+            cast(object, process_group_supervisor),
+            ProcessGroupSupervisor,
+        ):
+            raise ValueError(
+                "AgentRunner.process_group_supervisor must implement "
+                "ProcessGroupSupervisor"
+            )
+        self._process_group_supervisor = process_group_supervisor
+
     def start(
         self,
         spec: AgentSpec,
@@ -387,8 +526,8 @@ class AgentRunner(BaseAgentRunner):
             inherited_file_descriptors=inherited_file_descriptors,
         )
 
-    @staticmethod
     def _start_pty(
+        self,
         spec: AgentSpec,
         *,
         executable: str,
@@ -433,25 +572,38 @@ class AgentRunner(BaseAgentRunner):
                 inherited_file_descriptors,
             )
         )
-        child = _PexpectSpawnWithFileDescriptors(
-            executable,
-            list(arguments),
-            inherited_file_descriptors,
-            cwd=str(spec.working_dir),
-            env=env,
-            logfile=log_writer,
-            timeout=None,
-            preexec_fn=preexec_fn,
-            dimensions=(rows, cols),
-        )
-
-        return AgentSession(
-            child,
-            log_writer,
-            spec,
-            time.monotonic(),
-            interaction_handler=interaction_handler,
-        )
+        try:
+            child = _PexpectSpawnWithFileDescriptors(
+                executable,
+                list(arguments),
+                inherited_file_descriptors,
+                cwd=str(spec.working_dir),
+                env=env,
+                logfile=log_writer,
+                timeout=None,
+                preexec_fn=preexec_fn,
+                dimensions=(rows, cols),
+            )
+        except BaseException as primary_error:
+            _raise_spawn_failure_after_recording_cleanup(
+                primary_error,
+                log_writer,
+            )
+        try:
+            return AgentSession(
+                child,
+                log_writer,
+                spec,
+                time.monotonic(),
+                interaction_handler=interaction_handler,
+            )
+        except BaseException as primary_error:
+            _raise_session_construction_failure_after_spawn_cleanup(
+                primary_error,
+                child,
+                log_writer,
+                self._process_group_supervisor,
+            )
 
     def run_interactive(self, spec: AgentSpec, response_file: Path) -> AgentResult:
         """Run an interactive agent round without PTY/fork.

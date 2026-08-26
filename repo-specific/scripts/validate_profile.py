@@ -17,25 +17,45 @@ validation-lane fan-out.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 import json
+import math
 import os
 import re
+import shlex
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from io import TextIOBase
 from pathlib import Path
-from typing import Literal, Protocol, cast, runtime_checkable
+from types import MappingProxyType
+from typing import Literal, NoReturn, Protocol, cast, runtime_checkable
+from uuid import UUID, uuid4
 
 from issue_orchestrator.domain.executor import (
     ExecutorFairnessGroup,
     ExecutorPolicySource,
+)
+from issue_orchestrator.domain.validation_execution import (
+    ContainedValidationCommand,
+    ValidationCommandCleanupFailed,
+    ValidationCommandCleanupNotStarted,
+    ValidationCommandCompleted,
+    ValidationCommandExecution,
+    ValidationCommandExitUnknown,
+    ValidationCommandExited,
+    ValidationCommandNotStarted,
+    ValidationCommandOutput,
+    ValidationCommandOutputCapture,
+    ValidationCommandTimedOut,
+    ValidationCommandTimedOutCleanupFailed,
+    ValidationCommandTimeoutPhase,
+    ValidationExecutionDeadline,
 )
 from issue_orchestrator.domain.executor_monitoring import (
     ExecutorAllRepositories,
@@ -56,8 +76,17 @@ from issue_orchestrator.domain.executor_monitoring import (
 from issue_orchestrator.entrypoints.bootstrap import (
     build_executor,
     build_executor_monitor,
+    build_validation_command_runner,
 )
 from issue_orchestrator.infra.validation_timings import build_host_context
+from issue_orchestrator.execution.posix_file_lock import (
+    PosixFileLockAcquisition,
+    PosixFileLockFilePresence,
+    PosixFileLockMode,
+    PosixFileLockOwner,
+    PosixFileLockSpecification,
+)
+from issue_orchestrator.ports.validation_command_runner import ValidationCommandRunner
 from issue_orchestrator.ports.executor_monitor import ExecutorMonitor
 
 
@@ -68,6 +97,8 @@ AGGREGATE_TARGET = "validate-pr-raw"
 AGGREGATE_LANE_VARIABLE = "VALIDATE_PR_LANES"
 PROFILE_METHOD = "cold_then_learned_pinned_commit_with_warm_external_caches"
 EXECUTOR_EVENT_CAPTURE_LIMIT = 1000
+DEFAULT_PROFILE_COMMAND_TIMEOUT_SECONDS = 3600
+PROFILE_COMMAND_OUTPUT_TAIL_BYTES = 4_194_304
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +112,497 @@ class CommandResult:
     worktree_path: str | None
     output_log_path: str
 
+    def __post_init__(self) -> None:
+        if type(self.name) is not str or not self.name:
+            raise ValueError("CommandResult.name must not be empty")
+        if (
+            type(self.command) is not tuple
+            or not self.command
+            or any(type(argument) is not str for argument in self.command)
+        ):
+            raise ValueError("CommandResult.command must be a non-empty string tuple")
+        if (
+            type(self.wall_seconds) is not float
+            or not math.isfinite(self.wall_seconds)
+            or self.wall_seconds < 0
+        ):
+            raise ValueError(
+                "CommandResult.wall_seconds must be finite and non-negative"
+            )
+        if type(self.exit_code) is not int:
+            raise ValueError("CommandResult.exit_code must be an integer")
+        if self.worktree_path is not None and (
+            type(self.worktree_path) is not str or not self.worktree_path
+        ):
+            raise ValueError(
+                "CommandResult.worktree_path must be absent or a non-empty string"
+            )
+        if type(self.output_log_path) is not str or not self.output_log_path:
+            raise ValueError("CommandResult.output_log_path must not be empty")
+
+
+class ProfileCommandLogFinalizationOperation(StrEnum):
+    """Independent command-log operation attempted after child termination."""
+
+    OPEN = "open"
+    FOOTER_WRITE = "footer-write"
+    FLUSH = "flush"
+    FILE_SYNC = "file-sync"
+    CLOSE = "close"
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandLogFinalizationFailure:
+    """One exact command-log finalization failure."""
+
+    operation: ProfileCommandLogFinalizationOperation
+    error_type: str
+    error_message: str
+
+    def __post_init__(self) -> None:
+        if type(self.operation) is not ProfileCommandLogFinalizationOperation:
+            raise ValueError("command-log finalization operation must be typed")
+        if type(self.error_type) is not str or not self.error_type:
+            raise ValueError("command-log finalization error_type must not be empty")
+        if type(self.error_message) is not str or not self.error_message:
+            raise ValueError("command-log finalization error_message must not be empty")
+
+
+class ProfileCommandFinalizationError(RuntimeError):
+    """A command terminated exactly, but its diagnostic log did not close."""
+
+    def __init__(
+        self,
+        command_result: CommandResult,
+        failures: tuple[ProfileCommandLogFinalizationFailure, ...],
+    ) -> None:
+        if type(command_result) is not CommandResult:
+            raise ValueError(
+                "ProfileCommandFinalizationError.command_result must be typed"
+            )
+        if not failures or any(
+            type(failure) is not ProfileCommandLogFinalizationFailure
+            for failure in failures
+        ):
+            raise ValueError(
+                "ProfileCommandFinalizationError.failures must contain typed failures"
+            )
+        self.command_result = command_result
+        self.failures = failures
+        operations = ", ".join(failure.operation.value for failure in failures)
+        super().__init__(
+            "profile command terminated but log finalization failed: "
+            f"exit={command_result.exit_code} operations={operations}"
+        )
+
+
+class ProfileCommandLifecycleError(RuntimeError):
+    """Contained execution returned a non-successful lifecycle fact."""
+
+    def __init__(
+        self,
+        command_name: str,
+        execution: ValidationCommandExecution,
+        wall_seconds: float,
+        deadline: ValidationExecutionDeadline,
+    ) -> None:
+        if type(command_name) is not str or not command_name:
+            raise ValueError("ProfileCommandLifecycleError.command_name is required")
+        if type(execution) is not ValidationCommandExecution:
+            raise ValueError("ProfileCommandLifecycleError.execution must be typed")
+        if (
+            type(wall_seconds) is not float
+            or not math.isfinite(wall_seconds)
+            or wall_seconds < 0
+        ):
+            raise ValueError(
+                "ProfileCommandLifecycleError.wall_seconds must be finite and "
+                "non-negative"
+            )
+        self.command_name = command_name
+        self.execution = execution
+        self.wall_seconds = wall_seconds
+        if type(deadline) is not ValidationExecutionDeadline:
+            raise ValueError("ProfileCommandLifecycleError.deadline must be typed")
+        self.deadline = deadline
+        evidence = execution.evidence(deadline)
+        super().__init__(
+            f"contained profile command did not close normally: {command_name} "
+            f"exit={evidence.exit_code} timed_out={evidence.timed_out} "
+            f"stderr={evidence.stderr!r}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandOutsideWorktree:
+    """The command is not attributed to a disposable worktree."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandInWorktree:
+    """The command is attributed to one exact disposable worktree path."""
+
+    path: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, Path) or not self.path.is_absolute():
+            raise ValueError("ProfileCommandInWorktree.path must be absolute")
+
+
+ProfileCommandWorktree = ProfileCommandOutsideWorktree | ProfileCommandInWorktree
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandInvocation:
+    """Profiler vocabulary before durable journal paths are assigned."""
+
+    name: str
+    command: tuple[str, ...]
+    dry_run: bool
+    working_directory: Path
+    worktree: ProfileCommandWorktree
+    environment: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        if type(self.name) is not str or not self.name:
+            raise ValueError("ProfileCommandInvocation.name must not be empty")
+        if (
+            type(self.command) is not tuple
+            or not self.command
+            or any(type(argument) is not str for argument in self.command)
+            or any("\0" in argument for argument in self.command)
+        ):
+            raise ValueError(
+                "ProfileCommandInvocation.command must be a non-empty safe string tuple"
+            )
+        if type(self.dry_run) is not bool:
+            raise ValueError("ProfileCommandInvocation.dry_run must be boolean")
+        if (
+            not isinstance(self.working_directory, Path)
+            or not self.working_directory.is_absolute()
+        ):
+            raise ValueError(
+                "ProfileCommandInvocation.working_directory must be absolute"
+            )
+        if type(self.worktree) not in (
+            ProfileCommandOutsideWorktree,
+            ProfileCommandInWorktree,
+        ):
+            raise ValueError(
+                "ProfileCommandInvocation.worktree must be an explicit typed location"
+            )
+        environment = dict(self.environment)
+        if any(
+            type(key) is not str
+            or not key
+            or "=" in key
+            or "\0" in key
+            or type(value) is not str
+            or "\0" in value
+            for key, value in environment.items()
+        ):
+            raise ValueError(
+                "ProfileCommandInvocation.environment must contain process strings"
+            )
+        object.__setattr__(self, "environment", MappingProxyType(environment))
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandRequest:
+    """Complete non-null request for one profiler-owned process tree."""
+
+    invocation: ProfileCommandInvocation
+    output_log_path: Path
+    runner_stderr_path: Path
+
+    def __post_init__(self) -> None:
+        if type(self.invocation) is not ProfileCommandInvocation:
+            raise ValueError("ProfileCommandRequest.invocation must be typed")
+        for field_name, path in (
+            ("output_log_path", self.output_log_path),
+            ("runner_stderr_path", self.runner_stderr_path),
+        ):
+            if not isinstance(path, Path) or not path.is_absolute():
+                raise ValueError(f"ProfileCommandRequest.{field_name} must be absolute")
+        if self.output_log_path == self.runner_stderr_path:
+            raise ValueError("profile command journal paths must differ")
+
+    @property
+    def name(self) -> str:
+        return self.invocation.name
+
+    @property
+    def command(self) -> tuple[str, ...]:
+        return self.invocation.command
+
+    @property
+    def dry_run(self) -> bool:
+        return self.invocation.dry_run
+
+    @property
+    def working_directory(self) -> Path:
+        return self.invocation.working_directory
+
+    @property
+    def worktree_path(self) -> str | None:
+        worktree = self.invocation.worktree
+        if type(worktree) is ProfileCommandOutsideWorktree:
+            return None
+        if type(worktree) is ProfileCommandInWorktree:
+            return str(worktree.path)
+        raise AssertionError("ProfileCommandWorktree is a closed union")
+
+    @property
+    def environment(self) -> Mapping[str, str]:
+        return self.invocation.environment
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandExecution:
+    """Exact result and bounded command-only stdout retained for observers."""
+
+    result: CommandResult
+    captured_output: str
+    captured_output_complete: bool
+
+    def __post_init__(self) -> None:
+        if type(self.result) is not CommandResult:
+            raise ValueError("ProfileCommandExecution.result must be typed")
+        if type(self.captured_output) is not str:
+            raise ValueError("ProfileCommandExecution.captured_output must be text")
+        if type(self.captured_output_complete) is not bool:
+            raise ValueError(
+                "ProfileCommandExecution.captured_output_complete must be boolean"
+            )
+
+    def require_complete_output(self) -> str:
+        """Return query output only when the bounded capture retained it all."""
+        if not self.captured_output_complete:
+            raise RuntimeError(
+                f"profile command output exceeded the observation bound: "
+                f"{self.result.name}"
+            )
+        return self.captured_output
+
+
+@runtime_checkable
+class ProfileCommandOwner(Protocol):
+    """Deep boundary for deadline-bounded, process-tree-contained commands."""
+
+    def execute(self, request: ProfileCommandRequest) -> ProfileCommandExecution: ...
+
+
+@runtime_checkable
+class ProfileCommandLogAppender(Protocol):
+    """Required durable append operations for one terminated command log."""
+
+    def write(self, text: str) -> None: ...
+
+    def flush(self) -> None: ...
+
+    def sync(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class ProfileCommandLogAppenderFactory(Protocol):
+    def open(self, path: Path) -> ProfileCommandLogAppender: ...
+
+
+@dataclass(slots=True)
+class TextProfileCommandLogAppender:
+    """Text-file adapter with an explicit file-sync operation."""
+
+    handle: TextIOBase
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.handle, TextIOBase) or self.handle.closed:
+            raise ValueError(
+                "TextProfileCommandLogAppender.handle must be an open text stream"
+            )
+
+    def write(self, text: str) -> None:
+        self.handle.write(text)
+
+    def flush(self) -> None:
+        self.handle.flush()
+
+    def sync(self) -> None:
+        os.fsync(self.handle.fileno())
+
+    def close(self) -> None:
+        self.handle.close()
+
+
+class TextProfileCommandLogAppenderFactory:
+    def open(self, path: Path) -> ProfileCommandLogAppender:
+        return TextProfileCommandLogAppender(path.open("a", encoding="utf-8"))
+
+
+class DurableProfileCommandLogFinalizer:
+    """Attempt every applicable log close boundary after command termination."""
+
+    def __init__(self, appender_factory: ProfileCommandLogAppenderFactory) -> None:
+        if not isinstance(appender_factory, ProfileCommandLogAppenderFactory):
+            raise ValueError(
+                "DurableProfileCommandLogFinalizer.appender_factory must implement "
+                "its port"
+            )
+        self._appender_factory = appender_factory
+
+    def finalize(
+        self,
+        command_result: CommandResult,
+        ended_at: str,
+    ) -> tuple[ProfileCommandLogFinalizationFailure, ...]:
+        if type(command_result) is not CommandResult:
+            raise ValueError("command log finalization requires CommandResult")
+        if type(ended_at) is not str or not ended_at:
+            raise ValueError("command log finalization requires ended_at")
+        try:
+            appender = self._appender_factory.open(Path(command_result.output_log_path))
+        except BaseException as error:
+            return (self._failure(ProfileCommandLogFinalizationOperation.OPEN, error),)
+        footer = (
+            f"[profile-command] exit={command_result.exit_code} "
+            f"elapsed={command_result.wall_seconds:.6f}s ended_at={ended_at}\n"
+        )
+        failures: list[ProfileCommandLogFinalizationFailure] = []
+        for operation, attempt in (
+            (
+                ProfileCommandLogFinalizationOperation.FOOTER_WRITE,
+                lambda: appender.write(footer),
+            ),
+            (ProfileCommandLogFinalizationOperation.FLUSH, appender.flush),
+            (ProfileCommandLogFinalizationOperation.FILE_SYNC, appender.sync),
+            (ProfileCommandLogFinalizationOperation.CLOSE, appender.close),
+        ):
+            try:
+                attempt()
+            except BaseException as error:
+                failures.append(self._failure(operation, error))
+        return tuple(failures)
+
+    @staticmethod
+    def _failure(
+        operation: ProfileCommandLogFinalizationOperation,
+        error: BaseException,
+    ) -> ProfileCommandLogFinalizationFailure:
+        return ProfileCommandLogFinalizationFailure(
+            operation,
+            type(error).__name__,
+            _exception_message(error),
+        )
+
+
+class ContainedProfileCommandOwner:
+    """Execute profiler commands through the existing validation lifecycle."""
+
+    def __init__(
+        self,
+        runner: ValidationCommandRunner,
+        deadline: ValidationExecutionDeadline,
+        log_finalizer: DurableProfileCommandLogFinalizer,
+    ) -> None:
+        if not isinstance(runner, ValidationCommandRunner):
+            raise ValueError("ContainedProfileCommandOwner.runner must implement port")
+        if type(deadline) is not ValidationExecutionDeadline:
+            raise ValueError("ContainedProfileCommandOwner.deadline must be typed")
+        if type(log_finalizer) is not DurableProfileCommandLogFinalizer:
+            raise ValueError("ContainedProfileCommandOwner.log_finalizer must be typed")
+        self._runner = runner
+        self._deadline = deadline
+        self._log_finalizer = log_finalizer
+
+    def execute(self, request: ProfileCommandRequest) -> ProfileCommandExecution:
+        if type(request) is not ProfileCommandRequest:
+            raise ValueError("ContainedProfileCommandOwner.execute requires request")
+        if request.output_log_path.exists() or request.runner_stderr_path.exists():
+            raise FileExistsError(
+                "profile command journals already exist: "
+                f"{request.output_log_path}, {request.runner_stderr_path}"
+            )
+        cwd_info = f" (cwd={request.working_directory})"
+        print(f"[profile] {request.name}: {' '.join(request.command)}{cwd_info}")
+        header = self._header(request)
+        target_command = (
+            ":" if request.dry_run else f"exec {shlex.join(request.command)}"
+        )
+        shell_command = f"printf %s {shlex.quote(header)}; {target_command} 2>&1"
+        started = time.monotonic()
+        runner_working_directory = (
+            request.output_log_path.parent
+            if request.dry_run
+            else request.working_directory
+        )
+        execution = self._runner.run(
+            ContainedValidationCommand(
+                command=shell_command,
+                working_directory=runner_working_directory,
+                environment=request.environment,
+                deadline=self._deadline,
+                output_capture=ValidationCommandOutputCapture(
+                    request.output_log_path,
+                    request.runner_stderr_path,
+                    PROFILE_COMMAND_OUTPUT_TAIL_BYTES,
+                ),
+            )
+        )
+        observed_wall_seconds = time.monotonic() - started
+        wall_seconds = 0.0 if request.dry_run else observed_wall_seconds
+        if (
+            type(execution.child) is not ValidationCommandExited
+            or type(execution.cleanup) is not ValidationCommandCompleted
+        ):
+            raise ProfileCommandLifecycleError(
+                request.name,
+                execution,
+                wall_seconds,
+                self._deadline,
+            )
+        result = CommandResult(
+            request.name,
+            request.command,
+            wall_seconds,
+            execution.child.exit_code,
+            request.worktree_path,
+            str(request.output_log_path),
+        )
+        failures = self._log_finalizer.finalize(
+            result,
+            datetime.now(tz=UTC).isoformat(),
+        )
+        if failures:
+            raise ProfileCommandFinalizationError(result, failures)
+        print(
+            f"[profile] {request.name}: exit={result.exit_code} "
+            f"elapsed={result.wall_seconds:.2f}s log={request.output_log_path}"
+        )
+        output = execution.output.stdout
+        output_complete = output.startswith(header)
+        if output_complete:
+            output = output[len(header) :]
+        return ProfileCommandExecution(result, output, output_complete)
+
+    @staticmethod
+    def _header(request: ProfileCommandRequest) -> str:
+        lines = (
+            f"[profile-command] name={request.name}",
+            "[profile-command] argv=" + json.dumps(request.command),
+            f"[profile-command] cwd={request.working_directory}",
+            f"[profile-command] started_at={datetime.now(tz=UTC).isoformat()}",
+        )
+        environment_lines = tuple(
+            f"[profile-command] env.{variable}={request.environment[variable]}"
+            for variable in (
+                EXECUTOR_POOL_DIR_ENV,
+                EXECUTOR_AGGRESSIVENESS_ENV,
+            )
+            if variable in request.environment
+        )
+        return "\n".join((*lines, *environment_lines, ""))
+
 
 @dataclass(frozen=True, slots=True)
 class ProfileArtifactStore:
@@ -89,8 +611,8 @@ class ProfileArtifactStore:
     root: Path
 
     def __post_init__(self) -> None:
-        if not isinstance(self.root, Path):
-            raise ValueError("ProfileArtifactStore.root must be a Path")
+        if not isinstance(self.root, Path) or not self.root.is_absolute():
+            raise ValueError("ProfileArtifactStore.root must be an absolute Path")
 
     def initialize(self) -> None:
         """Create a new artifact directory without overwriting prior evidence."""
@@ -105,6 +627,24 @@ class ProfileArtifactStore:
             raise ValueError("profile command name must contain a filename character")
         return self.root / f"{filename}.log"
 
+    def command_runner_stderr_path(self, command_name: str) -> Path:
+        """Return the private guardian stderr journal for one command."""
+        output_log_path = self.command_log_path(command_name)
+        return output_log_path.with_suffix(".runner-stderr.log")
+
+    def command_request(
+        self,
+        invocation: ProfileCommandInvocation,
+    ) -> ProfileCommandRequest:
+        """Assign deterministic durable journals to one typed invocation."""
+        if type(invocation) is not ProfileCommandInvocation:
+            raise ValueError("profile artifact command invocation must be typed")
+        return ProfileCommandRequest(
+            invocation,
+            self.command_log_path(invocation.name).resolve(),
+            self.command_runner_stderr_path(invocation.name).resolve(),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ProfileArguments:
@@ -117,6 +657,23 @@ class ProfileArguments:
     targets: tuple[str, ...] | None
     repo_root: Path
     aggressiveness_percent: int | None
+    command_timeout_seconds: int
+
+    def __post_init__(self) -> None:
+        if type(self.make_bin) is not str or not self.make_bin:
+            raise ValueError("ProfileArguments.make_bin must not be empty")
+        for field_name, value in (
+            ("jobs", self.jobs),
+            ("command_timeout_seconds", self.command_timeout_seconds),
+        ):
+            if type(value) is not int or value < 1:
+                raise ValueError(
+                    f"ProfileArguments.{field_name} must be a positive integer"
+                )
+        if type(self.dry_run) is not bool:
+            raise ValueError("ProfileArguments.dry_run must be boolean")
+        if not isinstance(self.repo_root, Path):
+            raise ValueError("ProfileArguments.repo_root must be a Path")
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +805,15 @@ class ValidateProfileConfiguration:
     executor_learning: str
     external_caches: str
     artifact_directory: str
+    command_timeout_seconds: int
+
+    def __post_init__(self) -> None:
+        if type(self.command_timeout_seconds) is not int or (
+            self.command_timeout_seconds < 1
+        ):
+            raise ValueError(
+                "ValidateProfileConfiguration.command_timeout_seconds must be positive"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +829,48 @@ class ValidateProfileInitialization:
     host: ProfileHost
     aggressiveness: ProfileAggressiveness
     artifact_directory: str
+    command_timeout_seconds: int
+
+    def __post_init__(self) -> None:
+        if type(self.command_timeout_seconds) is not int or (
+            self.command_timeout_seconds < 1
+        ):
+            raise ValueError(
+                "ValidateProfileInitialization.command_timeout_seconds must be positive"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ValidateProfileStartup:
+    """Non-null invocation facts available once artifact storage exists."""
+
+    make_bin: str
+    repo_root: str
+    jobs: int
+    dry_run: bool
+    artifact_directory: str
+    command_timeout_seconds: int
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("make_bin", self.make_bin),
+            ("repo_root", self.repo_root),
+            ("artifact_directory", self.artifact_directory),
+        ):
+            if type(value) is not str or not value:
+                raise ValueError(
+                    f"ValidateProfileStartup.{field_name} must not be empty"
+                )
+        for field_name, value in (
+            ("jobs", self.jobs),
+            ("command_timeout_seconds", self.command_timeout_seconds),
+        ):
+            if type(value) is not int or value < 1:
+                raise ValueError(
+                    f"ValidateProfileStartup.{field_name} must be positive"
+                )
+        if type(self.dry_run) is not bool:
+            raise ValueError("ValidateProfileStartup.dry_run must be boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +887,25 @@ class ProfileMeasurementRequest:
     artifacts: ProfileArtifactStore
     profiled_commit_sha: str
     configuration: ValidateProfileConfiguration
+    command_owner: ProfileCommandOwner
+
+    def __post_init__(self) -> None:
+        for field_name, path in (
+            ("repo_root", self.repo_root),
+            ("executor_pool_dir", self.executor_pool_dir),
+        ):
+            if not isinstance(path, Path) or not path.is_absolute():
+                raise ValueError(
+                    f"ProfileMeasurementRequest.{field_name} must be absolute"
+                )
+        if type(self.artifacts) is not ProfileArtifactStore:
+            raise ValueError("ProfileMeasurementRequest.artifacts must be typed")
+        if not isinstance(self.command_owner, ProfileCommandOwner):
+            raise ValueError(
+                "ProfileMeasurementRequest.command_owner must implement its port"
+            )
+        if type(self.configuration) is not ValidateProfileConfiguration:
+            raise ValueError("ProfileMeasurementRequest.configuration must be typed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +926,7 @@ class ValidateProfileSummary:
 class ProfileStage(StrEnum):
     """Ordered profiler stage whose failure terminates later measurement."""
 
+    INITIALIZATION = "initialization"
     TARGET_DISCOVERY = "target-discovery"
     COLD_AGGREGATE = "cold-aggregate"
     TARGET = "target"
@@ -496,16 +1124,12 @@ class ProfileAggregateObservationError(RuntimeError):
         primary_error: BaseException,
     ) -> None:
         if type(operation) is not ProfileAggregateObservationOperation:
-            raise ValueError(
-                "ProfileAggregateObservationError.operation must be typed"
-            )
+            raise ValueError("ProfileAggregateObservationError.operation must be typed")
         if type(progress) not in (
             ProfileAggregateCommandCompleted,
             ProfileAggregateAfterStatusCaptured,
         ):
-            raise ValueError(
-                "ProfileAggregateObservationError.progress must be typed"
-            )
+            raise ValueError("ProfileAggregateObservationError.progress must be typed")
         if not isinstance(primary_error, BaseException):
             raise ValueError(
                 "ProfileAggregateObservationError.primary_error is required"
@@ -569,6 +1193,221 @@ class ProfileStageFailed(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class ProfileCommandExitedEvidence:
+    """Serializable evidence for one reaped process-group leader."""
+
+    state: Literal["exited"] = field(init=False, default="exited")
+    process_id: int
+    exit_code: int
+
+    def __post_init__(self) -> None:
+        if type(self.process_id) is not int or self.process_id <= 1:
+            raise ValueError("profile command exited process_id must be above 1")
+        if type(self.exit_code) is not int:
+            raise ValueError("profile command exited exit_code must be int")
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandNotStartedEvidence:
+    """Serializable evidence for a command whose process group never existed."""
+
+    state: Literal["not-started"] = field(init=False, default="not-started")
+    error_type: str
+    error_message: str
+
+    def __post_init__(self) -> None:
+        if type(self.error_type) is not str or not self.error_type:
+            raise ValueError("profile command launch error_type must not be empty")
+        if type(self.error_message) is not str or not self.error_message:
+            raise ValueError("profile command launch error_message must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandExitUnknownEvidence:
+    """Serializable evidence for a started leader lacking a trustworthy status."""
+
+    state: Literal["exit-unknown"] = field(init=False, default="exit-unknown")
+    process_id: int
+
+    def __post_init__(self) -> None:
+        if type(self.process_id) is not int or self.process_id <= 1:
+            raise ValueError("profile command unknown process_id must be above 1")
+
+
+ProfileCommandChildEvidence = (
+    ProfileCommandExitedEvidence
+    | ProfileCommandNotStartedEvidence
+    | ProfileCommandExitUnknownEvidence
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandCompletedEvidence:
+    """Serializable evidence for natural completion and closed containment."""
+
+    state: Literal["completed"] = field(init=False, default="completed")
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandTimedOutEvidence:
+    """Serializable evidence for containment caused by one exact clock."""
+
+    state: Literal["timed-out"] = field(init=False, default="timed-out")
+    phase: ValidationCommandTimeoutPhase
+
+    def __post_init__(self) -> None:
+        if type(self.phase) is not ValidationCommandTimeoutPhase:
+            raise ValueError("profile command timeout phase must be typed")
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandCleanupNotStartedEvidence:
+    """Serializable evidence that no process group required cleanup."""
+
+    state: Literal["not-started"] = field(init=False, default="not-started")
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandCleanupFailedEvidence:
+    """Serializable evidence for containment or output-closure failure."""
+
+    state: Literal["failed"] = field(init=False, default="failed")
+    error_type: str
+    error_message: str
+
+    def __post_init__(self) -> None:
+        if type(self.error_type) is not str or not self.error_type:
+            raise ValueError("profile command cleanup error_type must not be empty")
+        if type(self.error_message) is not str or not self.error_message:
+            raise ValueError("profile command cleanup error_message must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandTimedOutCleanupFailedEvidence:
+    """Serializable timeout fact plus its subsequent cleanup failure."""
+
+    state: Literal["timed-out-cleanup-failed"] = field(
+        init=False,
+        default="timed-out-cleanup-failed",
+    )
+    phase: ValidationCommandTimeoutPhase
+    error_type: str
+    error_message: str
+
+    def __post_init__(self) -> None:
+        if type(self.phase) is not ValidationCommandTimeoutPhase:
+            raise ValueError("profile command timeout-cleanup phase must be typed")
+        if type(self.error_type) is not str or not self.error_type:
+            raise ValueError(
+                "profile command timeout-cleanup error_type must not be empty"
+            )
+        if type(self.error_message) is not str or not self.error_message:
+            raise ValueError(
+                "profile command timeout-cleanup error_message must not be empty"
+            )
+
+
+ProfileCommandCleanupEvidence = (
+    ProfileCommandCompletedEvidence
+    | ProfileCommandTimedOutEvidence
+    | ProfileCommandCleanupNotStartedEvidence
+    | ProfileCommandCleanupFailedEvidence
+    | ProfileCommandTimedOutCleanupFailedEvidence
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandOutputEvidence:
+    """Exact retained capture returned by the contained execution owner."""
+
+    stdout: str
+    stderr: str
+
+    def __post_init__(self) -> None:
+        if type(self.stdout) is not str or type(self.stderr) is not str:
+            raise ValueError("profile command output evidence must be text")
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCommandDeadlineEvidence:
+    """All nested clocks that governed one contained command."""
+
+    active_timeout_seconds: float
+    absolute_timeout_seconds: float
+    outer_timeout_seconds: int
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("active_timeout_seconds", self.active_timeout_seconds),
+            ("absolute_timeout_seconds", self.absolute_timeout_seconds),
+        ):
+            if type(value) is not float or not math.isfinite(value) or value <= 0:
+                raise ValueError(
+                    f"ProfileCommandDeadlineEvidence.{field_name} must be positive"
+                )
+        if (
+            type(self.outer_timeout_seconds) is not int
+            or self.outer_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "ProfileCommandDeadlineEvidence.outer_timeout_seconds must be positive"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileUnexpectedCommandLifecycleFailure:
+    """Unexpected stage failure retaining the entire contained execution fact."""
+
+    stage: ProfileStage
+    operation_name: str
+    command_name: str
+    wall_seconds: float
+    deadline: ProfileCommandDeadlineEvidence
+    child: ProfileCommandChildEvidence
+    cleanup: ProfileCommandCleanupEvidence
+    output: ProfileCommandOutputEvidence
+    cleanup_failures: tuple[ProfileCleanupFailure, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.stage) is not ProfileStage:
+            raise ValueError("command lifecycle failure stage must be typed")
+        if type(self.operation_name) is not str or not self.operation_name:
+            raise ValueError("command lifecycle operation_name must not be empty")
+        if type(self.command_name) is not str or not self.command_name:
+            raise ValueError("command lifecycle command_name must not be empty")
+        if (
+            type(self.wall_seconds) is not float
+            or not math.isfinite(self.wall_seconds)
+            or self.wall_seconds < 0
+        ):
+            raise ValueError("command lifecycle wall_seconds must be non-negative")
+        if type(self.deadline) is not ProfileCommandDeadlineEvidence:
+            raise ValueError("command lifecycle deadline must be typed")
+        if type(self.child) not in (
+            ProfileCommandExitedEvidence,
+            ProfileCommandNotStartedEvidence,
+            ProfileCommandExitUnknownEvidence,
+        ):
+            raise ValueError("command lifecycle child evidence must be typed")
+        if type(self.cleanup) not in (
+            ProfileCommandCompletedEvidence,
+            ProfileCommandTimedOutEvidence,
+            ProfileCommandCleanupNotStartedEvidence,
+            ProfileCommandCleanupFailedEvidence,
+            ProfileCommandTimedOutCleanupFailedEvidence,
+        ):
+            raise ValueError("command lifecycle cleanup evidence must be typed")
+        if type(self.output) is not ProfileCommandOutputEvidence:
+            raise ValueError("command lifecycle output evidence must be typed")
+        if type(self.cleanup_failures) is not tuple or any(
+            type(failure)
+            not in (ProfileCleanupCommandFailure, ProfileCleanupFilesystemFailure)
+            for failure in self.cleanup_failures
+        ):
+            raise ValueError("command lifecycle cleanup_failures must be typed")
+
+
+@dataclass(frozen=True, slots=True)
 class ProfileUnexpectedFailure:
     """Unexpected stage failure retained without manufacturing command evidence."""
 
@@ -588,8 +1427,42 @@ class ProfileUnexpectedFailure:
         if type(self.error_type) is not str or not self.error_type:
             raise ValueError("ProfileUnexpectedFailure.error_type must not be empty")
         if type(self.error_message) is not str or not self.error_message:
+            raise ValueError("ProfileUnexpectedFailure.error_message must not be empty")
+        if type(self.cleanup_failures) is not tuple or any(
+            type(failure)
+            not in (ProfileCleanupCommandFailure, ProfileCleanupFilesystemFailure)
+            for failure in self.cleanup_failures
+        ):
             raise ValueError(
-                "ProfileUnexpectedFailure.error_message must not be empty"
+                "ProfileUnexpectedFailure.cleanup_failures must contain typed failures"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileUnexpectedCommandFinalizationFailure:
+    """Unexpected stage failure retaining an exact terminated command fact."""
+
+    stage: ProfileStage
+    operation_name: str
+    command_result: CommandResult
+    finalization_failures: tuple[ProfileCommandLogFinalizationFailure, ...]
+    cleanup_failures: tuple[ProfileCleanupFailure, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.stage) is not ProfileStage:
+            raise ValueError("command finalization failure stage must be typed")
+        if type(self.operation_name) is not str or not self.operation_name:
+            raise ValueError(
+                "command finalization failure operation_name must not be empty"
+            )
+        if type(self.command_result) is not CommandResult:
+            raise ValueError("command finalization result must be typed")
+        if not self.finalization_failures or any(
+            type(failure) is not ProfileCommandLogFinalizationFailure
+            for failure in self.finalization_failures
+        ):
+            raise ValueError(
+                "command finalization evidence must contain typed failures"
             )
         if type(self.cleanup_failures) is not tuple or any(
             type(failure)
@@ -597,9 +1470,21 @@ class ProfileUnexpectedFailure:
             for failure in self.cleanup_failures
         ):
             raise ValueError(
-                "ProfileUnexpectedFailure.cleanup_failures must contain typed "
-                "failures"
+                "command finalization cleanup evidence must contain typed failures"
             )
+
+
+ProfileUnexpectedFailureEvidence = (
+    ProfileUnexpectedFailure
+    | ProfileUnexpectedCommandFinalizationFailure
+    | ProfileUnexpectedCommandLifecycleFailure
+)
+
+_PROFILE_UNEXPECTED_FAILURE_CLASSES = (
+    ProfileUnexpectedFailure,
+    ProfileUnexpectedCommandFinalizationFailure,
+    ProfileUnexpectedCommandLifecycleFailure,
+)
 
 
 class IsolatedProfileWorktreeError(RuntimeError):
@@ -652,6 +1537,62 @@ def _exception_message(error: BaseException) -> str:
     return message if message else repr(error)
 
 
+def _profile_command_child_evidence(
+    execution: ValidationCommandExecution,
+) -> ProfileCommandChildEvidence:
+    child = execution.child
+    if type(child) is ValidationCommandExited:
+        return ProfileCommandExitedEvidence(child.process_id, child.exit_code)
+    if type(child) is ValidationCommandNotStarted:
+        return ProfileCommandNotStartedEvidence(
+            type(child.error).__name__,
+            _exception_message(child.error),
+        )
+    if type(child) is ValidationCommandExitUnknown:
+        return ProfileCommandExitUnknownEvidence(child.process_id)
+    raise AssertionError("ValidationCommandChild is a closed union")
+
+
+def _profile_command_cleanup_evidence(
+    execution: ValidationCommandExecution,
+) -> ProfileCommandCleanupEvidence:
+    cleanup = execution.cleanup
+    if type(cleanup) is ValidationCommandCompleted:
+        return ProfileCommandCompletedEvidence()
+    if type(cleanup) is ValidationCommandTimedOut:
+        return ProfileCommandTimedOutEvidence(cleanup.phase)
+    if type(cleanup) is ValidationCommandCleanupNotStarted:
+        return ProfileCommandCleanupNotStartedEvidence()
+    if type(cleanup) is ValidationCommandCleanupFailed:
+        return ProfileCommandCleanupFailedEvidence(
+            type(cleanup.error).__name__,
+            _exception_message(cleanup.error),
+        )
+    if type(cleanup) is ValidationCommandTimedOutCleanupFailed:
+        return ProfileCommandTimedOutCleanupFailedEvidence(
+            cleanup.phase,
+            type(cleanup.error).__name__,
+            _exception_message(cleanup.error),
+        )
+    raise AssertionError("ValidationCommandCleanup is a closed union")
+
+
+def _profile_command_output_evidence(
+    output: ValidationCommandOutput,
+) -> ProfileCommandOutputEvidence:
+    return ProfileCommandOutputEvidence(output.stdout, output.stderr)
+
+
+def _profile_command_deadline_evidence(
+    deadline: ValidationExecutionDeadline,
+) -> ProfileCommandDeadlineEvidence:
+    return ProfileCommandDeadlineEvidence(
+        active_timeout_seconds=deadline.executor_deadline.active_timeout_seconds,
+        absolute_timeout_seconds=deadline.executor_deadline.absolute_timeout_seconds,
+        outer_timeout_seconds=deadline.outer_timeout_seconds,
+    )
+
+
 def _filesystem_cleanup_failure(
     operation: ProfileCleanupOperation,
     error: BaseException,
@@ -686,38 +1627,66 @@ class ProfileWorktreeRegistrationObserver(Protocol):
         self,
         repo_root: Path,
         worktree: Path,
+        operation_name: str,
     ) -> ProfileWorktreeRegistration: ...
 
 
 class GitProfileWorktreeRegistrationObserver:
     """Read Git's porcelain registry without inferring from filesystem state."""
 
+    def __init__(
+        self,
+        command_owner: ProfileCommandOwner,
+        artifacts: ProfileArtifactStore,
+    ) -> None:
+        if not isinstance(command_owner, ProfileCommandOwner):
+            raise ValueError(
+                "GitProfileWorktreeRegistrationObserver.command_owner must "
+                "implement its port"
+            )
+        if type(artifacts) is not ProfileArtifactStore:
+            raise ValueError(
+                "GitProfileWorktreeRegistrationObserver.artifacts must be typed"
+            )
+        self._command_owner = command_owner
+        self._artifacts = artifacts
+
     def observe(
         self,
         repo_root: Path,
         worktree: Path,
+        operation_name: str,
     ) -> ProfileWorktreeRegistration:
-        completed = subprocess.run(
-            (
-                "git",
-                "-C",
-                str(repo_root),
-                "worktree",
-                "list",
-                "--porcelain",
-                "-z",
+        execution = execute_profile_command(
+            self._command_owner,
+            self._artifacts,
+            ProfileCommandInvocation(
+                name=f"{operation_name}:worktree-registration-query",
+                command=(
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "worktree",
+                    "list",
+                    "--porcelain",
+                    "-z",
+                ),
+                dry_run=False,
+                working_directory=repo_root,
+                worktree=ProfileCommandInWorktree(worktree.resolve()),
+                environment=os.environ.copy(),
             ),
-            capture_output=True,
-            text=True,
-            check=False,
         )
-        if completed.returncode != 0:
-            detail = completed.stderr.strip() or "git returned no diagnostic"
-            raise RuntimeError(f"cannot query Git worktree registration: {detail}")
+        if execution.result.exit_code != 0:
+            raise RuntimeError(
+                "cannot query Git worktree registration: "
+                f"exit={execution.result.exit_code} "
+                f"log={execution.result.output_log_path}"
+            )
         expected = worktree.resolve()
         registered_paths = tuple(
             Path(field.removeprefix("worktree ")).resolve()
-            for field in completed.stdout.split("\0")
+            for field in execution.require_complete_output().split("\0")
             if field.startswith("worktree ")
         )
         if expected in registered_paths:
@@ -754,6 +1723,14 @@ class ProfileWorktreeCommandRunner(Protocol):
 class LoggedProfileWorktreeCommandRunner:
     """Production adapter retaining every Git mutation in profiler artifacts."""
 
+    def __init__(self, command_owner: ProfileCommandOwner) -> None:
+        if not isinstance(command_owner, ProfileCommandOwner):
+            raise ValueError(
+                "LoggedProfileWorktreeCommandRunner.command_owner must implement "
+                "its port"
+            )
+        self._command_owner = command_owner
+
     def add(
         self,
         *,
@@ -765,21 +1742,25 @@ class LoggedProfileWorktreeCommandRunner:
         artifacts: ProfileArtifactStore,
     ) -> CommandResult:
         return run_command(
-            name=f"{operation_name}:worktree-add",
-            command=(
-                "git",
-                "-C",
-                str(repo_root),
-                "worktree",
-                "add",
-                "--detach",
-                str(worktree),
-                profiled_commit_sha,
+            self._command_owner,
+            artifacts,
+            ProfileCommandInvocation(
+                name=f"{operation_name}:worktree-add",
+                command=(
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(worktree),
+                    profiled_commit_sha,
+                ),
+                dry_run=dry_run,
+                working_directory=repo_root,
+                worktree=ProfileCommandOutsideWorktree(),
+                environment=os.environ.copy(),
             ),
-            dry_run=dry_run,
-            cwd=None,
-            worktree_path=None,
-            artifacts=artifacts,
         )
 
     def remove(
@@ -792,20 +1773,24 @@ class LoggedProfileWorktreeCommandRunner:
         artifacts: ProfileArtifactStore,
     ) -> CommandResult:
         return run_command(
-            name=f"{operation_name}:worktree-remove",
-            command=(
-                "git",
-                "-C",
-                str(repo_root),
-                "worktree",
-                "remove",
-                "--force",
-                str(worktree),
+            self._command_owner,
+            artifacts,
+            ProfileCommandInvocation(
+                name=f"{operation_name}:worktree-remove",
+                command=(
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(worktree),
+                ),
+                dry_run=dry_run,
+                working_directory=repo_root,
+                worktree=ProfileCommandOutsideWorktree(),
+                environment=os.environ.copy(),
             ),
-            dry_run=dry_run,
-            cwd=None,
-            worktree_path=None,
-            artifacts=artifacts,
         )
 
 
@@ -836,9 +1821,7 @@ class IsolatedProfileWorktree:
         if not isinstance(self.repo_root, Path) or not self.repo_root.is_absolute():
             raise ValueError("IsolatedProfileWorktree.repo_root must be absolute")
         if type(self.operation_name) is not str or not self.operation_name:
-            raise ValueError(
-                "IsolatedProfileWorktree.operation_name must not be empty"
-            )
+            raise ValueError("IsolatedProfileWorktree.operation_name must not be empty")
         if (
             type(self.profiled_commit_sha) is not str
             or len(self.profiled_commit_sha) != 40
@@ -856,9 +1839,7 @@ class IsolatedProfileWorktree:
             not isinstance(self.temporary_root, Path)
             or not self.temporary_root.is_absolute()
         ):
-            raise ValueError(
-                "IsolatedProfileWorktree.temporary_root must be absolute"
-            )
+            raise ValueError("IsolatedProfileWorktree.temporary_root must be absolute")
         if not isinstance(self.directory_remover, ProfileDirectoryRemover):
             raise ValueError(
                 "IsolatedProfileWorktree.directory_remover must implement "
@@ -915,7 +1896,10 @@ class IsolatedProfileWorktree:
 
     def add(self) -> CommandResult:
         """Attempt registration once and retain whether Git accepted it."""
-        if self._registration_state is not _ProfileWorktreeRegistrationState.NOT_ATTEMPTED:
+        if (
+            self._registration_state
+            is not _ProfileWorktreeRegistrationState.NOT_ATTEMPTED
+        ):
             raise RuntimeError("isolated profile worktree add was attempted twice")
         if self._closed:
             raise RuntimeError("isolated profile worktree is already closed")
@@ -964,6 +1948,7 @@ class IsolatedProfileWorktree:
             observation = self.registration_observer.observe(
                 self.repo_root,
                 self.worktree,
+                self.operation_name,
             )
         except BaseException as error:
             failures.append(
@@ -1021,7 +2006,7 @@ class ProfileSessionCleanupError(RuntimeError):
 class ValidateProfileReport:
     """Versioned JSON report written by the profiler."""
 
-    schema_version: Literal[7]
+    schema_version: Literal[8]
     outcome: Literal["complete"]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
@@ -1034,7 +2019,7 @@ class ValidateProfileReport:
 class ColdAggregateFailureReport:
     """Partial report when the first aggregate fails."""
 
-    schema_version: Literal[7]
+    schema_version: Literal[8]
     outcome: Literal["failed"]
     config: ValidateProfileConfiguration
     failed_aggregate: ProfileAggregateRun
@@ -1045,7 +2030,7 @@ class ColdAggregateFailureReport:
 class TargetFailureReport:
     """Partial report when one isolated target fails."""
 
-    schema_version: Literal[7]
+    schema_version: Literal[8]
     outcome: Literal["failed"]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
@@ -1057,7 +2042,7 @@ class TargetFailureReport:
 class LearnedAggregateFailureReport:
     """Partial report when the final aggregate fails."""
 
-    schema_version: Literal[7]
+    schema_version: Literal[8]
     outcome: Literal["failed"]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
@@ -1070,7 +2055,7 @@ class LearnedAggregateFailureReport:
 class ProfileSessionCleanupFailureReport:
     """Complete measurements retained when final session cleanup fails."""
 
-    schema_version: Literal[7]
+    schema_version: Literal[8]
     outcome: Literal["failed"]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
@@ -1084,13 +2069,13 @@ class ProfileSessionCleanupFailureReport:
 class UnexpectedProfileFailureReport:
     """Partial measurements retained when profiler code raises unexpectedly."""
 
-    schema_version: Literal[7]
+    schema_version: Literal[8]
     outcome: Literal["failed"]
     config: ValidateProfileConfiguration
     completed_aggregate_runs: tuple[ProfileAggregateRun, ...]
     incomplete_aggregate_runs: tuple[ProfileIncompleteAggregateRun, ...]
     completed_target_runs: tuple[CommandResult, ...]
-    failure: ProfileUnexpectedFailure
+    failure: ProfileUnexpectedFailureEvidence
 
     def __post_init__(self) -> None:
         if type(self.completed_aggregate_runs) is not tuple or any(
@@ -1120,21 +2105,18 @@ class UnexpectedProfileFailureReport:
                 "UnexpectedProfileFailureReport.completed_target_runs must contain "
                 "CommandResult values"
             )
-        if type(self.failure) is not ProfileUnexpectedFailure:
-            raise ValueError(
-                "UnexpectedProfileFailureReport.failure must be "
-                "ProfileUnexpectedFailure"
-            )
+        if type(self.failure) not in _PROFILE_UNEXPECTED_FAILURE_CLASSES:
+            raise ValueError("UnexpectedProfileFailureReport.failure must be typed")
 
 
 @dataclass(frozen=True, slots=True)
 class ProfileDiscoveryFailureReport:
     """Typed startup evidence when pinned target discovery fails."""
 
-    schema_version: Literal[7]
+    schema_version: Literal[8]
     outcome: Literal["failed"]
     initialization: ValidateProfileInitialization
-    failure: ProfileUnexpectedFailure
+    failure: ProfileUnexpectedFailureEvidence
 
     def __post_init__(self) -> None:
         if type(self.initialization) is not ValidateProfileInitialization:
@@ -1142,11 +2124,24 @@ class ProfileDiscoveryFailureReport:
                 "ProfileDiscoveryFailureReport.initialization must be "
                 "ValidateProfileInitialization"
             )
-        if type(self.failure) is not ProfileUnexpectedFailure:
-            raise ValueError(
-                "ProfileDiscoveryFailureReport.failure must be "
-                "ProfileUnexpectedFailure"
-            )
+        if type(self.failure) not in _PROFILE_UNEXPECTED_FAILURE_CLASSES:
+            raise ValueError("ProfileDiscoveryFailureReport.failure must be typed")
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileInitializationFailureReport:
+    """Typed evidence for any startup failure after artifact initialization."""
+
+    schema_version: Literal[8]
+    outcome: Literal["failed"]
+    startup: ValidateProfileStartup
+    failure: ProfileUnexpectedFailureEvidence
+
+    def __post_init__(self) -> None:
+        if type(self.startup) is not ValidateProfileStartup:
+            raise ValueError("ProfileInitializationFailureReport.startup must be typed")
+        if type(self.failure) not in _PROFILE_UNEXPECTED_FAILURE_CLASSES:
+            raise ValueError("ProfileInitializationFailureReport.failure must be typed")
 
 
 ValidateProfileArtifact = (
@@ -1157,7 +2152,265 @@ ValidateProfileArtifact = (
     | ProfileSessionCleanupFailureReport
     | UnexpectedProfileFailureReport
     | ProfileDiscoveryFailureReport
+    | ProfileInitializationFailureReport
 )
+
+_PROFILE_ARTIFACT_CLASSES = (
+    ValidateProfileReport,
+    ColdAggregateFailureReport,
+    TargetFailureReport,
+    LearnedAggregateFailureReport,
+    ProfileSessionCleanupFailureReport,
+    UnexpectedProfileFailureReport,
+    ProfileDiscoveryFailureReport,
+    ProfileInitializationFailureReport,
+)
+
+
+def _require_profile_artifact(artifact: object) -> None:
+    if type(artifact) not in _PROFILE_ARTIFACT_CLASSES:
+        raise ValueError("profile artifact must be a closed report variant")
+
+
+@runtime_checkable
+class ProfileArtifactPublisher(Protocol):
+    """Atomically and durably publish one closed report variant."""
+
+    def publish(
+        self,
+        output_path: Path,
+        artifact: ValidateProfileArtifact,
+    ) -> None: ...
+
+
+@runtime_checkable
+class ProfileArtifactPublicationLock(Protocol):
+    """Hold exclusive cross-process ownership of one report generation chain."""
+
+    def hold(self, output_path: Path) -> AbstractContextManager[None]: ...
+
+
+class PosixProfileArtifactPublicationLock:
+    """Map one report path to a stable sibling lock through the POSIX owner."""
+
+    def __init__(self, lock_owner: PosixFileLockOwner) -> None:
+        if type(lock_owner) is not PosixFileLockOwner:
+            raise ValueError("profile publication lock owner must be typed")
+        self._lock_owner = lock_owner
+
+    @staticmethod
+    def lock_path(output_path: Path) -> Path:
+        if not isinstance(output_path, Path) or not output_path.is_absolute():
+            raise ValueError("profile publication lock output_path must be absolute")
+        return output_path.with_name(f".{output_path.name}.publication.lock")
+
+    @contextmanager
+    def hold(self, output_path: Path) -> Iterator[None]:
+        specification = PosixFileLockSpecification(
+            path=self.lock_path(output_path),
+            mode=PosixFileLockMode.EXCLUSIVE,
+            acquisition=PosixFileLockAcquisition.BLOCKING,
+            file_presence=PosixFileLockFilePresence.CREATE_IF_MISSING,
+        )
+        with self._lock_owner.hold(specification):
+            yield
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileArtifactHadNoPriorReport:
+    """The requested report path was absent before publication."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileArtifactPriorReportRetained:
+    """A durable hard-link retains the report generation being replaced."""
+
+    path: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, Path) or not self.path.is_absolute():
+            raise ValueError("retained prior report path must be absolute")
+
+
+_ProfileArtifactPriorReport = (
+    _ProfileArtifactHadNoPriorReport | _ProfileArtifactPriorReportRetained
+)
+
+
+class PosixAtomicProfileArtifactPublisher:
+    """Durably replace a report while retaining or restoring its prior generation."""
+
+    def __init__(self, publication_lock: ProfileArtifactPublicationLock) -> None:
+        if not isinstance(publication_lock, ProfileArtifactPublicationLock):
+            raise ValueError(
+                "PosixAtomicProfileArtifactPublisher.publication_lock must "
+                "implement its port"
+            )
+        self._publication_lock = publication_lock
+
+    def publish(
+        self,
+        output_path: Path,
+        artifact: ValidateProfileArtifact,
+    ) -> None:
+        if not isinstance(output_path, Path) or not output_path.is_absolute():
+            raise ValueError("profile report output path must be absolute")
+        _require_profile_artifact(artifact)
+        serialized = (json.dumps(asdict(artifact), indent=2) + "\n").encode()
+        with self._publication_lock.hold(output_path):
+            self._publish_locked(output_path, serialized)
+
+    def _publish_locked(self, output_path: Path, serialized: bytes) -> None:
+        temporary_path = self._write_durable_temporary(output_path, serialized)
+        try:
+            prior_report = self._retain_prior_report(output_path)
+        except BaseException as retention_error:
+            self._raise_with_path_cleanup(
+                "prior report retention and new-report cleanup failed",
+                retention_error,
+                temporary_path,
+            )
+        try:
+            os.replace(temporary_path, output_path)
+        except BaseException as replace_error:
+            self._raise_with_path_cleanup(
+                "profile report replacement and temporary cleanup failed",
+                replace_error,
+                temporary_path,
+            )
+        try:
+            self._sync_directory(output_path.parent)
+        except BaseException as sync_error:
+            self._restore_prior_report(output_path, prior_report, sync_error)
+
+    @staticmethod
+    def _write_durable_temporary(output_path: Path, serialized: bytes) -> Path:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            dir=output_path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            offset = 0
+            while offset < len(serialized):
+                written = os.write(descriptor, serialized[offset:])
+                if written <= 0:
+                    raise OSError("profile report write made no progress")
+                offset += written
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+        except BaseException as primary_error:
+            cleanup_errors: list[BaseException] = []
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except BaseException as close_error:
+                    cleanup_errors.append(close_error)
+            try:
+                temporary_path.unlink()
+            except BaseException as unlink_error:
+                cleanup_errors.append(unlink_error)
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "profile report publication and temporary cleanup failed",
+                    (primary_error, *cleanup_errors),
+                ) from primary_error
+            raise
+        return temporary_path
+
+    @classmethod
+    def _retain_prior_report(
+        cls,
+        output_path: Path,
+    ) -> _ProfileArtifactPriorReport:
+        if not output_path.exists():
+            return _ProfileArtifactHadNoPriorReport()
+        previous_path = output_path.with_name(f"{output_path.name}.previous")
+        descriptor, link_name = tempfile.mkstemp(
+            prefix=f".{output_path.name}.prior.",
+            suffix=".tmp",
+            dir=output_path.parent,
+        )
+        link_path = Path(link_name)
+        try:
+            os.close(descriptor)
+            descriptor = -1
+            link_path.unlink()
+            os.link(output_path, link_path)
+            os.replace(link_path, previous_path)
+            cls._sync_directory(output_path.parent)
+        except BaseException as primary_error:
+            cleanup_errors: list[BaseException] = []
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except BaseException as close_error:
+                    cleanup_errors.append(close_error)
+            if link_path.exists():
+                try:
+                    link_path.unlink()
+                except BaseException as unlink_error:
+                    cleanup_errors.append(unlink_error)
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "prior report retention and temporary cleanup failed",
+                    (primary_error, *cleanup_errors),
+                ) from primary_error
+            raise
+        return _ProfileArtifactPriorReportRetained(previous_path)
+
+    @classmethod
+    def _restore_prior_report(
+        cls,
+        output_path: Path,
+        prior_report: _ProfileArtifactPriorReport,
+        publication_error: BaseException,
+    ) -> NoReturn:
+        rollback_errors: list[BaseException] = []
+        try:
+            if type(prior_report) is _ProfileArtifactHadNoPriorReport:
+                output_path.unlink()
+            elif type(prior_report) is _ProfileArtifactPriorReportRetained:
+                os.replace(prior_report.path, output_path)
+            else:
+                raise AssertionError("prior report state is a closed union")
+        except BaseException as rollback_error:
+            rollback_errors.append(rollback_error)
+        try:
+            cls._sync_directory(output_path.parent)
+        except BaseException as rollback_sync_error:
+            rollback_errors.append(rollback_sync_error)
+        if rollback_errors:
+            raise BaseExceptionGroup(
+                "profile report directory sync and rollback both failed",
+                (publication_error, *rollback_errors),
+            ) from publication_error
+        raise publication_error
+
+    @staticmethod
+    def _raise_with_path_cleanup(
+        message: str,
+        primary_error: BaseException,
+        path: Path,
+    ) -> NoReturn:
+        try:
+            path.unlink()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                message,
+                (primary_error, cleanup_error),
+            ) from primary_error
+        raise primary_error
+
+    @staticmethod
+    def _sync_directory(directory: Path) -> None:
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def detect_jobs() -> int:
@@ -1196,92 +2449,58 @@ def configured_default_jobs() -> int:
 
 
 def run_command(
-    *,
-    name: str,
-    command: tuple[str, ...],
-    dry_run: bool,
-    cwd: Path | None,
-    worktree_path: str | None,
+    command_owner: ProfileCommandOwner,
     artifacts: ProfileArtifactStore,
-    environment: dict[str, str] | None = None,
+    invocation: ProfileCommandInvocation,
 ) -> CommandResult:
-    """Execute and measure one exact argv while retaining combined output."""
-    cwd_info = f" (cwd={cwd})" if cwd is not None else ""
-    print(f"[profile] {name}: {' '.join(command)}{cwd_info}")
-    output_log = artifacts.command_log_path(name)
-    started_at = datetime.now(tz=UTC).isoformat()
-    started = time.monotonic()
-    with output_log.open("x", encoding="utf-8") as log_handle:
-        log_handle.write(f"[profile-command] name={name}\n")
-        log_handle.write("[profile-command] argv=" + json.dumps(command) + "\n")
-        log_handle.write(f"[profile-command] cwd={cwd}\n")
-        log_handle.write(f"[profile-command] started_at={started_at}\n")
-        if environment is not None:
-            for variable in (
-                EXECUTOR_POOL_DIR_ENV,
-                EXECUTOR_AGGRESSIVENESS_ENV,
-            ):
-                if variable in environment:
-                    log_handle.write(
-                        f"[profile-command] env.{variable}={environment[variable]}\n"
-                    )
-        log_handle.flush()
-        if dry_run:
-            exit_code = 0
-        else:
-            try:
-                completed = subprocess.run(
-                    command,
-                    check=False,
-                    cwd=cwd,
-                    env=environment,
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                )
-            except OSError as exc:
-                exit_code = 127
-                log_handle.write(
-                    f"[profile-command] start_error={type(exc).__name__}: {exc}\n"
-                )
-            else:
-                exit_code = completed.returncode
-        wall_seconds = time.monotonic() - started
-        log_handle.write(
-            f"[profile-command] exit={exit_code} elapsed={wall_seconds:.6f}s "
-            f"ended_at={datetime.now(tz=UTC).isoformat()}\n"
-        )
-    print(
-        f"[profile] {name}: exit={exit_code} elapsed={wall_seconds:.2f}s "
-        f"log={output_log}"
-    )
-    return CommandResult(
-        name=name,
-        command=command,
-        wall_seconds=wall_seconds,
-        exit_code=exit_code,
-        worktree_path=worktree_path,
-        output_log_path=str(output_log),
-    )
+    """Execute through the profiler command owner and return its exact result."""
+    return execute_profile_command(command_owner, artifacts, invocation).result
 
 
-def discover_validate_targets(repo_root: Path, make_bin: str) -> tuple[str, ...]:
+def execute_profile_command(
+    command_owner: ProfileCommandOwner,
+    artifacts: ProfileArtifactStore,
+    invocation: ProfileCommandInvocation,
+) -> ProfileCommandExecution:
+    """Translate profiler vocabulary into one deep-module invocation."""
+    if not isinstance(command_owner, ProfileCommandOwner):
+        raise ValueError("execute_profile_command.command_owner must implement port")
+    if type(artifacts) is not ProfileArtifactStore:
+        raise ValueError("execute_profile_command.artifacts must be typed")
+    if type(invocation) is not ProfileCommandInvocation:
+        raise ValueError("execute_profile_command.invocation must be typed")
+    return command_owner.execute(artifacts.command_request(invocation))
+
+
+def discover_validate_targets(
+    repo_root: Path,
+    make_bin: str,
+    command_owner: ProfileCommandOwner,
+    artifacts: ProfileArtifactStore,
+) -> tuple[str, ...]:
     """Read the aggregate PR lanes from GNU make's database."""
-    completed = subprocess.run(
-        (make_bin, "-pn"),
-        cwd=repo_root,
-        check=False,
-        capture_output=True,
-        text=True,
+    execution = execute_profile_command(
+        command_owner,
+        artifacts,
+        ProfileCommandInvocation(
+            name="target-discovery:make-database",
+            command=(make_bin, "-pn"),
+            dry_run=False,
+            working_directory=repo_root,
+            worktree=ProfileCommandInWorktree(repo_root.resolve()),
+            environment=os.environ.copy(),
+        ),
     )
-    if completed.returncode != 0:
+    if execution.result.exit_code != 0:
         raise RuntimeError(
             "cannot inspect GNU make validation targets: "
-            f"exit={completed.returncode} stderr={completed.stderr.strip()}"
+            f"exit={execution.result.exit_code} "
+            f"log={execution.result.output_log_path}"
         )
 
     lane_targets: tuple[str, ...] = ()
     lane_prefix = f"{AGGREGATE_LANE_VARIABLE} :="
-    for raw_line in completed.stdout.splitlines():
+    for raw_line in execution.require_complete_output().splitlines():
         line = raw_line.strip()
         if line.startswith(lane_prefix):
             _, _, value = line.partition(":=")
@@ -1299,6 +2518,7 @@ def discover_validate_targets_at_commit(
     make_bin: str,
     profiled_commit_sha: str,
     artifacts: ProfileArtifactStore,
+    command_owner: ProfileCommandOwner,
 ) -> tuple[str, ...]:
     """Discover lanes from the immutable tree used by every measurement."""
     worktree_owner = IsolatedProfileWorktree.create(
@@ -1308,8 +2528,11 @@ def discover_validate_targets_at_commit(
         dry_run=False,
         artifacts=artifacts,
         directory_remover=ShutilProfileDirectoryRemover(),
-        registration_observer=GitProfileWorktreeRegistrationObserver(),
-        command_runner=LoggedProfileWorktreeCommandRunner(),
+        registration_observer=GitProfileWorktreeRegistrationObserver(
+            command_owner,
+            artifacts,
+        ),
+        command_runner=LoggedProfileWorktreeCommandRunner(command_owner),
         temporary_prefix="io-validate-profile-discovery-",
     )
     try:
@@ -1319,7 +2542,12 @@ def discover_validate_targets_at_commit(
                 "cannot create pinned discovery worktree: "
                 f"exit={add_result.exit_code} log={add_result.output_log_path}"
             )
-        targets = discover_validate_targets(worktree_owner.worktree, make_bin)
+        targets = discover_validate_targets(
+            worktree_owner.worktree,
+            make_bin,
+            command_owner,
+            artifacts,
+        )
     except BaseException as error:
         cleanup_failures = worktree_owner.close()
         raise IsolatedProfileWorktreeError(
@@ -1371,12 +2599,21 @@ def parse_args() -> ProfileArguments:
         help="Job count for both aggregate make and inner validation lanes",
     )
     parser.add_argument(
+        "--command-timeout-seconds",
+        type=positive_integer,
+        default=DEFAULT_PROFILE_COMMAND_TIMEOUT_SECONDS,
+        help=(
+            "Active process-tree deadline for each profiler command "
+            f"(default: {DEFAULT_PROFILE_COMMAND_TIMEOUT_SECONDS})"
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         help=(
             "Write JSON report to this path "
             "(default: <repo-root>/.issue-orchestrator/diagnostics/"
-            "validate-profile-<timestamp>.json)"
+            "validate-profile-<timestamp>-pid-<pid>-run-<uuid>.json)"
         ),
     )
     parser.add_argument(
@@ -1406,15 +2643,64 @@ def parse_args() -> ProfileArguments:
         targets=parse_target_override(cast(str | None, namespace.targets)),
         repo_root=cast(Path, namespace.repo_root),
         aggressiveness_percent=cast(int | None, namespace.aggressiveness),
+        command_timeout_seconds=cast(int, namespace.command_timeout_seconds),
     )
 
 
-def default_output_path(repo_root: Path) -> Path:
-    timestamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+@dataclass(frozen=True, slots=True)
+class ProfileOutputIdentity:
+    """Human-traceable, collision-resistant identity for one profiler process."""
+
+    timestamp_utc: datetime
+    process_id: int
+    run_id: UUID
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.timestamp_utc) is not datetime
+            or self.timestamp_utc.tzinfo is not UTC
+        ):
+            raise ValueError("ProfileOutputIdentity.timestamp_utc must use UTC")
+        if type(self.process_id) is not int or self.process_id <= 1:
+            raise ValueError("ProfileOutputIdentity.process_id must be above 1")
+        if type(self.run_id) is not UUID:
+            raise ValueError("ProfileOutputIdentity.run_id must be UUID")
+
+    @property
+    def filename_component(self) -> str:
+        timestamp = self.timestamp_utc.strftime("%Y%m%dT%H%M%S.%fZ")
+        return f"{timestamp}-pid-{self.process_id}-run-{self.run_id}"
+
+
+@runtime_checkable
+class ProfileOutputIdentityFactory(Protocol):
+    """Create one required output identity when the caller omitted a path."""
+
+    def create(self) -> ProfileOutputIdentity: ...
+
+
+class SystemProfileOutputIdentityFactory:
+    """Use OS process identity and a full UUID for cross-process uniqueness."""
+
+    def create(self) -> ProfileOutputIdentity:
+        return ProfileOutputIdentity(datetime.now(tz=UTC), os.getpid(), uuid4())
+
+
+def default_output_path(
+    repo_root: Path,
+    identity_factory: ProfileOutputIdentityFactory,
+) -> Path:
+    if not isinstance(repo_root, Path) or not repo_root.is_absolute():
+        raise ValueError("default output repo_root must be absolute")
+    if not isinstance(identity_factory, ProfileOutputIdentityFactory):
+        raise ValueError("default output identity_factory must implement its port")
+    identity = identity_factory.create()
+    if type(identity) is not ProfileOutputIdentity:
+        raise ValueError("default output identity_factory must return a typed identity")
     return (
         repo_root
         / ".issue-orchestrator/diagnostics"
-        / f"validate-profile-{timestamp}.json"
+        / f"validate-profile-{identity.filename_component}.json"
     )
 
 
@@ -1437,23 +2723,13 @@ def require_stage_success(
 def write_profile_artifact(
     output_path: Path,
     artifact: ValidateProfileArtifact,
+    publisher: ProfileArtifactPublisher,
 ) -> None:
     """Serialize one closed report variant to the requested durable path."""
-    supported = (
-        ValidateProfileReport,
-        ColdAggregateFailureReport,
-        TargetFailureReport,
-        LearnedAggregateFailureReport,
-        ProfileSessionCleanupFailureReport,
-        UnexpectedProfileFailureReport,
-        ProfileDiscoveryFailureReport,
-    )
-    if type(artifact) not in supported:
-        raise ValueError("write_profile_artifact requires a profile report variant")
-    output_path.write_text(
-        json.dumps(asdict(artifact), indent=2) + "\n",
-        encoding="utf-8",
-    )
+    _require_profile_artifact(artifact)
+    if not isinstance(publisher, ProfileArtifactPublisher):
+        raise ValueError("write_profile_artifact.publisher must implement its port")
+    publisher.publish(output_path.resolve(), artifact)
     print(f"report: {output_path}")
 
 
@@ -1486,16 +2762,38 @@ def _extend_profile_failure(
 
 
 def _extend_unexpected_profile_failure(
-    failure: ProfileUnexpectedFailure,
+    failure: ProfileUnexpectedFailureEvidence,
     cleanup_failures: tuple[ProfileCleanupFailure, ...],
-) -> ProfileUnexpectedFailure:
-    return ProfileUnexpectedFailure(
-        failure.stage,
-        failure.operation_name,
-        failure.error_type,
-        failure.error_message,
-        (*failure.cleanup_failures, *cleanup_failures),
-    )
+) -> ProfileUnexpectedFailureEvidence:
+    if type(failure) is ProfileUnexpectedFailure:
+        return ProfileUnexpectedFailure(
+            failure.stage,
+            failure.operation_name,
+            failure.error_type,
+            failure.error_message,
+            (*failure.cleanup_failures, *cleanup_failures),
+        )
+    if type(failure) is ProfileUnexpectedCommandFinalizationFailure:
+        return ProfileUnexpectedCommandFinalizationFailure(
+            failure.stage,
+            failure.operation_name,
+            failure.command_result,
+            failure.finalization_failures,
+            (*failure.cleanup_failures, *cleanup_failures),
+        )
+    if type(failure) is ProfileUnexpectedCommandLifecycleFailure:
+        return ProfileUnexpectedCommandLifecycleFailure(
+            stage=failure.stage,
+            operation_name=failure.operation_name,
+            command_name=failure.command_name,
+            wall_seconds=failure.wall_seconds,
+            deadline=failure.deadline,
+            child=failure.child,
+            cleanup=failure.cleanup,
+            output=failure.output,
+            cleanup_failures=(*failure.cleanup_failures, *cleanup_failures),
+        )
+    raise AssertionError("ProfileUnexpectedFailureEvidence is a closed union")
 
 
 def _retain_profile_session_cleanup(
@@ -1506,7 +2804,7 @@ def _retain_profile_session_cleanup(
         return artifact
     if type(artifact) is ValidateProfileReport:
         return ProfileSessionCleanupFailureReport(
-            schema_version=7,
+            schema_version=8,
             outcome="failed",
             config=artifact.config,
             cold_validate_pr_raw_run=artifact.cold_validate_pr_raw_run,
@@ -1521,7 +2819,7 @@ def _retain_profile_session_cleanup(
         )
     if type(artifact) is ColdAggregateFailureReport:
         return ColdAggregateFailureReport(
-            schema_version=7,
+            schema_version=8,
             outcome="failed",
             config=artifact.config,
             failed_aggregate=artifact.failed_aggregate,
@@ -1529,7 +2827,7 @@ def _retain_profile_session_cleanup(
         )
     if type(artifact) is TargetFailureReport:
         return TargetFailureReport(
-            schema_version=7,
+            schema_version=8,
             outcome="failed",
             config=artifact.config,
             cold_validate_pr_raw_run=artifact.cold_validate_pr_raw_run,
@@ -1538,7 +2836,7 @@ def _retain_profile_session_cleanup(
         )
     if type(artifact) is LearnedAggregateFailureReport:
         return LearnedAggregateFailureReport(
-            schema_version=7,
+            schema_version=8,
             outcome="failed",
             config=artifact.config,
             cold_validate_pr_raw_run=artifact.cold_validate_pr_raw_run,
@@ -1548,7 +2846,7 @@ def _retain_profile_session_cleanup(
         )
     if type(artifact) is UnexpectedProfileFailureReport:
         return UnexpectedProfileFailureReport(
-            schema_version=7,
+            schema_version=8,
             outcome="failed",
             config=artifact.config,
             completed_aggregate_runs=artifact.completed_aggregate_runs,
@@ -1560,11 +2858,11 @@ def _retain_profile_session_cleanup(
             ),
         )
     if type(artifact) is ProfileDiscoveryFailureReport:
-        raise ValueError(
-            "target-discovery artifacts do not own a profile session root"
-        )
+        raise ValueError("target-discovery artifacts do not own a profile session root")
     if type(artifact) is ProfileSessionCleanupFailureReport:
         raise ValueError("profile session cleanup can only be finalized once")
+    if type(artifact) is ProfileInitializationFailureReport:
+        raise ValueError("initialization artifacts do not own a profile session root")
     raise AssertionError("ValidateProfileArtifact is a closed union")
 
 
@@ -1574,6 +2872,8 @@ def _profile_artifact_exit_code(artifact: ValidateProfileArtifact) -> int:
     if type(artifact) is UnexpectedProfileFailureReport:
         return 1
     if type(artifact) is ProfileDiscoveryFailureReport:
+        return 1
+    if type(artifact) is ProfileInitializationFailureReport:
         return 1
     if type(artifact) is ColdAggregateFailureReport:
         return artifact.failure.exit_code
@@ -1586,17 +2886,79 @@ def _profile_artifact_exit_code(artifact: ValidateProfileArtifact) -> int:
     raise AssertionError("ValidateProfileArtifact is a closed union")
 
 
+@dataclass(frozen=True, slots=True)
+class ProfileInitialPublicationPreserved:
+    """A durable initial report generation exists before disposable cleanup."""
+
+    output_path: Path
+    artifact: ValidateProfileArtifact
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.output_path, Path) or not self.output_path.is_absolute():
+            raise ValueError("initial publication output_path must be absolute")
+        _require_profile_artifact(self.artifact)
+
+
+class ProfileSessionCleanupAmendmentPublicationError(RuntimeError):
+    """Cleanup evidence could not replace the preserved initial generation."""
+
+    def __init__(
+        self,
+        initial_publication: ProfileInitialPublicationPreserved,
+        cleanup_amendment: ValidateProfileArtifact,
+        cleanup_failures: tuple[ProfileCleanupFailure, ...],
+        publication_error: BaseException,
+    ) -> None:
+        if type(initial_publication) is not ProfileInitialPublicationPreserved:
+            raise ValueError("cleanup amendment initial publication must be typed")
+        _require_profile_artifact(cleanup_amendment)
+        if not cleanup_failures or any(
+            type(failure)
+            not in (ProfileCleanupCommandFailure, ProfileCleanupFilesystemFailure)
+            for failure in cleanup_failures
+        ):
+            raise ValueError("cleanup amendment failures must be non-empty and typed")
+        if not isinstance(publication_error, BaseException):
+            raise ValueError("cleanup amendment publication_error must be an exception")
+        self.initial_publication = initial_publication
+        self.cleanup_amendment = cleanup_amendment
+        self.cleanup_failures = cleanup_failures
+        self.publication_error = publication_error
+        super().__init__(
+            "profile session cleanup evidence could not amend the preserved initial "
+            f"report: output={initial_publication.output_path} "
+            f"cleanup_failures={len(cleanup_failures)} "
+            f"publication_error={type(publication_error).__name__}: "
+            f"{_exception_message(publication_error)}"
+        )
+
+
 def finalize_profile_session(
     *,
     output_path: Path,
     profile_root: Path,
     artifact: ValidateProfileArtifact,
     directory_remover: ProfileDirectoryRemover,
+    publisher: ProfileArtifactPublisher,
 ) -> int:
-    """Remove the transient session, retain its outcome, and write one report."""
+    """Publish evidence before cleanup, then publish any cleanup amendment."""
+    write_profile_artifact(output_path, artifact, publisher)
+    initial_publication = ProfileInitialPublicationPreserved(
+        output_path.resolve(),
+        artifact,
+    )
     cleanup_failures = remove_profile_session_root(profile_root, directory_remover)
     final_artifact = _retain_profile_session_cleanup(artifact, cleanup_failures)
-    write_profile_artifact(output_path, final_artifact)
+    if final_artifact is not artifact:
+        try:
+            write_profile_artifact(output_path, final_artifact, publisher)
+        except BaseException as publication_error:
+            raise ProfileSessionCleanupAmendmentPublicationError(
+                initial_publication,
+                final_artifact,
+                cleanup_failures,
+                publication_error,
+            ) from publication_error
     return _profile_artifact_exit_code(final_artifact)
 
 
@@ -1647,6 +3009,7 @@ def summarize(
 
 def prepare_worktree(
     *,
+    command_owner: ProfileCommandOwner,
     make_bin: str,
     name: str,
     worktree: Path,
@@ -1655,17 +3018,22 @@ def prepare_worktree(
 ) -> CommandResult:
     """Prepare a fresh worktree exactly like a real agent or user worktree."""
     return run_command(
-        name=f"{name}:worktree-setup",
-        command=(make_bin, "worktree-setup"),
-        dry_run=dry_run,
-        cwd=worktree,
-        worktree_path=str(worktree),
-        artifacts=artifacts,
+        command_owner,
+        artifacts,
+        ProfileCommandInvocation(
+            name=f"{name}:worktree-setup",
+            command=(make_bin, "worktree-setup"),
+            dry_run=dry_run,
+            working_directory=worktree,
+            worktree=ProfileCommandInWorktree(worktree.resolve()),
+            environment=os.environ.copy(),
+        ),
     )
 
 
 def run_in_isolated_worktree(
     *,
+    command_owner: ProfileCommandOwner,
     repo_root: Path,
     make_bin: str,
     name: str,
@@ -1686,13 +3054,17 @@ def run_in_isolated_worktree(
         dry_run=dry_run,
         artifacts=artifacts,
         directory_remover=ShutilProfileDirectoryRemover(),
-        registration_observer=GitProfileWorktreeRegistrationObserver(),
-        command_runner=LoggedProfileWorktreeCommandRunner(),
+        registration_observer=GitProfileWorktreeRegistrationObserver(
+            command_owner,
+            artifacts,
+        ),
+        command_runner=LoggedProfileWorktreeCommandRunner(command_owner),
         temporary_prefix="io-validate-profile-",
     )
     try:
         command_result = _measure_in_isolated_worktree(
             worktree_owner=worktree_owner,
+            command_owner=command_owner,
             make_bin=make_bin,
             name=name,
             make_target=make_target,
@@ -1716,6 +3088,7 @@ def run_in_isolated_worktree(
 def _measure_in_isolated_worktree(
     *,
     worktree_owner: IsolatedProfileWorktree,
+    command_owner: ProfileCommandOwner,
     make_bin: str,
     name: str,
     make_target: str,
@@ -1736,6 +3109,7 @@ def _measure_in_isolated_worktree(
             output_log_path=add_result.output_log_path,
         )
     setup_result = prepare_worktree(
+        command_owner=command_owner,
         make_bin=make_bin,
         name=name,
         worktree=worktree_owner.worktree,
@@ -1763,59 +3137,87 @@ def _measure_in_isolated_worktree(
     make_arguments.append(make_target)
     environment = os.environ.copy()
     environment[EXECUTOR_POOL_DIR_ENV] = str(executor_pool_dir)
-    environment[EXECUTOR_AGGRESSIVENESS_ENV] = str(
-        executor_aggressiveness_percent
-    )
+    environment[EXECUTOR_AGGRESSIVENESS_ENV] = str(executor_aggressiveness_percent)
     environment[EXECUTOR_GROUP_ENV] = fairness_group.value
     return run_command(
-        name=name,
-        command=tuple(make_arguments),
-        dry_run=dry_run,
-        cwd=worktree_owner.worktree,
-        worktree_path=str(worktree_owner.worktree),
-        artifacts=worktree_owner.artifacts,
-        environment=environment,
+        command_owner,
+        worktree_owner.artifacts,
+        ProfileCommandInvocation(
+            name=name,
+            command=tuple(make_arguments),
+            dry_run=dry_run,
+            working_directory=worktree_owner.worktree,
+            worktree=ProfileCommandInWorktree(worktree_owner.worktree.resolve()),
+            environment=environment,
+        ),
     )
 
 
-def resolve_output_path(arguments: ProfileArguments, repo_root: Path) -> Path:
+def resolve_output_path(
+    arguments: ProfileArguments,
+    repo_root: Path,
+    identity_factory: ProfileOutputIdentityFactory,
+) -> Path:
     if arguments.output is None:
-        return default_output_path(repo_root)
+        return default_output_path(repo_root, identity_factory)
     if arguments.output.is_absolute():
         return arguments.output
     return repo_root / arguments.output
 
 
-def resolve_profiled_commit(repo_root: Path) -> str:
+def resolve_profiled_commit(
+    repo_root: Path,
+    command_owner: ProfileCommandOwner,
+    artifacts: ProfileArtifactStore,
+) -> str:
     """Resolve the exact committed tree profiled by detached worktrees."""
-    completed = subprocess.run(
-        ("git", "rev-parse", "HEAD"),
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        check=False,
+    execution = execute_profile_command(
+        command_owner,
+        artifacts,
+        ProfileCommandInvocation(
+            name="initialization:resolve-profiled-commit",
+            command=("git", "rev-parse", "HEAD"),
+            dry_run=False,
+            working_directory=repo_root,
+            worktree=ProfileCommandOutsideWorktree(),
+            environment=os.environ.copy(),
+        ),
     )
-    commit_sha = completed.stdout.strip()
-    if completed.returncode != 0 or len(commit_sha) != 40:
-        detail = completed.stderr.strip() or commit_sha or "git returned no SHA"
-        raise RuntimeError(f"cannot resolve profiled commit: {detail}")
+    commit_sha = execution.require_complete_output().strip()
+    if execution.result.exit_code != 0 or len(commit_sha) != 40:
+        detail = commit_sha or "git returned no SHA"
+        raise RuntimeError(
+            "cannot resolve profiled commit: "
+            f"exit={execution.result.exit_code} detail={detail}"
+        )
     return commit_sha
 
 
-def source_worktree_is_dirty(repo_root: Path) -> bool:
+def source_worktree_is_dirty(
+    repo_root: Path,
+    command_owner: ProfileCommandOwner,
+    artifacts: ProfileArtifactStore,
+) -> bool:
     """Report whether HEAD intentionally excludes local source changes."""
-    completed = subprocess.run(
-        ("git", "status", "--porcelain"),
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        check=False,
+    execution = execute_profile_command(
+        command_owner,
+        artifacts,
+        ProfileCommandInvocation(
+            name="initialization:source-worktree-status",
+            command=("git", "status", "--porcelain"),
+            dry_run=False,
+            working_directory=repo_root,
+            worktree=ProfileCommandOutsideWorktree(),
+            environment=os.environ.copy(),
+        ),
     )
-    if completed.returncode != 0:
+    if execution.result.exit_code != 0:
         raise RuntimeError(
-            f"cannot inspect profiler source worktree: {completed.stderr.strip()}"
+            "cannot inspect profiler source worktree: "
+            f"exit={execution.result.exit_code} "
+            f"log={execution.result.output_log_path}"
         )
-    return bool(completed.stdout)
+    return bool(execution.require_complete_output())
 
 
 def profile_host() -> ProfileHost:
@@ -1977,6 +3379,7 @@ def project_executor_status(status: ExecutorStatus) -> ProfileExecutorStatus:
 
 def run_profile_aggregate(
     *,
+    command_owner: ProfileCommandOwner,
     repo_root: Path,
     make_bin: str,
     name: str,
@@ -1991,6 +3394,7 @@ def run_profile_aggregate(
     """Measure one aggregate with learning provenance on both boundaries."""
     before = capture_executor_status(executor_pool_dir, aggressiveness)
     isolated_run = run_in_isolated_worktree(
+        command_owner=command_owner,
         repo_root=repo_root,
         make_bin=make_bin,
         name=name,
@@ -2047,7 +3451,7 @@ def profile_unexpected_failure(
     stage: ProfileStage,
     operation_name: str,
     error: BaseException,
-) -> ProfileUnexpectedFailure:
+) -> ProfileUnexpectedFailureEvidence:
     """Convert one exception and nested worktree cleanup into typed evidence."""
     if type(error) is IsolatedProfileWorktreeError:
         primary_error = error.primary_error
@@ -2060,6 +3464,26 @@ def profile_unexpected_failure(
     else:
         primary_error = error
         cleanup_failures = ()
+    if type(primary_error) is ProfileCommandFinalizationError:
+        return ProfileUnexpectedCommandFinalizationFailure(
+            stage=stage,
+            operation_name=operation_name,
+            command_result=primary_error.command_result,
+            finalization_failures=primary_error.failures,
+            cleanup_failures=cleanup_failures,
+        )
+    if type(primary_error) is ProfileCommandLifecycleError:
+        return ProfileUnexpectedCommandLifecycleFailure(
+            stage=stage,
+            operation_name=operation_name,
+            command_name=primary_error.command_name,
+            wall_seconds=primary_error.wall_seconds,
+            deadline=_profile_command_deadline_evidence(primary_error.deadline),
+            child=_profile_command_child_evidence(primary_error.execution),
+            cleanup=_profile_command_cleanup_evidence(primary_error.execution),
+            output=_profile_command_output_evidence(primary_error.execution.output),
+            cleanup_failures=cleanup_failures,
+        )
     return ProfileUnexpectedFailure(
         stage=stage,
         operation_name=operation_name,
@@ -2067,6 +3491,26 @@ def profile_unexpected_failure(
         error_message=_exception_message(primary_error),
         cleanup_failures=cleanup_failures,
     )
+
+
+def profile_unexpected_failure_detail(
+    failure: ProfileUnexpectedFailureEvidence,
+) -> str:
+    """Render one human diagnostic without duplicating closed-union knowledge."""
+    if type(failure) is ProfileUnexpectedFailure:
+        return f"error={failure.error_type}: {failure.error_message}"
+    if type(failure) is ProfileUnexpectedCommandFinalizationFailure:
+        return (
+            f"command_exit={failure.command_result.exit_code} "
+            f"finalization_failures={len(failure.finalization_failures)}"
+        )
+    if type(failure) is ProfileUnexpectedCommandLifecycleFailure:
+        return (
+            f"command={failure.command_name} "
+            f"child={type(failure.child).__name__} "
+            f"cleanup={type(failure.cleanup).__name__}"
+        )
+    raise AssertionError("ProfileUnexpectedFailureEvidence is a closed union")
 
 
 def unexpected_profile_failure_report(
@@ -2088,12 +3532,12 @@ def unexpected_profile_failure_report(
     print(
         "[profile] unexpected failure: "
         f"stage={stage.value} operation={failure.operation_name} "
-        f"error={failure.error_type}: {failure.error_message} "
+        f"{profile_unexpected_failure_detail(failure)} "
         f"cleanup_failures={len(failure.cleanup_failures)}",
         file=sys.stderr,
     )
     return UnexpectedProfileFailureReport(
-        schema_version=7,
+        schema_version=8,
         outcome="failed",
         config=request.configuration,
         completed_aggregate_runs=completed_aggregate_runs,
@@ -2116,6 +3560,7 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
     """Run every measurement and return the complete or first-failure artifact."""
     try:
         cold_aggregate = run_profile_aggregate(
+            command_owner=request.command_owner,
             repo_root=request.repo_root,
             make_bin=request.make_bin,
             name=f"cold-aggregate:{AGGREGATE_TARGET}",
@@ -2149,7 +3594,7 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
     except ProfileStageFailed as failed:
         print(f"[profile] {failed}", file=sys.stderr)
         return ColdAggregateFailureReport(
-            schema_version=7,
+            schema_version=8,
             outcome="failed",
             config=request.configuration,
             failed_aggregate=cold_aggregate,
@@ -2160,6 +3605,7 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
     for target in request.targets:
         try:
             target_run = run_in_isolated_worktree(
+                command_owner=request.command_owner,
                 repo_root=request.repo_root,
                 make_bin=request.make_bin,
                 name=f"target:{target}",
@@ -2194,7 +3640,7 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
         except ProfileStageFailed as failed:
             print(f"[profile] {failed}", file=sys.stderr)
             return TargetFailureReport(
-                schema_version=7,
+                schema_version=8,
                 outcome="failed",
                 config=request.configuration,
                 cold_validate_pr_raw_run=cold_aggregate,
@@ -2206,6 +3652,7 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
 
     try:
         learned_aggregate = run_profile_aggregate(
+            command_owner=request.command_owner,
             repo_root=request.repo_root,
             make_bin=request.make_bin,
             name=f"learned-aggregate:{AGGREGATE_TARGET}",
@@ -2239,7 +3686,7 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
     except ProfileStageFailed as failed:
         print(f"[profile] {failed}", file=sys.stderr)
         return LearnedAggregateFailureReport(
-            schema_version=7,
+            schema_version=8,
             outcome="failed",
             config=request.configuration,
             cold_validate_pr_raw_run=cold_aggregate,
@@ -2266,7 +3713,7 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
             completed_target_runs=target_results,
         )
     return ValidateProfileReport(
-        schema_version=7,
+        schema_version=8,
         outcome="complete",
         config=request.configuration,
         cold_validate_pr_raw_run=cold_aggregate,
@@ -2276,19 +3723,100 @@ def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifa
     )
 
 
+def build_profile_command_owner(
+    command_timeout_seconds: int,
+) -> ProfileCommandOwner:
+    """Compose the profiler's sole process-tree execution boundary."""
+    return ContainedProfileCommandOwner(
+        build_validation_command_runner(),
+        ValidationExecutionDeadline.for_active_timeout(command_timeout_seconds),
+        DurableProfileCommandLogFinalizer(TextProfileCommandLogAppenderFactory()),
+    )
+
+
+def build_profile_artifact_publisher() -> ProfileArtifactPublisher:
+    """Compose durable report publication behind one cross-process lock owner."""
+    return PosixAtomicProfileArtifactPublisher(
+        PosixProfileArtifactPublicationLock(PosixFileLockOwner())
+    )
+
+
+def publish_initialization_failure(
+    *,
+    output_path: Path,
+    startup: ValidateProfileStartup,
+    operation_name: str,
+    error: BaseException,
+    publisher: ProfileArtifactPublisher,
+) -> int:
+    """Own typed initialization-failure projection, publication, and status."""
+    artifact = ProfileInitializationFailureReport(
+        schema_version=8,
+        outcome="failed",
+        startup=startup,
+        failure=profile_unexpected_failure(
+            stage=ProfileStage.INITIALIZATION,
+            operation_name=operation_name,
+            error=error,
+        ),
+    )
+    write_profile_artifact(output_path, artifact, publisher)
+    return _profile_artifact_exit_code(artifact)
+
+
 def main() -> int:
     arguments = parse_args()
     repo_root = arguments.repo_root.resolve()
-    output_path = resolve_output_path(arguments, repo_root)
-    profiled_commit_sha = resolve_profiled_commit(repo_root)
-    dirty = source_worktree_is_dirty(repo_root)
+    output_path = resolve_output_path(
+        arguments,
+        repo_root,
+        SystemProfileOutputIdentityFactory(),
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    publisher = build_profile_artifact_publisher()
     artifacts = ProfileArtifactStore(
         output_path.parent / f"{output_path.stem}-artifacts"
     )
-    artifacts.initialize()
-    host = profile_host()
-    aggressiveness = resolve_aggressiveness(arguments)
+    startup = ValidateProfileStartup(
+        make_bin=arguments.make_bin,
+        repo_root=str(repo_root),
+        jobs=arguments.jobs,
+        dry_run=arguments.dry_run,
+        artifact_directory=str(artifacts.root),
+        command_timeout_seconds=arguments.command_timeout_seconds,
+    )
+    try:
+        artifacts.initialize()
+    except BaseException as error:
+        return publish_initialization_failure(
+            output_path=output_path,
+            startup=startup,
+            operation_name="artifact-directory-initialize",
+            error=error,
+            publisher=publisher,
+        )
+    try:
+        command_owner = build_profile_command_owner(arguments.command_timeout_seconds)
+        profiled_commit_sha = resolve_profiled_commit(
+            repo_root,
+            command_owner,
+            artifacts,
+        )
+        dirty = source_worktree_is_dirty(
+            repo_root,
+            command_owner,
+            artifacts,
+        )
+        host = profile_host()
+        aggressiveness = resolve_aggressiveness(arguments)
+    except BaseException as error:
+        return publish_initialization_failure(
+            output_path=output_path,
+            startup=startup,
+            operation_name="profile-initialization",
+            error=error,
+            publisher=publisher,
+        )
     initialization = ValidateProfileInitialization(
         make_bin=arguments.make_bin,
         repo_root=str(repo_root),
@@ -2299,6 +3827,7 @@ def main() -> int:
         host=host,
         aggressiveness=aggressiveness,
         artifact_directory=str(artifacts.root),
+        command_timeout_seconds=arguments.command_timeout_seconds,
     )
     if arguments.targets is not None:
         targets = arguments.targets
@@ -2309,6 +3838,7 @@ def main() -> int:
                 arguments.make_bin,
                 profiled_commit_sha,
                 artifacts,
+                command_owner,
             )
         except BaseException as error:
             failure = profile_unexpected_failure(
@@ -2318,17 +3848,17 @@ def main() -> int:
             )
             print(
                 "[profile] target discovery failed: "
-                f"error={failure.error_type}: {failure.error_message} "
+                f"{profile_unexpected_failure_detail(failure)} "
                 f"cleanup_failures={len(failure.cleanup_failures)}",
                 file=sys.stderr,
             )
             artifact = ProfileDiscoveryFailureReport(
-                schema_version=7,
+                schema_version=8,
                 outcome="failed",
                 initialization=initialization,
                 failure=failure,
             )
-            write_profile_artifact(output_path, artifact)
+            write_profile_artifact(output_path, artifact, publisher)
             return _profile_artifact_exit_code(artifact)
     configuration = ValidateProfileConfiguration(
         make_bin=arguments.make_bin,
@@ -2347,6 +3877,7 @@ def main() -> int:
         ),
         external_caches="preserved",
         artifact_directory=str(artifacts.root),
+        command_timeout_seconds=arguments.command_timeout_seconds,
     )
     profile_root = Path(tempfile.mkdtemp(prefix="io-validate-profile-session-"))
     executor_pool_dir = profile_root / "executor-pool"
@@ -2364,6 +3895,7 @@ def main() -> int:
                 artifacts=artifacts,
                 profiled_commit_sha=profiled_commit_sha,
                 configuration=configuration,
+                command_owner=command_owner,
             )
         )
     except BaseException as exc:
@@ -2379,6 +3911,7 @@ def main() -> int:
         profile_root=profile_root,
         artifact=artifact,
         directory_remover=directory_remover,
+        publisher=publisher,
     )
 
 

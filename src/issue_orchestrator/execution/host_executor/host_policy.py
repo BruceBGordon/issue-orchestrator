@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 from pathlib import Path
 
@@ -18,12 +17,17 @@ from ...domain.executor import (
 )
 from ._contracts import PersistedPolicyRecord
 from ..atomic_record_store import AtomicRecordStore
+from ..posix_file_lock import (
+    PosixFileLockAcquisition,
+    PosixFileLockFilePresence,
+    PosixFileLockMode,
+    PosixFileLockOwner,
+    PosixFileLockSpecification,
+)
 
 
 EXECUTOR_POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
-EXECUTOR_AGGRESSIVENESS_ENV = (
-    "ISSUE_ORCHESTRATOR_EXECUTOR_AGGRESSIVENESS_PERCENT"
-)
+EXECUTOR_AGGRESSIVENESS_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_AGGRESSIVENESS_PERCENT"
 
 _DEFAULT_AGGRESSIVENESS_PERCENT = 100
 
@@ -69,6 +73,13 @@ class ExecutorPolicyStore:
         self._pool_dir = pool_dir
         self._path = pool_dir / "policy.json"
         self._atomic_records = atomic_records
+        self._file_locks = PosixFileLockOwner()
+        self._policy_lock = PosixFileLockSpecification(
+            (pool_dir / "policy.lock").resolve(),
+            PosixFileLockMode.EXCLUSIVE,
+            PosixFileLockAcquisition.BLOCKING,
+            PosixFileLockFilePresence.CREATE_IF_MISSING,
+        )
 
     def effective(self) -> ExecutorPolicy:
         self._atomic_records.prune_crash_remnants()
@@ -94,12 +105,8 @@ class ExecutorPolicyStore:
         aggressiveness: ExecutorAggressiveness,
     ) -> ExecutorPolicyChange:
         self._pool_dir.mkdir(parents=True, exist_ok=True)
-        record = PersistedPolicyRecord(
-            aggressiveness_percent=aggressiveness.percent
-        )
-        lock_path = self._pool_dir / "policy.lock"
-        with lock_path.open("a+b") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        record = PersistedPolicyRecord(aggressiveness_percent=aggressiveness.percent)
+        with self._file_locks.hold(self._policy_lock):
             self._atomic_records.write(self._path, record)
         saved = ExecutorPolicy(aggressiveness, ExecutorPolicySource.PERSISTED)
         return ExecutorPolicyChange(saved=saved, effective=self.effective())

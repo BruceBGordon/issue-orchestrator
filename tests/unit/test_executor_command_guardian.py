@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -540,7 +541,7 @@ def test_guardian_timeout_wins_over_cooperative_term_exit() -> None:
                 lease_fd,
                 (sys.executable, "-c", command),
                 budget=ExecutorGuardianBoundedBudget(
-                    0.5,
+                    time.monotonic() + 2.0,
                     ExecutorDeadlineReason.ACTIVE,
                 ),
             )
@@ -751,6 +752,32 @@ def test_malformed_guardian_result_is_never_treated_as_command_success() -> None
             )
 
 
+def test_zero_wall_resource_record_is_rejected_at_guardian_wire_boundary() -> None:
+    fault = _fault_guardian_protocol_prelude() + (
+        "raw = sys.argv[sys.argv.index('--request-json') + 1]; "
+        "fd = json.loads(raw)['result_file_descriptor']; "
+        "os.write(fd, b'{\"outcome\":\"completed\",\"exit_code\":0,"
+        "\"resources\":{\"availability\":\"available\","
+        "\"wall_seconds\":0.0,\"cpu_seconds\":0.0,"
+        "\"max_rss_bytes\":0,\"input_blocks\":0,"
+        "\"output_blocks\":0}}')"
+    )
+    with _lease_descriptor() as lease_fd:
+        with pytest.raises(
+            ExecutorGuardianProtocolError,
+            match="malformed terminal record",
+        ):
+            _guardian(
+                ExecutorGuardianProgram((str(Path(sys.executable)), "-c", fault))
+            ).run(
+                _request(
+                    lease_fd,
+                    (sys.executable, "-c", "raise AssertionError('must not run')"),
+                    budget=ExecutorGuardianUnboundedBudget(),
+                )
+            )
+
+
 def test_valid_terminal_record_cannot_fabricate_containment() -> None:
     fault = _fault_guardian_protocol_prelude() + (
         "raw = sys.argv[sys.argv.index('--request-json') + 1]; "
@@ -764,7 +791,7 @@ def test_valid_terminal_record_cannot_fabricate_containment() -> None:
     with _lease_descriptor() as lease_fd:
         with pytest.raises(
             ExecutorGuardianProtocolError,
-            match="requires a contained SIGKILL exit",
+            match="exit code contradicts its terminal record",
         ):
             _guardian(
                 ExecutorGuardianProgram((str(Path(sys.executable)), "-c", fault))

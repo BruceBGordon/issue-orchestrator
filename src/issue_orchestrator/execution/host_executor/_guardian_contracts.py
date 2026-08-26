@@ -9,6 +9,7 @@ from pydantic import Field, TypeAdapter
 
 from ...domain.executor import ExecutorCommandLifecycle, ExecutorDeadlineReason
 from ...domain.executor_guardian import (
+    ExecutorGuardianActivationTimedOut,
     ExecutorGuardianBoundedBudget,
     ExecutorGuardianBudget,
     ExecutorGuardianCommandCompleted,
@@ -18,6 +19,7 @@ from ...domain.executor_guardian import (
     ExecutorGuardianCommandTimedOut,
     ExecutorGuardianInternalFailed,
     ExecutorGuardianResourceObservationFailed,
+    ExecutorGuardianSerializedFailure,
     ExecutorGuardianTerminal,
     ExecutorGuardianTerminationPolicy,
     ExecutorGuardianUnboundedBudget,
@@ -41,11 +43,14 @@ class GuardianUnboundedBudgetRecord(ExecutorStrictRecord):
 
 class GuardianBoundedBudgetRecord(ExecutorStrictRecord):
     kind: Literal["bounded"] = "bounded"
-    timeout_seconds: float = Field(gt=0)
+    expires_at_monotonic: float = Field(ge=0)
     reason: ExecutorDeadlineReason
 
     def to_domain(self) -> ExecutorGuardianBoundedBudget:
-        return ExecutorGuardianBoundedBudget(self.timeout_seconds, self.reason)
+        return ExecutorGuardianBoundedBudget(
+            self.expires_at_monotonic,
+            self.reason,
+        )
 
 
 GuardianBudgetRecord = Annotated[
@@ -80,14 +85,14 @@ def guardian_budget_record(budget: ExecutorGuardianBudget) -> GuardianBudgetReco
         return GuardianUnboundedBudgetRecord()
     if type(budget) is ExecutorGuardianBoundedBudget:
         return GuardianBoundedBudgetRecord(
-            timeout_seconds=budget.timeout_seconds,
+            expires_at_monotonic=budget.expires_at_monotonic,
             reason=budget.reason,
         )
     raise ValueError("guardian budget record requires a typed budget")
 
 
 class GuardianInvocationRecord(ExecutorStrictRecord):
-    schema_version: Literal[4] = 4
+    schema_version: Literal[5] = 5
     arguments: tuple[str, ...]
     result_file_descriptor: int = Field(ge=0)
     start_file_descriptor: int = Field(ge=0)
@@ -123,17 +128,13 @@ class GuardianInvocationRecord(ExecutorStrictRecord):
             result_file_descriptor=result_file_descriptor,
             start_file_descriptor=start_file_descriptor,
             owner_ready_file_descriptor=owner_ready_file_descriptor,
-            parent_lifetime_read_file_descriptor=(
-                parent_lifetime_read_file_descriptor
-            ),
+            parent_lifetime_read_file_descriptor=(parent_lifetime_read_file_descriptor),
             lifecycle=lifecycle,
             budget=guardian_budget_record(budget),
             cancellation=cancellation,
             graceful_shutdown_seconds=(termination_policy.graceful_shutdown_seconds),
             sentinel_program=sentinel_program.arguments,
-            sentinel_startup_timeout_seconds=(
-                sentinel_policy.startup_timeout_seconds
-            ),
+            sentinel_startup_timeout_seconds=(sentinel_policy.startup_timeout_seconds),
             lease_file_descriptors=lease_file_descriptors,
         )
 
@@ -155,7 +156,7 @@ class GuardianInvocationRecord(ExecutorStrictRecord):
 
 class GuardianAvailableCommandResourceRecord(ExecutorStrictRecord):
     availability: Literal["available"] = "available"
-    wall_seconds: float = Field(ge=0)
+    wall_seconds: float = Field(gt=0)
     cpu_seconds: float = Field(ge=0)
     max_rss_bytes: int = Field(ge=0)
     input_blocks: int = Field(ge=0)
@@ -184,8 +185,7 @@ class GuardianUnavailableCommandResourceRecord(ExecutorStrictRecord):
 
 
 GuardianCommandResourceRecord = Annotated[
-    GuardianAvailableCommandResourceRecord
-    | GuardianUnavailableCommandResourceRecord,
+    GuardianAvailableCommandResourceRecord | GuardianUnavailableCommandResourceRecord,
     Field(discriminator="availability"),
 ]
 
@@ -218,6 +218,31 @@ class GuardianTimedOutRecord(ExecutorStrictRecord):
         return ExecutorGuardianCommandTimedOut(self.reason)
 
 
+class GuardianSerializedFailureRecord(ExecutorStrictRecord):
+    operation: str = Field(min_length=1)
+    error_type: str = Field(min_length=1)
+    error_repr: str = Field(min_length=1)
+
+    def to_domain(self) -> ExecutorGuardianSerializedFailure:
+        return ExecutorGuardianSerializedFailure(
+            self.operation,
+            self.error_type,
+            self.error_repr,
+        )
+
+
+class GuardianActivationTimedOutRecord(ExecutorStrictRecord):
+    outcome: Literal["activation-timed-out"] = "activation-timed-out"
+    reason: ExecutorDeadlineReason
+    recovery_failures: tuple[GuardianSerializedFailureRecord, ...]
+
+    def to_domain(self) -> ExecutorGuardianActivationTimedOut:
+        return ExecutorGuardianActivationTimedOut(
+            self.reason,
+            tuple(failure.to_domain() for failure in self.recovery_failures),
+        )
+
+
 class GuardianCommandStartFailedRecord(ExecutorStrictRecord):
     outcome: Literal["command-start-failed"] = "command-start-failed"
     error_type: str = Field(min_length=1)
@@ -242,6 +267,7 @@ class GuardianInternalFailedRecord(ExecutorStrictRecord):
 GuardianTerminalRecord = Annotated[
     GuardianCompletedRecord
     | GuardianCommandInterruptedRecord
+    | GuardianActivationTimedOutRecord
     | GuardianTimedOutRecord
     | GuardianCommandStartFailedRecord
     | GuardianInternalFailedRecord,
@@ -284,6 +310,18 @@ def guardian_terminal_record(
     if type(terminal) is ExecutorGuardianCommandInterrupted:
         return GuardianCommandInterruptedRecord(
             signal_number=terminal.signal_number,
+        )
+    if type(terminal) is ExecutorGuardianActivationTimedOut:
+        return GuardianActivationTimedOutRecord(
+            reason=terminal.reason,
+            recovery_failures=tuple(
+                GuardianSerializedFailureRecord(
+                    operation=failure.operation,
+                    error_type=failure.error_type,
+                    error_repr=failure.error_repr,
+                )
+                for failure in terminal.recovery_failures
+            ),
         )
     if type(terminal) is ExecutorGuardianCommandTimedOut:
         return GuardianTimedOutRecord(reason=terminal.reason)

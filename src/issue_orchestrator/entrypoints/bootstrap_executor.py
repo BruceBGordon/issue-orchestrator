@@ -42,6 +42,8 @@ from ..ports.terminal_session_terminator import TerminalSessionTerminator
 from ..ports.terminal_session_owner import TerminalSessionOwner
 from ..ports.terminal_session_registry import TerminalSessionRegistry
 from ..ports.validation_command_runner import ValidationCommandRunner
+from ..ports.validation_host_probe import ValidationHostProbe
+
 if TYPE_CHECKING:
     from ..execution.terminal_session_lifecycle import TerminalSessionWatcherFactory
 
@@ -128,10 +130,16 @@ def compose_executor(host_cpu_observer: HostCpuUtilizationObserver) -> Executor:
             default_executor_pool_dir,
             detected_executor_cpu_count,
         )
+        from ..execution.host_executor._deadline import (
+            DurableExecutorDeadlineOwner,
+            StderrExecutorDeadlineReporter,
+        )
+        from ..execution.host_executor._journal import ExecutorEventStore
     except ModuleNotFoundError as exc:
         _raise_missing_posix_executor_dependency(exc)
         raise AssertionError("unreachable after missing executor dependency")
     pool_dir = default_executor_pool_dir()
+    deadline_events = ExecutorEventStore(pool_dir)
     return HostExecutor(
         pool_dir=pool_dir,
         host_cpu_slots=detected_executor_cpu_count(),
@@ -147,6 +155,10 @@ def compose_executor(host_cpu_observer: HostCpuUtilizationObserver) -> Executor:
             request_nonce=lambda: uuid4().hex,
         ),
         command_guardian=build_executor_command_guardian(),
+        deadline_owner=DurableExecutorDeadlineOwner(
+            deadline_events,
+            StderrExecutorDeadlineReporter(),
+        ),
         atomic_path_replacement=OsAtomicPathReplacement(),
         history_retention_lock=_build_history_retention_lock(pool_dir),
         history_retention_policy=_HISTORY_RETENTION,
@@ -179,6 +191,7 @@ def build_posix_process_launcher() -> PosixProcessLauncher:
     from ..execution.posix_process import (
         MaskedPosixSpawnPrimitive,
         RetainedPosixProcessLauncher,
+        SystemPosixProcessActivationClock,
     )
 
     return RetainedPosixProcessLauncher(
@@ -193,6 +206,7 @@ def build_posix_process_launcher() -> PosixProcessLauncher:
         build_process_group_supervisor(),
         PosixProcessActivationPolicy(_POSIX_PROCESS_ACTIVATION_TIMEOUT_SECONDS),
         _PROCESS_TERMINATION,
+        SystemPosixProcessActivationClock(),
     )
 
 
@@ -231,6 +245,9 @@ def build_terminal_session_owner() -> TerminalSessionOwner:
         PosixTerminalSessionOwner,
         TerminalSessionOwnerProgram,
     )
+    from ..execution.process_cancellation_endpoint import (
+        PosixProcessCancellationEndpointLeaseFactory,
+    )
     from ..domain.process_group_sentinel import ProcessGroupSentinelProgram
 
     owner_program = (
@@ -248,6 +265,7 @@ def build_terminal_session_owner() -> TerminalSessionOwner:
         ProcessGroupSentinelProgram(sentinel_program),
         _TERMINAL_SESSION_OWNER,
         build_atomic_record_store_factory(),
+        PosixProcessCancellationEndpointLeaseFactory(),
     )
 
 
@@ -335,7 +353,10 @@ def build_validation_command_runner() -> ValidationCommandRunner:
         SentinelValidationProcessGuardian,
         ValidationProcessGuardianProgram,
     )
-    from ..domain.validation_execution import ValidationGuardianClock
+    from ..domain.validation_execution import (
+        ValidationDeadlineObservationClock,
+        ValidationGuardianClock,
+    )
     from ..domain.process_group_sentinel import (
         ProcessGroupSentinelPolicy,
         ProcessGroupSentinelProgram,
@@ -346,6 +367,9 @@ def build_validation_command_runner() -> ValidationCommandRunner:
     from ..execution.posix_pipe import OsPosixPipeFactory
     from ..execution.validation_launch_pipes import (
         PosixValidationLaunchPipesFactory,
+    )
+    from ..execution.validation_output_journal import (
+        PosixValidationOutputJournalFactory,
     )
 
     process_launcher = build_posix_process_launcher()
@@ -367,12 +391,8 @@ def build_validation_command_runner() -> ValidationCommandRunner:
             )
         ),
         ProcessGroupSentinelPolicy(
-            graceful_shutdown_seconds=(
-                _PROCESS_TERMINATION.graceful_shutdown_seconds
-            ),
-            startup_timeout_seconds=(
-                _POSIX_PROCESS_ACTIVATION_TIMEOUT_SECONDS
-            ),
+            graceful_shutdown_seconds=(_PROCESS_TERMINATION.graceful_shutdown_seconds),
+            startup_timeout_seconds=(_POSIX_PROCESS_ACTIVATION_TIMEOUT_SECONDS),
         ),
         process_launcher,
         process_group_supervisor,
@@ -387,9 +407,20 @@ def build_validation_command_runner() -> ValidationCommandRunner:
             shutdown_timeout_seconds=2.0,
             final_drain_byte_limit=4_194_304,
         ),
-        PosixValidationPipeCaptureFactory(default_validation_pipe_selector),
+        PosixValidationPipeCaptureFactory(
+            default_validation_pipe_selector,
+            ValidationDeadlineObservationClock(time.monotonic),
+        ),
         PosixValidationLaunchPipesFactory(pipe_factory),
+        PosixValidationOutputJournalFactory(),
     )
+
+
+def build_validation_host_probe() -> ValidationHostProbe:
+    """Compose host observations through whole-process-tree containment."""
+    from ..execution.validation_resource_sampling import ContainedValidationHostProbe
+
+    return ContainedValidationHostProbe(build_validation_command_runner())
 
 
 def build_executor_command_guardian() -> ExecutorCommandGuardian:

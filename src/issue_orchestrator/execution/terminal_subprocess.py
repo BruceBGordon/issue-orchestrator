@@ -262,7 +262,7 @@ class SubprocessPlugin:
             log_path=log_path,
             output_dir=log_path.parent,
         )
-        runner = AgentRunner()
+        runner = AgentRunner(self._process_group_supervisor)
         try:
             session = runner.start_direct_with_file_descriptors(
                 spec,

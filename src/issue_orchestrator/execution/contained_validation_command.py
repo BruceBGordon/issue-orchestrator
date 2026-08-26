@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import locale
 import os
 import time
 from dataclasses import dataclass
@@ -11,14 +10,14 @@ from typing import TypeVar, cast
 from ..domain.contained_command import ContainedCommandOutputPolicy
 from ..domain.process_group import (
     OwnedProcessGroupLeader,
+    ProcessGroupTerminalCompletionAccepted,
+    ProcessGroupTerminalDecision,
+    ProcessGroupTerminalInterruptionRequested,
     ProcessGroupTermination,
     ProcessGroupUnboundedWait,
 )
 from ..domain.posix_process import (
-    PosixProcessGroupMode,
-    PosixProcessLaunchSpec,
     PosixProcessProgram,
-    PosixProcessWithoutTerminal,
 )
 from ..domain.validation_execution import (
     ContainedValidationCommand,
@@ -34,6 +33,7 @@ from ..domain.validation_execution import (
     ValidationCommandExitUnknown,
     ValidationCommandNotStarted,
     ValidationCommandOutput,
+    ValidationDeadlineObservationClock,
     ValidationExecutionDeadline,
     validation_cleanup_from_supervision,
     validation_cleanup_with_failure,
@@ -67,6 +67,17 @@ from ..ports.validation_process_guardian import (
     ValidationProcessGuardian,
     ValidationProcessGuardianStarted,
     ValidationProcessParentLifetime,
+)
+from ..ports.validation_output_journal import (
+    ValidationOutputJournal,
+    ValidationOutputJournalFactory,
+    ValidationOutputStream,
+)
+from .independent_cleanup import (
+    CleanupAction,
+    CleanupFailed,
+    CleanupSucceeded,
+    IndependentCleanupPlan,
 )
 from .validation_pipe_resources import (
     ValidationPipeResourceOwner,
@@ -109,6 +120,7 @@ class _StartedValidationCommand:
     parent_lifetime: ValidationProcessParentLifetime
     readers: ValidationLaunchReaders
     started_at_monotonic: float
+    output_journal: ValidationOutputJournal
 
     def __post_init__(self) -> None:
         if not isinstance(self.process, PosixProcessHandle):
@@ -124,6 +136,10 @@ class _StartedValidationCommand:
             or self.started_at_monotonic <= 0
         ):
             raise ValueError("started validation monotonic time must be positive")
+        if not isinstance(self.output_journal, ValidationOutputJournal):
+            raise ValueError(
+                "started validation output journal must implement its port"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +203,83 @@ _ValidationParentLifetimeClose = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidationLaunchReadersClosed:
+    """Every transferred reader was closed after capture rejected ownership."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationLaunchReadersCloseFailed:
+    error: BaseException
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.error, BaseException):
+            raise ValueError("validation launch reader cleanup failure must be typed")
+
+
+_ValidationLaunchReadersClose = (
+    _ValidationLaunchReadersClosed | _ValidationLaunchReadersCloseFailed
+)
+
+
+def _close_validation_launch_readers(
+    readers: ValidationLaunchReaders,
+) -> _ValidationLaunchReadersClose:
+    outcome = IndependentCleanupPlan(
+        tuple(
+            CleanupAction(
+                f"validation-capture-rejected-{role}-reader-close",
+                reader.close,
+            )
+            for role, reader in (
+                ("stdout", readers.stdout),
+                ("stderr", readers.stderr),
+                ("executor-handshake", readers.executor_handshake),
+            )
+        )
+    ).run()
+    if type(outcome) is CleanupSucceeded:
+        return _ValidationLaunchReadersClosed()
+    if type(outcome) is not CleanupFailed:
+        raise AssertionError("validation reader cleanup is a closed union")
+    errors = tuple(failure.error for failure in outcome.failures)
+    error = (
+        errors[0]
+        if len(errors) == 1
+        else BaseExceptionGroup("validation launch readers did not close", errors)
+    )
+    return _ValidationLaunchReadersCloseFailed(error)
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationCaptureAcquired:
+    capture: ValidationPipeCapture
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.capture, ValidationPipeCapture):
+            raise ValueError("acquired validation capture must implement its port")
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationCaptureRejected:
+    error: BaseException
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.error, BaseException):
+            raise ValueError("rejected validation capture error must be typed")
+
+
+_ValidationCaptureAcquisition = _ValidationCaptureAcquired | _ValidationCaptureRejected
+
+
+def _require_acquired_capture(
+    acquisition: _ValidationCaptureAcquisition,
+) -> ValidationPipeCapture:
+    if type(acquisition) is not _ValidationCaptureAcquired:
+        raise AssertionError("validation capture acquisition is a closed union")
+    return acquisition.capture
+
+
 class _ValidationPipeCapture(ProcessGroupInterruption):
     """Drain both pipes while the supervisor keeps the leader unreaped."""
 
@@ -199,6 +292,8 @@ class _ValidationPipeCapture(ProcessGroupInterruption):
         deadline: ValidationExecutionDeadline,
         started_at_monotonic: float,
         resource_owner: ValidationPipeResourceOwner,
+        output_journal: ValidationOutputJournal,
+        deadline_clock: ValidationDeadlineObservationClock,
     ) -> None:
         self._policy = _require_exact_type(
             policy,
@@ -206,7 +301,6 @@ class _ValidationPipeCapture(ProcessGroupInterruption):
             "validation pipe capture policy",
         )
         self._streams: dict[int, PosixPipeReader] = {}
-        self._buffers: dict[int, bytearray] = {}
         if type(resource_owner) is not ValidationPipeResourceOwner:
             raise ValueError(
                 "validation capture resource_owner must be ValidationPipeResourceOwner"
@@ -219,8 +313,9 @@ class _ValidationPipeCapture(ProcessGroupInterruption):
         )
         self._streams[self._stdout_descriptor] = stdout
         self._streams[self._stderr_descriptor] = stderr
-        self._buffers[self._stdout_descriptor] = bytearray()
-        self._buffers[self._stderr_descriptor] = bytearray()
+        if not isinstance(output_journal, ValidationOutputJournal):
+            raise ValueError("validation output journal must implement its port")
+        self._output_journal = output_journal
         deadline = _require_exact_type(
             deadline,
             ValidationExecutionDeadline,
@@ -234,6 +329,11 @@ class _ValidationPipeCapture(ProcessGroupInterruption):
             deadline,
             started_at_monotonic,
         )
+        self._deadline_clock = _require_exact_type(
+            deadline_clock,
+            ValidationDeadlineObservationClock,
+            "validation deadline observation clock",
+        )
         self._handshake_decoder = ValidationExecutorHandshakeDecoder()
         self._deadline_status: ValidationCommandDeadlineStatus = (
             ValidationCommandDeadlinePending()
@@ -242,15 +342,29 @@ class _ValidationPipeCapture(ProcessGroupInterruption):
     def wait_for_request(self, timeout_seconds: float) -> bool:
         _require_positive_float(timeout_seconds, "validation pipe wait")
         self._read_ready(timeout_seconds)
-        self._deadline_status = self._deadline_tracker.status(time.monotonic())
+        self._observe_deadline()
         if type(self._deadline_status) is ValidationCommandDeadlineExceeded:
             return True
         return False
+
+    def decide_terminal_observation(self) -> ProcessGroupTerminalDecision:
+        """Re-observe the authoritative deadline before accepting completion."""
+        self._observe_deadline()
+        if type(self._deadline_status) is ValidationCommandDeadlinePending:
+            return ProcessGroupTerminalCompletionAccepted()
+        if type(self._deadline_status) is ValidationCommandDeadlineExceeded:
+            return ProcessGroupTerminalInterruptionRequested()
+        raise AssertionError("validation deadline status is a closed union")
 
     @property
     def deadline_status(self) -> ValidationCommandDeadlineStatus:
         """Return the exact clock state observed by the capture owner."""
         return self._deadline_status
+
+    def _observe_deadline(self) -> None:
+        self._deadline_status = self._deadline_tracker.status(
+            self._deadline_clock.monotonic_now()
+        )
 
     def finalize(self) -> ValidationPipeCaptureResult:
         failure: BaseException | None = None
@@ -259,9 +373,7 @@ class _ValidationPipeCapture(ProcessGroupInterruption):
         try:
             while (
                 self._streams
-                or self._resources.is_registered(
-                    ValidationPipeRole.EXECUTOR_HANDSHAKE
-                )
+                or self._resources.is_registered(ValidationPipeRole.EXECUTOR_HANDSHAKE)
             ) and remaining_bytes > 0:
                 remaining_seconds = deadline - time.monotonic()
                 if remaining_seconds <= 0:
@@ -275,9 +387,7 @@ class _ValidationPipeCapture(ProcessGroupInterruption):
                 )
             if (
                 self._streams
-                or self._resources.is_registered(
-                    ValidationPipeRole.EXECUTOR_HANDSHAKE
-                )
+                or self._resources.is_registered(ValidationPipeRole.EXECUTOR_HANDSHAKE)
             ) and remaining_bytes <= 0:
                 raise RuntimeError(
                     "validation final output drain exceeded "
@@ -295,18 +405,18 @@ class _ValidationPipeCapture(ProcessGroupInterruption):
                 close_failure,
             )
         )
-        encoding = locale.getpreferredencoding(False)
+        journal_result = self._output_journal.finalize()
+        failure = (
+            journal_result.failure
+            if failure is None
+            else _combined_error(
+                "validation pipe and output journal finalization both failed",
+                failure,
+                journal_result.failure,
+            )
+        )
         return ValidationPipeCaptureResult(
-            ValidationCommandOutput(
-                stdout=bytes(self._buffers[self._stdout_descriptor]).decode(
-                    encoding,
-                    errors="replace",
-                ),
-                stderr=bytes(self._buffers[self._stderr_descriptor]).decode(
-                    encoding,
-                    errors="replace",
-                ),
-            ),
+            journal_result.output,
             failure,
         )
 
@@ -342,7 +452,12 @@ class _ValidationPipeCapture(ProcessGroupInterruption):
                 break
             chunk = os.read(descriptor, read_size)
             if chunk:
-                self._buffers[descriptor].extend(chunk)
+                stream = (
+                    ValidationOutputStream.STDOUT
+                    if descriptor == self._stdout_descriptor
+                    else ValidationOutputStream.STDERR
+                )
+                self._output_journal.append(stream, chunk)
                 bytes_read += len(chunk)
                 continue
             role = (
@@ -358,12 +473,21 @@ class _ValidationPipeCapture(ProcessGroupInterruption):
 class PosixValidationPipeCaptureFactory:
     """Create one real capture with all-or-nothing resource ownership."""
 
-    def __init__(self, selector_factory: ValidationPipeSelectorFactory) -> None:
+    def __init__(
+        self,
+        selector_factory: ValidationPipeSelectorFactory,
+        deadline_clock: ValidationDeadlineObservationClock,
+    ) -> None:
         if not callable(selector_factory):
             raise ValueError(
                 "PosixValidationPipeCaptureFactory.selector_factory must be callable"
             )
         self._selector_factory = selector_factory
+        self._deadline_clock = _require_exact_type(
+            deadline_clock,
+            ValidationDeadlineObservationClock,
+            "PosixValidationPipeCaptureFactory.deadline_clock",
+        )
 
     def create(
         self,
@@ -373,6 +497,7 @@ class PosixValidationPipeCaptureFactory:
         policy: ContainedCommandOutputPolicy,
         deadline: ValidationExecutionDeadline,
         started_at_monotonic: float,
+        output_journal: ValidationOutputJournal,
     ) -> ValidationPipeCapture:
         resources = ValidationPipeResourceOwner(
             stdout,
@@ -389,6 +514,8 @@ class PosixValidationPipeCaptureFactory:
                 deadline,
                 started_at_monotonic,
                 resources,
+                output_journal,
+                self._deadline_clock,
             )
         except BaseException as setup_error:
             cleanup_error = resources.close()
@@ -433,6 +560,7 @@ class PosixContainedValidationCommandRunner:
         output_policy: ContainedCommandOutputPolicy,
         capture_factory: ValidationPipeCaptureFactory,
         launch_pipes_factory: ValidationLaunchPipesFactory,
+        output_journal_factory: ValidationOutputJournalFactory,
     ) -> None:
         if not isinstance(process_guardian, ValidationProcessGuardian):
             raise ValueError(
@@ -463,6 +591,12 @@ class PosixContainedValidationCommandRunner:
                 "implement ValidationLaunchPipesFactory"
             )
         self._launch_pipes_factory = launch_pipes_factory
+        if not isinstance(output_journal_factory, ValidationOutputJournalFactory):
+            raise ValueError(
+                "PosixContainedValidationCommandRunner.output_journal_factory must "
+                "implement ValidationOutputJournalFactory"
+            )
+        self._output_journal_factory = output_journal_factory
 
     def run(self, command: ContainedValidationCommand) -> ValidationCommandExecution:
         command = _require_exact_type(
@@ -470,18 +604,31 @@ class PosixContainedValidationCommandRunner:
             ContainedValidationCommand,
             "PosixContainedValidationCommandRunner.run command",
         )
-        activation = self._activate(command)
+        try:
+            output_journal = self._output_journal_factory.create(command.output_capture)
+        except BaseException as journal_error:
+            return self._not_started(journal_error)
+        activation = self._activate(command, output_journal)
         if type(activation) is _ValidationActivationClosed:
             return activation.execution
         if type(activation) is not _StartedValidationCommand:
             raise AssertionError("validation activation is a closed union")
         return self._run_started(activation, command.deadline)
 
-    def _activate(self, command: ContainedValidationCommand) -> _ValidationActivation:
+    def _activate(
+        self,
+        command: ContainedValidationCommand,
+        output_journal: ValidationOutputJournal,
+    ) -> _ValidationActivation:
         try:
             pipes = self._launch_pipes_factory.create()
         except BaseException as acquisition_error:
-            return _ValidationActivationClosed(self._not_started(acquisition_error))
+            return _ValidationActivationClosed(
+                self._finalize_unstarted_output(
+                    self._not_started(acquisition_error),
+                    output_journal,
+                )
+            )
         try:
             launch = self._process_guardian.launch(
                 PosixProcessProgram(("/bin/sh", "-c", command.command)),
@@ -491,49 +638,61 @@ class PosixContainedValidationCommandRunner:
             )
         except BaseException as prelaunch_error:
             return _ValidationActivationClosed(
-                self._not_started(
-                    _combined_error(
-                        "validation prelaunch setup and pipe cleanup both failed",
-                        prelaunch_error,
-                        _launch_pipe_close_error(pipes),
-                    )
+                self._finalize_unstarted_output(
+                    self._not_started(
+                        _combined_error(
+                            "validation prelaunch setup and pipe cleanup both failed",
+                            prelaunch_error,
+                            _launch_pipe_close_error(pipes),
+                        )
+                    ),
+                    output_journal,
                 )
             )
         if type(launch) is PosixProcessLaunchRejected:
             return _ValidationActivationClosed(
-                self._not_started(
-                    _combined_error(
-                        "validation launch rejection and pipe cleanup both failed",
-                        launch.error,
-                        _launch_pipe_close_error(pipes),
-                    )
+                self._finalize_unstarted_output(
+                    self._not_started(
+                        _combined_error(
+                            "validation launch rejection and pipe cleanup both failed",
+                            launch.error,
+                            _launch_pipe_close_error(pipes),
+                        )
+                    ),
+                    output_journal,
                 )
             )
         if type(launch) is PosixProcessExecRejected:
             return _ValidationActivationClosed(
-                self._not_started(
-                    _combined_error(
-                        "validation exec rejection and pipe cleanup both failed",
-                        launch.as_error(),
-                        _launch_pipe_close_error(pipes),
-                    )
+                self._finalize_unstarted_output(
+                    self._not_started(
+                        _combined_error(
+                            "validation exec rejection and pipe cleanup both failed",
+                            launch.as_error(),
+                            _launch_pipe_close_error(pipes),
+                        )
+                    ),
+                    output_journal,
                 )
             )
         if type(launch) is PosixProcessLaunchRecovered:
             return _ValidationActivationClosed(
-                ValidationCommandExecution(
-                    child=ValidationCommandExited(
-                        launch.process_id,
-                        launch.exit_code,
+                self._finalize_output_journal(
+                    ValidationCommandExecution(
+                        child=ValidationCommandExited(
+                            launch.process_id,
+                            launch.exit_code,
+                        ),
+                        cleanup=ValidationCommandCleanupFailed(
+                            _combined_error(
+                                "validation activation and pipe cleanup both failed",
+                                launch.activation_error,
+                                _launch_pipe_close_error(pipes),
+                            )
+                        ),
+                        output=ValidationCommandOutput("", ""),
                     ),
-                    cleanup=ValidationCommandCleanupFailed(
-                        _combined_error(
-                            "validation activation and pipe cleanup both failed",
-                            launch.activation_error,
-                            _launch_pipe_close_error(pipes),
-                        )
-                    ),
-                    output=ValidationCommandOutput("", ""),
+                    output_journal,
                 )
             )
         if type(launch) is PosixProcessLaunchRecoveryFailed:
@@ -543,15 +702,18 @@ class PosixContainedValidationCommandRunner:
                 _launch_pipe_close_error(pipes),
             )
             return _ValidationActivationClosed(
-                ValidationCommandExecution(
-                    child=ValidationCommandExitUnknown(launch.process_id),
-                    cleanup=ValidationCommandCleanupFailed(
-                        BaseExceptionGroup(
-                            "validation activation and recovery both failed",
-                            (launch.activation_error, cleanup_error),
-                        )
+                self._finalize_output_journal(
+                    ValidationCommandExecution(
+                        child=ValidationCommandExitUnknown(launch.process_id),
+                        cleanup=ValidationCommandCleanupFailed(
+                            BaseExceptionGroup(
+                                "validation activation and recovery both failed",
+                                (launch.activation_error, cleanup_error),
+                            )
+                        ),
+                        output=ValidationCommandOutput("", ""),
                     ),
-                    output=ValidationCommandOutput("", ""),
+                    output_journal,
                 )
             )
         if type(launch) is not ValidationProcessGuardianStarted:
@@ -568,6 +730,7 @@ class PosixContainedValidationCommandRunner:
                         transfer_error,
                         _launch_pipe_close_error(pipes),
                     ),
+                    output_journal,
                 )
             )
         return _StartedValidationCommand(
@@ -575,6 +738,7 @@ class PosixContainedValidationCommandRunner:
             launch.parent_lifetime,
             readers,
             time.monotonic(),
+            output_journal,
         )
 
     @staticmethod
@@ -585,27 +749,87 @@ class PosixContainedValidationCommandRunner:
             output=ValidationCommandOutput("", ""),
         )
 
+    @staticmethod
+    def _finalize_unstarted_output(
+        execution: ValidationCommandExecution,
+        output_journal: ValidationOutputJournal,
+    ) -> ValidationCommandExecution:
+        if type(execution.child) is not ValidationCommandNotStarted:
+            raise ValueError("unstarted output finalization requires unstarted child")
+        try:
+            journal_result = output_journal.finalize()
+        except BaseException as error:
+            return ValidationCommandExecution(
+                ValidationCommandNotStarted(
+                    _combined_error(
+                        "validation start and output journal finalization both failed",
+                        execution.child.error,
+                        error,
+                    )
+                ),
+                execution.cleanup,
+                execution.output,
+            )
+        child = execution.child
+        if journal_result.failure is not None:
+            child = ValidationCommandNotStarted(
+                _combined_error(
+                    "validation start and output journal finalization both failed",
+                    child.error,
+                    journal_result.failure,
+                )
+            )
+        return ValidationCommandExecution(
+            child,
+            execution.cleanup,
+            journal_result.output,
+        )
+
+    @staticmethod
+    def _finalize_output_journal(
+        execution: ValidationCommandExecution,
+        output_journal: ValidationOutputJournal,
+    ) -> ValidationCommandExecution:
+        try:
+            journal_result = output_journal.finalize()
+        except BaseException as error:
+            return ValidationCommandExecution(
+                execution.child,
+                validation_cleanup_with_failure(
+                    execution.cleanup,
+                    error,
+                    "validation execution and output journal finalization both failed",
+                ),
+                execution.output,
+            )
+        cleanup = execution.cleanup
+        if journal_result.failure is not None:
+            cleanup = validation_cleanup_with_failure(
+                cleanup,
+                journal_result.failure,
+                "validation execution and output journal finalization both failed",
+            )
+        return ValidationCommandExecution(
+            execution.child,
+            cleanup,
+            journal_result.output,
+        )
+
     def _run_started(
         self,
         started: _StartedValidationCommand,
         deadline: ValidationExecutionDeadline,
     ) -> ValidationCommandExecution:
         process = started.process
-        try:
-            capture = self._capture_factory.create(
-                started.readers.stdout,
-                started.readers.stderr,
-                started.readers.executor_handshake,
-                self._output_policy,
-                deadline,
-                started.started_at_monotonic,
-            )
-        except BaseException as capture_setup_error:
+        acquisition = self._acquire_capture(started, deadline)
+        if type(acquisition) is _ValidationCaptureRejected:
             return self._abort_without_capture(
                 process,
                 started.parent_lifetime,
-                capture_setup_error,
+                acquisition.error,
+                started.output_journal,
             )
+        capture = _require_acquired_capture(acquisition)
         leader = OwnedProcessGroupLeader(process.process_id)
         try:
             supervision = self._supervisor.supervise(
@@ -670,11 +894,41 @@ class PosixContainedValidationCommandRunner:
             raise AssertionError("validation parent lifetime close is a closed union")
         return ValidationCommandExecution(child, cleanup, output)
 
+    def _acquire_capture(
+        self,
+        started: _StartedValidationCommand,
+        deadline: ValidationExecutionDeadline,
+    ) -> _ValidationCaptureAcquisition:
+        """Transfer readers to capture or close every rejected transfer."""
+        try:
+            capture = self._capture_factory.create(
+                started.readers.stdout,
+                started.readers.stderr,
+                started.readers.executor_handshake,
+                self._output_policy,
+                deadline,
+                started.started_at_monotonic,
+                started.output_journal,
+            )
+        except BaseException as capture_setup_error:
+            reader_cleanup = _close_validation_launch_readers(started.readers)
+            if type(reader_cleanup) is _ValidationLaunchReadersCloseFailed:
+                capture_setup_error = _combined_error(
+                    "validation capture rejection and reader cleanup both failed",
+                    capture_setup_error,
+                    reader_cleanup.error,
+                )
+            elif type(reader_cleanup) is not _ValidationLaunchReadersClosed:
+                raise AssertionError("validation reader cleanup is a closed union")
+            return _ValidationCaptureRejected(capture_setup_error)
+        return _ValidationCaptureAcquired(capture)
+
     def _abort_without_capture(
         self,
         process: PosixProcessHandle,
         parent_lifetime: ValidationProcessParentLifetime,
         original_error: BaseException,
+        output_journal: ValidationOutputJournal,
     ) -> ValidationCommandExecution:
         leader = OwnedProcessGroupLeader(process.process_id)
         lifetime_close = self._close_parent_lifetime(parent_lifetime)
@@ -692,16 +946,19 @@ class PosixContainedValidationCommandRunner:
                 raise AssertionError(
                     "validation parent lifetime close is a closed union"
                 )
-            return ValidationCommandExecution(
-                child=ValidationCommandExitUnknown(process.process_id),
-                cleanup=ValidationCommandCleanupFailed(
-                    _combined_error(
-                        "validation setup and cleanup both failed",
-                        original_error,
-                        containment_error,
-                    )
+            return self._finalize_output_journal(
+                ValidationCommandExecution(
+                    child=ValidationCommandExitUnknown(process.process_id),
+                    cleanup=ValidationCommandCleanupFailed(
+                        _combined_error(
+                            "validation setup and cleanup both failed",
+                            original_error,
+                            containment_error,
+                        )
+                    ),
+                    output=ValidationCommandOutput("", ""),
                 ),
-                output=ValidationCommandOutput("", ""),
+                output_journal,
             )
         cleanup: ValidationCommandCleanup = ValidationCommandCleanupFailed(
             original_error
@@ -724,13 +981,16 @@ class PosixContainedValidationCommandRunner:
             )
         elif type(reap_evidence) is not _ValidationReapEvidenceRecorded:
             raise AssertionError("validation reap evidence is a closed union")
-        return ValidationCommandExecution(
-            child=ValidationCommandExited(
-                process.process_id,
-                termination.leader_exit_code,
+        return self._finalize_output_journal(
+            ValidationCommandExecution(
+                child=ValidationCommandExited(
+                    process.process_id,
+                    termination.leader_exit_code,
+                ),
+                cleanup=cleanup,
+                output=ValidationCommandOutput("", ""),
             ),
-            cleanup=cleanup,
-            output=ValidationCommandOutput("", ""),
+            output_journal,
         )
 
     def _recover_after_supervision_failure(

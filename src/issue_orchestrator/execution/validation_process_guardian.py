@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import math
 import os
 import selectors
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
@@ -16,6 +18,7 @@ from pydantic import Field, ValidationError
 from ..domain.posix_pipe import PosixPipeClosed, PosixPipeCloseFailed
 from ..domain.posix_process import (
     PosixDescriptorMapping,
+    PosixProcessConfiguredActivationDeadline,
     PosixProcessEnvironment,
     PosixProcessGroupMode,
     PosixProcessLaunchSpec,
@@ -64,6 +67,62 @@ from .strict_wire_record import StrictWireRecord
 
 _GUARDIAN_READY = b"R"
 _MAX_EXEC_REJECTION_BYTES = 4096
+
+
+class ValidationGuardianStartupPhase(StrEnum):
+    READINESS = "readiness"
+    EXEC_STATUS = "exec-status"
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationGuardianStartupDeadlineOwner:
+    """Own exact deadline observations around guardian select/read transitions."""
+
+    clock: ValidationGuardianClock
+    absolute_deadline: float
+
+    def __post_init__(self) -> None:
+        if type(self.clock) is not ValidationGuardianClock:
+            raise ValueError("guardian startup deadline clock must be typed")
+        if (
+            type(self.absolute_deadline) is not float
+            or not math.isfinite(self.absolute_deadline)
+            or self.absolute_deadline <= 0
+        ):
+            raise ValueError(
+                "guardian startup absolute deadline must be positive and finite"
+            )
+
+    def remaining_before_select(
+        self,
+        phase: ValidationGuardianStartupPhase,
+    ) -> float:
+        """Return a positive wait only after an immediate deadline observation."""
+        return self._remaining(phase)
+
+    def accept_after_read(self, phase: ValidationGuardianStartupPhase) -> None:
+        """Reject readiness or decoded exec status observed at/after the deadline."""
+        self._remaining(phase)
+
+    def _remaining(self, phase: ValidationGuardianStartupPhase) -> float:
+        if type(phase) is not ValidationGuardianStartupPhase:
+            raise ValueError("guardian startup phase must be typed")
+        observed_at = self.clock.monotonic_now()
+        if (
+            type(observed_at) is not float
+            or not math.isfinite(observed_at)
+            or observed_at <= 0
+        ):
+            raise ValueError(
+                "guardian startup clock must return a positive finite float"
+            )
+        remaining = self.absolute_deadline - observed_at
+        if remaining <= 0:
+            raise TimeoutError(
+                f"validation guardian {phase.value} exhausted its absolute "
+                "startup deadline"
+            )
+        return remaining
 
 
 def _require_error(value: object, field_name: str) -> None:
@@ -123,7 +182,9 @@ class _OwnedValidationParentLifetime:
 
     def __post_init__(self) -> None:
         if not callable(getattr(self._writer, "close", None)):
-            raise ValueError("validation parent lifetime writer must implement its port")
+            raise ValueError(
+                "validation parent lifetime writer must implement its port"
+            )
 
     def close(self) -> None:
         if self._closed:
@@ -200,7 +261,9 @@ class _ValidationGuardianActivationResources:
             cleanup = IndependentCleanupPlan(
                 (
                     CleanupAction("guardian-lifetime-pipe-close", self._close_lifetime),
-                    CleanupAction("guardian-readiness-pipe-close", self._close_readiness),
+                    CleanupAction(
+                        "guardian-readiness-pipe-close", self._close_readiness
+                    ),
                 )
             ).run()
             if type(cleanup) is CleanupSucceeded:
@@ -260,18 +323,31 @@ class _ValidationGuardianActivationResources:
                 tuple(
                     action
                     for action in (
-                        CleanupAction("guardian-lifetime-writer-close", lifetime_writer.close)
+                        CleanupAction(
+                            "guardian-lifetime-writer-close", lifetime_writer.close
+                        )
                         if lifetime_writer is not None
                         else None,
-                        CleanupAction("guardian-readiness-reader-close", readiness_reader.close)
+                        CleanupAction(
+                            "guardian-readiness-reader-close", readiness_reader.close
+                        )
                         if readiness_reader is not None
                         else None,
-                        CleanupAction("guardian-exec-status-reader-close", exec_status_reader.close)
+                        CleanupAction(
+                            "guardian-exec-status-reader-close",
+                            exec_status_reader.close,
+                        )
                         if exec_status_reader is not None
                         else None,
-                        CleanupAction("guardian-lifetime-pipe-close", self._close_lifetime),
-                        CleanupAction("guardian-readiness-pipe-close", self._close_readiness),
-                        CleanupAction("guardian-exec-status-pipe-close", self._close_exec_status),
+                        CleanupAction(
+                            "guardian-lifetime-pipe-close", self._close_lifetime
+                        ),
+                        CleanupAction(
+                            "guardian-readiness-pipe-close", self._close_readiness
+                        ),
+                        CleanupAction(
+                            "guardian-exec-status-pipe-close", self._close_exec_status
+                        ),
                     )
                     if action is not None
                 )
@@ -300,7 +376,9 @@ class _ValidationGuardianActivationResources:
             (
                 CleanupAction("guardian-lifetime-pipe-close", self._close_lifetime),
                 CleanupAction("guardian-readiness-pipe-close", self._close_readiness),
-                CleanupAction("guardian-exec-status-pipe-close", self._close_exec_status),
+                CleanupAction(
+                    "guardian-exec-status-pipe-close", self._close_exec_status
+                ),
             )
         ).run()
         if type(cleanup) is CleanupSucceeded:
@@ -407,6 +485,7 @@ class SentinelValidationProcessGuardian:
                     *resources.descriptor_mappings,
                 ),
                 terminal=PosixProcessWithoutTerminal(),
+                activation_deadline=PosixProcessConfiguredActivationDeadline(),
             )
         except BaseException as error:
             return PosixProcessLaunchRejected(
@@ -435,9 +514,9 @@ class SentinelValidationProcessGuardian:
         launch: PosixProcessLaunchStarted,
         resources: _ValidationGuardianActivationResources,
     ) -> ValidationProcessGuardianLaunch:
-        absolute_deadline = (
-            self._clock.monotonic_now()
-            + self._sentinel_policy.startup_timeout_seconds
+        deadline_owner = ValidationGuardianStartupDeadlineOwner(
+            self._clock,
+            self._clock.monotonic_now() + self._sentinel_policy.startup_timeout_seconds,
         )
         try:
             transferred = resources.transfer_after_launch()
@@ -445,7 +524,7 @@ class SentinelValidationProcessGuardian:
             return self._recover_started(launch, transfer_error)
         readiness_error = self._await_guardian_ready(
             transferred.readiness_reader,
-            absolute_deadline,
+            deadline_owner,
         )
         if readiness_error is not None:
             readiness_error = self._close_transferred_after_activation_failure(
@@ -455,7 +534,7 @@ class SentinelValidationProcessGuardian:
             return self._recover_started(launch, readiness_error)
         exec_status = self._await_opaque_exec_status(
             transferred.exec_status_reader,
-            absolute_deadline,
+            deadline_owner,
         )
         if type(exec_status) is _GuardianOpaqueExecStatusFailed:
             activation_error = self._close_lifetime_after_activation_failure(
@@ -466,9 +545,7 @@ class SentinelValidationProcessGuardian:
         if type(exec_status) is _GuardianOpaqueExecRejected:
             rejection_error = self._close_lifetime_after_activation_failure(
                 transferred.lifetime_writer,
-                RuntimeError(
-                    f"{exec_status.error_type}: {exec_status.error_repr}"
-                ),
+                RuntimeError(f"{exec_status.error_type}: {exec_status.error_repr}"),
             )
             return self._recover_exec_rejection(
                 launch,
@@ -501,13 +578,17 @@ class SentinelValidationProcessGuardian:
     def _await_guardian_ready(
         self,
         readiness_reader: PosixPipeReader,
-        absolute_deadline: float,
+        deadline_owner: ValidationGuardianStartupDeadlineOwner,
     ) -> BaseException | None:
         error: BaseException | None = None
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(readiness_reader.fileno(), selectors.EVENT_READ)
-                ready = selector.select(self._remaining(absolute_deadline))
+                ready = selector.select(
+                    deadline_owner.remaining_before_select(
+                        ValidationGuardianStartupPhase.READINESS
+                    )
+                )
             if not ready:
                 raise TimeoutError(
                     "validation guardian did not become ready before its "
@@ -517,6 +598,7 @@ class SentinelValidationProcessGuardian:
                 raise RuntimeError(
                     "validation guardian exited before publishing readiness"
                 )
+            deadline_owner.accept_after_read(ValidationGuardianStartupPhase.READINESS)
         except BaseException as readiness_error:
             error = readiness_error
         try:
@@ -532,13 +614,17 @@ class SentinelValidationProcessGuardian:
     def _await_opaque_exec_status(
         self,
         exec_status_reader: PosixPipeReader,
-        absolute_deadline: float,
+        deadline_owner: ValidationGuardianStartupDeadlineOwner,
     ) -> _GuardianOpaqueExecStatus:
         status: _GuardianOpaqueExecStatus
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(exec_status_reader.fileno(), selectors.EVENT_READ)
-                ready = selector.select(self._remaining(absolute_deadline))
+                ready = selector.select(
+                    deadline_owner.remaining_before_select(
+                        ValidationGuardianStartupPhase.EXEC_STATUS
+                    )
+                )
             if not ready:
                 raise TimeoutError(
                     "validation command did not exec before its absolute "
@@ -553,10 +639,16 @@ class SentinelValidationProcessGuardian:
                     "validation command exec rejection exceeds size limit"
                 )
             if not payload:
+                deadline_owner.accept_after_read(
+                    ValidationGuardianStartupPhase.EXEC_STATUS
+                )
                 status = _GuardianOpaqueExecStarted()
             else:
                 record = _ValidationCommandExecRejectedRecord.model_validate_json(
                     payload
+                )
+                deadline_owner.accept_after_read(
+                    ValidationGuardianStartupPhase.EXEC_STATUS
                 )
                 status = _GuardianOpaqueExecRejected(
                     record.error_type,
@@ -576,14 +668,6 @@ class SentinelValidationProcessGuardian:
                 )
             return _GuardianOpaqueExecStatusFailed(close_error)
         return status
-
-    def _remaining(self, absolute_deadline: float) -> float:
-        remaining = absolute_deadline - self._clock.monotonic_now()
-        if remaining <= 0:
-            raise TimeoutError(
-                "validation guardian exhausted its absolute startup deadline"
-            )
-        return remaining
 
     @staticmethod
     def _close_transferred_after_activation_failure(
@@ -664,7 +748,11 @@ class SentinelValidationProcessGuardian:
         launch: PosixProcessLaunchStarted,
         rejection: _GuardianOpaqueExecRejected,
         rejection_error: BaseException,
-    ) -> PosixProcessExecRejected | PosixProcessLaunchRecovered | PosixProcessLaunchRecoveryFailed:
+    ) -> (
+        PosixProcessExecRejected
+        | PosixProcessLaunchRecovered
+        | PosixProcessLaunchRecoveryFailed
+    ):
         recovery = self._recover_started(launch, rejection_error)
         if type(recovery) is PosixProcessLaunchRecoveryFailed:
             return recovery
@@ -735,9 +823,7 @@ class _ValidationProcessGuardianChild:
             raise RuntimeError("validation guardian must be its process-group leader")
         from ..entrypoints.bootstrap import build_posix_process_launcher
 
-        self._mark_close_on_exec(
-            invocation.command_exec_status_write_file_descriptor
-        )
+        self._mark_close_on_exec(invocation.command_exec_status_write_file_descriptor)
         controller = ProcessGroupSentinelController.start_with_parent_lifetime(
             invocation.process_group_sentinel_program(),
             ProcessGroupSentinelWithoutCancellation(),
@@ -786,11 +872,7 @@ class _ValidationProcessGuardianChild:
                 "validation command exec and sentinel cleanup failed",
                 (
                     error,
-                    *(
-                        (publication_error,)
-                        if publication_error is not None
-                        else ()
-                    ),
+                    *((publication_error,) if publication_error is not None else ()),
                     *(failure.error for failure in cleanup.failures),
                 ),
             )

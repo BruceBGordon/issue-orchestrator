@@ -12,6 +12,9 @@ from ..domain.process_group import (
     ProcessGroupCompleted,
     ProcessGroupInterrupted,
     ProcessGroupSupervision,
+    ProcessGroupTerminalCompletionAccepted,
+    ProcessGroupTerminalDecision,
+    ProcessGroupTerminalInterruptionRequested,
     ProcessGroupTermination,
     ProcessGroupTimedOut,
     ProcessGroupUnboundedWait,
@@ -44,6 +47,9 @@ class NeverInterruptProcessGroup:
             )
         time.sleep(timeout_seconds)
         return False
+
+    def decide_terminal_observation(self) -> ProcessGroupTerminalDecision:
+        return ProcessGroupTerminalCompletionAccepted()
 
 
 class PosixProcessGroupSupervisor:
@@ -108,7 +114,7 @@ class PosixProcessGroupSupervisor:
     ) -> bool:
         while True:
             if cls._leader_has_exited(leader):
-                return True
+                return cls._terminal_completion_accepted(interruption)
             if interruption.wait_for_request(0.01):
                 return False
 
@@ -122,7 +128,9 @@ class PosixProcessGroupSupervisor:
         deadline = time.monotonic() + timeout_seconds
         while True:
             if cls._leader_has_exited(leader):
-                return _ProcessGroupWaitResult.COMPLETED
+                if cls._terminal_completion_accepted(interruption):
+                    return _ProcessGroupWaitResult.COMPLETED
+                return _ProcessGroupWaitResult.INTERRUPTED
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
                 return _ProcessGroupWaitResult.TIMED_OUT
@@ -145,3 +153,14 @@ class PosixProcessGroupSupervisor:
                 "outside its supervision owner"
             ) from exc
         return observation is not None and observation.si_pid == leader.process_id
+
+    @staticmethod
+    def _terminal_completion_accepted(
+        interruption: ProcessGroupInterruption,
+    ) -> bool:
+        decision = interruption.decide_terminal_observation()
+        if type(decision) is ProcessGroupTerminalCompletionAccepted:
+            return True
+        if type(decision) is ProcessGroupTerminalInterruptionRequested:
+            return False
+        raise AssertionError("process-group terminal decision is a closed union")

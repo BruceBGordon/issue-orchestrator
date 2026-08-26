@@ -13,6 +13,7 @@ from ..domain.validation_execution import (
 )
 from .process_group_supervisor import ProcessGroupInterruption
 from .posix_pipe import PosixPipeReader
+from .validation_output_journal import ValidationOutputJournal
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,10 @@ class ValidationPipeCaptureResult:
         if type(self.output) is not ValidationCommandOutput:
             raise ValueError(
                 "ValidationPipeCaptureResult.output must be ValidationCommandOutput"
+            )
+        if self.failure is not None and not isinstance(self.failure, BaseException):
+            raise ValueError(
+                "ValidationPipeCaptureResult.failure must be None or BaseException"
             )
 
 
@@ -55,6 +60,7 @@ class ValidationPipeCaptureFactory(Protocol):
         policy: ContainedCommandOutputPolicy,
         deadline: ValidationExecutionDeadline,
         started_at_monotonic: float,
+        output_journal: ValidationOutputJournal,
     ) -> ValidationPipeCapture:
         """Return a ready owner or raise only after closing partial resources."""
         ...

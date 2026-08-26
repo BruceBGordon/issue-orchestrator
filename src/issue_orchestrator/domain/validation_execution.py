@@ -33,11 +33,24 @@ class ValidationGuardianClock:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidationDeadlineObservationClock:
+    """Injected monotonic clock for authoritative validation deadline decisions."""
+
+    monotonic_now: Callable[[], float]
+
+    def __post_init__(self) -> None:
+        if not callable(self.monotonic_now):
+            raise ValueError(
+                "ValidationDeadlineObservationClock.monotonic_now must be callable"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ValidationExecutionDeadline:
     """Queue-aware executor budget plus its outer containment watchdog."""
 
     executor_deadline: ExecutorBoundedDeadline
-    outer_timeout_seconds: int
+    outer_timeout_seconds: float
 
     def __post_init__(self) -> None:
         if type(self.executor_deadline) is not ExecutorBoundedDeadline:
@@ -45,9 +58,11 @@ class ValidationExecutionDeadline:
                 "ValidationExecutionDeadline.executor_deadline must be "
                 "ExecutorBoundedDeadline"
             )
-        if type(self.outer_timeout_seconds) is not int:
+        if type(self.outer_timeout_seconds) is not float or not math.isfinite(
+            self.outer_timeout_seconds
+        ):
             raise ValueError(
-                "ValidationExecutionDeadline.outer_timeout_seconds must be int"
+                "ValidationExecutionDeadline.outer_timeout_seconds must be finite"
             )
         if (
             self.outer_timeout_seconds
@@ -61,21 +76,52 @@ class ValidationExecutionDeadline:
     @classmethod
     def for_active_timeout(
         cls,
-        active_timeout_seconds: int,
+        active_timeout_seconds: int | float,
     ) -> ValidationExecutionDeadline:
         """Give queue admission an equal budget without consuming active work."""
-        if type(active_timeout_seconds) is not int or active_timeout_seconds <= 0:
-            raise ValueError("validation active timeout must be a positive integer")
-        absolute_timeout_seconds = active_timeout_seconds * 2
+        if (
+            type(active_timeout_seconds) not in (int, float)
+            or not math.isfinite(active_timeout_seconds)
+            or active_timeout_seconds <= 0
+        ):
+            raise ValueError("validation active timeout must be finite and positive")
+        active_seconds = float(active_timeout_seconds)
+        absolute_timeout_seconds = active_seconds * 2
         return cls(
             executor_deadline=ExecutorBoundedDeadline(
-                active_timeout_seconds=float(active_timeout_seconds),
+                active_timeout_seconds=active_seconds,
                 absolute_timeout_seconds=float(absolute_timeout_seconds),
             ),
             outer_timeout_seconds=(
-                absolute_timeout_seconds + _OUTER_CONTAINMENT_MARGIN_SECONDS
+                absolute_timeout_seconds + float(_OUTER_CONTAINMENT_MARGIN_SECONDS)
             ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationCommandOutputCapture:
+    """Durable stream journals plus the bounded diagnostic tail to retain."""
+
+    stdout_path: Path
+    stderr_path: Path
+    retained_tail_bytes: int
+
+    def __post_init__(self) -> None:
+        for field_name, path in (
+            ("stdout_path", self.stdout_path),
+            ("stderr_path", self.stderr_path),
+        ):
+            if not isinstance(path, Path) or not path.is_absolute():
+                raise ValueError(
+                    f"ValidationCommandOutputCapture.{field_name} must be "
+                    "an absolute Path"
+                )
+        if self.stdout_path == self.stderr_path:
+            raise ValueError("validation stdout and stderr journals must differ")
+        if type(self.retained_tail_bytes) is not int or self.retained_tail_bytes <= 0:
+            raise ValueError(
+                "ValidationCommandOutputCapture.retained_tail_bytes must be positive"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +132,7 @@ class ContainedValidationCommand:
     working_directory: Path
     environment: Mapping[str, str]
     deadline: ValidationExecutionDeadline
+    output_capture: ValidationCommandOutputCapture
 
     def __post_init__(self) -> None:
         if type(self.command) is not str or not self.command:
@@ -113,6 +160,11 @@ class ContainedValidationCommand:
             raise ValueError(
                 "ContainedValidationCommand.deadline must be "
                 "ValidationExecutionDeadline"
+            )
+        if type(self.output_capture) is not ValidationCommandOutputCapture:
+            raise ValueError(
+                "ContainedValidationCommand.output_capture must be "
+                "ValidationCommandOutputCapture"
             )
 
 
@@ -314,7 +366,9 @@ class ValidationCommandCleanupFailed:
 
     def __post_init__(self) -> None:
         if not isinstance(self.error, BaseException):
-            raise ValueError("ValidationCommandCleanupFailed.error must be an exception")
+            raise ValueError(
+                "ValidationCommandCleanupFailed.error must be an exception"
+            )
 
 
 @dataclass(frozen=True, slots=True)

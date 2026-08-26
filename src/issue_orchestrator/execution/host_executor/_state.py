@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import BinaryIO, Generator, NoReturn, TypeVar
+from typing import BinaryIO, Generator, NoReturn, TypeVar, cast
 
 from pydantic import BaseModel, ValidationError
 
@@ -40,9 +40,27 @@ from ..independent_cleanup import (
     raise_cleanup_failures,
     raise_primary_with_cleanup,
 )
+from ..posix_file_lock import (
+    PosixFileLockAcquired,
+    PosixFileLockAcquisition,
+    PosixFileLockContended,
+    PosixFileLockFilePresence,
+    PosixFileLockMode,
+    PosixFileLockOwner,
+    PosixFileLockSpecification,
+)
 
 
 _RecordType = TypeVar("_RecordType", bound=BaseModel)
+
+
+def _require_exception_tuple(value: object) -> tuple[BaseException, ...]:
+    if type(value) is not tuple:
+        raise ValueError("lease transfer failures must contain exceptions")
+    entries = cast(tuple[object, ...], value)
+    if any(not isinstance(failure, BaseException) for failure in entries):
+        raise ValueError("lease transfer failures must contain exceptions")
+    return cast(tuple[BaseException, ...], entries)
 
 
 class OwnedQueuedRequest:
@@ -104,7 +122,21 @@ class OwnedQueuedRequest:
 class _HostExecutorLeaseOwnership(Enum):
     LOCAL = "local"
     GUARDIAN = "guardian"
+    GUARDIAN_WITH_LOCAL_RECOVERY = "guardian-with-local-recovery"
     RELEASED = "released"
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutorLeaseDescriptorTransfer:
+    """Exact failures and still-owned handles after descriptor transfer."""
+
+    retained_handles: tuple[BinaryIO, ...]
+    failures: tuple[BaseException, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.retained_handles) is not tuple:
+            raise ValueError("retained lease handles must be a tuple")
+        _require_exception_tuple(self.failures)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,20 +195,29 @@ class HostExecutorLease:
             raise RuntimeError("host executor lease can be transferred only once")
         # flock ownership follows the inherited open-file description. Explicit
         # LOCK_UN here would also unlock the guardian's copy.
-        outcome = _close_handles(self._handles)
-        self._handles.clear()
-        self._ownership = _HostExecutorLeaseOwnership.GUARDIAN
-        raise_cleanup_failures(
-            "executor lease transfer descriptor failures",
-            outcome,
+        transfer = _transfer_lease_descriptors(tuple(reversed(self._handles)))
+        self._handles = list(transfer.retained_handles)
+        self._ownership = (
+            _HostExecutorLeaseOwnership.GUARDIAN
+            if not transfer.retained_handles
+            else _HostExecutorLeaseOwnership.GUARDIAN_WITH_LOCAL_RECOVERY
         )
+        if transfer.failures:
+            raise BaseExceptionGroup(
+                "executor lease transfer descriptor failures",
+                transfer.failures,
+            )
 
     def release(self) -> None:
         if self._ownership is _HostExecutorLeaseOwnership.RELEASED:
             raise RuntimeError("host executor lease was released twice")
         outcome = (
             _cleanup_record_and_handles(self.path, self._handles)
-            if self._ownership is _HostExecutorLeaseOwnership.LOCAL
+            if self._ownership
+            in (
+                _HostExecutorLeaseOwnership.LOCAL,
+                _HostExecutorLeaseOwnership.GUARDIAN_WITH_LOCAL_RECOVERY,
+            )
             else IndependentCleanupPlan(
                 (
                     CleanupAction(
@@ -219,6 +260,19 @@ class HostExecutorState:
         self._pool_dir = pool_dir
         self.host_cpu_slots = host_cpu_slots
         self._atomic_records = atomic_records
+        self._file_locks = PosixFileLockOwner()
+        self._capacity_lock = PosixFileLockSpecification(
+            (pool_dir / "capacity.lock").resolve(),
+            PosixFileLockMode.EXCLUSIVE,
+            PosixFileLockAcquisition.BLOCKING,
+            PosixFileLockFilePresence.CREATE_IF_MISSING,
+        )
+        self._queue_lock = PosixFileLockSpecification(
+            (pool_dir / "queue.lock").resolve(),
+            PosixFileLockMode.EXCLUSIVE,
+            PosixFileLockAcquisition.BLOCKING,
+            PosixFileLockFilePresence.CREATE_IF_MISSING,
+        )
 
     def configure_capacity(self) -> None:
         """Persist capacity, refusing to change it while leases are active."""
@@ -368,14 +422,12 @@ class HostExecutorState:
 
     @contextmanager
     def _capacity_guard(self) -> Generator[None, None, None]:
-        with (self._pool_dir / "capacity.lock").open("a+b") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        with self._file_locks.hold(self._capacity_lock):
             yield
 
     @contextmanager
     def _queue_guard(self) -> Generator[None, None, None]:
-        with (self._pool_dir / "queue.lock").open("a+b") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        with self._file_locks.hold(self._queue_lock):
             yield
 
     def _live_requests(
@@ -417,30 +469,42 @@ class HostExecutorState:
                     leases.append(record.to_domain())
         return tuple(leases)
 
-    @staticmethod
     def _read_live_record(
+        self,
         path: Path,
         record_type: type[_RecordType],
     ) -> _RecordType | None:
         try:
-            handle = path.open("r+b")
+            lock = self._file_locks.acquire(
+                PosixFileLockSpecification(
+                    path,
+                    PosixFileLockMode.EXCLUSIVE,
+                    PosixFileLockAcquisition.NON_BLOCKING,
+                    PosixFileLockFilePresence.REQUIRE_EXISTING,
+                )
+            )
         except FileNotFoundError:
             return None
         try:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                handle.seek(0)
+            if type(lock) is PosixFileLockContended:
+                lock.lease.handle.seek(0)
                 try:
-                    return record_type.model_validate_json(handle.read())
+                    result: _RecordType | None = record_type.model_validate_json(
+                        lock.lease.handle.read()
+                    )
                 except ValidationError as exc:
                     raise RuntimeError(
                         f"invalid host executor state file: {path}"
                     ) from exc
-            path.unlink(missing_ok=True)
-            return None
-        finally:
-            handle.close()
+            elif type(lock) is PosixFileLockAcquired:
+                path.unlink(missing_ok=True)
+                result = None
+            else:
+                raise AssertionError("POSIX file-lock outcome is a closed union")
+        except BaseException as record_error:
+            lock.lease.release_after_failure(record_error)
+        lock.lease.release()
+        return result
 
     def _reconciled_group_service(
         self,
@@ -631,16 +695,20 @@ def _cleanup_handles(handles: list[BinaryIO]) -> CleanupOutcome:
     ).run()
 
 
-def _close_handles(handles: list[BinaryIO]) -> CleanupOutcome:
-    return IndependentCleanupPlan(
-        tuple(
-            CleanupAction(
-                "close transferred executor descriptor",
-                handle.close,
-            )
-            for handle in reversed(handles)
-        )
-    ).run()
+def _transfer_lease_descriptors(
+    handles: tuple[BinaryIO, ...],
+) -> _ExecutorLeaseDescriptorTransfer:
+    retained: list[BinaryIO] = []
+    failures: list[BaseException] = []
+    for handle in handles:
+        try:
+            handle.close()
+        except BaseException as close_error:
+            close_error.add_note("close transferred executor descriptor")
+            failures.append(close_error)
+            if not handle.closed:
+                retained.append(handle)
+    return _ExecutorLeaseDescriptorTransfer(tuple(retained), tuple(failures))
 
 
 def _locked_handle_cleanup_actions(

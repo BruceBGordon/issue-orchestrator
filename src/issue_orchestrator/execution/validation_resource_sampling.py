@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
+import shlex
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -12,6 +13,10 @@ from pathlib import Path
 from typing import TypeVar, cast
 
 from ..domain.validation_resource_sampling import (
+    ValidationHostProbeObserved,
+    ValidationHostProbeRequest,
+    ValidationHostProbeResult,
+    ValidationHostProbeUnavailable,
     ValidationResourceSamplerFailed,
     ValidationResourceSamplerShutdown,
     ValidationResourceSamplerShutdownFailed,
@@ -21,6 +26,14 @@ from ..domain.validation_resource_sampling import (
     ValidationResourceSamplerStartIndeterminate,
     ValidationResourceSamplerStartRejected,
     ValidationResourceSamplingPolicy,
+)
+from ..domain.validation_timing import ValidationDiskDeltaStatus
+from ..domain.validation_execution import (
+    ContainedValidationCommand,
+    ValidationCommandCompleted,
+    ValidationCommandExited,
+    ValidationCommandOutputCapture,
+    ValidationExecutionDeadline,
 )
 from ..domain.retained_thread import (
     RetainedThreadActivated,
@@ -42,6 +55,8 @@ from ..infra.validation_timings import (
 )
 from ..ports.validation_resource_probe import ValidationResourceProbe
 from ..ports.retained_thread import RetainedThreadFactory, RetainedThreadLease
+from ..ports.validation_command_runner import ValidationCommandRunner
+from ..ports.validation_host_probe import ValidationHostProbe
 
 
 _MEMORY_FREE_RE = re.compile(r"System-wide memory free percentage:\s*(?P<percent>\d+)%")
@@ -50,11 +65,6 @@ _SWAP_RE = re.compile(
     r"free = (?P<free>[0-9.]+)M"
 )
 _ExactValue = TypeVar("_ExactValue")
-
-
-def _require_positive_float(value: float, field_name: str) -> None:
-    if type(value) is not float or value <= 0:
-        raise ValueError(f"{field_name} must be a positive float")
 
 
 def _require_exact_type(
@@ -74,32 +84,59 @@ def _require_protocol(
         raise ValueError(f"{field_name} does not implement {protocol_type.__name__}")
 
 
-def run_bounded_host_probe(
-    arguments: tuple[str, ...],
-    *,
-    working_directory: Path,
-    timeout_seconds: float,
-) -> str | None:
-    """Return successful probe text; absence is explicit best-effort evidence."""
-    if type(arguments) is not tuple or not arguments:
-        raise ValueError("host probe arguments must be a non-empty tuple")
-    if not working_directory.is_absolute():
-        raise ValueError("host probe working_directory must be absolute")
-    _require_positive_float(timeout_seconds, "host probe timeout_seconds")
-    try:
-        result = subprocess.run(
-            arguments,
-            cwd=working_directory,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_seconds,
+class ContainedValidationHostProbe:
+    """Adapt host observations onto the authoritative validation tree owner."""
+
+    def __init__(self, command_runner: ValidationCommandRunner) -> None:
+        _require_protocol(
+            command_runner,
+            ValidationCommandRunner,
+            "ContainedValidationHostProbe.command_runner",
         )
-    except (OSError, subprocess.TimeoutExpired):
+        self._command_runner = command_runner
+
+    def run(self, request: ValidationHostProbeRequest) -> ValidationHostProbeResult:
+        if type(request) is not ValidationHostProbeRequest:
+            raise ValueError("contained host probe request must be exact")
+        deadline = ValidationExecutionDeadline.for_active_timeout(
+            request.timeout_seconds
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="issue-orchestrator-host-probe-"
+        ) as raw:
+            output_root = Path(raw).resolve()
+            execution = self._command_runner.run(
+                ContainedValidationCommand(
+                    command=shlex.join(request.arguments),
+                    working_directory=request.working_directory,
+                    environment=os.environ,
+                    deadline=deadline,
+                    output_capture=ValidationCommandOutputCapture(
+                        (output_root / "stdout.log").resolve(),
+                        (output_root / "stderr.log").resolve(),
+                        retained_tail_bytes=65_536,
+                    ),
+                )
+            )
+        if (
+            type(execution.child) is ValidationCommandExited
+            and type(execution.cleanup) is ValidationCommandCompleted
+            and execution.child.exit_code == 0
+        ):
+            return ValidationHostProbeObserved(execution.output.stdout.strip())
+        return ValidationHostProbeUnavailable(execution)
+
+
+def _host_probe_output(
+    host_probe: ValidationHostProbe,
+    request: ValidationHostProbeRequest,
+) -> str | None:
+    result = host_probe.run(request)
+    if type(result) is ValidationHostProbeObserved:
+        return result.output
+    if type(result) is ValidationHostProbeUnavailable:
         return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip()
+    raise AssertionError("validation host probe result is a closed union")
 
 
 def parse_memory_free_percent(output: str | None) -> int | None:
@@ -146,7 +183,19 @@ def parse_iostat_totals(output: str | None) -> ValidationDiskObservation | None:
         megabytes_total=megabytes,
         transfers_delta=None,
         megabytes_delta=None,
+        transfers_delta_status=ValidationDiskDeltaStatus.BASELINE_UNAVAILABLE,
+        megabytes_delta_status=ValidationDiskDeltaStatus.BASELINE_UNAVAILABLE,
     )
+
+
+def _disk_counter_delta(
+    current: float,
+    previous: float,
+) -> tuple[float | None, ValidationDiskDeltaStatus]:
+    """Classify one cumulative counter independently without manufacturing usage."""
+    if current < previous:
+        return None, ValidationDiskDeltaStatus.COUNTER_RESET
+    return round(current - previous, 3), ValidationDiskDeltaStatus.AVAILABLE
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +264,7 @@ class SystemValidationResourceProbe:
 
     worktree: Path
     policy: ValidationResourceSamplingPolicy
+    host_probe: ValidationHostProbe
     _last_disk_totals: ValidationDiskObservation | None = field(
         default=None,
         init=False,
@@ -227,6 +277,11 @@ class SystemValidationResourceProbe:
             self.policy,
             ValidationResourceSamplingPolicy,
             "SystemValidationResourceProbe.policy",
+        )
+        _require_protocol(
+            self.host_probe,
+            ValidationHostProbe,
+            "SystemValidationResourceProbe.host_probe",
         )
 
     def collect(self) -> ValidationResourceSample:
@@ -243,40 +298,53 @@ class SystemValidationResourceProbe:
 
         timeout = self.policy.probe_timeout_seconds
         free_percent = parse_memory_free_percent(
-            run_bounded_host_probe(
-                ("memory_pressure", "-Q"),
-                working_directory=self.worktree,
-                timeout_seconds=timeout,
+            _host_probe_output(
+                self.host_probe,
+                ValidationHostProbeRequest(
+                    ("memory_pressure", "-Q"),
+                    self.worktree,
+                    timeout,
+                ),
             )
         )
         swap_usage = parse_swap_usage(
-            run_bounded_host_probe(
-                ("sysctl", "vm.swapusage"),
-                working_directory=self.worktree,
-                timeout_seconds=timeout,
+            _host_probe_output(
+                self.host_probe,
+                ValidationHostProbeRequest(
+                    ("sysctl", "vm.swapusage"),
+                    self.worktree,
+                    timeout,
+                ),
             )
         )
         disk_totals = parse_iostat_totals(
-            run_bounded_host_probe(
-                ("iostat", "-Id", "disk0"),
-                working_directory=self.worktree,
-                timeout_seconds=timeout,
+            _host_probe_output(
+                self.host_probe,
+                ValidationHostProbeRequest(
+                    ("iostat", "-Id", "disk0"),
+                    self.worktree,
+                    timeout,
+                ),
             )
         )
         if disk_totals is not None:
             previous = self._last_disk_totals
             if previous is not None:
+                transfers_delta, transfers_status = _disk_counter_delta(
+                    disk_totals.transfers_total,
+                    previous.transfers_total,
+                )
+                megabytes_delta, megabytes_status = _disk_counter_delta(
+                    disk_totals.megabytes_total,
+                    previous.megabytes_total,
+                )
                 disk_totals = ValidationDiskObservation(
                     transfers_total=disk_totals.transfers_total,
                     megabytes_total=disk_totals.megabytes_total,
-                    transfers_delta=round(
-                        disk_totals.transfers_total - previous.transfers_total,
-                        3,
-                    ),
-                    megabytes_delta=round(
-                        disk_totals.megabytes_total - previous.megabytes_total,
-                        3,
-                    ),
+                    transfers_delta=transfers_delta,
+                    megabytes_delta=megabytes_delta,
+                    transfers_delta_status=transfers_status,
+                    megabytes_delta_status=megabytes_status,
                 )
             self._last_disk_totals = disk_totals
 

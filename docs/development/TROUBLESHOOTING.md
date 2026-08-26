@@ -322,7 +322,33 @@ fresh executor-learning pool shared by its cold aggregate, isolated lane
 training, and learned aggregate, while normal external caches remain enabled. Its
 `VALIDATE_JOBS` value controls both aggregate GNU make fan-out and the inner
 validation-lane fan-out; the JSON report records both facts explicitly. The
-headline serial sum includes the aggregate static lane exactly once; nested
+profiler runs every Git query, worktree mutation, setup, discovery, and measured
+Make command through the process-tree containment owner. The
+`--command-timeout-seconds` dial (default: 3600) is the active deadline for each
+of those commands; its queue-independent outer bound is derived by the same
+typed validation deadline contract and the selected value is recorded in the
+report. The Make wrapper exposes the same dial as `COMMAND_TIMEOUT_SECONDS`.
+Command logs are streamed outside disposable worktrees. If a command
+terminates but its footer, flush, file sync, or close fails, the failure report
+retains the command's exact exit code and wall time alongside the named log
+finalization failures.
+
+The default report name includes UTC microseconds, the profiler PID, and a full
+run UUID. Explicitly named reports are also safe to share: a sibling POSIX file
+lock serializes the complete two-generation publish or rollback transaction.
+The profiler atomically writes and file-syncs its report, replaces the requested
+path, and syncs the containing directory before removing the temporary session
+root or executor pool. A failed report write, file sync, or replacement leaves
+an older report at that path unchanged. Successful replacement retains that
+generation at the sibling `<report>.previous` path; a failed post-replacement
+directory sync restores it to the requested path before failing loudly. If
+session cleanup adds failure evidence, the profiler atomically republishes the
+amended report. If that amendment cannot be published, the initial durable
+report remains and the profiler raises a typed failure carrying the unpublished
+cleanup evidence. Artifact-directory initialization failures produce a typed
+report whenever the requested report directory remains writable.
+
+The headline serial sum includes the aggregate static lane exactly once; nested
 typecheck, architecture, and quality components are not double-counted as
 independent execution lanes. A sibling `*-artifacts` directory retains one
 combined-output log per command and the exact fairness-group event suffix for

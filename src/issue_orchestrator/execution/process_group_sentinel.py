@@ -22,6 +22,7 @@ from ..domain.process_group_sentinel import (
 )
 from ..domain.posix_process import (
     PosixDescriptorMapping,
+    PosixProcessConfiguredActivationDeadline,
     PosixProcessEnvironment,
     PosixProcessJoinGroup,
     PosixProcessLaunchSpec,
@@ -298,12 +299,10 @@ class ProcessGroupSentinelController:
             lifetime_file_descriptors,
             process_launcher,
         )
-        cancellation_record, cancellation_descriptors = (
-            cls._cancellation_record(cancellation)
+        cancellation_record, cancellation_descriptors = cls._cancellation_record(
+            cancellation
         )
-        parent_lifetime_descriptors = cls._parent_lifetime_descriptors(
-            parent_lifetime
-        )
+        parent_lifetime_descriptors = cls._parent_lifetime_descriptors(parent_lifetime)
         inherited_descriptors = (
             *cancellation_descriptors,
             *lifetime_file_descriptors,
@@ -450,6 +449,7 @@ class ProcessGroupSentinelController:
                     for descriptor in descriptors
                 ),
                 terminal=PosixProcessWithoutTerminal(),
+                activation_deadline=PosixProcessConfiguredActivationDeadline(),
             )
         )
         if type(launch) is PosixProcessLaunchStarted:
@@ -681,9 +681,7 @@ class ProcessGroupSentinelController:
             if reaped_id == process_id:
                 return
             if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"uncontained sentinel {process_id} was not reaped"
-                )
+                raise TimeoutError(f"uncontained sentinel {process_id} was not reaped")
             time.sleep(min(0.01, deadline - time.monotonic()))
 
 
@@ -959,9 +957,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Own one POSIX process group")
     parser.add_argument("--request-json", required=True)
     arguments = parser.parse_args()
-    return _ProcessGroupSentinelChild().run(
-        _parse_invocation(arguments.request_json)
-    )
+    return _ProcessGroupSentinelChild().run(_parse_invocation(arguments.request_json))
 
 
 if __name__ == "__main__":

@@ -20,20 +20,20 @@ class ExecutorGuardianUnboundedBudget:
 
 @dataclass(frozen=True, slots=True)
 class ExecutorGuardianBoundedBudget:
-    """The exact post-admission duration and selected deadline reason."""
+    """The one absolute command expiry and selected deadline reason."""
 
-    timeout_seconds: float
+    expires_at_monotonic: float
     reason: ExecutorDeadlineReason
 
     def __post_init__(self) -> None:
         if (
-            type(self.timeout_seconds) is not float
-            or not math.isfinite(self.timeout_seconds)
-            or self.timeout_seconds <= 0.0
+            type(self.expires_at_monotonic) is not float
+            or not math.isfinite(self.expires_at_monotonic)
+            or self.expires_at_monotonic < 0.0
         ):
             raise ValueError(
-                "ExecutorGuardianBoundedBudget.timeout_seconds must be finite "
-                "and positive"
+                "ExecutorGuardianBoundedBudget.expires_at_monotonic must be "
+                "finite and non-negative"
             )
         _require_exact(
             type(self).__name__,
@@ -41,6 +41,15 @@ class ExecutorGuardianBoundedBudget:
             self.reason,
             ExecutorDeadlineReason,
         )
+
+    def is_expired_at(self, observed_at_monotonic: float) -> bool:
+        if (
+            type(observed_at_monotonic) is not float
+            or not math.isfinite(observed_at_monotonic)
+            or observed_at_monotonic < 0.0
+        ):
+            raise ValueError("observed_at_monotonic must be finite and non-negative")
+        return observed_at_monotonic >= self.expires_at_monotonic
 
 
 ExecutorGuardianBudget = ExecutorGuardianUnboundedBudget | ExecutorGuardianBoundedBudget
@@ -183,6 +192,64 @@ class ExecutorGuardianCommandTimedOut:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutorGuardianSerializedFailure:
+    """One child-process failure retained across the guardian wire boundary."""
+
+    operation: str
+    error_type: str
+    error_repr: str
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("operation", self.operation),
+            ("error_type", self.error_type),
+            ("error_repr", self.error_repr),
+        ):
+            if type(value) is not str or not value:
+                raise ValueError(
+                    f"ExecutorGuardianSerializedFailure.{field_name} must not be empty"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorGuardianActivationTimedOut:
+    """The shared command expiry elapsed before opaque work was activated."""
+
+    reason: ExecutorDeadlineReason
+    recovery_failures: tuple[ExecutorGuardianSerializedFailure, ...]
+
+    def __post_init__(self) -> None:
+        _require_exact(
+            type(self).__name__,
+            "reason",
+            self.reason,
+            ExecutorDeadlineReason,
+        )
+        if type(self.recovery_failures) is not tuple or any(
+            type(failure) is not ExecutorGuardianSerializedFailure
+            for failure in self.recovery_failures
+        ):
+            raise ValueError(
+                "ExecutorGuardianActivationTimedOut.recovery_failures must "
+                "contain ExecutorGuardianSerializedFailure values"
+            )
+
+
+class ExecutorGuardianSerializedFailureError(RuntimeError):
+    """Materialize child-side recovery evidence for host finalization."""
+
+    def __init__(self, failure: ExecutorGuardianSerializedFailure) -> None:
+        if type(failure) is not ExecutorGuardianSerializedFailure:
+            raise ValueError(
+                "ExecutorGuardianSerializedFailureError.failure must be typed"
+            )
+        self.failure = failure
+        super().__init__(
+            f"{failure.operation}: {failure.error_type}: {failure.error_repr}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutorGuardianCommandStartFailed:
     """The guardian lived, but the opaque command could not be spawned."""
 
@@ -221,6 +288,7 @@ class ExecutorGuardianInternalFailed:
 ExecutorGuardianTerminal = (
     ExecutorGuardianCommandCompleted
     | ExecutorGuardianCommandInterrupted
+    | ExecutorGuardianActivationTimedOut
     | ExecutorGuardianCommandTimedOut
     | ExecutorGuardianCommandStartFailed
     | ExecutorGuardianInternalFailed
@@ -237,13 +305,11 @@ class ExecutorGuardianPostContainmentFailure:
     def __post_init__(self) -> None:
         if type(self.attempt_name) is not str or not self.attempt_name:
             raise ValueError(
-                "ExecutorGuardianPostContainmentFailure.attempt_name must not "
-                "be empty"
+                "ExecutorGuardianPostContainmentFailure.attempt_name must not be empty"
             )
         if not isinstance(self.error, BaseException):
             raise ValueError(
-                "ExecutorGuardianPostContainmentFailure.error must be a "
-                "BaseException"
+                "ExecutorGuardianPostContainmentFailure.error must be a BaseException"
             )
 
 
@@ -258,6 +324,7 @@ class ExecutorGuardianPostContainmentError(RuntimeError):
         if type(terminal) not in (
             ExecutorGuardianCommandCompleted,
             ExecutorGuardianCommandInterrupted,
+            ExecutorGuardianActivationTimedOut,
             ExecutorGuardianCommandTimedOut,
             ExecutorGuardianCommandStartFailed,
             ExecutorGuardianInternalFailed,
@@ -266,9 +333,13 @@ class ExecutorGuardianPostContainmentError(RuntimeError):
                 "ExecutorGuardianPostContainmentError.terminal must be an "
                 "ExecutorGuardianTerminal"
             )
-        if type(failures) is not tuple or not failures or any(
-            type(failure) is not ExecutorGuardianPostContainmentFailure
-            for failure in failures
+        if (
+            type(failures) is not tuple
+            or not failures
+            or any(
+                type(failure) is not ExecutorGuardianPostContainmentFailure
+                for failure in failures
+            )
         ):
             raise ValueError(
                 "ExecutorGuardianPostContainmentError.failures must contain "

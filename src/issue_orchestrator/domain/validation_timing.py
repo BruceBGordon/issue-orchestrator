@@ -351,6 +351,7 @@ class ValidationTimingProtocolFailure:
     configuration: ValidationConfiguration
     failure_kind: ValidationTimingProtocolFailureKind
     line: str
+    line_truncated: bool
     target: str | None
 
     def __post_init__(self) -> None:
@@ -369,6 +370,7 @@ class ValidationTimingProtocolFailure:
             ValidationTimingProtocolFailureKind,
         )
         _require_non_empty(owner, "line", self.line)
+        _require_exact(owner, "line_truncated", self.line_truncated, bool)
         _require_optional_non_empty(owner, "target", self.target)
 
     def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
@@ -378,6 +380,7 @@ class ValidationTimingProtocolFailure:
             {
                 "failure_kind": self.failure_kind.value,
                 "line": self.line,
+                "line_truncated": self.line_truncated,
                 "target": self.target,
             },
             self.configuration,
@@ -389,6 +392,9 @@ class ValidationRunLifecycle(StrEnum):
 
     COMPLETED = "completed"
     CAPTURE_FAILED = "capture-failed"
+    FINALIZATION_FAILED = "finalization-failed"
+    CLEANUP_FAILED = "cleanup-failed"
+    OUTCOME_UNAVAILABLE = "outcome-unavailable"
 
 
 class ValidationProcessGroupCleanup(StrEnum):
@@ -508,7 +514,7 @@ def _validation_command_fields(
             raise ValueError("finalization failure requires a typed capture fact")
         return merge_validation_timing_fields(
             {
-                "lifecycle": ValidationRunLifecycle.CAPTURE_FAILED.value,
+                "lifecycle": ValidationRunLifecycle.FINALIZATION_FAILED.value,
                 "exit_code": 1,
                 "process_group_cleanup": _validation_cleanup_value(result.cleanup),
                 "cleanup_error_type": result.finalization_failure.error_type,
@@ -519,7 +525,7 @@ def _validation_command_fields(
         )
     if type(result) is ContainedCommandOutcomeUnavailable:
         return {
-            "lifecycle": ValidationRunLifecycle.CAPTURE_FAILED.value,
+            "lifecycle": ValidationRunLifecycle.OUTCOME_UNAVAILABLE.value,
             "exit_code": 1,
             "process_group_cleanup": ValidationProcessGroupCleanup.UNKNOWN.value,
             "capture_status": ValidationCaptureStatus.FAILED.value,
@@ -549,7 +555,7 @@ def _validation_command_fields(
             raise ValueError("cleanup failure requires a typed capture fact")
         return merge_validation_timing_fields(
             {
-                "lifecycle": ValidationRunLifecycle.CAPTURE_FAILED.value,
+                "lifecycle": ValidationRunLifecycle.CLEANUP_FAILED.value,
                 "exit_code": 1,
                 "process_group_cleanup": (
                     ValidationProcessGroupCleanup.CLEANUP_FAILED.value
@@ -656,6 +662,14 @@ class ValidationSwapUsage:
         }
 
 
+class ValidationDiskDeltaStatus(StrEnum):
+    """Whether one cumulative disk counter produced an interval delta."""
+
+    BASELINE_UNAVAILABLE = "baseline-unavailable"
+    AVAILABLE = "available"
+    COUNTER_RESET = "counter-reset"
+
+
 @dataclass(frozen=True, slots=True)
 class ValidationDiskObservation:
     """Cumulative and optional interval disk-I/O observation."""
@@ -664,6 +678,8 @@ class ValidationDiskObservation:
     megabytes_total: float
     transfers_delta: float | None
     megabytes_delta: float | None
+    transfers_delta_status: ValidationDiskDeltaStatus
+    megabytes_delta_status: ValidationDiskDeltaStatus
 
     def __post_init__(self) -> None:
         owner = type(self).__name__
@@ -681,6 +697,36 @@ class ValidationDiskObservation:
             self.megabytes_delta,
             minimum=0.0,
         )
+        self._require_delta_status(
+            "transfers",
+            self.transfers_delta,
+            self.transfers_delta_status,
+        )
+        self._require_delta_status(
+            "megabytes",
+            self.megabytes_delta,
+            self.megabytes_delta_status,
+        )
+
+    @staticmethod
+    def _require_delta_status(
+        counter: str,
+        delta: float | None,
+        status: ValidationDiskDeltaStatus,
+    ) -> None:
+        if type(status) is not ValidationDiskDeltaStatus:
+            raise ValueError(
+                f"ValidationDiskObservation.{counter}_delta_status must be typed"
+            )
+        if status is ValidationDiskDeltaStatus.AVAILABLE and delta is None:
+            raise ValueError(
+                f"ValidationDiskObservation.{counter}_delta must exist when available"
+            )
+        if status is not ValidationDiskDeltaStatus.AVAILABLE and delta is not None:
+            raise ValueError(
+                f"ValidationDiskObservation.{counter}_delta must be unavailable "
+                f"when status is {status.value}"
+            )
 
     def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
         return {
@@ -688,6 +734,8 @@ class ValidationDiskObservation:
             "disk_mb_total": self.megabytes_total,
             "disk_xfrs_delta": self.transfers_delta,
             "disk_mb_delta": self.megabytes_delta,
+            "disk_xfrs_delta_status": self.transfers_delta_status.value,
+            "disk_mb_delta_status": self.megabytes_delta_status.value,
         }
 
 

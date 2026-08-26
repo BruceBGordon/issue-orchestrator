@@ -22,6 +22,7 @@ import pytest
 from issue_orchestrator.domain.contained_command import (
     ContainedCommandCaptureSucceeded,
     ContainedCommandCleanupError,
+    ContainedCommandCompleted,
     ContainedCommandExited,
     ContainedCommandFailure,
     ContainedCommandFinalizationFailed,
@@ -33,10 +34,16 @@ from issue_orchestrator.domain.retained_thread import (
     RetainedThreadActivated,
     RetainedThreadActivation,
     RetainedThreadFinalization,
+    RetainedThreadFinalized,
     RetainedThreadFinalizedAfterFailure,
     RetainedThreadShutdownPolicy,
     RetainedThreadSpec,
     RetainedThreadState,
+)
+from issue_orchestrator.domain.validation_resource_sampling import (
+    ValidationHostProbeObserved,
+    ValidationHostProbeRequest,
+    ValidationHostProbeResult,
 )
 from issue_orchestrator.domain.process_group import (
     OwnedProcessGroupLeader,
@@ -78,6 +85,7 @@ from issue_orchestrator.ports.retained_thread import (
     RetainedThreadFactory,
     RetainedThreadLease,
 )
+from issue_orchestrator.ports.validation_host_probe import ValidationHostProbe
 from tests.process_tree_fixture import (
     CooperativeTermResistantProcessTreeProgram,
     ExitingTermResistantProcessTreeProgram,
@@ -99,6 +107,18 @@ def _with_repo_on_pythonpath(env: dict[str, str]) -> dict[str, str]:
         os.pathsep + pythonpath if pythonpath else ""
     )
     return env
+
+
+@dataclass(frozen=True, slots=True)
+class _NoHostEvidenceProbe(ValidationHostProbe):
+    """Fast port fake for validate-runner tests unrelated to host observations."""
+
+    def run(self, request: ValidationHostProbeRequest) -> ValidationHostProbeResult:
+        del request
+        return ValidationHostProbeObserved("")
+
+
+_NO_HOST_EVIDENCE_PROBE = _NoHostEvidenceProbe()
 
 
 def _run_validation_cli(
@@ -217,6 +237,87 @@ class _FinalizationFailingRetainedThreadFactory(RetainedThreadFactory):
         return _FinalizationFailingRetainedThreadLease(self.failure)
 
 
+@dataclass(slots=True)
+class _ActivationRaisingRetainedThreadLease(RetainedThreadLease):
+    failure: RuntimeError
+    finalization_action: Callable[[], None]
+    _state: RetainedThreadState = field(
+        default=RetainedThreadState.CREATED,
+        init=False,
+    )
+
+    @property
+    def state(self) -> RetainedThreadState:
+        return self._state
+
+    def activate(self) -> RetainedThreadActivation:
+        self._state = RetainedThreadState.ACTIVATING
+        raise self.failure
+
+    def finalize(
+        self,
+        policy: RetainedThreadShutdownPolicy,
+    ) -> RetainedThreadFinalization:
+        del policy
+        self.finalization_action()
+        return RetainedThreadFinalized()
+
+
+@dataclass(frozen=True, slots=True)
+class _ActivationRaisingRetainedThreadFactory(RetainedThreadFactory):
+    failure: RuntimeError
+    finalization_action: Callable[[], None]
+
+    def prepare(
+        self,
+        spec: RetainedThreadSpec,
+        target: Callable[[], None],
+    ) -> RetainedThreadLease:
+        del spec, target
+        return _ActivationRaisingRetainedThreadLease(
+            self.failure,
+            self.finalization_action,
+        )
+
+
+@dataclass(slots=True)
+class _FinalizationActionRetainedThreadLease(RetainedThreadLease):
+    finalization_action: Callable[[], None]
+    _state: RetainedThreadState = field(
+        default=RetainedThreadState.CREATED,
+        init=False,
+    )
+
+    @property
+    def state(self) -> RetainedThreadState:
+        return self._state
+
+    def activate(self) -> RetainedThreadActivation:
+        self._state = RetainedThreadState.ACTIVATED
+        return RetainedThreadActivated()
+
+    def finalize(
+        self,
+        policy: RetainedThreadShutdownPolicy,
+    ) -> RetainedThreadFinalization:
+        del policy
+        self.finalization_action()
+        return RetainedThreadFinalized()
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalizationActionRetainedThreadFactory(RetainedThreadFactory):
+    finalization_action: Callable[[], None]
+
+    def prepare(
+        self,
+        spec: RetainedThreadSpec,
+        target: Callable[[], None],
+    ) -> RetainedThreadLease:
+        del spec, target
+        return _FinalizationActionRetainedThreadLease(self.finalization_action)
+
+
 def _contained_finalization_failure(
     failure: RuntimeError,
 ) -> ContainedCommandFinalizationFailed:
@@ -227,6 +328,16 @@ def _contained_finalization_failure(
         finalization_failure=ContainedCommandFailure(failure),
         metrics=ContainedCommandMetrics(2, 20),
     )
+
+
+def _leaf_exception_types(error: BaseException) -> set[type[BaseException]]:
+    if isinstance(error, BaseExceptionGroup):
+        return {
+            error_type
+            for nested in error.exceptions
+            for error_type in _leaf_exception_types(nested)
+        }
+    return {type(error)}
 
 
 class TestValidateRunner:
@@ -647,6 +758,7 @@ class TestValidateRunner:
             ),
             contained_command_capture=build_contained_command_capture(),
             retained_thread_factory=build_retained_thread_factory(),
+            host_probe=_NO_HOST_EVIDENCE_PROBE,
         )
 
         assert exit_code == 0
@@ -674,6 +786,49 @@ class TestValidateRunner:
         assert summary["exit_code"] == 0
         assert summary["child_exit_code"] == 0
         assert summary["timing_protocol_status"] == "partial"
+        assert summary["timing_protocol_failure_count"] == 1
+
+    def test_oversized_profiler_marker_preserves_exact_child_success(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        source = (
+            "import os; os.write(1, b'[validate-timing] ' + (b'x' * 20000) + b'\\n')"
+        )
+
+        exit_code = run_validation(
+            shlex.join((sys.executable, "-c", source)),
+            tmp_path / "oversized-marker-output",
+            fake_git_repo,
+            clock=ValidationRunnerClock(
+                lambda: datetime.now(timezone.utc),
+                time.monotonic,
+            ),
+            contained_command_capture=build_contained_command_capture(),
+            retained_thread_factory=build_retained_thread_factory(),
+            host_probe=_NO_HOST_EVIDENCE_PROBE,
+        )
+
+        assert exit_code == 0
+        records = [
+            json.loads(line)
+            for line in (
+                fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        failures = [
+            record for record in records if record["kind"] == "timing_protocol_failure"
+        ]
+        assert len(failures) == 1
+        assert failures[0]["failure_kind"] == "malformed-marker"
+        assert failures[0]["line_truncated"] is True
+        assert len(failures[0]["line"]) == 16_384
+        summary = next(record for record in records if record["kind"] == "run_summary")
+        assert summary["lifecycle"] == "completed"
+        assert summary["child_exit_code"] == 0
         assert summary["timing_protocol_failure_count"] == 1
 
     @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process cleanup")
@@ -725,6 +880,7 @@ class TestValidateRunner:
                     OsContainedCommandOutputPipeFactory(),
                 ),
                 retained_thread_factory=build_retained_thread_factory(),
+                host_probe=_NO_HOST_EVIDENCE_PROBE,
             )
 
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
@@ -744,7 +900,7 @@ class TestValidateRunner:
             .splitlines()
         ]
         summary = next(record for record in records if record["kind"] == "run_summary")
-        assert summary["lifecycle"] == "capture-failed"
+        assert summary["lifecycle"] == "cleanup-failed"
         assert summary["process_group_cleanup"] == "cleanup-failed"
         assert summary["capture_status"] == "failed"
         assert summary["capture_error_type"] == "RuntimeError"
@@ -777,6 +933,7 @@ class TestValidateRunner:
                     _contained_finalization_failure(failure)
                 ),
                 retained_thread_factory=build_retained_thread_factory(),
+                host_probe=_NO_HOST_EVIDENCE_PROBE,
             )
 
         assert caught.value is failure
@@ -789,12 +946,205 @@ class TestValidateRunner:
             .splitlines()
         ]
         summary = next(record for record in records if record["kind"] == "run_summary")
+        assert summary["lifecycle"] == "finalization-failed"
         assert summary["process_group_cleanup"] == "supervised"
         assert summary["capture_status"] == "succeeded"
         assert summary["cleanup_error_repr"] == repr(failure)
         output = (output_dir / "validation-output.log").read_text(encoding="utf-8")
         assert "[validate_runner] child_exited" in output
+        assert "lifecycle=finalization-failed" in output
         assert "process_group_cleanup=supervised" in output
+
+    def test_sampler_start_exception_retains_provenance_and_attempts_finalization(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        start_failure = RuntimeError("injected sampler activation exception")
+        output_dir = (tmp_path / "sampler-start-output").resolve()
+        sampler_finalized = False
+
+        def record_sampler_finalization() -> None:
+            nonlocal sampler_finalized
+            sampler_finalized = True
+
+        with pytest.raises(RuntimeError) as caught:
+            run_validation(
+                "true",
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(
+                    lambda: datetime.now(timezone.utc),
+                    time.monotonic,
+                ),
+                contained_command_capture=_StaticContainedCommandCapture(
+                    ContainedCommandCompleted(
+                        ContainedCommandExited(42_424, 0),
+                        ContainedCommandMetrics(0, 0),
+                    )
+                ),
+                retained_thread_factory=_ActivationRaisingRetainedThreadFactory(
+                    start_failure,
+                    record_sampler_finalization,
+                ),
+                host_probe=_NO_HOST_EVIDENCE_PROBE,
+            )
+
+        assert caught.value is start_failure
+        assert sampler_finalized
+        records = [
+            json.loads(line)
+            for line in (
+                fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        summary = next(record for record in records if record["kind"] == "run_summary")
+        assert summary["lifecycle"] == "capture-failed"
+        assert summary["child_outcome"] == "not-started"
+        assert summary["capture_error_repr"] == repr(start_failure)
+        output_file = output_dir / "validation-output.log"
+        assert "lifecycle=capture-failed" in output_file.read_text(encoding="utf-8")
+        output_file.unlink()
+
+    def test_timing_finalization_failure_still_emits_exact_terminal_marker(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        output_dir = (tmp_path / "timing-finalization-output").resolve()
+        timings_file = (
+            fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+        )
+
+        def poison_timing_destination() -> None:
+            timings_file.unlink()
+            timings_file.mkdir()
+
+        with pytest.raises(IsADirectoryError):
+            run_validation(
+                "true",
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(
+                    lambda: datetime.now(timezone.utc),
+                    time.monotonic,
+                ),
+                contained_command_capture=_StaticContainedCommandCapture(
+                    ContainedCommandCompleted(
+                        ContainedCommandExited(42_424, 0),
+                        ContainedCommandMetrics(2, 20),
+                    )
+                ),
+                retained_thread_factory=_FinalizationActionRetainedThreadFactory(
+                    poison_timing_destination
+                ),
+                host_probe=_NO_HOST_EVIDENCE_PROBE,
+            )
+
+        output = (output_dir / "validation-output.log").read_text(encoding="utf-8")
+        assert "[validate_runner] child_exited pid=42424" in output
+        assert "child_exit_code=0" in output
+        assert "lifecycle=finalization-failed" in output
+        assert "lines=2 bytes=20" in output
+
+    def test_terminal_file_failure_does_not_erase_durable_command_fact(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        output_dir = (tmp_path / "missing-marker-output").resolve()
+        output_file = output_dir / "validation-output.log"
+
+        def remove_terminal_destination() -> None:
+            output_file.unlink()
+            output_dir.rmdir()
+
+        with pytest.raises(FileNotFoundError):
+            run_validation(
+                "true",
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(
+                    lambda: datetime.now(timezone.utc),
+                    time.monotonic,
+                ),
+                contained_command_capture=_StaticContainedCommandCapture(
+                    ContainedCommandCompleted(
+                        ContainedCommandExited(42_424, 0),
+                        ContainedCommandMetrics(2, 20),
+                    )
+                ),
+                retained_thread_factory=_FinalizationActionRetainedThreadFactory(
+                    remove_terminal_destination
+                ),
+                host_probe=_NO_HOST_EVIDENCE_PROBE,
+            )
+
+        records = [
+            json.loads(line)
+            for line in (
+                fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        summary = next(record for record in records if record["kind"] == "run_summary")
+        assert summary["lifecycle"] == "finalization-failed"
+        assert summary["child_process_id"] == 42_424
+        assert summary["child_exit_code"] == 0
+        terminal_output = capsys.readouterr().out
+        assert "[validate_runner] child_exited pid=42424" in terminal_output
+        assert "lifecycle=finalization-failed" in terminal_output
+
+    def test_terminal_marker_and_recorder_failures_retain_both_faults(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        output_dir = (tmp_path / "dual-reporting-failure").resolve()
+        output_file = output_dir / "validation-output.log"
+        timings_file = (
+            fake_git_repo / ".git" / "issue-orchestrator" / "validate-timings.jsonl"
+        )
+
+        def break_file_and_recorder_sinks() -> None:
+            output_file.unlink()
+            output_dir.rmdir()
+            timings_file.unlink(missing_ok=True)
+            timings_file.mkdir()
+
+        with pytest.raises(BaseExceptionGroup) as caught:
+            run_validation(
+                "true",
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(
+                    lambda: datetime.now(timezone.utc),
+                    time.monotonic,
+                ),
+                contained_command_capture=_StaticContainedCommandCapture(
+                    ContainedCommandCompleted(
+                        ContainedCommandExited(42_424, 0),
+                        ContainedCommandMetrics(2, 20),
+                    )
+                ),
+                retained_thread_factory=_FinalizationActionRetainedThreadFactory(
+                    break_file_and_recorder_sinks
+                ),
+                host_probe=_NO_HOST_EVIDENCE_PROBE,
+            )
+
+        assert _leaf_exception_types(caught.value) == {
+            FileNotFoundError,
+            IsADirectoryError,
+        }
+        terminal_output = capsys.readouterr().out
+        assert "child_exited pid=42424" in terminal_output
+        assert "lifecycle=finalization-failed" in terminal_output
 
     def test_sampler_failure_combines_with_exact_finalization_provenance(
         self,
@@ -820,6 +1170,7 @@ class TestValidateRunner:
                 retained_thread_factory=_FinalizationFailingRetainedThreadFactory(
                     sampler_failure
                 ),
+                host_probe=_NO_HOST_EVIDENCE_PROBE,
             )
 
         assert caught.value.exceptions == (command_failure, sampler_failure)
@@ -863,6 +1214,7 @@ class TestValidateRunner:
                 ),
                 contained_command_capture=_RaisingContainedCommandCapture(failure),
                 retained_thread_factory=build_retained_thread_factory(),
+                host_probe=_NO_HOST_EVIDENCE_PROBE,
             )
 
         assert caught.value is failure
@@ -964,6 +1316,7 @@ class TestValidateRunner:
             ),
             contained_command_capture=build_contained_command_capture(),
             retained_thread_factory=build_retained_thread_factory(),
+            host_probe=_NO_HOST_EVIDENCE_PROBE,
         )
         try:
             PROCESS_COMPLETION_WATCHDOG.join_thread(
@@ -1048,6 +1401,7 @@ class TestValidateRunner:
             clock=ValidationRunnerClock(wall_now, monotonic_now),
             contained_command_capture=build_contained_command_capture(),
             retained_thread_factory=build_retained_thread_factory(),
+            host_probe=_NO_HOST_EVIDENCE_PROBE,
         )
 
         assert result == 0
@@ -1063,6 +1417,215 @@ class TestValidateRunner:
         assert summary["total_elapsed_seconds"] == 5.0
         assert summary["monotonic_elapsed_seconds"] == 5.0
         assert summary["wall_elapsed_seconds"] == -3600.0
+
+    def test_end_clock_failures_do_not_skip_sampler_or_terminal_evidence(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        wall_failure = RuntimeError("injected wall-end clock failure")
+        monotonic_failure = RuntimeError("injected monotonic-end clock failure")
+        wall_started_at = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+        wall_calls = 0
+        monotonic_calls = 0
+        sampler_finalized = False
+
+        def wall_now() -> datetime:
+            nonlocal wall_calls
+            wall_calls += 1
+            if wall_calls == 1:
+                return wall_started_at
+            raise wall_failure
+
+        def monotonic_now() -> float:
+            nonlocal monotonic_calls
+            monotonic_calls += 1
+            if monotonic_calls == 1:
+                return 100.0
+            raise monotonic_failure
+
+        def record_sampler_finalization() -> None:
+            nonlocal sampler_finalized
+            sampler_finalized = True
+
+        output_dir = (tmp_path / "clock-failure-output").resolve()
+        with pytest.raises(BaseExceptionGroup) as caught:
+            run_validation(
+                "true",
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(wall_now, monotonic_now),
+                contained_command_capture=_StaticContainedCommandCapture(
+                    ContainedCommandCompleted(
+                        ContainedCommandExited(42_424, 0),
+                        ContainedCommandMetrics(2, 20),
+                    )
+                ),
+                retained_thread_factory=_FinalizationActionRetainedThreadFactory(
+                    record_sampler_finalization
+                ),
+                host_probe=_NO_HOST_EVIDENCE_PROBE,
+            )
+
+        assert caught.value.exceptions == (wall_failure, monotonic_failure)
+        assert wall_calls == 2
+        assert monotonic_calls == 2
+        assert sampler_finalized
+        output = (output_dir / "validation-output.log").read_text(encoding="utf-8")
+        assert "[validate_runner] child_exited pid=42424" in output
+        assert "child_exit_code=0" in output
+        assert "lifecycle=finalization-failed" in output
+        assert "elapsed=unavailable" in output
+
+    @pytest.mark.parametrize(
+        "invalid_end",
+        (float("nan"), float("inf"), float("-inf")),
+        ids=("nan", "positive-infinity", "negative-infinity"),
+    )
+    def test_non_finite_end_monotonic_is_typed_unavailable(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+        invalid_end: float,
+    ) -> None:
+        monotonic_calls = 0
+
+        def monotonic_now() -> float:
+            nonlocal monotonic_calls
+            monotonic_calls += 1
+            return 100.0 if monotonic_calls == 1 else invalid_end
+
+        output_dir = (tmp_path / "non-finite-end-output").resolve()
+        with pytest.raises(
+            ValueError,
+            match="validation monotonic end must be finite and non-negative",
+        ):
+            run_validation(
+                "true",
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(
+                    lambda: datetime.now(timezone.utc),
+                    monotonic_now,
+                ),
+                contained_command_capture=_StaticContainedCommandCapture(
+                    ContainedCommandCompleted(
+                        ContainedCommandExited(42_424, 0),
+                        ContainedCommandMetrics(2, 20),
+                    )
+                ),
+                retained_thread_factory=_FinalizationActionRetainedThreadFactory(
+                    lambda: None
+                ),
+                host_probe=_NO_HOST_EVIDENCE_PROBE,
+            )
+
+        assert monotonic_calls == 2
+        output = (output_dir / "validation-output.log").read_text(encoding="utf-8")
+        assert "[validate_runner] child_exited pid=42424" in output
+        assert "lifecycle=finalization-failed" in output
+        assert "elapsed=unavailable" in output
+
+    def test_naive_end_wall_clock_is_typed_unavailable(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        wall_calls = 0
+
+        def wall_now() -> datetime:
+            nonlocal wall_calls
+            wall_calls += 1
+            if wall_calls == 1:
+                return datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+            return datetime(2026, 8, 24, 12)
+
+        output_dir = (tmp_path / "naive-end-output").resolve()
+        with pytest.raises(
+            ValueError,
+            match="validation wall end must be timezone-aware",
+        ):
+            run_validation(
+                "true",
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(wall_now, lambda: 105.0),
+                contained_command_capture=_StaticContainedCommandCapture(
+                    ContainedCommandCompleted(
+                        ContainedCommandExited(42_424, 0),
+                        ContainedCommandMetrics(2, 20),
+                    )
+                ),
+                retained_thread_factory=_FinalizationActionRetainedThreadFactory(
+                    lambda: None
+                ),
+                host_probe=_NO_HOST_EVIDENCE_PROBE,
+            )
+
+        assert wall_calls == 2
+        output = (output_dir / "validation-output.log").read_text(encoding="utf-8")
+        assert "[validate_runner] child_exited pid=42424" in output
+        assert "lifecycle=finalization-failed" in output
+        assert "elapsed=unavailable" in output
+
+    @pytest.mark.parametrize(
+        ("wall_start", "monotonic_start", "expected_message"),
+        (
+            (
+                datetime(2026, 8, 24, 12),
+                100.0,
+                "validation wall start must be timezone-aware",
+            ),
+            (
+                datetime(2026, 8, 24, 12, tzinfo=timezone.utc),
+                float("nan"),
+                "validation monotonic start must be finite and non-negative",
+            ),
+            (
+                datetime(2026, 8, 24, 12, tzinfo=timezone.utc),
+                float("inf"),
+                "validation monotonic start must be finite and non-negative",
+            ),
+            (
+                datetime(2026, 8, 24, 12, tzinfo=timezone.utc),
+                -1.0,
+                "validation monotonic start must be finite and non-negative",
+            ),
+        ),
+        ids=("naive-wall", "nan-monotonic", "infinite-monotonic", "negative-monotonic"),
+    )
+    def test_invalid_start_clock_fails_before_sampler_or_command_activation(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+        wall_start: datetime,
+        monotonic_start: float,
+        expected_message: str,
+    ) -> None:
+        activation_failure = RuntimeError("sampler must not activate")
+        capture_failure = RuntimeError("command must not capture")
+        output_dir = (tmp_path / "invalid-start-output").resolve()
+
+        with pytest.raises(ValueError, match=expected_message):
+            run_validation(
+                "true",
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(
+                    lambda: wall_start,
+                    lambda: monotonic_start,
+                ),
+                contained_command_capture=_RaisingContainedCommandCapture(
+                    capture_failure
+                ),
+                retained_thread_factory=_ActivationRaisingRetainedThreadFactory(
+                    activation_failure,
+                    lambda: None,
+                ),
+                host_probe=_NO_HOST_EVIDENCE_PROBE,
+            )
+
+        assert not (output_dir / "validation-output.log").exists()
 
     def test_default_run_ids_are_unique_within_the_same_second(
         self,

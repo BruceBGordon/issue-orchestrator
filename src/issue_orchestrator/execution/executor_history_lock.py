@@ -5,8 +5,15 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from contextlib import contextmanager
-import fcntl
 from pathlib import Path
+
+from .posix_file_lock import (
+    PosixFileLockAcquisition,
+    PosixFileLockFilePresence,
+    PosixFileLockMode,
+    PosixFileLockOwner,
+    PosixFileLockSpecification,
+)
 
 
 class PosixExecutorHistoryRetentionLock:
@@ -18,22 +25,30 @@ class PosixExecutorHistoryRetentionLock:
                 "PosixExecutorHistoryRetentionLock.lock_path must be absolute"
             )
         self._lock_path = lock_path
+        self._file_locks = PosixFileLockOwner()
+        self._shared_specification = PosixFileLockSpecification(
+            lock_path,
+            PosixFileLockMode.SHARED,
+            PosixFileLockAcquisition.BLOCKING,
+            PosixFileLockFilePresence.CREATE_IF_MISSING,
+        )
+        self._exclusive_specification = PosixFileLockSpecification(
+            lock_path,
+            PosixFileLockMode.EXCLUSIVE,
+            PosixFileLockAcquisition.BLOCKING,
+            PosixFileLockFilePresence.CREATE_IF_MISSING,
+        )
 
     @contextmanager
     def shared(self) -> Generator[None]:
         """Hold a cross-process shared lock for the whole read transaction."""
-        with self._locked(fcntl.LOCK_SH):
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._file_locks.hold(self._shared_specification):
             yield
 
     @contextmanager
     def exclusive(self) -> Generator[None]:
         """Hold a cross-process exclusive lock for mutation and pruning."""
-        with self._locked(fcntl.LOCK_EX):
-            yield
-
-    @contextmanager
-    def _locked(self, operation: int) -> Generator[None]:
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock_path.open("a+b") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), operation)
+        with self._file_locks.hold(self._exclusive_specification):
             yield

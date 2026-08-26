@@ -10,12 +10,14 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from typing import cast
 
 import pytest
 
 from issue_orchestrator.control.executor_admission import (
     ExecutorAdmissionPolicy,
     ExecutorLearningPolicy,
+    QueuedExecutorWork,
     ExecutorSaturationPolicy,
     ExecutorWorkDemandEstimator,
 )
@@ -70,6 +72,16 @@ from issue_orchestrator.execution.host_executor import (
     HostExecutor,
     HostExecutorMonitor,
 )
+from issue_orchestrator.execution.host_executor._deadline import (
+    DurableExecutorDeadlineOwner,
+    ExecutorAdmissionDeadlineEvents,
+    ExecutorDeadlineOwner,
+    ExecutorDeadlineReport,
+    ExecutorDeadlineReporter,
+    StderrExecutorDeadlineReporter,
+)
+from issue_orchestrator.execution.host_executor._journal import ExecutorEventStore
+from issue_orchestrator.execution.host_executor._types import ExecutorWorkIdentity
 from issue_orchestrator.execution.executor_history_lock import (
     PosixExecutorHistoryRetentionLock,
 )
@@ -198,6 +210,61 @@ class _RecordingScheduledWatchdogStore:
         self.records.append((run, watchdog))
 
 
+class _DeadlineEvidenceAttempts:
+    """Retain exact evidence attempts across independently faulting seams."""
+
+    def __init__(self) -> None:
+        self.event_count = 0
+        self.report_count = 0
+
+
+class _RecordingAdmissionDeadlineEvents:
+    def __init__(self, attempts: _DeadlineEvidenceAttempts) -> None:
+        self._attempts = attempts
+
+    def admission_deadline_exceeded(
+        self,
+        identity: ExecutorWorkIdentity,
+        work: QueuedExecutorWork,
+        deadline: ExecutorBoundedDeadline,
+        elapsed_seconds: float,
+    ) -> None:
+        del identity, work, deadline, elapsed_seconds
+        self._attempts.event_count += 1
+
+
+class _FailingAdmissionDeadlineEvents(_RecordingAdmissionDeadlineEvents):
+    def admission_deadline_exceeded(
+        self,
+        identity: ExecutorWorkIdentity,
+        work: QueuedExecutorWork,
+        deadline: ExecutorBoundedDeadline,
+        elapsed_seconds: float,
+    ) -> None:
+        super().admission_deadline_exceeded(
+            identity,
+            work,
+            deadline,
+            elapsed_seconds,
+        )
+        raise RuntimeError("simulated admission deadline event failure")
+
+
+class _RecordingDeadlineReporter:
+    def __init__(self, attempts: _DeadlineEvidenceAttempts) -> None:
+        self._attempts = attempts
+
+    def deadline_exceeded(self, report: ExecutorDeadlineReport) -> None:
+        del report
+        self._attempts.report_count += 1
+
+
+class _FailingDeadlineReporter(_RecordingDeadlineReporter):
+    def deadline_exceeded(self, report: ExecutorDeadlineReport) -> None:
+        super().deadline_exceeded(report)
+        raise RuntimeError("simulated admission deadline report failure")
+
+
 def _demand_estimator() -> ExecutorWorkDemandEstimator:
     return ExecutorWorkDemandEstimator(
         ExecutorLearningPolicy(
@@ -212,6 +279,94 @@ def _history_lock(pool_dir: Path) -> PosixExecutorHistoryRetentionLock:
     return PosixExecutorHistoryRetentionLock(
         (pool_dir / "work-history" / "retention.lock").resolve()
     )
+
+
+def _deadline_owner(pool_dir: Path) -> DurableExecutorDeadlineOwner:
+    return DurableExecutorDeadlineOwner(
+        ExecutorEventStore(pool_dir),
+        StderrExecutorDeadlineReporter(),
+    )
+
+
+def _admission_blocked_executor(
+    pool_dir: Path,
+    deadline_owner: ExecutorDeadlineOwner,
+) -> HostExecutor:
+    return HostExecutor(
+        pool_dir=pool_dir,
+        host_cpu_slots=1,
+        admission_policy=ExecutorAdmissionPolicy(
+            ExecutorSaturationPolicy(maximum_busy_percent=95)
+        ),
+        demand_estimator=_demand_estimator(),
+        host_cpu_observer=_SaturatedHostCpuObserver(),
+        request_identity_factory=ExecutorRequestIdentityFactory(
+            wall_time_nanoseconds=time.time_ns,
+            monotonic_nanoseconds=time.monotonic_ns,
+            process_id=os.getpid,
+            request_nonce=lambda: "e" * 32,
+        ),
+        command_guardian=executor_command_guardian(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
+            )
+        ),
+        deadline_owner=deadline_owner,
+        atomic_path_replacement=OsAtomicPathReplacement(),
+        history_retention_lock=_history_lock(pool_dir),
+        history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
+        queue_settle_seconds=0.001,
+        queue_poll_seconds=0.001,
+    )
+
+
+def _assert_admission_deadline_evidence_failure(
+    tmp_path: Path,
+    events: ExecutorAdmissionDeadlineEvents,
+    reporter: ExecutorDeadlineReporter,
+    attempts: _DeadlineEvidenceAttempts,
+    expected_secondary_messages: tuple[str, ...],
+) -> None:
+    pool_dir = tmp_path / "pool"
+    marker = tmp_path / "must-not-run"
+    executor = _admission_blocked_executor(
+        pool_dir,
+        DurableExecutorDeadlineOwner(events, reporter),
+    )
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        executor.run(
+            ExecutorRunSpecification(
+                work_key=ExecutorWorkKey("agent-phase:test:evidence-failure"),
+                fairness_group=ExecutorFairnessGroup("agent:test:evidence-failure"),
+                concurrency_range=ExecutorConcurrencyRange(1, 1),
+                exclusive_resources=(),
+            ),
+            ExecutorCommand(
+                (
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                ),
+                ExecutorBoundedDeadline(0.001, 0.01),
+                ExecutorCommandLifecycle.DETACHED,
+                ExecutorNoCommandCancellation(),
+            ),
+        )
+
+    exceptions = raised.value.exceptions
+    assert type(exceptions[0]) is ExecutorDeadlineExceededError
+    primary = cast(ExecutorDeadlineExceededError, exceptions[0])
+    assert primary.reason is ExecutorDeadlineReason.ABSOLUTE
+    assert tuple(str(error) for error in exceptions[1:]) == (
+        expected_secondary_messages
+    )
+    assert attempts.event_count == 1
+    assert attempts.report_count == 1
+    assert not marker.exists()
+    assert not tuple((pool_dir / "requests").glob("*.json"))
+    assert not tuple((pool_dir / "leases").glob("*.json"))
 
 
 def _deterministic_host_executor(
@@ -256,6 +411,7 @@ def _host_executor(
             request_nonce=lambda: request_nonce,
         ),
         command_guardian=command_guardian,
+        deadline_owner=_deadline_owner(pool_dir),
         atomic_path_replacement=OsAtomicPathReplacement(),
         history_retention_lock=_history_lock(pool_dir),
         history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
@@ -719,9 +875,7 @@ def test_interrupted_command_is_durable_and_human_traceable(
         OsAtomicPathReplacement(),
     ).recent_events(ExecutorRecentEventsQuery(20))
     [interrupted] = [
-        event
-        for event in timeline.events
-        if type(event) is ExecutorCommandInterrupted
+        event for event in timeline.events if type(event) is ExecutorCommandInterrupted
     ]
     assert interrupted.exit_code == -signal.SIGTERM
     assert interrupted.signal_number == signal.SIGTERM
@@ -983,6 +1137,7 @@ def test_admission_deadline_fails_before_command_and_is_durable(
                 forceful_shutdown_seconds=2.0,
             )
         ),
+        deadline_owner=_deadline_owner(pool_dir),
         atomic_path_replacement=OsAtomicPathReplacement(),
         history_retention_lock=_history_lock(pool_dir),
         history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
@@ -1046,6 +1201,48 @@ def test_admission_deadline_fails_before_command_and_is_durable(
     assert deadline_event.absolute_timeout_seconds == 0.05
 
 
+def test_admission_deadline_event_failure_preserves_primary_and_reports(
+    tmp_path: Path,
+) -> None:
+    attempts = _DeadlineEvidenceAttempts()
+    _assert_admission_deadline_evidence_failure(
+        tmp_path,
+        _FailingAdmissionDeadlineEvents(attempts),
+        _RecordingDeadlineReporter(attempts),
+        attempts,
+        ("simulated admission deadline event failure",),
+    )
+
+
+def test_admission_deadline_report_failure_preserves_primary_and_event(
+    tmp_path: Path,
+) -> None:
+    attempts = _DeadlineEvidenceAttempts()
+    _assert_admission_deadline_evidence_failure(
+        tmp_path,
+        _RecordingAdmissionDeadlineEvents(attempts),
+        _FailingDeadlineReporter(attempts),
+        attempts,
+        ("simulated admission deadline report failure",),
+    )
+
+
+def test_admission_deadline_dual_failure_preserves_primary_and_both_faults(
+    tmp_path: Path,
+) -> None:
+    attempts = _DeadlineEvidenceAttempts()
+    _assert_admission_deadline_evidence_failure(
+        tmp_path,
+        _FailingAdmissionDeadlineEvents(attempts),
+        _FailingDeadlineReporter(attempts),
+        attempts,
+        (
+            "simulated admission deadline event failure",
+            "simulated admission deadline report failure",
+        ),
+    )
+
+
 def test_deadline_expiring_after_admission_records_terminal_events_without_spawn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1082,6 +1279,7 @@ def test_deadline_expiring_after_admission_records_terminal_events_without_spawn
                 forceful_shutdown_seconds=2.0,
             )
         ),
+        deadline_owner=_deadline_owner(pool_dir),
         atomic_path_replacement=OsAtomicPathReplacement(),
         history_retention_lock=_history_lock(pool_dir),
         history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),

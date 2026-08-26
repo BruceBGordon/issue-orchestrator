@@ -37,6 +37,11 @@ from issue_orchestrator.execution.host_executor import (
     ExecutorRequestIdentityFactory,
     HostExecutor,
 )
+from issue_orchestrator.execution.host_executor._deadline import (
+    DurableExecutorDeadlineOwner,
+    StderrExecutorDeadlineReporter,
+)
+from issue_orchestrator.execution.host_executor._journal import ExecutorEventStore
 from issue_orchestrator.execution.atomic_record_store import OsAtomicPathReplacement
 from issue_orchestrator.execution.executor_history_lock import (
     PosixExecutorHistoryRetentionLock,
@@ -146,6 +151,10 @@ def main() -> int:
                 request_nonce=lambda: uuid4().hex,
             ),
             command_guardian=build_executor_command_guardian(),
+            deadline_owner=DurableExecutorDeadlineOwner(
+                ExecutorEventStore(pool_dir),
+                StderrExecutorDeadlineReporter(),
+            ),
             atomic_path_replacement=OsAtomicPathReplacement(),
             history_retention_lock=PosixExecutorHistoryRetentionLock(
                 (pool_dir / "work-history" / "retention.lock").resolve()

@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import Field, ValidationError
 
@@ -18,8 +18,14 @@ from ..domain.terminal_session_owner import TerminalSessionOwnerPolicy
 from ..domain.terminal_session_termination import TerminalSessionOwnerCancellation
 from ..ports.atomic_record_store import AtomicRecordStoreFactory
 from ..ports.posix_process import PosixProcessLauncher
+from .independent_cleanup import (
+    CleanupAction,
+    IndependentCleanupPlan,
+    raise_primary_with_cleanup,
+)
 from .process_cancellation_endpoint import (
-    ProcessCancellationEndpointLease,
+    ProcessCancellationEndpointLeaseContract,
+    ProcessCancellationEndpointLeaseFactory,
     ProcessCancellationEndpointReadiness,
     ProcessCancellationInheritedEndpointActivator,
     ProcessCancellationOwnerControls,
@@ -69,15 +75,20 @@ class PosixTerminalSessionLaunchLease:
         self,
         command: tuple[str, ...],
         cancellation: TerminalSessionOwnerCancellation,
-        lease: ProcessCancellationEndpointLease,
+        lease: ProcessCancellationEndpointLeaseContract,
         readiness: ProcessCancellationEndpointReadiness,
     ) -> None:
         if type(command) is not tuple or not command:
             raise ValueError("terminal launch command must be a non-empty tuple")
         if type(cancellation) is not TerminalSessionOwnerCancellation:
             raise ValueError("terminal launch cancellation must be typed")
-        if type(lease) is not ProcessCancellationEndpointLease:
-            raise ValueError("terminal launch lease must be typed")
+        if not isinstance(
+            cast(object, lease),
+            ProcessCancellationEndpointLeaseContract,
+        ):
+            raise ValueError(
+                "terminal launch lease must implement the cancellation lease contract"
+            )
         if type(readiness) is not ProcessCancellationEndpointReadiness:
             raise ValueError("terminal launch readiness must be typed")
         self._command = command
@@ -118,6 +129,7 @@ class PosixTerminalSessionOwner:
         sentinel_program: ProcessGroupSentinelProgram,
         policy: TerminalSessionOwnerPolicy,
         record_stores: AtomicRecordStoreFactory,
+        cancellation_endpoint_leases: ProcessCancellationEndpointLeaseFactory,
     ) -> None:
         if type(owner_program) is not TerminalSessionOwnerProgram:
             raise ValueError("owner_program must be TerminalSessionOwnerProgram")
@@ -125,10 +137,19 @@ class PosixTerminalSessionOwner:
             raise ValueError("sentinel_program must be ProcessGroupSentinelProgram")
         if type(policy) is not TerminalSessionOwnerPolicy:
             raise ValueError("policy must be TerminalSessionOwnerPolicy")
+        if not isinstance(
+            cast(object, cancellation_endpoint_leases),
+            ProcessCancellationEndpointLeaseFactory,
+        ):
+            raise ValueError(
+                "cancellation_endpoint_leases must implement "
+                "ProcessCancellationEndpointLeaseFactory"
+            )
         self._owner_program = owner_program
         self._sentinel_program = sentinel_program
         self._policy = policy
         self._record_stores = record_stores
+        self._cancellation_endpoint_leases = cancellation_endpoint_leases
 
     def prepare(
         self,
@@ -137,39 +158,59 @@ class PosixTerminalSessionOwner:
     ) -> PosixTerminalSessionLaunchLease:
         if type(command) is not tuple or not command:
             raise ValueError("terminal owner command must be a non-empty tuple")
-        if any(type(argument) is not str for argument in command):
-            raise ValueError("terminal owner command must contain strings")
+        if any(
+            type(argument) is not str or not argument or "\0" in argument
+            for argument in command
+        ):
+            raise ValueError(
+                "terminal owner command must contain non-empty, NUL-free strings"
+            )
         if type(cancellation) is not TerminalSessionOwnerCancellation:
             raise ValueError(
                 "terminal owner cancellation must be TerminalSessionOwnerCancellation"
             )
-        lease = ProcessCancellationEndpointLease(
+        lease = self._cancellation_endpoint_leases.create(
             cancellation.record_path,
             self._record_stores,
         )
-        controls = lease.controls()
-        invocation = _TerminalSessionOwnerInvocation(
-            command=command,
-            cancellation_record_path=str(cancellation.record_path),
-            sentinel_program=self._sentinel_program.arguments,
-            startup_timeout_seconds=self._policy.startup_timeout_seconds,
-            graceful_shutdown_seconds=self._policy.graceful_shutdown_seconds,
-            listener_file_descriptor=controls.listener_file_descriptor,
-            owner_lock_file_descriptor=controls.owner_lock_file_descriptor,
-        )
-        return PosixTerminalSessionLaunchLease(
-            (
-                *self._owner_program.arguments,
-                "--owner-request-json",
-                invocation.model_dump_json(),
-            ),
-            cancellation,
-            lease,
-            ProcessCancellationEndpointReadiness(
+        try:
+            controls = lease.controls()
+            invocation = _TerminalSessionOwnerInvocation(
+                command=command,
+                cancellation_record_path=str(cancellation.record_path),
+                sentinel_program=self._sentinel_program.arguments,
+                startup_timeout_seconds=self._policy.startup_timeout_seconds,
+                graceful_shutdown_seconds=self._policy.graceful_shutdown_seconds,
+                listener_file_descriptor=controls.listener_file_descriptor,
+                owner_lock_file_descriptor=controls.owner_lock_file_descriptor,
+            )
+            readiness = ProcessCancellationEndpointReadiness(
                 self._policy.startup_timeout_seconds,
                 self._record_stores,
-            ),
-        )
+            )
+            return PosixTerminalSessionLaunchLease(
+                (
+                    *self._owner_program.arguments,
+                    "--owner-request-json",
+                    invocation.model_dump_json(),
+                ),
+                cancellation,
+                lease,
+                readiness,
+            )
+        except BaseException as primary_error:
+            raise_primary_with_cleanup(
+                "terminal launch preparation and endpoint retirement failed",
+                primary_error,
+                IndependentCleanupPlan(
+                    (
+                        CleanupAction(
+                            "cancellation-endpoint-retirement",
+                            lease.retire,
+                        ),
+                    )
+                ).run(),
+            )
 
 
 class TerminalSessionOwnerChild:

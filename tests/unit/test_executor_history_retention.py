@@ -47,6 +47,11 @@ from issue_orchestrator.execution.host_executor import (
     HostExecutor,
     HostExecutorMonitor,
 )
+from issue_orchestrator.execution.host_executor._deadline import (
+    DurableExecutorDeadlineOwner,
+    StderrExecutorDeadlineReporter,
+)
+from issue_orchestrator.execution.host_executor._journal import ExecutorEventStore
 from issue_orchestrator.execution.atomic_record_store import OsAtomicPathReplacement
 from issue_orchestrator.execution.executor_history_lock import (
     PosixExecutorHistoryRetentionLock,
@@ -83,6 +88,13 @@ def _demand_estimator() -> ExecutorWorkDemandEstimator:
     )
 
 
+def _deadline_owner(pool_dir: Path) -> DurableExecutorDeadlineOwner:
+    return DurableExecutorDeadlineOwner(
+        ExecutorEventStore(pool_dir),
+        StderrExecutorDeadlineReporter(),
+    )
+
+
 def _executor(
     pool_dir: Path,
     retention: ExecutorHistoryRetentionPolicy,
@@ -111,6 +123,7 @@ def _executor(
                 forceful_shutdown_seconds=0.1,
             )
         ),
+        deadline_owner=_deadline_owner(pool_dir),
         atomic_path_replacement=atomic_path_replacement,
         history_retention_lock=retention_lock,
         history_retention_policy=retention,
@@ -216,9 +229,7 @@ def test_post_command_evidence_failure_releases_lease_and_records_terminal_fact(
         executor.run(
             ExecutorRunSpecification(
                 work_key=ExecutorWorkKey("history:post-command-failure"),
-                fairness_group=ExecutorFairnessGroup(
-                    "history:post-command-failure"
-                ),
+                fairness_group=ExecutorFairnessGroup("history:post-command-failure"),
                 concurrency_range=ExecutorConcurrencyRange(1, 1),
                 exclusive_resources=(),
             ),
@@ -237,9 +248,9 @@ def test_post_command_evidence_failure_releases_lease_and_records_terminal_fact(
     assert marker.exists()
     assert raised.value.command_result.exit_code == 0
     assert raised.value.command_result.grant.concurrency == 1
-    assert tuple(
-        failure.attempt_name for failure in raised.value.failures
-    ) == ("record successful command history",)
+    assert tuple(failure.attempt_name for failure in raised.value.failures) == (
+        "record successful command history",
+    )
     assert len(replacement.rejected_destinations) == 1
     assert tuple((pool_dir / "leases").glob("*.json")) == ()
     timeline = HostExecutorMonitor(
@@ -656,6 +667,7 @@ def test_history_prunes_old_profiles_and_bounds_samples_per_profile(
                 forceful_shutdown_seconds=0.1,
             )
         ),
+        deadline_owner=_deadline_owner(tmp_path),
         atomic_path_replacement=OsAtomicPathReplacement(),
         history_retention_lock=PosixExecutorHistoryRetentionLock(
             (pool_dir / "work-history" / "retention.lock").resolve()

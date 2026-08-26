@@ -150,15 +150,18 @@ the same absolute bound, so it cannot race the executor and kill a correctly
 queued phase early. Wall timestamps are diagnostic only: forward or backward
 wall-clock adjustments cannot change either deadline.
 
-A monotonic instant is meaningful only within the process that observed it. If
-the orchestrator restarts while a terminal session survives, restoration
-requires the exact planner-produced outer timeout persisted in that run's
-manifest and starts a fresh monotonic observation window with that value. It
-does not recompute from current repository configuration and has no missing-data
-fallback. The already-running executor process retains and enforces its original
-monotonic absolute deadline. Recovery can therefore extend observation of a
-broken wrapper by at most one persisted outer budget, but it cannot shorten the
-executor's valid queue or execution budget.
+A monotonic instant is shared by live processes in the same host boot clock
+domain. The executor therefore computes one absolute expiry and passes that
+exact instant through guardian activation, guardian readiness, opaque-command
+activation, and command supervision. A monotonic instant is not meaningful
+after a reboot or on another machine. If the orchestrator restarts while a
+terminal session survives, restoration instead uses the exact planner-produced
+outer *duration* persisted in that run's manifest and starts a fresh monotonic
+observation window. It does not recompute from current repository configuration
+and has no missing-data fallback. The already-running executor and guardian
+processes retain and enforce their original shared absolute expiry. Recovery can
+therefore extend observation of a broken wrapper by at most one persisted outer
+budget, but it cannot shorten the executor's valid queue or execution budget.
 
 Publish and agent validation commands use the same clock separation without a
 new public configuration surface. A plain command remains bounded by the

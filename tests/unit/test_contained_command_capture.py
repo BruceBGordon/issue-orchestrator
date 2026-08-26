@@ -48,6 +48,7 @@ from issue_orchestrator.execution.process_group_terminator import (
 from issue_orchestrator.execution.posix_process import (
     MaskedPosixSpawnPrimitive,
     RetainedPosixProcessLauncher,
+    SystemPosixProcessActivationClock,
 )
 from issue_orchestrator.domain.posix_process import (
     PosixDescriptorMapping,
@@ -276,6 +277,7 @@ def _process_launcher(
             graceful_shutdown_seconds=0.05,
             forceful_shutdown_seconds=1.0,
         ),
+        SystemPosixProcessActivationClock(),
     )
 
 

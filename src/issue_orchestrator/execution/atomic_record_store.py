@@ -3,13 +3,10 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 import tempfile
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator
 
 from pydantic import BaseModel
 
@@ -20,6 +17,13 @@ from .independent_cleanup import (
     IndependentCleanupPlan,
     raise_cleanup_failures,
     raise_primary_with_cleanup,
+)
+from .posix_file_lock import (
+    PosixFileLockAcquisition,
+    PosixFileLockFilePresence,
+    PosixFileLockMode,
+    PosixFileLockOwner,
+    PosixFileLockSpecification,
 )
 
 
@@ -51,18 +55,23 @@ class AtomicRecordStore:
         replacement: AtomicPathReplacement,
     ) -> None:
         if not directory.is_absolute():
-            raise ValueError(
-                "AtomicRecordStore.directory must be an absolute path"
-            )
+            raise ValueError("AtomicRecordStore.directory must be an absolute path")
         self._directory = directory
         self._replacement = replacement
         self._lock_path = directory / "atomic-records.lock"
+        self._file_locks = PosixFileLockOwner()
+        self._lock_specification = PosixFileLockSpecification(
+            self._lock_path,
+            PosixFileLockMode.EXCLUSIVE,
+            PosixFileLockAcquisition.BLOCKING,
+            PosixFileLockFilePresence.CREATE_IF_MISSING,
+        )
 
     def write(self, path: Path, record: BaseModel) -> None:
         """Replace one owned record after pruning debris under the same lock."""
         self._require_owned_path(path)
         self._directory.mkdir(parents=True, exist_ok=True)
-        with self._locked():
+        with self._file_locks.hold(self._lock_specification):
             self._prune_crash_remnants_unlocked()
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=_CRASH_REMNANT_PREFIX,
@@ -119,14 +128,14 @@ class AtomicRecordStore:
     def prune_crash_remnants(self) -> AtomicRecordPruneResult:
         """Remove only recognizable atomic-record debris under its owner lock."""
         self._directory.mkdir(parents=True, exist_ok=True)
-        with self._locked():
+        with self._file_locks.hold(self._lock_specification):
             return self._prune_crash_remnants_unlocked()
 
     def delete(self, path: Path) -> bool:
         """Durably remove one owned record under the atomic-record lock."""
         self._require_owned_path(path)
         self._directory.mkdir(parents=True, exist_ok=True)
-        with self._locked():
+        with self._file_locks.hold(self._lock_specification):
             existed = path.exists()
             path.unlink(missing_ok=True)
             if existed:
@@ -149,15 +158,8 @@ class AtomicRecordStore:
             raise ValueError("AtomicRecordStore.path must be absolute")
         if path.parent != self._directory:
             raise ValueError(
-                "AtomicRecordStore.path must be a direct child of its "
-                "owned directory"
+                "AtomicRecordStore.path must be a direct child of its owned directory"
             )
-
-    @contextmanager
-    def _locked(self) -> Generator[None]:
-        with self._lock_path.open("a+b") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-            yield
 
     def _sync_directory(self) -> None:
         descriptor = os.open(self._directory, os.O_RDONLY)

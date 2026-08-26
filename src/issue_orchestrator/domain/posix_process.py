@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 import math
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, cast
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +125,93 @@ class PosixProcessActivationPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class PosixProcessConfiguredActivationDeadline:
+    """Use the process module's configured activation safety bound."""
+
+
+class PosixProcessActivationDeadlineExceededError(TimeoutError):
+    """The caller's absolute activation deadline expired."""
+
+
+class PosixProcessJoinedGroupContainmentRequiredError(RuntimeError):
+    """Post-gate activation requires the external group owner to contain."""
+
+
+@dataclass(frozen=True, slots=True)
+class PosixProcessActivationDeadlineAbsent:
+    """An activation error does not contain caller-deadline evidence."""
+
+
+@dataclass(frozen=True, slots=True)
+class PosixProcessActivationDeadlinePresent:
+    """Deadline evidence plus every independent recovery failure beside it."""
+
+    recovery_failures: tuple[BaseException, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.recovery_failures) is not tuple or any(
+            not isinstance(failure, BaseException) for failure in self.recovery_failures
+        ):
+            raise ValueError(
+                "PosixProcessActivationDeadlinePresent.recovery_failures "
+                "must contain exceptions"
+            )
+
+
+PosixProcessActivationDeadlineEvidence = (
+    PosixProcessActivationDeadlineAbsent | PosixProcessActivationDeadlinePresent
+)
+
+
+def classify_posix_process_activation_deadline(
+    error: BaseException,
+) -> PosixProcessActivationDeadlineEvidence:
+    """Separate an exact deadline cause from sibling recovery failures."""
+    if isinstance(error, PosixProcessActivationDeadlineExceededError):
+        return PosixProcessActivationDeadlinePresent(())
+    if not isinstance(error, BaseExceptionGroup):
+        return PosixProcessActivationDeadlineAbsent()
+    group = cast(BaseExceptionGroup[BaseException], error)
+    found = False
+    recovery_failures: list[BaseException] = []
+    for child in group.exceptions:
+        classified = classify_posix_process_activation_deadline(child)
+        if type(classified) is PosixProcessActivationDeadlinePresent:
+            found = True
+            recovery_failures.extend(classified.recovery_failures)
+        elif type(classified) is PosixProcessActivationDeadlineAbsent:
+            recovery_failures.append(child)
+        else:
+            raise AssertionError("activation deadline evidence is a closed union")
+    if found:
+        return PosixProcessActivationDeadlinePresent(tuple(recovery_failures))
+    return PosixProcessActivationDeadlineAbsent()
+
+
+@dataclass(frozen=True, slots=True)
+class PosixProcessAbsoluteActivationDeadline:
+    """One caller-owned monotonic expiry spanning the whole activation."""
+
+    expires_at_monotonic: float
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.expires_at_monotonic) is not float
+            or not math.isfinite(self.expires_at_monotonic)
+            or self.expires_at_monotonic < 0.0
+        ):
+            raise ValueError(
+                "PosixProcessAbsoluteActivationDeadline.expires_at_monotonic "
+                "must be finite and non-negative"
+            )
+
+
+PosixProcessActivationDeadline = (
+    PosixProcessConfiguredActivationDeadline | PosixProcessAbsoluteActivationDeadline
+)
+
+
+@dataclass(frozen=True, slots=True)
 class PosixDescriptorMapping:
     """Duplicate one owned parent descriptor onto one exact child descriptor."""
 
@@ -177,6 +264,7 @@ class PosixProcessLaunchSpec:
     group_mode: PosixProcessGroup
     descriptor_mappings: tuple[PosixDescriptorMapping, ...]
     terminal: PosixProcessTerminal
+    activation_deadline: PosixProcessActivationDeadline
 
     def __post_init__(self) -> None:
         if type(self.program) is not PosixProcessProgram:
@@ -194,6 +282,11 @@ class PosixProcessLaunchSpec:
             PosixProcessJoinGroup,
         ):
             raise ValueError("PosixProcessLaunchSpec.group_mode must be typed")
+        if type(self.activation_deadline) not in (
+            PosixProcessConfiguredActivationDeadline,
+            PosixProcessAbsoluteActivationDeadline,
+        ):
+            raise ValueError("PosixProcessLaunchSpec.activation_deadline must be typed")
         targets = self._validate_descriptor_mappings()
         self._validate_terminal(targets)
 

@@ -101,7 +101,7 @@ class ValidationRecord:
         self._validate_exact_types()
         self._validate_identity_fields()
         self._validate_optional_paths()
-        self._validate_timestamp_order()
+        self._validate_timestamps()
         self._validate_result_consistency()
 
     def _validate_exact_types(self) -> None:
@@ -144,18 +144,14 @@ class ValidationRecord:
             if value is not None and (type(value) is not str or not value):
                 raise TypeError(f"ValidationRecord.{name} must be str or None")
 
-    def _validate_timestamp_order(self) -> None:
+    def _validate_timestamps(self) -> None:
         try:
-            started_at = datetime.fromisoformat(self.started_at)
-            ended_at = datetime.fromisoformat(self.ended_at)
+            datetime.fromisoformat(self.started_at)
+            datetime.fromisoformat(self.ended_at)
         except ValueError as exc:
             raise ValueError(
                 "ValidationRecord timestamps must be ISO-8601 datetime strings"
             ) from exc
-        if ended_at < started_at:
-            raise ValueError(
-                "ValidationRecord.ended_at must not precede ValidationRecord.started_at"
-            )
 
     def _validate_result_consistency(self) -> None:
         if self.passed is not (self.exit_code == 0):

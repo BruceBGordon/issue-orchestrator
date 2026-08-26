@@ -269,9 +269,7 @@ class ExecutedCommandResourceRecord(ExecutorStrictRecord):
             concurrency=resources.concurrency,
             wall_seconds=resources.wall_seconds,
             cpu_seconds=resources.cpu_seconds,
-            max_rss_bytes=(
-                resources.guardian_process_lifetime_children_max_rss_bytes
-            ),
+            max_rss_bytes=(resources.guardian_process_lifetime_children_max_rss_bytes),
             input_blocks=resources.input_blocks,
             output_blocks=resources.output_blocks,
         )

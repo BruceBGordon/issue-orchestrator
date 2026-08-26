@@ -20,9 +20,11 @@ Exit codes:
 import os
 import sys
 import time
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import TextIO, cast
 
@@ -69,6 +71,7 @@ from ...ports.contained_command import (
     ContainedShellCommand,
 )
 from ...ports.retained_thread import RetainedThreadFactory
+from ...ports.validation_host_probe import ValidationHostProbe
 
 _RESOURCE_SAMPLING_POLICY = ValidationResourceSamplingPolicy(
     sample_interval_seconds=5.0,
@@ -95,6 +98,20 @@ SYSTEM_VALIDATION_RUNNER_CLOCK = ValidationRunnerClock(
     wall_now=lambda: datetime.now(timezone.utc),
     monotonic_now=time.monotonic,
 )
+
+
+def _require_validation_wall_datetime(value: object, field_name: str) -> datetime:
+    if type(value) is not datetime:
+        raise ValueError(f"{field_name} must be a datetime")
+    if value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
+    return value
+
+
+def _require_validation_monotonic(value: object, field_name: str) -> float:
+    if type(value) is not float or not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"{field_name} must be finite and non-negative")
+    return value
 
 
 def find_worktree_root() -> Path:
@@ -142,13 +159,62 @@ def load_validation_cmd(worktree: Path) -> str | None:
 
 
 @dataclass(frozen=True, slots=True)
-class _TimedValidationCommandResult:
-    """One contained terminal fact paired with monotonic/wall-clock evidence."""
+class _ValidationTimingAvailable:
+    """Complete monotonic and wall-clock evidence for one command."""
 
-    command_result: ContainedCommandResult
     duration_seconds: float
     wall_ended_at: datetime
     monotonic_ended_at: float
+
+    def __post_init__(self) -> None:
+        _require_validation_monotonic(
+            self.duration_seconds,
+            "validation timing duration",
+        )
+        _require_validation_wall_datetime(
+            self.wall_ended_at,
+            "validation wall end",
+        )
+        _require_validation_monotonic(
+            self.monotonic_ended_at,
+            "validation monotonic end",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationTimingUnavailable:
+    """Exact failures that prevented a complete timing observation."""
+
+    failures: tuple[ContainedCommandFailure, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.failures) is not tuple or not self.failures:
+            raise ValueError("unavailable validation timing requires failures")
+        if any(
+            type(failure) is not ContainedCommandFailure for failure in self.failures
+        ):
+            raise ValueError("validation timing failures must be typed")
+
+
+_ValidationTiming = _ValidationTimingAvailable | _ValidationTimingUnavailable
+
+
+class _ValidationTerminalLifecycle(StrEnum):
+    """Exact lifecycle vocabulary emitted by the human terminal marker."""
+
+    COMPLETED = "completed"
+    CAPTURE_FAILED = "capture-failed"
+    FINALIZATION_FAILED = "finalization-failed"
+    CLEANUP_FAILED = "cleanup-failed"
+    OUTCOME_UNAVAILABLE = "outcome-unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationCommandResult:
+    """One contained terminal fact paired with exact timing evidence."""
+
+    command_result: ContainedCommandResult
+    timing: _ValidationTiming
 
     def __post_init__(self) -> None:
         if type(self.command_result) not in (
@@ -159,12 +225,13 @@ class _TimedValidationCommandResult:
             ContainedCommandCleanupFailed,
         ):
             raise ValueError(
-                "timed validation result requires a closed contained-command result"
+                "validation result requires a closed contained-command result"
             )
-        if type(self.duration_seconds) is not float or self.duration_seconds < 0.0:
-            raise ValueError(
-                "timed validation result duration must be a non-negative float"
-            )
+        if type(self.timing) not in (
+            _ValidationTimingAvailable,
+            _ValidationTimingUnavailable,
+        ):
+            raise ValueError("validation result requires closed timing evidence")
 
     @property
     def validation_exit_code(self) -> int:
@@ -176,6 +243,22 @@ class _TimedValidationCommandResult:
     def passed(self) -> bool:
         """Whether validation completed with the success exit status."""
         return self.validation_exit_code == 0
+
+    @property
+    def elapsed_marker(self) -> str:
+        if type(self.timing) is _ValidationTimingUnavailable:
+            return "unavailable"
+        if type(self.timing) is _ValidationTimingAvailable:
+            return f"{self.timing.duration_seconds:.1f}s"
+        raise AssertionError("validation timing evidence is a closed union")
+
+    @property
+    def duration_seconds(self) -> float:
+        if type(self.timing) is _ValidationTimingUnavailable:
+            raise AssertionError("failed validation timing has no duration")
+        if type(self.timing) is _ValidationTimingAvailable:
+            return self.timing.duration_seconds
+        raise AssertionError("validation timing evidence is a closed union")
 
 
 @dataclass(slots=True)
@@ -292,40 +375,95 @@ def _command_result_process_id(result: ContainedCommandResult) -> str:
     raise AssertionError("closed command result has unknown child identity")
 
 
-def _record_terminal_marker(
-    output_file: Path,
-    result: _TimedValidationCommandResult,
-) -> None:
+@dataclass(frozen=True, slots=True)
+class _ValidationTerminalMarkers:
+    eof: str
+    terminal: str
+
+    def __post_init__(self) -> None:
+        if type(self.eof) is not str or not self.eof:
+            raise ValueError("validation EOF marker must be non-empty")
+        if type(self.terminal) is not str or not self.terminal:
+            raise ValueError("validation terminal marker must be non-empty")
+
+
+def _build_terminal_markers(
+    result: _ValidationCommandResult,
+) -> _ValidationTerminalMarkers:
     command_result = result.command_result
-    lifecycle = (
-        "completed"
-        if type(command_result) is ContainedCommandCompleted
-        else "capture-failed"
-    )
+    lifecycle = _command_result_lifecycle(command_result)
     terminal_marker = _command_result_terminal_marker(command_result)
     metrics = _command_result_metrics(command_result)
-    marker = (
-        f"[validate_runner] {terminal_marker} "
-        f"pid={_command_result_process_id(command_result)} "
-        f"child_exit_code={_command_result_child_exit(command_result)} "
-        f"validation_exit_code={result.validation_exit_code} "
-        f"lifecycle={lifecycle} "
-        f"process_group_cleanup={_command_result_cleanup(command_result)} "
-        f"elapsed={result.duration_seconds:.1f}s "
-        f"{metrics}\n"
+    return _ValidationTerminalMarkers(
+        eof=(
+            "[validate_runner] stdout_eof "
+            f"pid={_command_result_process_id(command_result)} "
+            f"{metrics} "
+            f"elapsed={result.elapsed_marker}\n"
+        ),
+        terminal=(
+            f"[validate_runner] {terminal_marker} "
+            f"pid={_command_result_process_id(command_result)} "
+            f"child_exit_code={_command_result_child_exit(command_result)} "
+            f"validation_exit_code={result.validation_exit_code} "
+            f"lifecycle={lifecycle.value} "
+            f"process_group_cleanup={_command_result_cleanup(command_result)} "
+            f"elapsed={result.elapsed_marker} "
+            f"{metrics}\n"
+        ),
     )
-    eof_marker = (
-        "[validate_runner] stdout_eof "
-        f"pid={_command_result_process_id(command_result)} "
-        f"{metrics} "
-        f"elapsed={result.duration_seconds:.1f}s\n"
-    )
-    with open(output_file, "a", encoding="utf-8") as output_handle:
-        output_handle.write(eof_marker)
-        output_handle.write(marker)
-    sys.stdout.write(eof_marker)
-    sys.stdout.write(marker)
-    sys.stdout.flush()
+
+
+def _append_terminal_file_markers(
+    output_file: Path,
+    markers: _ValidationTerminalMarkers,
+) -> tuple[ContainedCommandFailure, ...]:
+    failures: list[ContainedCommandFailure] = []
+    try:
+        output_handle = open(output_file, "a", encoding="utf-8")
+    except BaseException as error:
+        failures.append(ContainedCommandFailure(error))
+    else:
+        try:
+            output_handle.write(markers.eof)
+            output_handle.write(markers.terminal)
+        except BaseException as error:
+            failures.append(ContainedCommandFailure(error))
+        finally:
+            try:
+                output_handle.close()
+            except BaseException as error:
+                failures.append(ContainedCommandFailure(error))
+    return tuple(failures)
+
+
+def _write_terminal_console_markers(
+    markers: _ValidationTerminalMarkers,
+) -> tuple[ContainedCommandFailure, ...]:
+    failures: list[ContainedCommandFailure] = []
+    try:
+        sys.stdout.write(markers.eof)
+        sys.stdout.write(markers.terminal)
+        sys.stdout.flush()
+    except BaseException as error:
+        failures.append(ContainedCommandFailure(error))
+    return tuple(failures)
+
+
+def _command_result_lifecycle(
+    result: ContainedCommandResult,
+) -> _ValidationTerminalLifecycle:
+    if type(result) is ContainedCommandCompleted:
+        return _ValidationTerminalLifecycle.COMPLETED
+    if type(result) is ContainedCommandCaptureFailed:
+        return _ValidationTerminalLifecycle.CAPTURE_FAILED
+    if type(result) is ContainedCommandFinalizationFailed:
+        return _ValidationTerminalLifecycle.FINALIZATION_FAILED
+    if type(result) is ContainedCommandCleanupFailed:
+        return _ValidationTerminalLifecycle.CLEANUP_FAILED
+    if type(result) is ContainedCommandOutcomeUnavailable:
+        return _ValidationTerminalLifecycle.OUTCOME_UNAVAILABLE
+    raise AssertionError("closed command result has unknown lifecycle fact")
 
 
 def _command_result_terminal_marker(result: ContainedCommandResult) -> str:
@@ -372,16 +510,13 @@ def _not_started_capture_failure(
     )
 
 
-def _finalize_validation_evidence(
+def _stop_validation_resource_sampler(
     *,
     sampler: ValidationResourceSampler,
     sampler_start: ValidationResourceSamplerStart,
-    recorder: ValidateTimingRecorder,
-    result: _TimedValidationCommandResult,
-    wall_started_at: datetime,
-    monotonic_started_at: float,
-) -> _TimedValidationCommandResult:
-    finalized_result = result
+    result: _ValidationCommandResult,
+) -> _ValidationCommandResult:
+    stopped_result = result
     if type(sampler_start) in (
         ValidationResourceSamplerStarted,
         ValidationResourceSamplerStartIndeterminate,
@@ -393,27 +528,131 @@ def _finalize_validation_evidence(
         else:
             shutdown_failure = validation_resource_sampler_shutdown_failure(shutdown)
         if shutdown_failure is not None:
-            finalized_result = _with_sampler_shutdown_failure(
-                result,
+            stopped_result = _with_sampler_shutdown_failure(
+                stopped_result,
                 ContainedCommandFailure(shutdown_failure),
             )
     elif type(sampler_start) is not ValidationResourceSamplerStartRejected:
         raise AssertionError("validation resource sampler start is a closed union")
-    recorder.finalize(
-        command_result=finalized_result.command_result,
-        total_elapsed_seconds=finalized_result.duration_seconds,
-        wall_started_at=wall_started_at,
-        monotonic_started_at=monotonic_started_at,
-        wall_ended_at=finalized_result.wall_ended_at,
-        monotonic_ended_at=finalized_result.monotonic_ended_at,
-    )
-    return finalized_result
+    return stopped_result
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationSummaryPublished:
+    result: _ValidationCommandResult
+
+    def __post_init__(self) -> None:
+        if type(self.result) is not _ValidationCommandResult:
+            raise ValueError("published validation summary result must be typed")
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationSummaryPublicationFailed:
+    result: _ValidationCommandResult
+
+    def __post_init__(self) -> None:
+        if type(self.result) is not _ValidationCommandResult:
+            raise ValueError("failed validation summary result must be typed")
+
+
+_ValidationSummaryPublication = (
+    _ValidationSummaryPublished | _ValidationSummaryPublicationFailed
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationTerminalEvidenceOwner:
+    """Publish terminal/file facts before one final durable aggregate."""
+
+    recorder: ValidateTimingRecorder
+    output_file: Path
+    wall_started_at: datetime
+    monotonic_started_at: float
+
+    def __post_init__(self) -> None:
+        if type(self.recorder) is not ValidateTimingRecorder:
+            raise ValueError("validation terminal owner recorder must be typed")
+        if not isinstance(self.output_file, Path) or not self.output_file.is_absolute():
+            raise ValueError("validation terminal owner output file must be absolute")
+        _require_validation_wall_datetime(
+            self.wall_started_at,
+            "validation terminal owner wall start",
+        )
+        _require_validation_monotonic(
+            self.monotonic_started_at,
+            "validation terminal owner monotonic start",
+        )
+
+    def publish(self, result: _ValidationCommandResult) -> _ValidationCommandResult:
+        published_result = result
+        file_markers = _build_terminal_markers(published_result)
+        for failure in _append_terminal_file_markers(
+            self.output_file,
+            file_markers,
+        ):
+            published_result = _with_post_execution_failure(
+                published_result,
+                failure,
+                "validation execution and terminal-file reporting both failed",
+            )
+        console_markers = _build_terminal_markers(published_result)
+        for failure in _write_terminal_console_markers(console_markers):
+            published_result = _with_post_execution_failure(
+                published_result,
+                failure,
+                "validation execution and terminal-console reporting both failed",
+            )
+        publication = self._publish_summary(published_result)
+        if type(publication) is _ValidationSummaryPublished:
+            return publication.result
+        if type(publication) is not _ValidationSummaryPublicationFailed:
+            raise AssertionError("validation summary publication is a closed union")
+        reporting_result = publication.result
+        reporting_markers = _build_terminal_markers(reporting_result)
+        for failure in (
+            *_append_terminal_file_markers(self.output_file, reporting_markers),
+            *_write_terminal_console_markers(reporting_markers),
+        ):
+            reporting_result = _with_post_execution_failure(
+                reporting_result,
+                failure,
+                "validation execution and final reporting both failed",
+            )
+        return reporting_result
+
+    def _publish_summary(
+        self,
+        result: _ValidationCommandResult,
+    ) -> _ValidationSummaryPublication:
+        timing = result.timing
+        if type(timing) is _ValidationTimingUnavailable:
+            return _ValidationSummaryPublished(result)
+        if type(timing) is not _ValidationTimingAvailable:
+            raise AssertionError("validation timing evidence is a closed union")
+        try:
+            self.recorder.finalize(
+                command_result=result.command_result,
+                total_elapsed_seconds=timing.duration_seconds,
+                wall_started_at=self.wall_started_at,
+                monotonic_started_at=self.monotonic_started_at,
+                wall_ended_at=timing.wall_ended_at,
+                monotonic_ended_at=timing.monotonic_ended_at,
+            )
+        except BaseException as error:
+            return _ValidationSummaryPublicationFailed(
+                _with_post_execution_failure(
+                    result,
+                    ContainedCommandFailure(error),
+                    "validation execution and timing-recorder finalization both failed",
+                )
+            )
+        return _ValidationSummaryPublished(result)
 
 
 def _with_sampler_shutdown_failure(
-    result: _TimedValidationCommandResult,
+    result: _ValidationCommandResult,
     sampler_failure: ContainedCommandFailure,
-) -> _TimedValidationCommandResult:
+) -> _ValidationCommandResult:
     return _with_post_execution_failure(
         result,
         sampler_failure,
@@ -422,10 +661,10 @@ def _with_sampler_shutdown_failure(
 
 
 def _with_post_execution_failure(
-    result: _TimedValidationCommandResult,
+    result: _ValidationCommandResult,
     finalization_failure: ContainedCommandFailure,
     message: str,
-) -> _TimedValidationCommandResult:
+) -> _ValidationCommandResult:
     command_result = result.command_result
     if type(command_result) is ContainedCommandCompleted:
         failed_result: ContainedCommandResult = ContainedCommandFinalizationFailed(
@@ -496,11 +735,9 @@ def _with_post_execution_failure(
         )
     else:
         raise AssertionError("contained command result is a closed union")
-    return _TimedValidationCommandResult(
+    return _ValidationCommandResult(
         command_result=failed_result,
-        duration_seconds=result.duration_seconds,
-        wall_ended_at=result.wall_ended_at,
-        monotonic_ended_at=result.monotonic_ended_at,
+        timing=result.timing,
     )
 
 
@@ -512,6 +749,49 @@ def _combine_command_failures(
     return ContainedCommandFailure(
         BaseExceptionGroup(message, (primary.error, secondary.error))
     )
+
+
+def _observe_validation_end_timing(
+    clock: ValidationRunnerClock,
+    *,
+    monotonic_started_at: float,
+) -> _ValidationTiming:
+    """Read both end clocks independently and return all-or-nothing evidence."""
+    try:
+        wall_read: datetime | ContainedCommandFailure = (
+            _require_validation_wall_datetime(
+                clock.wall_now(),
+                "validation wall end",
+            )
+        )
+    except BaseException as error:
+        wall_read = ContainedCommandFailure(error)
+
+    try:
+        monotonic_read: float | ContainedCommandFailure = _require_validation_monotonic(
+            clock.monotonic_now(),
+            "validation monotonic end",
+        )
+    except BaseException as error:
+        monotonic_read = ContainedCommandFailure(error)
+
+    failures = tuple(
+        read
+        for read in (wall_read, monotonic_read)
+        if type(read) is ContainedCommandFailure
+    )
+    if failures:
+        return _ValidationTimingUnavailable(failures)
+    if type(wall_read) is not datetime or type(monotonic_read) is not float:
+        raise AssertionError("validation end clock reads are a closed union")
+    try:
+        return _ValidationTimingAvailable(
+            duration_seconds=monotonic_read - monotonic_started_at,
+            wall_ended_at=wall_read,
+            monotonic_ended_at=monotonic_read,
+        )
+    except BaseException as error:
+        return _ValidationTimingUnavailable((ContainedCommandFailure(error),))
 
 
 @dataclass(frozen=True, slots=True)
@@ -535,9 +815,10 @@ class _ValidationCapturePhase:
             ValidationResourceSamplerStartRejected,
         ):
             raise ValueError("validation capture phase sampler start must be closed")
-        if self.output_close_failure is not None and type(
-            self.output_close_failure
-        ) is not ContainedCommandFailure:
+        if (
+            self.output_close_failure is not None
+            and type(self.output_close_failure) is not ContainedCommandFailure
+        ):
             raise ValueError("validation output close failure must be typed")
 
 
@@ -554,7 +835,10 @@ def _capture_validation_phase(
     output_handle = open(output_file, "w", buffering=1)
     output_close_failure: ContainedCommandFailure | None = None
     try:
-        sampler_start = resource_sampler.start()
+        try:
+            sampler_start = resource_sampler.start()
+        except BaseException as error:
+            sampler_start = ValidationResourceSamplerStartIndeterminate(error)
         try:
             output_handle.write(
                 f"[validate_runner] start pid={os.getpid()} cwd={worktree} "
@@ -608,6 +892,48 @@ def _capture_after_sampler_start(
     )
 
 
+def _finalize_validation_run_evidence(
+    *,
+    clock: ValidationRunnerClock,
+    capture_phase: _ValidationCapturePhase,
+    resource_sampler: ValidationResourceSampler,
+    timing_recorder: ValidateTimingRecorder,
+    output_file: Path,
+    wall_started_at: datetime,
+    monotonic_started_at: float,
+) -> _ValidationCommandResult:
+    """Close each evidence seam independently around one exact command fact."""
+    timing = _observe_validation_end_timing(
+        clock,
+        monotonic_started_at=monotonic_started_at,
+    )
+    result = _ValidationCommandResult(capture_phase.command_result, timing)
+    if capture_phase.output_close_failure is not None:
+        result = _with_post_execution_failure(
+            result,
+            capture_phase.output_close_failure,
+            "validation execution and output-handle close both failed",
+        )
+    if type(timing) is _ValidationTimingUnavailable:
+        for timing_failure in timing.failures:
+            result = _with_post_execution_failure(
+                result,
+                timing_failure,
+                "validation execution and end-clock observation both failed",
+            )
+    result = _stop_validation_resource_sampler(
+        sampler=resource_sampler,
+        sampler_start=capture_phase.sampler_start,
+        result=result,
+    )
+    return _ValidationTerminalEvidenceOwner(
+        recorder=timing_recorder,
+        output_file=output_file.resolve(),
+        wall_started_at=wall_started_at,
+        monotonic_started_at=monotonic_started_at,
+    ).publish(result)
+
+
 def run_validation(
     command: str,
     output_dir: Path,
@@ -616,6 +942,7 @@ def run_validation(
     clock: ValidationRunnerClock,
     contained_command_capture: ContainedCommandCapture,
     retained_thread_factory: RetainedThreadFactory,
+    host_probe: ValidationHostProbe,
 ) -> int:
     """Run validation command and capture output.
 
@@ -630,10 +957,19 @@ def run_validation(
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "validation-output.log"
     is_orchestrated_run = get_env("VALIDATION_OUTPUT_DIR") is not None
+    wall_start = _require_validation_wall_datetime(
+        clock.wall_now(),
+        "validation wall start",
+    )
+    start = _require_validation_monotonic(
+        clock.monotonic_now(),
+        "validation monotonic start",
+    )
     timing_recorder = ValidateTimingRecorder(worktree=worktree, command=command)
     resource_probe = SystemValidationResourceProbe(
         worktree=worktree.resolve(),
         policy=_RESOURCE_SAMPLING_POLICY,
+        host_probe=host_probe,
     )
     resource_sampler = ValidationResourceSampler(
         recorder=timing_recorder,
@@ -650,8 +986,6 @@ def run_validation(
         )
     print()
 
-    wall_start = clock.wall_now()
-    start = clock.monotonic_now()
     capture_phase = _capture_validation_phase(
         command=command,
         worktree=worktree,
@@ -662,29 +996,15 @@ def run_validation(
         contained_command_capture=contained_command_capture,
     )
 
-    wall_end = clock.wall_now()
-    monotonic_end = clock.monotonic_now()
-    result = _TimedValidationCommandResult(
-        command_result=capture_phase.command_result,
-        duration_seconds=monotonic_end - start,
-        wall_ended_at=wall_end,
-        monotonic_ended_at=monotonic_end,
-    )
-    if capture_phase.output_close_failure is not None:
-        result = _with_post_execution_failure(
-            result,
-            capture_phase.output_close_failure,
-            "validation execution and output-handle close both failed",
-        )
-    result = _finalize_validation_evidence(
-        sampler=resource_sampler,
-        sampler_start=capture_phase.sampler_start,
-        recorder=timing_recorder,
-        result=result,
+    result = _finalize_validation_run_evidence(
+        clock=clock,
+        capture_phase=capture_phase,
+        resource_sampler=resource_sampler,
+        timing_recorder=timing_recorder,
+        output_file=output_file,
         wall_started_at=wall_start,
         monotonic_started_at=start,
     )
-    _record_terminal_marker(output_file, result)
 
     finalized_command_result = result.command_result
     if type(finalized_command_result) is ContainedCommandCaptureFailed:
@@ -753,7 +1073,10 @@ def main() -> None:
         sys.exit(2)
 
     from ..bootstrap import build_contained_command_capture
-    from ..bootstrap_executor import build_retained_thread_factory
+    from ..bootstrap_executor import (
+        build_retained_thread_factory,
+        build_validation_host_probe,
+    )
 
     exit_code = run_validation(
         command,
@@ -762,6 +1085,7 @@ def main() -> None:
         clock=SYSTEM_VALIDATION_RUNNER_CLOCK,
         contained_command_capture=build_contained_command_capture(),
         retained_thread_factory=build_retained_thread_factory(),
+        host_probe=build_validation_host_probe(),
     )
     sys.exit(exit_code)
 
