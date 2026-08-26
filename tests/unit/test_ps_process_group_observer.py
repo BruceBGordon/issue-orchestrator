@@ -52,8 +52,8 @@ def test_snapshot_accepts_system_pid_one_and_identifies_requested_process(
 ) -> None:
     observer = _observer(
         tmp_path,
-        "1 1 Ss\n"
-        "42 42 S",
+        "1 1 1 Ss\n"
+        "42 42 42 S",
     )
 
     assert observer.observe_process(42) == ProcessIdentityPresent(
@@ -67,14 +67,14 @@ def test_group_observation_distinguishes_zombies_from_executable_members(
 ) -> None:
     zombies = _observer(
         tmp_path,
-        "42 42 Z\n"
-        "43 42 Z+",
+        "42 42 42 Z\n"
+        "43 42 42 Z+",
         name="ps-zombies",
     )
     executable = _observer(
         tmp_path,
-        "42 42 Z\n"
-        "43 42 S+",
+        "42 42 42 Z\n"
+        "43 42 42 S+",
         name="ps-executable",
     )
 

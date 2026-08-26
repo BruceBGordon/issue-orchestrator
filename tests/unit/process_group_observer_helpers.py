@@ -40,6 +40,10 @@ class RecordingProcessGroupObserver:
         self.process_group_ids.append(process_group_id)
         return self._group_observation
 
+    def observe_session_group_ids(self, session_id: int) -> tuple[int, ...]:
+        del session_id
+        return ()
+
     def observe_session(
         self,
         process_id: int,

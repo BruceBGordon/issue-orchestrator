@@ -51,6 +51,10 @@ class _LeaderDisappearsBeforeReusedGroupObserver:
         del process_id
         return ProcessIdentityAbsent()
 
+    def observe_session_group_ids(self, session_id: int) -> tuple[int, ...]:
+        del session_id
+        return ()
+
     def observe_group(self, process_group_id: int) -> ProcessGroupObservation:
         del process_group_id
         return ProcessGroupExecutable(1)
