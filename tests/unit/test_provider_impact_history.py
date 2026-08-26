@@ -221,7 +221,8 @@ def test_provider_outage_lifecycle_survives_in_issue_history():
     assert blocked_label in labels.labels
 
     # --- Provider confirms recovery: a successful call deletes the row. ---
-    manager.record_success(PROVIDER, now=NOW + timedelta(minutes=10))
+    success_at = NOW + timedelta(minutes=10)
+    manager.record_success(PROVIDER, observed_at=success_at, now=success_at)
     later = NOW + timedelta(minutes=10)
     assert manager.is_open(PROVIDER, later) is False
 
@@ -393,7 +394,7 @@ def test_release_after_confirmed_success_has_distinct_wording():
 
     # A successful call deletes the row: the provider is confirmed healthy.
     later = NOW + timedelta(minutes=5)
-    manager.record_success(PROVIDER, now=later)
+    manager.record_success(PROVIDER, observed_at=later, now=later)
 
     assessment = policy.assess((PROVIDER,), now=later)
     assert assessment.recovering_providers == ()

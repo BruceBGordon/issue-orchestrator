@@ -289,6 +289,14 @@ class EventName(str, Enum):
     #   * a session already running: it is terminated
     #     => SESSION_PROVIDER_AUTH_TERMINATED
     PROVIDER_AUTH_FAILED = "provider.auth_failed"
+    # A typed QUOTA outcome reached the circuit owner: the provider reported an
+    # exhausted balance or usage allowance. Fleet-scoped like its neighbours.
+    # Distinct from PROVIDER_AUTH_FAILED because the operator action differs —
+    # the credential is valid and re-authenticating changes nothing — and
+    # distinct from PROVIDER_TRANSIENT_ERROR because no retry schedule applies.
+    # Unlike the auth verdict this can only ever come from what a session
+    # printed: no provider CLI exposes a balance to probe (#7096).
+    PROVIDER_QUOTA_EXHAUSTED = "provider.quota_exhausted"
     PROVIDER_OUTAGE_ENTERED = "provider.outage_entered"
     PROVIDER_RETRY_SCHEDULED = "provider.retry_scheduled"
     PROVIDER_RETRY_ATTEMPTED = "provider.retry_attempted"

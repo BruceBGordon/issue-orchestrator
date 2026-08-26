@@ -178,13 +178,18 @@ def record_completed_session_problem(
     exists to serve. Tech Lead's own sessions are excluded below — that check, not
     task kind, is what prevents tech_lead self-recursion.
 
-    A typed AUTH verdict is excluded: an unauthenticated provider says nothing
-    about the issue, and on 2026-08-04 one expired login minted four failure
-    investigations that each spent their budget reading the wrong code. Only a
-    human re-authenticating clears it, and the circuit owner has already paused
-    the fleet — an investigation adds load, not information (#6999).
+    A typed human-fixable verdict is excluded: a provider that never ran says
+    nothing about the issue, and on 2026-08-04 one expired login minted four
+    failure investigations that each spent their budget reading the wrong code.
+    Only a person clears it — by re-authenticating, or by restoring an
+    exhausted balance — and the circuit owner has already paused the fleet, so
+    an investigation adds load, not information (#6999, #7096).
+
+    The exclusion is asked as a policy question rather than named as AUTH.
+    Quota exhaustion mints exactly the same worthless investigations, and
+    naming one cause here is how the second one got investigated anyway.
     """
-    if provider_error_type is ProviderErrorType.AUTH:
+    if provider_error_type is not None and provider_error_type.requires_human_intervention:
         return
     if status not in _REACTIVE_SESSION_STATUSES:
         return

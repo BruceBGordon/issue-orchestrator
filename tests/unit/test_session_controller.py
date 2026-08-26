@@ -17,6 +17,7 @@ from issue_orchestrator.control.session_controller import (
     SessionController,
     SessionDecision,
 )
+from issue_orchestrator.control.session_decision import provider_success_from_status
 from issue_orchestrator.control.completion_processor import CompletionProcessor
 from issue_orchestrator.control.completion_types import ProcessingResult
 from issue_orchestrator.control.completion_record_validation import (
@@ -296,6 +297,55 @@ class TestSessionControllerRunning:
 class TestSessionControllerTerminated:
     """Tests for TERMINATED observation (session exited)."""
 
+    def test_unnamed_provider_success_has_no_circuit_effect(self) -> None:
+        """Generic runners can succeed without identifying a circuit provider."""
+        status = ProviderStatus(
+            provider=None,
+            error_type=None,
+            attempts=1,
+            succeeded=True,
+            exit_code=0,
+            timed_out=False,
+            last_error_summary=None,
+            last_attempt_at="2026-08-26T00:20:00+00:00",
+        )
+
+        assert provider_success_from_status(status) is None
+
+    def test_provider_status_missing_observation_time_fails_loudly(self) -> None:
+        """Persisted recovery evidence must never fabricate a fresh timestamp."""
+        with pytest.raises(
+            ValueError, match="provider status must include last_attempt_at"
+        ):
+            ProviderStatus.from_dict(
+                {
+                    "provider": "codex",
+                    "succeeded": True,
+                    "attempts": 1,
+                }
+            )
+
+    @pytest.mark.parametrize(
+        "last_attempt_at",
+        ["not-a-timestamp", "2026-08-26T00:20:00"],
+    )
+    def test_provider_success_invalid_observation_time_fails_loudly(
+        self, last_attempt_at: str
+    ) -> None:
+        status = ProviderStatus(
+            provider="codex",
+            error_type=None,
+            attempts=1,
+            succeeded=True,
+            exit_code=0,
+            timed_out=False,
+            last_error_summary=None,
+            last_attempt_at=last_attempt_at,
+        )
+
+        with pytest.raises(ValueError, match="last_attempt_at"):
+            provider_success_from_status(status)
+
     def test_provider_success_is_returned_as_decision_effect(
         self,
         tmp_path: Path,
@@ -313,6 +363,7 @@ class TestSessionControllerTerminated:
         session_name = "issue-123"
         worktree = tmp_path / "worktree"
         run_assets = make_session_run_assets(worktree, session_name, session_output)
+        attempted_at = "2026-08-26T00:20:00+00:00"
         write_provider_status(
             run_assets.run_dir,
             ProviderStatus(
@@ -323,7 +374,7 @@ class TestSessionControllerTerminated:
                 exit_code=0,
                 timed_out=False,
                 last_error_summary=None,
-                last_attempt_at=now_iso(),
+                last_attempt_at=attempted_at,
             ),
         )
 
@@ -337,7 +388,11 @@ class TestSessionControllerTerminated:
         )
 
         assert decision.status == SessionStatus.COMPLETED
-        assert decision.provider_success == "codex"
+        assert decision.provider_success is not None
+        assert decision.provider_success.provider == "codex"
+        assert decision.provider_success.observed_at == datetime.fromisoformat(
+            attempted_at
+        )
 
     def test_provider_transient_failure_is_returned_as_decision_effect(
         self,
@@ -356,6 +411,7 @@ class TestSessionControllerTerminated:
         session_name = "issue-123"
         worktree = tmp_path / "worktree"
         run_assets = make_session_run_assets(worktree, session_name, session_output)
+        attempted_at = "2026-08-26T00:19:00+00:00"
         write_provider_status(
             run_assets.run_dir,
             ProviderStatus(
@@ -366,7 +422,7 @@ class TestSessionControllerTerminated:
                 exit_code=1,
                 timed_out=False,
                 last_error_summary="provider overloaded",
-                last_attempt_at=now_iso(),
+                last_attempt_at=attempted_at,
             ),
         )
 
@@ -388,6 +444,109 @@ class TestSessionControllerTerminated:
         assert decision.provider_transient_failure.provider == "codex"
         assert decision.provider_transient_failure.error_summary == "provider overloaded"
         assert decision.provider_transient_failure.attempts == 3
+        assert decision.provider_transient_failure.observed_at == datetime.fromisoformat(
+            attempted_at
+        )
+
+    def test_quota_failure_without_provider_identity_fails_fast(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Malformed quota evidence must not silently degrade to TIMED_OUT."""
+        processor = MockCompletionProcessor()
+        processor.completion_record = None
+        session_output = FileSystemSessionOutput()
+        controller = SessionController(
+            completion_processor=processor,
+            events=NullEventSink(),
+            session_output=session_output,
+            working_copy=StubWorkingCopy(),
+        )
+        session_name = "issue-123"
+        worktree = tmp_path / "worktree"
+        run_assets = make_session_run_assets(worktree, session_name, session_output)
+        write_provider_status(
+            run_assets.run_dir,
+            ProviderStatus(
+                provider=None,
+                error_type=ProviderErrorType.QUOTA,
+                attempts=1,
+                succeeded=False,
+                exit_code=1,
+                timed_out=True,
+                last_error_summary="usage_limit_exceeded",
+                last_attempt_at=now_iso(),
+            ),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="failed QUOTA ProviderStatus must carry a named provider",
+        ):
+            controller.decide_outcome(
+                SessionObservationResult.timed_out(
+                    runtime_minutes=60.0,
+                    timeout_minutes=45,
+                    session_exists=True,
+                ),
+                worktree,
+                123,
+                "Test Issue",
+                session_name,
+                session_run_assets=run_assets,
+            )
+
+    def test_quota_failure_keeps_the_provider_observation_time(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The circuit effect carries attempt chronology, not drain time."""
+        processor = MockCompletionProcessor()
+        processor.completion_record = None
+        session_output = FileSystemSessionOutput()
+        controller = SessionController(
+            completion_processor=processor,
+            events=NullEventSink(),
+            session_output=session_output,
+            working_copy=StubWorkingCopy(),
+        )
+        session_name = "issue-123"
+        worktree = tmp_path / "worktree"
+        run_assets = make_session_run_assets(worktree, session_name, session_output)
+        attempted_at = "2026-08-26T00:20:00+00:00"
+        write_provider_status(
+            run_assets.run_dir,
+            ProviderStatus(
+                provider="codex",
+                error_type=ProviderErrorType.QUOTA,
+                attempts=1,
+                succeeded=False,
+                exit_code=1,
+                timed_out=True,
+                last_error_summary="usage_limit_exceeded",
+                last_attempt_at=attempted_at,
+            ),
+        )
+
+        decision = controller.decide_outcome(
+            SessionObservationResult.timed_out(
+                runtime_minutes=60.0,
+                timeout_minutes=45,
+                session_exists=True,
+            ),
+            worktree,
+            123,
+            "Test Issue",
+            session_name,
+            session_run_assets=run_assets,
+        )
+
+        assert decision.status == SessionStatus.BLOCKED
+        assert decision.provider_quota_failure is not None
+        assert decision.provider_quota_failure.provider == "codex"
+        assert decision.provider_quota_failure.observed_at == datetime.fromisoformat(
+            attempted_at
+        )
 
     def test_terminated_without_completion_record_is_failed(self, tmp_path: Path):
         """Session that exits without completion.json = FAILED."""

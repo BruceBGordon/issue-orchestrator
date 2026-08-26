@@ -12,7 +12,22 @@ class ProviderErrorType(str, Enum):
     TRANSIENT = "transient"
     RATE_LIMIT = "rate_limit"
     AUTH = "auth"
+    QUOTA = "quota"
     FATAL = "fatal"
+
+    @property
+    def requires_human_intervention(self) -> bool:
+        """Whether waiting can never clear this failure.
+
+        The distinction the retry ladder and the circuit both turn on. A
+        transient outage and a rate limit heal on a timer; an expired
+        credential and an exhausted balance heal only when a person acts.
+        Call sites that mean "a human must fix this" branch on this predicate
+        rather than on ``is AUTH``, so adding a second human-fixable cause
+        does not silently reinstate the retry-until-the-wall-clock behaviour
+        that AUTH was given its own window to prevent (#6999).
+        """
+        return self in (ProviderErrorType.AUTH, ProviderErrorType.QUOTA)
 
 
 @dataclass(frozen=True)
@@ -23,7 +38,9 @@ class ProviderCircuitState:
     provider, and each has its own validity window. Collapsing them into a
     single ``open_until`` meant retiring one silently released the other: a
     ``READY`` credential probe says nothing about a 429/5xx outage, but would
-    have re-opened launches into it (#6999 F3). Both dimensions are stored, and
+    have re-opened launches into it (#6999 F3). An exhausted balance is a third
+    such fact, independent of both: credits are not restored by a service
+    recovering, nor by a login being renewed. Every dimension is stored, and
     "is the circuit open" is *derived* from them.
     """
 
@@ -33,6 +50,9 @@ class ProviderCircuitState:
     updated_at: datetime
     # Deadline for the escalating transient ladder (429/5xx/transport).
     transient_open_until: datetime | None = None
+    # Observation watermark for transient state. Success may arrive out of
+    # attempt order and can retire only an outage older than itself.
+    transient_observed_at: datetime | None = None
     # Deadline for the human-fixable credential outage. Its own (long) window,
     # cleared the moment the probe confirms re-authentication.
     auth_open_until: datetime | None = None
@@ -46,20 +66,51 @@ class ProviderCircuitState:
     # exactly once so a configured threshold > 1 still means "more than one
     # observation" (#6999 F2).
     last_auth_sample_id: str = ""
+    # Deadline for an exhausted balance or usage allowance. A third dimension
+    # rather than a reuse of the auth window, because the two recover on
+    # different signals: a readiness probe confirming a valid login proves
+    # nothing about restored credits, while a successful provider call does.
+    # Clearing the auth window must therefore not release a quota outage.
+    quota_open_until: datetime | None = None
+    consecutive_quota_failures: int = 0
+    # Observation watermark for the quota dimension. Completion effects can be
+    # applied out of attempt order, so recovery evidence must be newer than the
+    # exhaustion fact it retires.
+    quota_observed_at: datetime | None = None
 
     @property
     def open_until(self) -> datetime | None:
-        """The latest deadline across both causes, or ``None`` if neither is set.
+        """The latest deadline across all causes, or ``None`` if none are set.
 
         The aggregate the circuit is judged on: a provider is unavailable while
         *any* cause is still within its own window.
         """
         deadlines = [
             deadline
-            for deadline in (self.transient_open_until, self.auth_open_until)
+            for deadline in (
+                self.transient_open_until,
+                self.auth_open_until,
+                self.quota_open_until,
+            )
             if deadline is not None
         ]
         return max(deadlines) if deadlines else None
+
+
+@dataclass(frozen=True)
+class ProviderEvidenceWatermarks:
+    """Durable chronology for provider-call evidence.
+
+    This ledger is deliberately separate from :class:`ProviderCircuitState`.
+    A confirmed healthy provider has no active circuit row, but its success
+    observation must survive so a late, older failure cannot reopen the
+    circuit after completion effects drain out of order.
+    """
+
+    provider: str
+    success_observed_at: datetime | None = None
+    transient_failure_observed_at: datetime | None = None
+    quota_failure_observed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -124,7 +175,7 @@ NO_PROVIDER_CIRCUIT_STATUS: StaticProviderCircuitStatusReader = (
 
 
 class ProviderCircuitStore(Protocol):
-    """Persistence for provider circuit breaker state."""
+    """Persistence for active circuits and their durable evidence ledger."""
 
     def get(self, provider: str) -> ProviderCircuitState | None:
         ...
@@ -138,12 +189,24 @@ class ProviderCircuitStore(Protocol):
     def delete(self, provider: str) -> None:
         ...
 
+    def get_evidence(self, provider: str) -> ProviderEvidenceWatermarks | None:
+        ...
+
+    def save_reduction(
+        self,
+        evidence: ProviderEvidenceWatermarks,
+        state: ProviderCircuitState | None,
+    ) -> None:
+        """Atomically persist evidence and its resulting active circuit state."""
+        ...
+
 
 class InMemoryProviderCircuitStore:
     """In-memory store for tests."""
 
     def __init__(self) -> None:
         self._states: dict[str, ProviderCircuitState] = {}
+        self._evidence: dict[str, ProviderEvidenceWatermarks] = {}
 
     def get(self, provider: str) -> ProviderCircuitState | None:
         return self._states.get(provider)
@@ -156,3 +219,17 @@ class InMemoryProviderCircuitStore:
 
     def delete(self, provider: str) -> None:
         self._states.pop(provider, None)
+
+    def get_evidence(self, provider: str) -> ProviderEvidenceWatermarks | None:
+        return self._evidence.get(provider)
+
+    def save_reduction(
+        self,
+        evidence: ProviderEvidenceWatermarks,
+        state: ProviderCircuitState | None,
+    ) -> None:
+        self._evidence[evidence.provider] = evidence
+        if state is None:
+            self._states.pop(evidence.provider, None)
+        else:
+            self._states[state.provider] = state

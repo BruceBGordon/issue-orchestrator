@@ -111,6 +111,9 @@ _EXPORTS = {
     "GoalPilotStore": (".goal_pilot_store", "GoalPilotStore"),
     "AttemptStore": (".attempt_store", "AttemptStore"),
     "ProviderCircuitState": (".provider_resilience", "ProviderCircuitState"),
+    "ProviderEvidenceWatermarks": (
+        ".provider_resilience", "ProviderEvidenceWatermarks",
+    ),
     "ProviderCircuitStatus": (".provider_resilience", "ProviderCircuitStatus"),
     "ProviderCircuitStatusReader": (".provider_resilience", "ProviderCircuitStatusReader"),
     "StaticProviderCircuitStatusReader": (".provider_resilience", "StaticProviderCircuitStatusReader"),
@@ -209,6 +212,7 @@ __all__ = (
     "GoalPilotStore",
     "AttemptStore",
     "ProviderCircuitState",
+    "ProviderEvidenceWatermarks",
     "ProviderCircuitStatus",
     "ProviderCircuitStatusReader",
     "StaticProviderCircuitStatusReader",
