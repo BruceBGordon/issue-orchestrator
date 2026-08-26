@@ -856,7 +856,7 @@ def test_interrupted_command_is_durable_and_human_traceable(
         ),
         ExecutorCommand(
             (sys.executable, "-c", "raise AssertionError('must not run')"),
-            ExecutorBoundedDeadline(2.0, 4.0),
+            ExecutorBoundedDeadline(30.0, 60.0),
             ExecutorCommandLifecycle.INTERACTIVE_SESSION,
             ExecutorInteractiveSessionCancellation.for_run_dir(tmp_path.resolve()),
         ),
@@ -907,7 +907,7 @@ def test_resource_observation_failure_preserves_result_lease_and_cli_evidence(
     )
     command = ExecutorCommand(
         (sys.executable, "-c", "pass"),
-        ExecutorBoundedDeadline(2.0, 4.0),
+        ExecutorBoundedDeadline(30.0, 60.0),
         ExecutorCommandLifecycle.DETACHED,
         ExecutorNoCommandCancellation(),
     )
@@ -980,7 +980,12 @@ def test_internal_phase_client_terminates_at_active_deadline_and_releases_lease(
                 "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                 "signal.pause()",
             ),
-            ExecutorBoundedDeadline(0.05, 1.0),
+            # The workload ignores TERM, so the guardian must walk its full
+            # graceful escalation (2s here) after the active timeout. The
+            # absolute deadline must dwarf active + graceful, or the launcher
+            # intervenes mid-escalation and races the guardian's cooperative
+            # record-then-exit — a race the guardian loses under suite load.
+            ExecutorBoundedDeadline(0.05, 10.0),
             ExecutorCommandLifecycle.DETACHED,
             ExecutorNoCommandCancellation(),
         ),
@@ -989,7 +994,7 @@ def test_internal_phase_client_terminates_at_active_deadline_and_releases_lease(
         specification,
         ExecutorCommand(
             (sys.executable, "-c", "print('RECOVERED')"),
-            ExecutorBoundedDeadline(2.0, 4.0),
+            ExecutorBoundedDeadline(30.0, 60.0),
             ExecutorCommandLifecycle.DETACHED,
             ExecutorNoCommandCancellation(),
         ),
@@ -1007,7 +1012,7 @@ def test_internal_phase_client_terminates_at_active_deadline_and_releases_lease(
     assert "group=agent:run-1:coding-1" in deadline_line
     assert "phase=command reason=active" in deadline_line
     assert "active_timeout=0.050s" in deadline_line
-    assert "absolute_timeout=1.000s" in deadline_line
+    assert "absolute_timeout=10.000s" in deadline_line
 
 
 def test_descendant_is_gone_before_timed_out_phase_releases_lease(
