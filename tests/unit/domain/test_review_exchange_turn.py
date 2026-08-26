@@ -12,6 +12,11 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.domain.dirty_remediation import (
+    CLASSIFY_BEFORE_STAGING,
+    NEVER_DESTROY_UNKNOWN,
+    REMEDIATION_LADDER,
+)
 from issue_orchestrator.domain.review_exchange import (
     build_coder_prompt,
     build_reviewer_prompt,
@@ -271,7 +276,15 @@ class TestBuildCoderPrompt:
 
         prompt = build_coder_prompt(packet)
 
-        assert "clean working tree required" in prompt
+        # The prompt no longer says "commit all changes (clean working tree
+        # required)": that told a rework coder to sweep in whatever the tree
+        # happened to contain, including files it never created. It now renders
+        # the shared remediation ladder, so the classification rule arrives
+        # every round instead of a blanket instruction.
+        assert CLASSIFY_BEFORE_STAGING in prompt
+        assert NEVER_DESTROY_UNKNOWN in prompt
+        for rung in REMEDIATION_LADDER:
+            assert rung.classification in prompt
         assert "prepush-check --dirty-only -v" in prompt
         assert "Tracked project files" in prompt
         assert ".issue-orchestrator/" in prompt

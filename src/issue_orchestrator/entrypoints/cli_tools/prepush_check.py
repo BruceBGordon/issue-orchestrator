@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from ...control.dirty_remediation import guard_hint_lines
+from ...domain.dirty_remediation import guard_hint_lines
 from ...control.validation import PublishGate
 from ...execution import GitWorkingCopy, LocalCommandRunner
 from ...infra.runtime_artifacts import filter_runtime_managed_dirty_paths

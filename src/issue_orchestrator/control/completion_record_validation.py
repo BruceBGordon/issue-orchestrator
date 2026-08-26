@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from ..domain.models import COMPLETION_RECORD_PATH, CompletionRecord, RequestedAction, sanitize_agent_label
-from .dirty_remediation import blocked_reason
+from ..domain.dirty_remediation import blocked_reason
 from ..infra.runtime_artifacts import filter_runtime_managed_dirty_paths
 
 if TYPE_CHECKING:

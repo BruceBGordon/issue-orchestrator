@@ -22,6 +22,7 @@ be removed. Everything else is preserved, ignored in place, or escalated.
 """
 
 from dataclasses import dataclass
+from enum import Enum
 
 # Marker sentences. Runtime messages render these, and the markdown contract
 # test requires them verbatim, so a reworded copy in one surface fails loudly
@@ -30,6 +31,16 @@ CLASSIFY_BEFORE_STAGING = "Classify each dirty file before staging anything."
 NEVER_DESTROY_UNKNOWN = "Never delete or revert a file you did not create."
 COMMIT_WHAT_BELONGS = "Commit the changes that belong in this push"
 NEVER_STASH_WHAT_BELONGS = "Do not stash work that belongs in this push"
+
+#: The escalation an agent runs when a dirty file cannot be classified. It is a
+#: complete, runnable invocation on purpose: ``blocked`` requires both --reason
+#: and --attempted, so a bare "run coding-done blocked" exits 1, and
+#: test_completion_command_contracts executes any command it finds in an
+#: instruction surface.
+ESCALATION_COMMAND = (
+    'coding-done blocked --reason "cannot classify dirty file <path>" '
+    '--attempted "inspected the file and its history"'
+)
 
 
 @dataclass(frozen=True)
@@ -55,11 +66,16 @@ REMEDIATION_LADDER: tuple[RemediationRung, ...] = (
     ),
     RemediationRung(
         classification="A disposable artifact you created yourself",
-        action="delete it, or add its path to .gitignore",
+        action="delete it",
         detail=(
             "Only take this path when you created the file during this session "
             "and can positively identify it as disposable, such as build output "
-            "or a generated artifact you produced."
+            "or a generated artifact you produced. Do not reach for .gitignore "
+            "to clear the guard: an ignore rule is a repository policy change, "
+            "and using one to hide a file is what this ladder exists to "
+            "prevent. If an artifact genuinely should be ignored from now on, "
+            "that rule is part of your change -- commit it under rung 1 on its "
+            "own merits."
         ),
     ),
     RemediationRung(
@@ -67,16 +83,16 @@ REMEDIATION_LADDER: tuple[RemediationRung, ...] = (
             "Anything else -- pre-existing edits, files you did not create, "
             "anything you cannot positively classify"
         ),
-        action="preserve it and clear the guard without touching its contents",
+        action="leave it exactly as it is and escalate",
         detail=(
             f"{NEVER_DESTROY_UNKNOWN} It may be operator or user work that "
-            "cannot be recovered. An untracked path can be added to .gitignore, "
-            "which clears the guard and leaves the file on disk untouched -- "
-            "that edit makes .gitignore itself dirty, and it belongs in your "
-            "commit. If the file cannot be cleared that way, stop and report "
-            "coding-done blocked --reason \"cannot classify dirty file "
-            "<path>\" --attempted \"inspected the file and its history\", "
-            "rather than destroying it."
+            "cannot be recovered. Do not add it to .gitignore either: that "
+            "commits repository policy about a path you just said you cannot "
+            "classify, and it would hide a file someone else may be working "
+            f"on. Report it instead: {ESCALATION_COMMAND} (or the needs_human "
+            "status). Those two statuses are accepted on a dirty tree "
+            "precisely so this path is reachable -- the file stays on disk, "
+            "untouched, for a human to resolve."
         ),
     ),
 )
@@ -122,8 +138,14 @@ def blocked_reason(override_hint: str) -> str:
     )
 
 
-def retry_prompt_steps() -> str:
-    """The numbered remediation block injected into the dirty-worktree retry."""
+def remediation_prompt_steps() -> str:
+    """The numbered remediation block for any prompt that must clear a dirty tree.
+
+    Shared verbatim by the orchestrator's dirty-worktree retry prompt and the
+    review-exchange coder prompt. Rework rounds add commits every round, so the
+    exchange prompt is re-issued each round and must not restate the ladder in
+    its own words.
+    """
     rungs = "\n".join(f"   {line}" for line in _rung_lines())
     return (
         f"2. {CLASSIFY_BEFORE_STAGING} For each one:\n"
@@ -131,3 +153,50 @@ def retry_prompt_steps() -> str:
         "3. Stage the paths from step 2 explicitly by name and commit them. "
         "Do not stage every changed file at once."
     )
+
+
+def rejection_hint_lines(phase: str) -> tuple[str, ...]:
+    """Lines the ``coding-done`` dirty rejection prints back to the agent.
+
+    This is the surface an agent actually reads at the moment it is blocked, so
+    it is the one most likely to be acted on literally. ``phase`` is
+    ``"post-validation"`` when the validation run itself dirtied the tree, which
+    changes only the framing sentence -- the ladder is identical, because the
+    classification question is the same one either way.
+    """
+    opening = (
+        "Validation modified the working tree (auto-formatter, generated "
+        "artifacts, integration-test side effects, ...)."
+        if phase == "post-validation"
+        else "Commit the work that belongs in this push before calling coding-done."
+    )
+    return (opening, CLASSIFY_BEFORE_STAGING, *_rung_lines())
+
+
+class DirtyTreeDisposition(Enum):
+    """What a completion status is allowed to do with a dirty working tree."""
+
+    REJECT = "reject"
+    PRESERVE_AND_ESCALATE = "preserve_and_escalate"
+
+
+#: Statuses where the agent is *reporting* a problem rather than publishing
+#: work. These are rung 3's escalation, so a dirty tree is frequently the very
+#: thing being reported: rejecting them would leave an agent that cannot
+#: classify a file with no legal move at all -- unable to commit it, forbidden
+#: to destroy it, and unable to hand it over -- which is the pressure that gets
+#: someone else's uncommitted work deleted. Nothing unclean reaches a push by
+#: this route: the orchestrator's own publish gate applies the dirty policy
+#: only when a record requests PUSH_BRANCH, which neither status does.
+ESCALATION_STATUSES: frozenset[str] = frozenset({"blocked", "needs_human"})
+
+
+def dirty_tree_disposition(status: str) -> DirtyTreeDisposition:
+    """Decide how a dirty tree must be handled for ``status``.
+
+    Policy lives here rather than in the completion CLI so the rule is stated
+    once, beside the ladder whose last rung depends on it.
+    """
+    if status in ESCALATION_STATUSES:
+        return DirtyTreeDisposition.PRESERVE_AND_ESCALATE
+    return DirtyTreeDisposition.REJECT

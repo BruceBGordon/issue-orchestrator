@@ -14,7 +14,10 @@ import os
 import subprocess
 import sys
 import traceback
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .agent_done import (
     AgentStatus,
@@ -44,6 +47,11 @@ from .dirty_retry_budget import (
 )
 from .orchestrator_resume import trigger_orchestrator_resume
 from .orchestrator_run_assets import require_orchestrator_run_assets_for_session
+from ...domain.dirty_remediation import (
+    DirtyTreeDisposition,
+    dirty_tree_disposition,
+    rejection_hint_lines,
+)
 from ...infra.env import get_env
 from ...infra.logging_config import issue_log
 from ...infra.runtime_artifacts import (
@@ -64,6 +72,7 @@ CODING_STATUSES = [
 
 def _is_managed_session() -> bool:
     return bool(get_env("SESSION_ID") or os.environ.get("ORCHESTRATOR_SESSION_ID"))
+
 
 
 def check_dirty_files(worktree_root: Path | None = None) -> list[str]:
@@ -120,15 +129,66 @@ def check_dirty_files(worktree_root: Path | None = None) -> list[str]:
     return dirty
 
 
-def _handle_dirty_files_rejection(
-    *,
-    dirty_files: list[str],
-    worktree_root: Path,
-    issue_number: int | None,
-    status: str,
-    under_orchestrator: bool,
-    phase: str,
-) -> None:
+#: How many dirty paths any operator-facing listing shows before eliding.
+_DIRTY_PREVIEW_LIMIT = 15
+
+
+@dataclass(frozen=True)
+class _DirtyTreeContext:
+    """Everything either dirty-tree outcome needs, gathered once.
+
+    Both outcomes previously took the same five keyword arguments threaded
+    through by hand, which is what let the two paths drift into disagreeing
+    about what an agent should do with a file it did not create.
+    """
+
+    dirty_files: list[str]
+    worktree_root: Path
+    issue_number: int | None
+    status: str
+    under_orchestrator: bool
+    phase: str
+    record: Any = None
+
+
+def _preserve_dirty_files_on_escalation(ctx: _DirtyTreeContext) -> None:
+    """Accept an escalation on a dirty tree, leaving every file untouched.
+
+    Nothing here writes to the working tree. The point is that the files
+    survive: the agent reached rung 3 of the remediation ladder, where the
+    correct move is to preserve what it cannot classify and hand it to a human.
+    The list is folded into the record's comment body so whoever picks the
+    escalation up sees exactly what was left behind, instead of discovering an
+    unexplained dirty worktree later.
+    """
+    dirty_files = ctx.dirty_files
+    preview = ", ".join(dirty_files[:_DIRTY_PREVIEW_LIMIT])
+    remaining = len(dirty_files) - _DIRTY_PREVIEW_LIMIT
+    if remaining > 0:
+        preview = f"{preview} (+{remaining} more)"
+    notice = (
+        f"Working tree left dirty and preserved ({len(dirty_files)} file(s)): "
+        f"{preview}. The agent escalated instead of resolving these; nothing "
+        "was deleted, reverted, or ignored."
+    )
+    print(f"\n{notice}")
+    record = ctx.record
+    record.comment_body = (
+        f"{record.comment_body}\n\n{notice}" if record.comment_body else notice
+    )
+    if ctx.issue_number:
+        logger.info(
+            issue_log(
+                ctx.issue_number,
+                "coding-done accepted escalation on dirty tree: "
+                "status=%s dirty_files=%d",
+            ),
+            ctx.status,
+            len(dirty_files),
+        )
+
+
+def _handle_dirty_files_rejection(ctx: _DirtyTreeContext) -> None:
     """Print actionable error, record rejection, escalate-or-exit non-zero.
 
     Used by both the pre-validation and post-validation dirty checks. The
@@ -139,6 +199,13 @@ def _handle_dirty_files_rejection(
     completes "successfully" while the orchestrator silently rejects the
     push and starts a rework loop.
     """
+    dirty_files = ctx.dirty_files
+    worktree_root = ctx.worktree_root
+    issue_number = ctx.issue_number
+    status = ctx.status
+    under_orchestrator = ctx.under_orchestrator
+    phase = ctx.phase
+
     print(f"\n{'='*60}")
     if phase == "post-validation":
         print("❌ WORKING TREE WAS DIRTIED BY VALIDATION — coding-done cannot complete")
@@ -146,26 +213,16 @@ def _handle_dirty_files_rejection(
         print("❌ WORKING TREE IS DIRTY — coding-done cannot complete")
     print(f"{'='*60}")
     print(f"\nUncommitted files ({len(dirty_files)}):")
-    for entry in dirty_files[:15]:
+    for entry in dirty_files[:_DIRTY_PREVIEW_LIMIT]:
         print(f"  {entry}")
-    if len(dirty_files) > 15:
-        print(f"  ... and {len(dirty_files) - 15} more")
-    if phase == "post-validation":
-        print(
-            "\nValidation modified the working tree (auto-formatter, generated "
-            "artifacts, integration-test side effects, ...)."
-        )
-        print(
-            "Decide for each file: commit it (part of your change) or add to "
-            ".gitignore / remove it (detritus). Then run coding-done again."
-        )
-        print(
-            "If you cannot classify a file, run "
-            "`coding-done blocked --reason 'unable to classify dirty file X'`."
-        )
-    else:
-        print("\nCommit all changes before calling coding-done.")
+    if len(dirty_files) > _DIRTY_PREVIEW_LIMIT:
+        print(f"  ... and {len(dirty_files) - _DIRTY_PREVIEW_LIMIT} more")
+    print()
+    for line in rejection_hint_lines(phase):
+        print(line)
+    if phase != "post-validation":
         print("If you modified contracts or schemas, regenerate artifacts first.")
+    print("Then run coding-done again.")
     print(f"{'='*60}")
 
     if issue_number:
@@ -292,6 +349,24 @@ STATUSES:
     return parser
 
 
+_DIRTY_TREE_HANDLERS: dict[DirtyTreeDisposition, Callable[[_DirtyTreeContext], None]] = {
+    DirtyTreeDisposition.REJECT: _handle_dirty_files_rejection,
+    DirtyTreeDisposition.PRESERVE_AND_ESCALATE: _preserve_dirty_files_on_escalation,
+}
+
+
+def _apply_dirty_tree_policy(ctx: _DirtyTreeContext) -> None:
+    """Resolve a dirty tree the way this status is entitled to.
+
+    The choice itself belongs to ``domain.dirty_remediation``, beside the
+    ladder whose last rung depends on it; this dispatches on that answer so
+    the entrypoint holds no copy of the policy.
+    """
+    if not ctx.dirty_files:
+        return
+    _DIRTY_TREE_HANDLERS[dirty_tree_disposition(ctx.status)](ctx)
+
+
 def main() -> None:  # noqa: C901, PLR0912
     """Main entry point for coding-done."""
     parser = build_parser()
@@ -335,17 +410,27 @@ def main() -> None:  # noqa: C901, PLR0912
     # prompts emit.
     managed = _is_managed_session()
 
-    # 2. Check for dirty files (coding agents must commit everything)
+    # 2. Dirty check. A publishing status must have a clean tree. ``blocked``
+    #    and ``needs_human`` are the escalation path *for* a dirty file the
+    #    agent must not resolve on its own (rung 3 of the remediation ladder),
+    #    so rejecting them here would leave that agent with no legal move: it
+    #    cannot commit the file, must not delete it, and could not report it
+    #    either. That dead end is exactly the pressure that gets someone's
+    #    uncommitted work deleted. The orchestrator agrees these are safe to
+    #    accept -- ``validate_worktree_state`` applies the dirty policy only
+    #    when the record requests PUSH_BRANCH, which neither status does.
     dirty_files = check_dirty_files(worktree_root)
-    if dirty_files:
-        _handle_dirty_files_rejection(
+    _apply_dirty_tree_policy(
+        _DirtyTreeContext(
             dirty_files=dirty_files,
             worktree_root=worktree_root,
             issue_number=issue_number,
             status=status,
             under_orchestrator=managed,
             phase="pre-validation",
+            record=record,
         )
+    )
 
     # Dirty check passed — if a prior rejection left a non-zero counter
     # the agent has demonstrated recovery, so clear it. Subsequent
@@ -446,12 +531,15 @@ def main() -> None:  # noqa: C901, PLR0912
         post_validation_dirty = check_dirty_files(worktree_root)
         if post_validation_dirty:
             _handle_dirty_files_rejection(
-                dirty_files=post_validation_dirty,
-                worktree_root=worktree_root,
-                issue_number=issue_number,
-                status=status,
-                under_orchestrator=managed,
-                phase="post-validation",
+                _DirtyTreeContext(
+                    dirty_files=post_validation_dirty,
+                    worktree_root=worktree_root,
+                    issue_number=issue_number,
+                    status=status,
+                    under_orchestrator=managed,
+                    phase="post-validation",
+                    record=record,
+                )
             )
 
     # 4. Run preflight push check

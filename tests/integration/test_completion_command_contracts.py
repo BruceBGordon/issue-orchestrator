@@ -636,3 +636,119 @@ def test_wrapper_and_git_guardrail_path_resolution(tmp_path: Path) -> None:
     # No remote is configured, so push may still fail — but wrapper block message
     # must not appear when auth bypass is set.
     assert "BLOCKED: 'git push' is not allowed" not in passthrough_push.stderr
+
+
+class TestEscalationIsReachableOnADirtyTree:
+    """The rung 3 escalation must actually run against the tree it describes.
+
+    The remediation ladder's last rung tells an agent that cannot classify a
+    dirty file to preserve it and report `blocked` / `needs_human`. That advice
+    is worthless if the command itself rejects a dirty tree -- the agent would
+    be left with no legal move at all, which is the pressure that gets a
+    stranger's uncommitted work deleted.
+
+    The rest of this module cannot catch that: `_run_completion_command`
+    appends `--dry-run`, which returns before the dirty check ever runs. These
+    tests deliberately invoke the real path with a genuinely dirty worktree.
+    """
+
+    @staticmethod
+    def _dirty_repo(tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+        # A file the agent did not create and cannot classify -- rung 3.
+        (repo / "operator_notes.py").write_text("pre-existing operator work\n")
+        return repo
+
+    def _run(self, argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+        assert "--dry-run" not in argv, "this suite must exercise the real path"
+        return _run_completion_raw(argv, cwd=cwd)
+
+    def test_blocked_is_accepted_while_the_tree_is_dirty(self, tmp_path):
+        repo = self._dirty_repo(tmp_path)
+
+        result = self._run(
+            [
+                "blocked",
+                "--reason",
+                "cannot classify dirty file operator_notes.py",
+                "--attempted",
+                "inspected the file and its history",
+            ],
+            cwd=repo,
+        )
+
+        assert result.returncode == 0, (
+            "rung 3 escalation must be reachable on a dirty tree; got:\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}"
+        )
+
+    def test_needs_human_is_accepted_while_the_tree_is_dirty(self, tmp_path):
+        repo = self._dirty_repo(tmp_path)
+
+        result = self._run(
+            ["needs_human", "--question", "who owns operator_notes.py?"],
+            cwd=repo,
+        )
+
+        assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+
+    def test_the_unclassified_file_survives_the_escalation(self, tmp_path):
+        """Escalating must not be a euphemism for cleaning up."""
+        repo = self._dirty_repo(tmp_path)
+        target = repo / "operator_notes.py"
+        before = target.read_text()
+
+        self._run(
+            [
+                "blocked",
+                "--reason",
+                "cannot classify dirty file operator_notes.py",
+                "--attempted",
+                "inspected the file and its history",
+            ],
+            cwd=repo,
+        )
+
+        assert target.exists(), "the escalation deleted the file it was preserving"
+        assert target.read_text() == before
+
+    def test_the_escalation_records_what_was_left_behind(self, tmp_path):
+        """A human picking this up must see the files, not just the reason."""
+        repo = self._dirty_repo(tmp_path)
+
+        self._run(
+            [
+                "blocked",
+                "--reason",
+                "cannot classify dirty file operator_notes.py",
+                "--attempted",
+                "inspected the file and its history",
+            ],
+            cwd=repo,
+        )
+
+        record = json.loads(
+            (repo / ".issue-orchestrator" / "completion.json").read_text()
+        )
+        body = record.get("comment_body") or ""
+        assert "operator_notes.py" in body
+        assert "preserved" in body
+
+    def test_completed_still_requires_a_clean_tree(self, tmp_path):
+        """Only the escalation statuses are exempt; publishing is not."""
+        repo = self._dirty_repo(tmp_path)
+
+        result = self._run(
+            [
+                "completed",
+                "--implementation",
+                "did the thing",
+                "--problems",
+                "None",
+            ],
+            cwd=repo,
+        )
+
+        assert result.returncode != 0

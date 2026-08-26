@@ -13,13 +13,13 @@ hook misses and re-runs the whole suite.
 import re
 from pathlib import Path
 
-from issue_orchestrator.control.dirty_remediation import (
+from issue_orchestrator.domain.dirty_remediation import (
     CLASSIFY_BEFORE_STAGING,
     NEVER_DESTROY_UNKNOWN,
     REMEDIATION_LADDER,
     blocked_reason,
     guard_hint_lines,
-    retry_prompt_steps,
+    remediation_prompt_steps,
 )
 from issue_orchestrator.resources import (
     get_coding_done_instructions,
@@ -31,6 +31,57 @@ from issue_orchestrator.resources import (
 def _flat(text: str) -> str:
     """Collapse markdown line wrapping so assertions survive reflowing."""
     return re.sub(r"\s+", " ", text)
+
+
+def _actual_rejection_output(phase: str) -> str:
+    """Capture what `coding-done` really prints when it rejects a dirty tree.
+
+    This is the surface an agent reads at the moment it is stuck, so the table
+    must see the printed bytes rather than a helper's return value: the round 3
+    review found the printed text still saying "commit it ... or ... remove it"
+    while the helper it supposedly used had already been corrected.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    from issue_orchestrator.entrypoints.cli_tools import coding_done
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        try:
+            coding_done._handle_dirty_files_rejection(
+                coding_done._DirtyTreeContext(
+                    dirty_files=["operator_notes.py"],
+                    worktree_root=Path("/nonexistent-for-rendering"),
+                    issue_number=None,
+                    status="completed",
+                    under_orchestrator=False,
+                    phase=phase,
+                )
+            )
+        except SystemExit:
+            pass
+    return buffer.getvalue()
+
+
+def _actual_coder_prompt() -> str:
+    """Render the real review-exchange coder prompt for a round."""
+    from issue_orchestrator.domain.review_exchange import build_coder_prompt
+    from issue_orchestrator.domain.review_exchange_turn import (
+        ReviewExchangeTurnPacket,
+        Role,
+    )
+
+    packet = ReviewExchangeTurnPacket(
+        issue_number=1,
+        issue_title="t",
+        round_index=1,
+        role=Role.CODER,
+        require_validation=True,
+        run_dir=Path("/tmp/run"),
+        reviewer_feedback="please fix the thing",
+    )
+    return build_coder_prompt(packet)
 
 
 class TestCommitBeforePublishGate:
@@ -224,6 +275,17 @@ class TestDirtyRemediationContract:
         (r"\brm\s+-rf\b", "destructive cleanup of possibly-unowned work"),
         (r"commit\s+(?:them\s+)?all\b", "blanket commit-all"),
         (r"commit\s+everything", "blanket commit-all"),
+        # Prose forms. Round 3 found the live `coding-done` rejection offering
+        # "add to .gitignore / remove it (detritus)" and the exchange prompt
+        # saying repo changes "must still be committed or removed" -- neither
+        # contains a command, so a command-only table waved both through. What
+        # makes these unsafe is that they offer removal with no test of whether
+        # the agent owns the file; rung 2's "delete it" is allowed because it
+        # is gated on exactly that, and every surface must additionally carry
+        # the preservation rule (asserted separately).
+        (r"or\s+remove\s+it\b", "ungated removal"),
+        (r"committed\s+or\s+removed", "ungated removal"),
+        (r"\.gitignore\s*/\s*remove", "ungated removal"),
     )
 
     @staticmethod
@@ -247,7 +309,17 @@ class TestDirtyRemediationContract:
             "repo-specific/prompts/simple-fix.md": cls._repo_file(
                 "repo-specific", "prompts", "simple-fix.md"
             ),
-            "session_controller:dirty-retry": retry_prompt_steps(),
+            "session_controller:dirty-retry": remediation_prompt_steps(),
+            # The two surfaces below are rendered by production code paths, not
+            # by reading a resource file. Round 3 review found both of them
+            # still carrying "Commit all changes" and "remove it" while this
+            # table claimed to cover everything injected into a coding session,
+            # so they are exercised through their real entry points here.
+            "coding_done:dirty-rejection": _actual_rejection_output("pre-validation"),
+            "coding_done:dirty-rejection-post-validation": (
+                _actual_rejection_output("post-validation")
+            ),
+            "review_exchange:build_coder_prompt": _actual_coder_prompt(),
             "prepush_check:tracked": "\n".join(guard_hint_lines("tracked")),
             "prepush_check:all": "\n".join(guard_hint_lines("all")),
             "coding-done:blocked-reason": blocked_reason("Override with x."),
@@ -262,12 +334,38 @@ class TestDirtyRemediationContract:
             ),
         }
 
+    #: Wording that actually shipped in this repo and had to be removed. The
+    #: contract is only worth anything if it rejects these, so it is tested
+    #: against them directly rather than trusted.
+    HISTORICAL_UNSAFE_WORDING = (
+        "2. Commit all changes (clean working tree required).",
+        "Commit all changes before calling coding-done.",
+        "Decide for each file: commit it (part of your change) or add to "
+        ".gitignore / remove it (detritus).",
+        "git add -A",
+        "Tracked changes that do not belong in this branch should be reverted "
+        "(git restore).",
+    )
+
+    def test_the_contract_rejects_the_wording_it_was_written_for(self):
+        """Every string below is real wording this PR had to remove.
+
+        Case matters: the first two shipped capitalized, and a case-sensitive
+        pattern would have waved them straight through the table that claims
+        to forbid them.
+        """
+        for sample in self.HISTORICAL_UNSAFE_WORDING:
+            assert any(
+                re.search(pattern, sample, re.IGNORECASE)
+                for pattern, _ in self.FORBIDDEN_COMMANDS
+            ), f"contract does not reject known-bad wording: {sample!r}"
+
     def test_no_surface_carries_a_bulk_or_destructive_command(self):
         surfaces = {**self._injected_surfaces(), **self._human_docs()}
         offenders = []
         for name, text in surfaces.items():
             for pattern, why in self.FORBIDDEN_COMMANDS:
-                match = re.search(pattern, text)
+                match = re.search(pattern, text, re.IGNORECASE)
                 if match:
                     offenders.append(f"{name}: {match.group(0)!r} ({why})")
         assert not offenders, "unsafe instruction(s):\n" + "\n".join(offenders)
@@ -295,11 +393,15 @@ class TestDirtyRemediationContract:
         Each rung's classification text must appear verbatim in the guard hint,
         the retry prompt, and nowhere as a hand-maintained duplicate.
         """
-        guard = "\n".join(guard_hint_lines("all"))
-        prompt = retry_prompt_steps()
-        for rung in REMEDIATION_LADDER:
-            assert rung.classification in guard
-            assert rung.classification in prompt
+        rendered = {
+            "guard": "\n".join(guard_hint_lines("all")),
+            "prompt": remediation_prompt_steps(),
+            "coding-done rejection": _actual_rejection_output("pre-validation"),
+            "coder prompt": _actual_coder_prompt(),
+        }
+        for name, text in rendered.items():
+            for rung in REMEDIATION_LADDER:
+                assert rung.classification in text, f"{name}: {rung.classification}"
 
     def test_untracked_wording_is_scoped_to_the_mode_that_lists_them(self):
         tracked = "\n".join(guard_hint_lines("tracked"))

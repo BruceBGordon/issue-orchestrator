@@ -13,7 +13,7 @@ Architecture reminder:
 import json
 import pytest
 
-from issue_orchestrator.control.dirty_remediation import (
+from issue_orchestrator.domain.dirty_remediation import (
     NEVER_DESTROY_UNKNOWN,
     blocked_reason,
 )

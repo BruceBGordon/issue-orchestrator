@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .coder_prompt import append_coder_prompt_addendum
+from .dirty_remediation import remediation_prompt_steps
 from .review_exchange_run import ReviewExchangeRunAssets
 from .review_exchange_summary import (
     ReviewExchangeReason,
@@ -200,14 +201,14 @@ def build_coder_prompt(packet: "ReviewExchangeTurnPacket") -> str:
         "\n"
         "Steps:\n"
         "1. Make the requested changes (or prepare a disagreement).\n"
-        "2. Commit all changes (clean working tree required).\n"
-        "3. Run `prepush-check --dirty-only -v` and fix any dirty-worktree failure.\n"
-        "4. Run `coding-done completed --implementation '...' --problems '...'`\n"
-        "5. Submit your verdict by running `exchange-respond`\n"
+        f"{remediation_prompt_steps()}\n"
+        "4. Run `prepush-check --dirty-only -v` and fix any dirty-worktree failure.\n"
+        "5. Run `coding-done completed --implementation '...' --problems '...'`\n"
+        "6. Submit your verdict by running `exchange-respond`\n"
         "Runtime-managed metadata under `.issue-orchestrator/` and `.claude/` "
         "is ignored by the orchestrator dirty guard. Tracked project files, "
-        "generated sources, lock files, schemas, and other repo changes must "
-        "still be committed or removed.\n"
+        "generated sources, lock files, and schemas that belong to this push "
+        "must still be committed.\n"
         "\n"
         f"Session output dir: {packet.run_dir}\n"
         f"\nReviewer report:\n{packet.reviewer_feedback}\n"

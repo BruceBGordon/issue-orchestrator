@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from ..ports.validation_attempt_key_factory import ValidationAttemptKeyFactory
 
 from ..events import EventName
-from .dirty_remediation import retry_prompt_steps
+from ..domain.dirty_remediation import remediation_prompt_steps
 from ..domain.artifact_contracts import (
     ValidationFailed,
     ValidationOutcome,
@@ -1734,7 +1734,7 @@ class SessionController:
                 "The validation command passed, but the worktree became dirty "
                 "before publish."
             )
-        remediation = retry_prompt_steps()
+        remediation = remediation_prompt_steps()
         return f"""# Dirty Worktree Retry (Attempt {display_count}/{display_max}) - {display_max - display_count} attempt(s) remaining after this
 
 {timing}

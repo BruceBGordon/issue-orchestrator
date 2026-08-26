@@ -7,8 +7,9 @@ import tempfile
 import subprocess
 from pathlib import Path
 
-from issue_orchestrator.control.dirty_remediation import (
+from issue_orchestrator.domain.dirty_remediation import (
     CLASSIFY_BEFORE_STAGING,
+    ESCALATION_COMMAND,
     COMMIT_WHAT_BELONGS,
     NEVER_DESTROY_UNKNOWN,
     NEVER_STASH_WHAT_BELONGS,
@@ -848,7 +849,11 @@ validation:
         assert "also lists untracked paths" in captured.out
         assert "Never commit one just to clear this gate" in captured.out
         assert NEVER_DESTROY_UNKNOWN in captured.out
-        assert "add its path to .gitignore" in captured.out
+        # An unclassifiable file is escalated, not ignored: an ignore rule is a
+        # repository policy change, and hiding someone else's file behind one
+        # is the failure this ladder exists to prevent.
+        assert "Do not add it to .gitignore either" in captured.out
+        assert ESCALATION_COMMAND in captured.out
         # No blanket commit-everything order, stash escape, or destructive remedy.
         assert "commit them before running this gate" not in captured.out
         assert "or stash" not in captured.out
