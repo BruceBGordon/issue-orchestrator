@@ -5503,6 +5503,7 @@ class TestEscalationSurvivesAFailedPublish:
             ],
             summary="cannot classify dirty file operator_notes.py",
         )
+        record.comment_body = "AGENT-CONTEXT: cannot classify operator_notes.py"
         worktree = worktree_with_completion(record)
 
         processor.process(
@@ -5513,11 +5514,18 @@ class TestEscalationSurvivesAFailedPublish:
         )
 
         mock_label_adapter.add_label.assert_any_call(123, label)
-        mock_pr_adapter.add_comment.assert_called()
+        # Not `assert_called()`: processing also posts a generic failure comment,
+        # so that would pass even if the agent's context never reached anyone.
+        posted = [
+            call.args[1] if len(call.args) > 1 else call.kwargs.get("body", "")
+            for call in mock_pr_adapter.add_comment.call_args_list
+        ]
+        assert any("AGENT-CONTEXT" in str(body) for body in posted), (
+            f"the agent's escalation context was never posted; got {posted}"
+        )
 
     def test_an_oversized_comment_body_still_reaches_the_human(
         self,
-        tmp_path,
         mock_label_adapter,
         mock_pr_adapter,
         mock_git_adapter,
@@ -5530,8 +5538,25 @@ class TestEscalationSurvivesAFailedPublish:
         64 KiB. An earlier revision appended a recovery notice *after* that
         validation, so an accepted body became an oversized post, the bounded
         adapter rejected it, and the escalation context the human needed was
-        never delivered. Nothing is appended here any more.
+        never delivered.
+
+        Asserted at the adapter, not on the record: the processor deserializes
+        its own `CompletionRecord`, so the object built here is never the one
+        posted, and checking it would pass under the very bug this pins.
+        Processing also posts a later generic failure comment, so
+        `assert_called()` cannot tell the two apart -- the exact body has to be
+        found among the accepted calls.
         """
+        accepted: list[str] = []
+
+        def bounded_add_comment(issue_number, body, *args, **kwargs):
+            if len(body.encode("utf-8")) > GITHUB_COMMENT_BODY_LIMIT:
+                raise ValueError("comment body exceeds GitHub limit")
+            accepted.append(body)
+            return True
+
+        mock_pr_adapter.add_comment.side_effect = bounded_add_comment
+
         processor = CompletionProcessor(
             agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
@@ -5568,8 +5593,10 @@ class TestEscalationSurvivesAFailedPublish:
             issue_title="Test",
         )
 
-        # The body the agent wrote is unchanged, so it is still postable.
-        assert len(record.comment_body.encode("utf-8")) <= GITHUB_COMMENT_BODY_LIMIT
+        assert at_the_limit in accepted, (
+            "the escalation context the human needs was never posted; "
+            f"accepted bodies of length {[len(b) for b in accepted]}"
+        )
         mock_label_adapter.add_label.assert_any_call(123, "blocked")
 
     def test_a_failed_publish_still_stops_a_completed_record(
