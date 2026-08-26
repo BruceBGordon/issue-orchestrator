@@ -476,6 +476,9 @@ class TestClaudeViaAdapterPath:
             build_terminal_session_terminator,
         )
         from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_owner,
+    build_terminal_session_registry,
+    build_terminal_session_watcher_factory,
             terminal_session_watcher_policy,
         )
 
@@ -507,8 +510,11 @@ class TestClaudeViaAdapterPath:
 
             plugin = SubprocessPlugin(
                 build_terminal_session_terminator(),
+                build_terminal_session_owner(),
+                build_terminal_session_registry((worktree).resolve()),
                 build_process_group_supervisor(),
                 terminal_session_watcher_policy(),
+                build_terminal_session_watcher_factory(),
             )
             created = plugin.create_session(
                 session_id=999,

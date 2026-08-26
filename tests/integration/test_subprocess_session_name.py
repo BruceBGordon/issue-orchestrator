@@ -29,6 +29,9 @@ from issue_orchestrator.entrypoints.bootstrap import (
     build_terminal_session_terminator,
 )
 from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_owner,
+    build_terminal_session_registry,
+    build_terminal_session_watcher_factory,
     terminal_session_watcher_policy,
 )
 from issue_orchestrator.infra.hooks.hookspec import PROJECT_NAME, TerminalSpec
@@ -72,8 +75,11 @@ def plugin_manager(temp_repo_root: Path, monkeypatch: pytest.MonkeyPatch) -> plu
     # Create and register the subprocess plugin
     plugin = SubprocessPlugin(
         build_terminal_session_terminator(),
+        build_terminal_session_owner(),
+        build_terminal_session_registry((temp_repo_root).resolve()),
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
+        build_terminal_session_watcher_factory(),
     )
     pm.register(plugin, name="terminal_subprocess")
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import shutil
 import signal
@@ -179,11 +180,21 @@ _GuardianResourceMeasurement = (
 )
 
 
+
+def _descriptor_path(descriptor: int) -> Path:
+    """Resolve an open descriptor's filesystem path (macOS and Linux)."""
+    if hasattr(fcntl, "F_GETPATH"):
+        raw = fcntl.fcntl(descriptor, fcntl.F_GETPATH, bytes(1024))
+        return Path(raw.split(b"\x00", 1)[0].decode())
+    return Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+
 @dataclass(slots=True)
 class _SentinelGuardianGroupOwner:
     """Dual guardian/sentinel owner that survives either single failure."""
 
     controller: ProcessGroupSentinelController
+    cancellation_record_path: Path | None = None
+    lease_file_descriptors: tuple[int, ...] = ()
 
     def retire_before_opaque_work(self) -> None:
         self.controller.retire_without_group()
@@ -197,6 +208,30 @@ class _SentinelGuardianGroupOwner:
         termination_policy: ExecutorGuardianTerminationPolicy,
     ) -> None:
         del terminal
+        # This group is now unconditionally dying by its own hand.  Retiring
+        # the cancellation record first lets later stop requests observe a
+        # completed owner as ABSENT; a record that outlives its guardian then
+        # always means the guardian died without containing its work.
+        if self.cancellation_record_path is not None:
+            try:
+                self.cancellation_record_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        # The guardian is the crash-safe lease owner: with the group dying,
+        # the charge ends here, so the lease record must not outlive it.
+        # Only per-command records under leases/ are retired; shared capacity
+        # locks travel on the same descriptors and must survive.
+        for descriptor in self.lease_file_descriptors:
+            try:
+                record_path = _descriptor_path(descriptor)
+            except OSError:
+                continue
+            if record_path.parent.name != "leases":
+                continue
+            try:
+                record_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         try:
             self.controller.request_containment()
         except BaseException:
@@ -340,6 +375,7 @@ class PosixExecutorGuardianChild:
         invocation: GuardianInvocationRecord,
     ) -> _GuardianGroupOwner:
         cancellation = invocation.cancellation
+        cancellation_record_path: Path | None = None
         if type(cancellation) is GuardianDetachedCancellationControlRecord:
             sentinel_cancellation = ProcessGroupSentinelWithoutCancellation()
             cancellation_descriptors: tuple[int, ...] = ()
@@ -349,6 +385,7 @@ class PosixExecutorGuardianChild:
                 cancellation.owner_lock_file_descriptor,
             )
             sentinel_cancellation = controls
+            cancellation_record_path = Path(cancellation.record_path)
             cancellation_descriptors = (
                 controls.listener_file_descriptor,
                 controls.owner_lock_file_descriptor,
@@ -383,7 +420,11 @@ class PosixExecutorGuardianChild:
                 "guardian could not transfer cancellation ownership to sentinel",
                 cleanup_errors,
             )
-        return _SentinelGuardianGroupOwner(controller)
+        return _SentinelGuardianGroupOwner(
+            controller,
+            cancellation_record_path,
+            invocation.lease_file_descriptors,
+        )
 
     def _run_started_command(
         self,

@@ -32,7 +32,12 @@ from ...domain.executor_guardian import (
     ExecutorGuardianTerminationPolicy,
     ExecutorGuardianUnboundedBudget,
 )
-from ...domain.executor import ExecutorCommandLifecycle, ExecutorDeadlineReason
+from ...domain.executor import (
+    ExecutorCommandCancellation,
+    ExecutorCommandLifecycle,
+    ExecutorDeadlineReason,
+    ExecutorInteractiveSessionCancellation,
+)
 from ...domain.process_group_sentinel import (
     ProcessGroupSentinelPolicy,
     ProcessGroupSentinelProgram,
@@ -406,7 +411,10 @@ class PosixExecutorCommandGuardian:
                 ),
                 lifecycle=request.lifecycle,
                 budget=request.budget,
-                cancellation=self._guardian_cancellation_record(cancellation_controls),
+                cancellation=self._guardian_cancellation_record(
+                    cancellation_controls,
+                    request.cancellation,
+                ),
                 termination_policy=self._termination_policy,
                 sentinel_program=self._sentinel_program,
                 sentinel_policy=self._sentinel_policy,
@@ -858,13 +866,20 @@ class PosixExecutorCommandGuardian:
     @staticmethod
     def _guardian_cancellation_record(
         controls: ExecutorGuardianCancellationControls,
+        cancellation: ExecutorCommandCancellation,
     ) -> GuardianCancellationControlRecord:
         if type(controls) is NoExecutorGuardianCancellationControls:
             return GuardianDetachedCancellationControlRecord()
         if type(controls) is ProcessCancellationOwnerControls:
+            if type(cancellation) is not ExecutorInteractiveSessionCancellation:
+                raise AssertionError(
+                    "interactive cancellation controls require an interactive "
+                    "cancellation contract"
+                )
             return GuardianInteractiveCancellationControlRecord(
                 listener_file_descriptor=controls.listener_file_descriptor,
                 owner_lock_file_descriptor=controls.owner_lock_file_descriptor,
+                record_path=str(cancellation.record_path),
             )
         raise AssertionError("guardian cancellation controls are a closed union")
 

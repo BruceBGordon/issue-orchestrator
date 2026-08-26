@@ -1048,7 +1048,7 @@ class TestBuildOrchestrator:
         try:
             with patch("issue_orchestrator.entrypoints.bootstrap.install_gh_guard"):
                 with patch("issue_orchestrator.entrypoints.bootstrap.create_plugin_manager"):
-                    with patch("issue_orchestrator.entrypoints.bootstrap.build_github_auth"):
+                    with patch("issue_orchestrator.entrypoints.bootstrap_adapters.build_github_auth"):
                         with patch("issue_orchestrator.entrypoints.bootstrap.GitHubAdapter"):
                             with patch("issue_orchestrator.adapters.github.fresh_issue_reader.GitHubFreshIssueReader"):
                                 with patch("issue_orchestrator.entrypoints.bootstrap.EventHub"):
@@ -1125,7 +1125,7 @@ class TestBuildOrchestrator:
             with patch("issue_orchestrator.entrypoints.bootstrap.create_plugin_manager"):
                 with patch("issue_orchestrator.entrypoints.bootstrap.GitHubAdapter"):
                     with patch("issue_orchestrator.entrypoints.bootstrap.EventHub"):
-                        with patch("issue_orchestrator.entrypoints.bootstrap.gh_audit") as mock_audit:
+                        with patch("issue_orchestrator.entrypoints.bootstrap_adapters.gh_audit") as mock_audit:
                             try:
                                 build_orchestrator(minimal_config)
                             except ValueError:

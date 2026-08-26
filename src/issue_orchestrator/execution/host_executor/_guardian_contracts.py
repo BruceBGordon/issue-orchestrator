@@ -71,6 +71,7 @@ class GuardianInteractiveCancellationControlRecord(ExecutorStrictRecord):
     kind: Literal["interactive"] = "interactive"
     listener_file_descriptor: int = Field(ge=0)
     owner_lock_file_descriptor: int = Field(ge=0)
+    record_path: str = Field(min_length=1)
 
 
 GuardianCancellationControlRecord = Annotated[

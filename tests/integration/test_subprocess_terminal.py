@@ -21,6 +21,9 @@ from issue_orchestrator.entrypoints.bootstrap import (
     build_terminal_session_terminator,
 )
 from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_owner,
+    build_terminal_session_registry,
+    build_terminal_session_watcher_factory,
     terminal_session_watcher_policy,
 )
 from issue_orchestrator.domain.terminal_launch import (
@@ -135,8 +138,11 @@ def test_subprocess_session_writes_completion_and_log(tmp_path, monkeypatch):
 
     plugin = SubprocessPlugin(
         build_terminal_session_terminator(),
+        build_terminal_session_owner(),
+        build_terminal_session_registry((worktree).resolve()),
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
+        build_terminal_session_watcher_factory(),
     )
     created = plugin.create_session(
         session_id=42,
@@ -187,8 +193,11 @@ def test_subprocess_send_input_writes_to_log(tmp_path, monkeypatch):
 
     plugin = SubprocessPlugin(
         build_terminal_session_terminator(),
+        build_terminal_session_owner(),
+        build_terminal_session_registry((worktree).resolve()),
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
+        build_terminal_session_watcher_factory(),
     )
     created = plugin.create_session(
         session_id=7,

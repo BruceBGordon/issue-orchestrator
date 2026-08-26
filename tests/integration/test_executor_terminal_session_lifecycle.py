@@ -33,6 +33,9 @@ from issue_orchestrator.entrypoints.bootstrap import (
     build_terminal_session_terminator,
 )
 from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_owner,
+    build_terminal_session_registry,
+    build_terminal_session_watcher_factory,
     terminal_session_watcher_policy,
 )
 from issue_orchestrator.infra.hooks.hookspec import PROJECT_NAME, TerminalSpec
@@ -59,14 +62,17 @@ class _OutputRecordingEvent(BaseModel):
     data_b64: str
 
 
-def _runner() -> PluggySessionRunner:
+def _runner(repo_root: Path) -> PluggySessionRunner:
     manager = pluggy.PluginManager(PROJECT_NAME)
     manager.add_hookspecs(TerminalSpec)
     manager.register(
         SubprocessPlugin(
             build_terminal_session_terminator(),
+            build_terminal_session_owner(),
+            build_terminal_session_registry(repo_root.resolve()),
             build_process_group_supervisor(),
             terminal_session_watcher_policy(),
+            build_terminal_session_watcher_factory(),
         ),
         name="terminal_subprocess",
     )
@@ -195,7 +201,7 @@ def test_interactive_executor_preserves_dev_tty_and_input(
         busy_file,
         (sys.executable, "-c", command_source),
     )
-    runner = _runner()
+    runner = _runner(repo_root)
     recording_path = run_dir / TERMINAL_RECORDING_FILENAME
 
     _create_session(runner, launch, worktree, "pty-input")
@@ -336,9 +342,9 @@ def test_session_stop_contains_executor_guardian_and_opaque_command(
         busy_file,
         (sys.executable, "-c", command_source),
     )
-    original_runner = _runner()
+    original_runner = _runner(repo_root)
     _create_session(original_runner, launch, worktree, session_name)
-    stopping_runner = _runner() if recover_before_stop else original_runner
+    stopping_runner = _runner(repo_root) if recover_before_stop else original_runner
     try:
         _await(opaque_pid_path.exists)
         _await(lambda: (run_dir / EXECUTOR_SESSION_CANCELLATION_FILENAME).exists())
@@ -380,7 +386,7 @@ def test_stalled_outer_session_cannot_strand_executor_guardian(
         busy_file,
         (sys.executable, "-c", command_source),
     )
-    runner = _runner()
+    runner = _runner(repo_root)
     _create_session(runner, launch, worktree, "stalled-outer-stop")
     try:
         _await(opaque_pid_path.exists)
