@@ -48,6 +48,7 @@ from .dirty_retry_budget import (
 from .orchestrator_resume import trigger_orchestrator_resume
 from .orchestrator_run_assets import require_orchestrator_run_assets_for_session
 from ...domain.dirty_remediation import (
+    ESCALATION_STATUSES,
     DirtyTreeDisposition,
     dirty_tree_disposition,
     rejection_hint_lines,
@@ -72,7 +73,6 @@ CODING_STATUSES = [
 
 def _is_managed_session() -> bool:
     return bool(get_env("SESSION_ID") or os.environ.get("ORCHESTRATOR_SESSION_ID"))
-
 
 
 def check_dirty_files(worktree_root: Path | None = None) -> list[str]:
@@ -131,6 +131,12 @@ def check_dirty_files(worktree_root: Path | None = None) -> list[str]:
 
 #: How many dirty paths any operator-facing listing shows before eliding.
 _DIRTY_PREVIEW_LIMIT = 15
+
+#: Which statuses each stage applies to. ESCALATION_STATUSES is imported from
+#: the remediation owner rather than restated, so the completion CLI and the
+#: orchestrator cannot disagree about what an escalation is.
+_STATUSES_REQUIRING_VALIDATION = frozenset({AgentStatus.COMPLETED})
+_STATUSES_THAT_PUSH = ESCALATION_STATUSES | {AgentStatus.COMPLETED}
 
 
 @dataclass(frozen=True)
@@ -206,12 +212,12 @@ def _handle_dirty_files_rejection(ctx: _DirtyTreeContext) -> None:
     under_orchestrator = ctx.under_orchestrator
     phase = ctx.phase
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     if phase == "post-validation":
         print("❌ WORKING TREE WAS DIRTIED BY VALIDATION — coding-done cannot complete")
     else:
         print("❌ WORKING TREE IS DIRTY — coding-done cannot complete")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"\nUncommitted files ({len(dirty_files)}):")
     for entry in dirty_files[:_DIRTY_PREVIEW_LIMIT]:
         print(f"  {entry}")
@@ -223,7 +229,7 @@ def _handle_dirty_files_rejection(ctx: _DirtyTreeContext) -> None:
     if phase != "post-validation":
         print("If you modified contracts or schemas, regenerate artifacts first.")
     print("Then run coding-done again.")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     if issue_number:
         logger.info(
@@ -256,17 +262,16 @@ def _handle_dirty_files_rejection(ctx: _DirtyTreeContext) -> None:
             write_marker_file("needs_human")
             reset_rejection_counter(worktree_root, session_id)
 
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(
-                f"⚠️  Auto-escalated to needs_human after {count} "
-                f"dirty-tree rejections."
+                f"⚠️  Auto-escalated to needs_human after {count} dirty-tree rejections."
             )
             print(
                 "The orchestrator will route this to a human. Session "
                 "will now exit cleanly rather than burn to the 90-minute "
                 "timeout."
             )
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
 
             trigger_orchestrator_resume(verbose=False)
             sys.exit(0)
@@ -302,13 +307,13 @@ STATUSES:
   completed    - Work done, PR ready (requires: --implementation, --problems)
   blocked      - Cannot proceed (requires: --reason, --attempted)
   needs_human  - Need decision (requires: --question)
-"""
+""",
     )
 
     parser.add_argument(
         "status",
         choices=["completed", "blocked", "needs_human"],
-        help="Completion status"
+        help="Completion status",
     )
 
     # Completion fields
@@ -318,8 +323,12 @@ STATUSES:
     # Blocked fields
     parser.add_argument("--reason", "-r", help="Why blocked")
     parser.add_argument("--attempted", "-a", help="What was attempted")
-    parser.add_argument("--blocked-by", "-b", type=int, nargs="+", help="Blocking issue numbers")
-    parser.add_argument("--when-unblocked", "-w", help="Hint for when blocker is resolved")
+    parser.add_argument(
+        "--blocked-by", "-b", type=int, nargs="+", help="Blocking issue numbers"
+    )
+    parser.add_argument(
+        "--when-unblocked", "-w", help="Hint for when blocker is resolved"
+    )
 
     # Needs human fields
     parser.add_argument("--question", "-q", help="Question for human")
@@ -338,8 +347,12 @@ STATUSES:
     )
 
     # Meta options
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be written")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed output")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would be written"
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Show detailed output"
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -349,7 +362,9 @@ STATUSES:
     return parser
 
 
-_DIRTY_TREE_HANDLERS: dict[DirtyTreeDisposition, Callable[[_DirtyTreeContext], None]] = {
+_DIRTY_TREE_HANDLERS: dict[
+    DirtyTreeDisposition, Callable[[_DirtyTreeContext], None]
+] = {
     DirtyTreeDisposition.REJECT: _handle_dirty_files_rejection,
     DirtyTreeDisposition.PRESERVE_AND_ESCALATE: _preserve_dirty_files_on_escalation,
 }
@@ -367,10 +382,264 @@ def _apply_dirty_tree_policy(ctx: _DirtyTreeContext) -> None:
     _DIRTY_TREE_HANDLERS[dirty_tree_disposition(ctx.status)](ctx)
 
 
-def main() -> None:  # noqa: C901, PLR0912
-    """Main entry point for coding-done."""
-    parser = build_parser()
-    args = parser.parse_args()
+@dataclass(frozen=True)
+class _CompletionRun:
+    """The invariants of one ``coding-done`` invocation, resolved once.
+
+    ``main`` used to thread these six values through 232 lines of inline
+    stages, which is how the same dirty-tree decision came to be spelled out
+    twice with different wording. Each stage now takes the run.
+    """
+
+    args: argparse.Namespace
+    status: str
+    issue_number: int | None
+    record: Any
+    worktree_root: Path
+    managed: bool
+
+    def dirty_context(self, dirty_files: list[str], phase: str) -> _DirtyTreeContext:
+        """Bind this run's identity to a set of dirty files."""
+        return _DirtyTreeContext(
+            dirty_files=dirty_files,
+            worktree_root=self.worktree_root,
+            issue_number=self.issue_number,
+            status=self.status,
+            under_orchestrator=self.managed,
+            phase=phase,
+            record=self.record,
+        )
+
+    def log_outcome(self, message: str, *args: Any) -> None:
+        if self.issue_number:
+            logger.info(issue_log(self.issue_number, message), *args)
+
+
+@dataclass(frozen=True)
+class _ValidationStage:
+    """What the agent-side validation stage produced, if it ran at all."""
+
+    result: Any = None
+
+    @property
+    def passed(self) -> bool:
+        return bool(self.result and self.result.passed)
+
+
+def _print_captured_stream(
+    raw_path: str | None, stream: str, note: str, max_lines: int
+) -> None:
+    """Echo a captured validation stream, tail-truncated.
+
+    ``note`` annotates the opening marker only; the closing marker stays
+    ``--- END <stream> ---`` because agents and tests match on that exact form.
+    """
+    if not raw_path:
+        return
+    path = Path(raw_path)
+    if not path.exists():
+        return
+    content = path.read_text().strip()
+    if not content:
+        return
+    header = f"{stream} {note}".strip()
+    print(f"\n--- {header} ---")
+    lines = content.split("\n")
+    if len(lines) > max_lines:
+        print(f"... ({len(lines) - max_lines} lines truncated)")
+        lines = lines[-max_lines:]
+    print("\n".join(lines))
+    print(f"--- END {stream} ---")
+
+
+def _fail_on_validation(run: _CompletionRun, validation_result: Any) -> None:
+    """Report a failed validation run and exit non-zero."""
+    print(f"\n{'=' * 60}")
+    print("❌ VALIDATION FAILED — coding-done cannot complete")
+    print(f"{'=' * 60}")
+    print(f"\nReason: {validation_result.reason}")
+
+    record = validation_result.record
+    if record:
+        _print_captured_stream(record.stderr_path, "STDERR", "(what failed)", 50)
+        _print_captured_stream(record.stdout_path, "STDOUT", "", 30)
+
+    print(f"\n{'=' * 60}")
+    print("TO FIX: Read the errors above, fix them, then run coding-done again.")
+    print("If you CANNOT fix after 2-3 attempts, use:")
+    print(
+        '  coding-done blocked --reason "Validation failing: <error>" --attempted "..."'
+    )
+    print(f"{'=' * 60}")
+
+    run.log_outcome("coding-done outcome: status=%s validation=FAILED", run.status)
+    sys.exit(1)
+
+
+def _enforce_pre_validation_dirty_policy(run: _CompletionRun) -> None:
+    """Stage 2: resolve the working tree before anything else runs.
+
+    A publishing status must have a clean tree. ``blocked`` and ``needs_human``
+    are the escalation path *for* a dirty file the agent must not resolve on its
+    own (rung 3 of the remediation ladder), so rejecting them would leave that
+    agent with no legal move at all -- the pressure that gets someone else's
+    uncommitted work deleted. ``domain.dirty_remediation`` owns that call, and
+    every other enforcement point asks it the same question.
+    """
+    _apply_dirty_tree_policy(
+        run.dirty_context(check_dirty_files(run.worktree_root), "pre-validation")
+    )
+
+    # Cleared tree: a prior rejection counter means the agent has demonstrated
+    # recovery, so subsequent rejections start from scratch.
+    if run.managed:
+        reset_rejection_counter(run.worktree_root, get_session_id())
+
+
+def _open_run_assets(run: _CompletionRun) -> Any:
+    if not run.record.session_id:
+        logger.error("[coding-done] Validation requires session_id but none found")
+        sys.exit(1)
+    if run.managed:
+        return require_orchestrator_run_assets_for_session(
+            run.worktree_root, run.record.session_id
+        )
+    return FileSystemSessionOutput().start_run(run.worktree_root, run.record.session_id)
+
+
+def _run_agent_validation(run: _CompletionRun) -> _ValidationStage:
+    """Stage 3: the agent's own fast feedback loop.
+
+    Deeper publish validation runs later, through the orchestrator-controlled
+    pre-push/pre-publish gate.
+    """
+    if run.status in ESCALATION_STATUSES:
+        print(
+            f"Note: Skipping validation for '{run.status}' status "
+            "(agent is reporting a problem)"
+        )
+        return _ValidationStage()
+    if run.status not in _STATUSES_REQUIRING_VALIDATION:
+        return _ValidationStage()
+
+    validation_cmd, _ = load_validation_cmd(run.worktree_root)
+    if not validation_cmd:
+        return _ValidationStage()
+
+    assets = _open_run_assets(run)
+    validation_result = run_validation(
+        run.worktree_root,
+        session_output_dir=assets.run_dir,
+        verbose=run.args.verbose,
+    )
+
+    if validation_result:
+        validation_record_path = record_validation_artifacts(
+            run.worktree_root, assets.validation_artifacts, validation_result
+        )
+        if validation_record_path is not None:
+            run.record.validation_record_path = str(validation_record_path)
+        if not validation_result.passed:
+            _fail_on_validation(run, validation_result)
+
+    return _ValidationStage(result=validation_result)
+
+
+def _enforce_post_validation_dirty_policy(
+    run: _CompletionRun, validation: _ValidationStage
+) -> None:
+    """Stage 3b: re-check the tree, because validation can dirty it.
+
+    Closes the temporal variance with the orchestrator's publish gate: the
+    validation command can write to the tree (auto-formatters, generated
+    artifacts, integration-test output that is not gitignored). Without this
+    the agent completes "successfully" while the orchestrator's later check
+    finds dirty files and silently rejects the push -- the rework loop seen on
+    issue #359 in tixmeup.
+    """
+    if not validation.passed:
+        return
+    post_validation_dirty = check_dirty_files(run.worktree_root)
+    if not post_validation_dirty:
+        return
+    _handle_dirty_files_rejection(
+        run.dirty_context(post_validation_dirty, "post-validation")
+    )
+
+
+def _enforce_preflight_push(run: _CompletionRun) -> None:
+    """Stage 4: prove the push would land, for unmanaged runs only.
+
+    Under the orchestrator this is skipped: it pushes through its own adapters
+    with credentials, and a dry-run push here would trigger the pre-push hook
+    inside the session timeout, which can fail on flaky tests and leave the
+    agent unable to complete at all.
+    """
+    if run.status not in _STATUSES_THAT_PUSH:
+        return
+    if run.managed:
+        if run.args.verbose:
+            print("Skipping push preflight (orchestrator handles pushing)")
+        return
+
+    would_succeed, error, fix_hint = run_preflight_push_check(
+        run.worktree_root, verbose=run.args.verbose
+    )
+    if would_succeed:
+        return
+
+    print(f"\n{'=' * 60}")
+    print("❌ PUSH WOULD FAIL — coding-done cannot complete")
+    print(f"{'=' * 60}")
+    print(f"\nError: {error}")
+    if fix_hint:
+        print(f"\nTo fix: {fix_hint}")
+    print(f"\n{'=' * 60}")
+    print("Fix the issue above, then run coding-done again.")
+    print(f"{'=' * 60}")
+
+    run.log_outcome("coding-done outcome: status=%s push_preflight=FAILED", run.status)
+    sys.exit(1)
+
+
+def _finalize(run: _CompletionRun, validation: _ValidationStage) -> None:
+    """Stage 5: write the marker and the record, then hand back to the operator."""
+    write_marker_file(run.status)
+    output_path = write_completion_record(run.record)
+
+    print(f"Completion record written to: {output_path.resolve()}")
+    print(f"Status: {run.status}")
+    print(f"Session: {run.record.session_id}")
+    if validation.result:
+        print(f"Validation: {'passed' if validation.passed else 'failed'}")
+
+    if run.args.resume:
+        print("\nTriggering orchestrator resume...")
+        resume_success, resume_error = trigger_orchestrator_resume(
+            verbose=run.args.verbose
+        )
+        print(
+            "Orchestrator resume triggered successfully."
+            if resume_success
+            else f"\n{resume_error}"
+        )
+    else:
+        print(
+            "\nThe orchestrator will process this record and perform the "
+            "necessary actions."
+        )
+
+    run.log_outcome(
+        "coding-done outcome: status=%s validation=%s resume=%s",
+        run.status,
+        "passed" if validation.passed else "skipped",
+        "triggered" if run.args.resume else "not_requested",
+    )
+
+
+def main() -> None:
+    """Run the completion stages in order; any stage may exit non-zero."""
+    args = build_parser().parse_args()
     status = args.status
     issue_number = get_issue_number()
 
@@ -379,10 +648,7 @@ def main() -> None:  # noqa: C901, PLR0912
     else:
         logger.info("[coding-done] Starting (standalone): status=%s", status)
 
-    # 1. Validate required fields
     validate_fields(status, args)
-
-    # Build completion record
     record = build_completion_record(status, args)
 
     if args.dry_run:
@@ -391,212 +657,23 @@ def main() -> None:  # noqa: C901, PLR0912
         print("--- END ---")
         return
 
-    worktree_root = find_worktree_root()
-
-    # The retry budget (#5949) only applies under orchestrator-managed
-    # sessions. Standalone dev invocations have per-call session ids
-    # (``standalone-<timestamp>``) so the counter never reaches the
-    # escalation threshold anyway, but gating explicitly avoids surprising
-    # a developer whose workflow is to deliberately rerun ``coding-done``
-    # against a dirty tree during testing.
-    #
-    # Two env vars, two eras: ``ISSUE_ORCHESTRATOR_SESSION_ID``
-    # (via ``get_env("SESSION_ID")`` — the ``get_env`` helper adds the
-    # ``ISSUE_ORCHESTRATOR_`` prefix) is the current contract;
-    # ``ORCHESTRATOR_SESSION_ID`` is the legacy form still accepted for
-    # compatibility. Short-circuit OR means the current form wins when
-    # both are set — the hypothetical "both set but disagree" case
-    # favours the current contract, which is the behaviour the agent
-    # prompts emit.
-    managed = _is_managed_session()
-
-    # 2. Dirty check. A publishing status must have a clean tree. ``blocked``
-    #    and ``needs_human`` are the escalation path *for* a dirty file the
-    #    agent must not resolve on its own (rung 3 of the remediation ladder),
-    #    so rejecting them here would leave that agent with no legal move: it
-    #    cannot commit the file, must not delete it, and could not report it
-    #    either. That dead end is exactly the pressure that gets someone's
-    #    uncommitted work deleted. The orchestrator agrees these are safe to
-    #    accept -- ``validate_worktree_state`` applies the dirty policy only
-    #    when the record requests PUSH_BRANCH, which neither status does.
-    dirty_files = check_dirty_files(worktree_root)
-    _apply_dirty_tree_policy(
-        _DirtyTreeContext(
-            dirty_files=dirty_files,
-            worktree_root=worktree_root,
-            issue_number=issue_number,
-            status=status,
-            under_orchestrator=managed,
-            phase="pre-validation",
-            record=record,
-        )
+    run = _CompletionRun(
+        args=args,
+        status=status,
+        issue_number=issue_number,
+        record=record,
+        worktree_root=find_worktree_root(),
+        # The retry budget (#5949) applies only under orchestrator-managed
+        # sessions; standalone dev invocations get per-call session ids so the
+        # counter never reaches the escalation threshold anyway.
+        managed=_is_managed_session(),
     )
 
-    # Dirty check passed — if a prior rejection left a non-zero counter
-    # the agent has demonstrated recovery, so clear it. Subsequent
-    # rejections start from scratch rather than continuing the streak.
-    if managed:
-        reset_rejection_counter(worktree_root, get_session_id())
-
-    # 3. Run quick validation if configured. This is the immediate feedback
-    #    path for coding agents; deeper publish validation runs later through
-    #    the orchestrator-controlled pre-push/pre-publish gate.
-    validation_result = None
-    statuses_requiring_validation = {AgentStatus.COMPLETED}
-    assets = None
-    if status in statuses_requiring_validation:
-        validation_cmd, _ = load_validation_cmd(worktree_root)
-        if validation_cmd:
-            if not record.session_id:
-                logger.error("[coding-done] Validation requires session_id but none found")
-                sys.exit(1)
-            if managed:
-                assets = require_orchestrator_run_assets_for_session(
-                    worktree_root,
-                    record.session_id,
-                )
-            else:
-                assets = FileSystemSessionOutput().start_run(
-                    worktree_root,
-                    record.session_id,
-                )
-            validation_result = run_validation(
-                worktree_root,
-                session_output_dir=assets.run_dir,
-                verbose=args.verbose,
-            )
-    elif status in {AgentStatus.BLOCKED, AgentStatus.NEEDS_HUMAN}:
-        print(f"Note: Skipping validation for '{status}' status (agent is reporting a problem)")
-
-    if validation_result and assets is not None:
-        validation_record_path = record_validation_artifacts(
-            worktree_root,
-            assets.validation_artifacts,
-            validation_result,
-        )
-        if validation_record_path is not None:
-            record.validation_record_path = str(validation_record_path)
-
-    if validation_result and not validation_result.passed:
-        print(f"\n{'='*60}")
-        print("❌ VALIDATION FAILED — coding-done cannot complete")
-        print(f"{'='*60}")
-        print(f"\nReason: {validation_result.reason}")
-
-        if validation_result.record and validation_result.record.stderr_path:
-            stderr_path = Path(validation_result.record.stderr_path)
-            if stderr_path.exists():
-                stderr_content = stderr_path.read_text()
-                if stderr_content.strip():
-                    print(f"\n--- STDERR (what failed) ---")
-                    lines = stderr_content.strip().split('\n')
-                    if len(lines) > 50:
-                        print(f"... ({len(lines) - 50} lines truncated)")
-                        lines = lines[-50:]
-                    print('\n'.join(lines))
-                    print("--- END STDERR ---")
-
-        if validation_result.record and validation_result.record.stdout_path:
-            stdout_path = Path(validation_result.record.stdout_path)
-            if stdout_path.exists():
-                stdout_content = stdout_path.read_text()
-                if stdout_content.strip():
-                    print(f"\n--- STDOUT ---")
-                    lines = stdout_content.strip().split('\n')
-                    if len(lines) > 30:
-                        print(f"... ({len(lines) - 30} lines truncated)")
-                        lines = lines[-30:]
-                    print('\n'.join(lines))
-                    print("--- END STDOUT ---")
-
-        print(f"\n{'='*60}")
-        print("TO FIX: Read the errors above, fix them, then run coding-done again.")
-        print("If you CANNOT fix after 2-3 attempts, use:")
-        print('  coding-done blocked --reason "Validation failing: <error>" --attempted "..."')
-        print(f"{'='*60}")
-
-        if issue_number:
-            logger.info(issue_log(issue_number, "coding-done outcome: status=%s validation=FAILED"), status)
-        sys.exit(1)
-
-    # 3b. Re-check dirty tree AFTER validation. Closes the temporal
-    #     variance with the orchestrator's publish gate: validate.sh can
-    #     write to the tree (auto-formatters, generated artifacts,
-    #     integration-test outputs that aren't gitignored). Without this
-    #     re-check the agent completed "successfully" while the
-    #     orchestrator's later check found dirty files and silently
-    #     rejected the push, producing the rework loop seen on issue
-    #     #359 in tixmeup.
-    if validation_result and validation_result.passed:
-        post_validation_dirty = check_dirty_files(worktree_root)
-        if post_validation_dirty:
-            _handle_dirty_files_rejection(
-                _DirtyTreeContext(
-                    dirty_files=post_validation_dirty,
-                    worktree_root=worktree_root,
-                    issue_number=issue_number,
-                    status=status,
-                    under_orchestrator=managed,
-                    phase="post-validation",
-                    record=record,
-                )
-            )
-
-    # 4. Run preflight push check
-    #    Skip under orchestrator — the orchestrator handles pushing via its own
-    #    adapters with credentials.  Running a dry-run push here triggers the
-    #    pre-push hook inside the session timeout, which can fail on flaky tests
-    #    and leave the agent unable to complete at all.
-    statuses_that_push = {AgentStatus.COMPLETED, AgentStatus.BLOCKED, AgentStatus.NEEDS_HUMAN}
-    if status in statuses_that_push and not managed:
-        would_succeed, error, fix_hint = run_preflight_push_check(worktree_root, verbose=args.verbose)
-        if not would_succeed:
-            print(f"\n{'='*60}")
-            print("❌ PUSH WOULD FAIL — coding-done cannot complete")
-            print(f"{'='*60}")
-            print(f"\nError: {error}")
-            if fix_hint:
-                print(f"\nTo fix: {fix_hint}")
-            print(f"\n{'='*60}")
-            print("Fix the issue above, then run coding-done again.")
-            print(f"{'='*60}")
-
-            if issue_number:
-                logger.info(issue_log(issue_number, "coding-done outcome: status=%s push_preflight=FAILED"), status)
-            sys.exit(1)
-    elif status in statuses_that_push and managed:
-        if args.verbose:
-            print("Skipping push preflight (orchestrator handles pushing)")
-
-    # 5. Write marker + completion record
-    write_marker_file(status)
-    output_path = write_completion_record(record)
-    output_path_abs = output_path.resolve()
-
-    print(f"Completion record written to: {output_path_abs}")
-    print(f"Status: {status}")
-    print(f"Session: {record.session_id}")
-    if validation_result:
-        print(f"Validation: {'passed' if validation_result.passed else 'failed'}")
-
-    # Handle --resume flag
-    if args.resume:
-        print("\nTriggering orchestrator resume...")
-        resume_success, resume_error = trigger_orchestrator_resume(verbose=args.verbose)
-        if resume_success:
-            print("Orchestrator resume triggered successfully.")
-        else:
-            print(f"\n{resume_error}")
-    else:
-        print("\nThe orchestrator will process this record and perform the necessary actions.")
-
-    if issue_number:
-        logger.info(
-            issue_log(issue_number, "coding-done outcome: status=%s validation=%s resume=%s"),
-            status,
-            "passed" if validation_result and validation_result.passed else "skipped",
-            "triggered" if args.resume else "not_requested",
-        )
+    _enforce_pre_validation_dirty_policy(run)
+    validation = _run_agent_validation(run)
+    _enforce_post_validation_dirty_policy(run, validation)
+    _enforce_preflight_push(run)
+    _finalize(run, validation)
 
 
 def safe_main() -> None:
@@ -616,9 +693,9 @@ def safe_main() -> None:
         if issue_number:
             logger.error(issue_log(issue_number, "coding-done crashed: %s"), str(e))
 
-        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"\n{'=' * 60}", file=sys.stderr)
         print("❌ CODING-DONE INTERNAL ERROR", file=sys.stderr)
-        print(f"{'='*60}", file=sys.stderr)
+        print(f"{'=' * 60}", file=sys.stderr)
         print(f"\nError: {e}", file=sys.stderr)
         print(f"\n{traceback.format_exc()}", file=sys.stderr)
 
