@@ -8,6 +8,7 @@ No external mocking needed - pure logic tests.
 
 import json
 import pytest
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -114,6 +115,14 @@ def make_session_run_assets(
     """Allocate the run contract the active-session owner would inject."""
     worktree = worktree.resolve()
     worktree.mkdir(parents=True, exist_ok=True)
+    if not (worktree / ".git").exists():
+        # The validation timing journal fail-fasts without a Git common
+        # directory; every controller-owned worktree is a real repository.
+        subprocess.run(
+            ("git", "init", "--quiet", str(worktree)),
+            check=True,
+            capture_output=True,
+        )
     return session_output.start_run(
         worktree,
         session_name,
@@ -1165,6 +1174,10 @@ class MockCommandRunner:
     def run(self, command: ContainedValidationCommand) -> ValidationCommandExecution:
         """Record the call and return configured result."""
         self.run_calls.append(command)
+        # The contained runner's contract includes durable output journals at
+        # the capture paths; downstream gate-timing recording reads them.
+        command.output_capture.stdout_path.write_text(self.stdout, encoding="utf-8")
+        command.output_capture.stderr_path.write_text(self.stderr, encoding="utf-8")
         return ValidationCommandExecution(
             child=ValidationCommandExited(
                 process_id=42_424,

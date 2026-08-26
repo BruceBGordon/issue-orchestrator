@@ -65,6 +65,8 @@ class _CompletionModuleBindings:
 
     subprocess_modules: frozenset[str]
     subprocess_runs: frozenset[str]
+    string_join_modules: frozenset[str]
+    os_modules: frozenset[str]
     watchdog_owners: frozenset[str]
     watchdog_rebinding_lines: tuple[int, ...]
 
@@ -80,6 +82,7 @@ class ProcessCompletionCallGuardrail:
     }
     _WATCHDOG_MODULE = "tests.process_completion_fixture"
     _WATCHDOG_SYMBOL = "PROCESS_COMPLETION_WATCHDOG"
+    _STRING_JOIN_MODULES = frozenset({"shlex", "posixpath", "ntpath"})
 
     def __init__(self, client_paths: tuple[Path, ...]) -> None:
         if type(client_paths) is not tuple or not client_paths:
@@ -161,6 +164,8 @@ class ProcessCompletionCallGuardrail:
                 and receiver.id in bindings.watchdog_owners
             ):
                 continue
+            if method_name == "join" and cls._is_string_join(receiver, bindings):
+                continue
             violations.append(
                 CompletionGuardrailViolation(
                     path,
@@ -170,10 +175,34 @@ class ProcessCompletionCallGuardrail:
             )
         return tuple(violations)
 
+    @staticmethod
+    def _is_string_join(
+        receiver: ast.expr,
+        bindings: _CompletionModuleBindings,
+    ) -> bool:
+        """Recognize joins that assemble strings rather than await completion."""
+        if isinstance(receiver, ast.Constant) and isinstance(
+            receiver.value, (str, bytes)
+        ):
+            return True
+        if (
+            isinstance(receiver, ast.Name)
+            and receiver.id in bindings.string_join_modules
+        ):
+            return True
+        return (
+            isinstance(receiver, ast.Attribute)
+            and receiver.attr == "path"
+            and isinstance(receiver.value, ast.Name)
+            and receiver.value.id in bindings.os_modules
+        )
+
     @classmethod
     def _module_bindings(cls, tree: ast.AST) -> _CompletionModuleBindings:
         subprocess_modules: set[str] = set()
         subprocess_runs: set[str] = set()
+        string_join_modules: set[str] = set()
+        os_modules: set[str] = set()
         watchdog_owners: set[str] = set()
         imports: list[tuple[str, bool, int]] = []
         for node in ast.walk(tree):
@@ -183,6 +212,12 @@ class ProcessCompletionCallGuardrail:
                     imports.append((local_name, False, node.lineno))
                     if alias.name == "subprocess":
                         subprocess_modules.add(local_name)
+                    if alias.name in cls._STRING_JOIN_MODULES:
+                        string_join_modules.add(local_name)
+                    if alias.name in ("os", "os.path"):
+                        os_modules.add(local_name)
+                        if alias.name == "os.path":
+                            string_join_modules.add(local_name)
             elif isinstance(node, ast.ImportFrom):
                 for alias in node.names:
                     local_name = alias.asname or alias.name
@@ -223,6 +258,8 @@ class ProcessCompletionCallGuardrail:
         return _CompletionModuleBindings(
             subprocess_modules=frozenset(subprocess_modules),
             subprocess_runs=frozenset(subprocess_runs),
+            string_join_modules=frozenset(string_join_modules),
+            os_modules=frozenset(os_modules),
             watchdog_owners=frozenset(watchdog_owners),
             watchdog_rebinding_lines=tuple(sorted(rebinding_lines)),
         )
@@ -312,3 +349,30 @@ PROCESS_COMPLETION_WATCHDOG.wait(timeout=5)
         CompletionGuardrailViolationKind.WATCHDOG_OWNER_REBINDING,
         CompletionGuardrailViolationKind.WAIT,
     )
+
+
+def test_completion_guardrail_permits_string_joins(tmp_path: Path) -> None:
+    permitted = (tmp_path / "string_joins.py").resolve()
+    permitted.write_text(
+        """
+import os
+import os.path
+import shlex
+import shlex as lex
+
+shlex.join(('command', 'argument'))
+lex.join(('command', 'argument'))
+os.path.join('a', 'b')
+', '.join(('a', 'b'))
+b''.join((b'a', b'b'))
+thread.join(timeout=5)
+""",
+        encoding="utf-8",
+    )
+
+    violations = ProcessCompletionCallGuardrail((permitted,)).violations()
+
+    assert tuple(violation.kind for violation in violations) == (
+        CompletionGuardrailViolationKind.JOIN,
+    )
+    assert violations[0].line_number == 12

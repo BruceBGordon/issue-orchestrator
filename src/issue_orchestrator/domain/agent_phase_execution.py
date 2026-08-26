@@ -197,11 +197,15 @@ class AgentPhaseRunSpecification:
         active_timeout_minutes: int,
         interaction_intent: TerminalInteractionIntent,
         shell_command: str,
-        cancellation: ExecutorInteractiveSessionCancellation,
         destination: TerminalRunDestination,
     ) -> AgentPhaseRunSpecification:
         if type(active_timeout_minutes) is not int or active_timeout_minutes < 1:
             raise ValueError("active_timeout_minutes must be a positive integer")
+        if type(destination) is not TerminalRunDestination:
+            raise ValueError(
+                "AgentPhaseRunSpecification.destination must be "
+                "TerminalRunDestination"
+            )
         active_seconds = float(active_timeout_minutes * 60)
         return cls(
             work_key=work_key,
@@ -212,7 +216,9 @@ class AgentPhaseRunSpecification:
             ),
             interaction_intent=interaction_intent,
             shell_command=shell_command,
-            cancellation=cancellation,
+            cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
+                destination.run_dir
+            ),
             destination=destination,
         )
 

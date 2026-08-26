@@ -1334,24 +1334,18 @@ class ProfileCommandDeadlineEvidence:
 
     active_timeout_seconds: float
     absolute_timeout_seconds: float
-    outer_timeout_seconds: int
+    outer_timeout_seconds: float
 
     def __post_init__(self) -> None:
         for field_name, value in (
             ("active_timeout_seconds", self.active_timeout_seconds),
             ("absolute_timeout_seconds", self.absolute_timeout_seconds),
+            ("outer_timeout_seconds", self.outer_timeout_seconds),
         ):
             if type(value) is not float or not math.isfinite(value) or value <= 0:
                 raise ValueError(
                     f"ProfileCommandDeadlineEvidence.{field_name} must be positive"
                 )
-        if (
-            type(self.outer_timeout_seconds) is not int
-            or self.outer_timeout_seconds <= 0
-        ):
-            raise ValueError(
-                "ProfileCommandDeadlineEvidence.outer_timeout_seconds must be positive"
-            )
 
 
 @dataclass(frozen=True, slots=True)

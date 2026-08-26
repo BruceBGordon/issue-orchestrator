@@ -247,6 +247,10 @@ def test_append_preserves_write_journal_close_and_lock_close_failures(
         def __init__(self, delegate: BinaryIO) -> None:
             self._delegate = delegate
 
+        @property
+        def closed(self) -> bool:
+            return self._delegate.closed
+
         def fileno(self) -> int:
             return self._delegate.fileno()
 

@@ -288,12 +288,15 @@ def test_pressure_guardian_enforces_deadline_after_executor_parent_crash(
         command_pid_path=(tmp_path / "hung-command.pid").resolve(),
     )
     with PressureRig(pool_dir, host_cpu_slots=1) as rig:
+        # Command activation legitimately spends real machinery time (guardian
+        # and child-launcher interpreters); the bound must dwarf that cost so
+        # the deadline under test measures the hung command, not startup.
         crashed_parent = rig.admit(
             PressureWork(
                 "HUNG-COMMAND",
                 "pressure-guardian-timeout",
                 command=hung,
-                deadline=BoundedPressureDeadline(1.0, 5.0),
+                deadline=BoundedPressureDeadline(10.0, 20.0),
             )
         )
         rig.crash_parent(crashed_parent)

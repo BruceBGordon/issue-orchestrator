@@ -367,7 +367,7 @@ def test_foreign_parent_child_cannot_contaminate_guardian_resource_usage(
             "from pathlib import Path; import sys, time; "
             "marker=Path(sys.argv[1]); "
             "exec('while not marker.exists():\\n time.sleep(0.01)'); "
-            "end=time.process_time()+0.5; "
+            "end=time.process_time()+2.0; "
             "exec('while time.process_time() < end:\\n pass')"
         )
         result = PROCESS_COMPLETION_WATCHDOG.run_text(
@@ -402,7 +402,9 @@ def test_foreign_parent_child_cannot_contaminate_guardian_resource_usage(
 
     assert type(terminal) is ExecutorGuardianCommandCompleted
     assert type(terminal.resources) is ExecutorGuardianCommandResourceUsage
-    assert terminal.resources.cpu_seconds < 0.2
+    # Contamination would add the foreign child's full 2.0 CPU-second burn;
+    # the guardian's own cost is interpreter startup, far below half of it.
+    assert terminal.resources.cpu_seconds < 1.0
 
 
 def test_completed_terminal_record_wins_over_late_parent_sigterm(

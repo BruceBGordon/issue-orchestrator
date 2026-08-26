@@ -1,9 +1,13 @@
 # pyright: strict
-"""One typed owner for POSIX flock acquisition and handle finalization."""
+"""One typed owner for POSIX flock acquisition and handle finalization.
+
+``fcntl`` is imported at each syscall site, never at module import: entry-point
+composition must stay importable on hosts without the POSIX executor, failing
+explicitly only when a lock is actually attempted.
+"""
 
 from __future__ import annotations
 
-import fcntl
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -102,6 +106,8 @@ class PosixFileLockLease:
         )
 
     def _finalize(self) -> CleanupOutcome:
+        import fcntl
+
         outcome = IndependentCleanupPlan(
             (
                 CleanupAction(
@@ -195,6 +201,8 @@ class PosixFileLockOwner:
                     )
                 ).run(),
             )
+        import fcntl
+
         lease = PosixFileLockLease(handle)
         try:
             fcntl.flock(handle.fileno(), self._operation(specification))
@@ -224,6 +232,8 @@ class PosixFileLockOwner:
 
     @staticmethod
     def _operation(specification: PosixFileLockSpecification) -> int:
+        import fcntl
+
         operation = (
             fcntl.LOCK_SH
             if specification.mode is PosixFileLockMode.SHARED

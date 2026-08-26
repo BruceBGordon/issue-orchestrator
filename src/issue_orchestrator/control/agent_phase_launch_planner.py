@@ -13,7 +13,6 @@ from ..domain.agent_phase_execution import (
 )
 from ..domain.executor import (
     ExecutorFairnessGroup,
-    ExecutorInteractiveSessionCancellation,
     ExecutorWorkKey,
 )
 from ..domain.models import AgentConfig
@@ -74,9 +73,6 @@ class AgentPhaseLaunchPlanner:
             interaction_intent=interaction_intent,
             shell_command=(
                 f"{request.environment_exports} && {wrapped_provider_command}"
-            ),
-            cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
-                request.run.run_dir.resolve()
             ),
             destination=request.run.terminal_destination,
         )

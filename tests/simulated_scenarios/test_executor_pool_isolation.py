@@ -63,9 +63,6 @@ def test_spawned_agent_phase_uses_worker_local_executor_pool(
         active_timeout_minutes=1,
         interaction_intent=TerminalInteractionIntent.NONE,
         shell_command=shlex.join((sys.executable, "-c", "pass")),
-        cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
-            destination.run_dir
-        ),
         destination=destination,
     )
     scheduled = host_agent_phase_command_scheduler().schedule(specification)

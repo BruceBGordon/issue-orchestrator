@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from ...domain.executor import ExecutorCommandLifecycle
 from ...domain.executor_child_resources import ExecutorChildResourceSnapshot
 from ...domain.posix_process import (
+    PosixProcessActivationDeadlineExceededError,
     PosixProcessAbsoluteActivationDeadline,
     PosixProcessActivationDeadlineAbsent,
     PosixProcessActivationDeadlinePresent,
@@ -477,14 +478,33 @@ class PosixExecutorGuardianChild:
                 )
             raise AssertionError("guardian containment unexpectedly returned")
         if type(launch) is PosixProcessLaunchRecoveryFailed:
-            recovery = BaseExceptionGroup(
-                "opaque command activation and recovery failed",
-                (launch.activation_error, launch.recovery_error),
-            )
-            terminal = ExecutorGuardianInternalFailed(
-                type(recovery).__name__,
-                repr(recovery),
-            )
+            terminal: ExecutorGuardianActivationTimedOut | ExecutorGuardianInternalFailed
+            if type(budget) is ExecutorGuardianBoundedBudget and isinstance(
+                launch.activation_error,
+                PosixProcessActivationDeadlineExceededError,
+            ):
+                # The budget legitimately expired mid-activation; the joined
+                # child needs full-group containment, but the terminal is a
+                # deadline outcome, not a guardian defect.
+                terminal = ExecutorGuardianActivationTimedOut(
+                    budget.reason,
+                    (
+                        ExecutorGuardianSerializedFailure(
+                            "recover activation-expired opaque command",
+                            type(launch.recovery_error).__name__,
+                            repr(launch.recovery_error),
+                        ),
+                    ),
+                )
+            else:
+                recovery = BaseExceptionGroup(
+                    "opaque command activation and recovery failed",
+                    (launch.activation_error, launch.recovery_error),
+                )
+                terminal = ExecutorGuardianInternalFailed(
+                    type(recovery).__name__,
+                    repr(recovery),
+                )
             try:
                 result_writer.write(terminal)
             finally:

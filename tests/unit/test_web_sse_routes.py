@@ -5,6 +5,11 @@
 from issue_orchestrator.events.catalog import EVENT_SCHEMA_VERSION
 from issue_orchestrator.entrypoints.bootstrap import build_process_group_supervisor
 from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_owner,
+    build_terminal_session_registry,
+    build_terminal_session_watcher_factory,
+)
+from issue_orchestrator.entrypoints.bootstrap_executor import (
     terminal_session_watcher_policy,
 )
 from issue_orchestrator.ports.tech_lead_run_record_store import (
@@ -317,7 +322,7 @@ class TestSSEFunctionality:
 class TestEmitEventHelper:
     """Test the trace event emission via PluginManager.emit()."""
 
-    def test_plugin_manager_emit_broadcasts_to_hooks(self):
+    def test_plugin_manager_emit_broadcasts_to_hooks(self, tmp_path: Path):
         """Test that PluginManager.emit() broadcasts to on_trace_event hooks."""
         from issue_orchestrator.execution.manager import PluginManager
         from issue_orchestrator.infra.hooks.hookspec import hookimpl
@@ -333,8 +338,11 @@ class TestEmitEventHelper:
         # Create plugin manager and register test plugin
         pm = PluginManager(
             RecordingTerminalSessionTerminator(),
+            build_terminal_session_owner(),
+            build_terminal_session_registry(tmp_path),
             build_process_group_supervisor(),
             terminal_session_watcher_policy(),
+            build_terminal_session_watcher_factory(),
             terminal_plugin="subprocess",
         )
         pm.register_plugin(TestPlugin(), name="test_plugin")
@@ -478,7 +486,7 @@ class TestIssueRowsEndpoint:
         finally:
             set_orchestrator(original)
 
-    def test_plugin_manager_emit_with_empty_data(self):
+    def test_plugin_manager_emit_with_empty_data(self, tmp_path: Path):
         """Test that emit() works with no data argument."""
         from issue_orchestrator.execution.manager import PluginManager
         from issue_orchestrator.infra.hooks.hookspec import hookimpl
@@ -492,8 +500,11 @@ class TestIssueRowsEndpoint:
 
         pm = PluginManager(
             RecordingTerminalSessionTerminator(),
+            build_terminal_session_owner(),
+            build_terminal_session_registry(tmp_path),
             build_process_group_supervisor(),
             terminal_session_watcher_policy(),
+            build_terminal_session_watcher_factory(),
             terminal_plugin="subprocess",
         )
         pm.register_plugin(TestPlugin(), name="test_plugin")

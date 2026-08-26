@@ -12,13 +12,18 @@ from issue_orchestrator.domain.executor import (
     ExecutorInteractiveSessionCancellation,
 )
 from issue_orchestrator.domain.terminal_session_termination import (
+    TerminalSessionOwnerCancellation,
     TerminalSessionProcess,
     TerminalSessionTerminationPolicy,
 )
 from issue_orchestrator.domain.process_group import ProcessBirthIdentity
 
 
-def _cancellation(tmp_path: Path) -> ExecutorInteractiveSessionCancellation:
+def _terminal_cancellation(tmp_path: Path) -> TerminalSessionOwnerCancellation:
+    return TerminalSessionOwnerCancellation.for_run_dir(tmp_path.resolve())
+
+
+def _executor_cancellation(tmp_path: Path) -> ExecutorInteractiveSessionCancellation:
     return ExecutorInteractiveSessionCancellation.for_run_dir(tmp_path.resolve())
 
 
@@ -31,15 +36,28 @@ def test_terminal_session_process_requires_real_group_leader_identity(
         TerminalSessionProcess(
             process_id,
             ProcessBirthIdentity("darwin-timeval:1700000000:100"),
-            _cancellation(tmp_path),
+            _terminal_cancellation(tmp_path),
+            _executor_cancellation(tmp_path),
         )
 
 
 def test_terminal_session_process_requires_typed_cancellation(tmp_path: Path) -> None:
-    invalid = cast(ExecutorInteractiveSessionCancellation, None)
+    identity = ProcessBirthIdentity("darwin-timeval:1700000000:100")
 
+    with pytest.raises(ValueError, match="terminal_cancellation"):
+        TerminalSessionProcess(
+            42,
+            identity,
+            cast(TerminalSessionOwnerCancellation, None),
+            _executor_cancellation(tmp_path),
+        )
     with pytest.raises(ValueError, match="executor_cancellation"):
-        TerminalSessionProcess(42, ProcessBirthIdentity("darwin-timeval:1700000000:100"), invalid)
+        TerminalSessionProcess(
+            42,
+            identity,
+            _terminal_cancellation(tmp_path),
+            cast(ExecutorInteractiveSessionCancellation, None),
+        )
 
 
 @pytest.mark.parametrize("seconds", (0.0, -1.0, math.nan, math.inf))

@@ -5,6 +5,9 @@ from pathlib import Path
 from issue_orchestrator.execution.manager import create_plugin_manager
 from issue_orchestrator.entrypoints.bootstrap_executor import (
     build_process_group_supervisor,
+    build_terminal_session_owner,
+    build_terminal_session_registry,
+    build_terminal_session_watcher_factory,
     terminal_session_watcher_policy,
 )
 from tests.unit.terminal_session_termination_helpers import (
@@ -12,12 +15,15 @@ from tests.unit.terminal_session_termination_helpers import (
 )
 
 
-def test_subprocess_plugin_can_load():
+def test_subprocess_plugin_can_load(tmp_path):
     """Ensure subprocess plugin mapping resolves to a valid class."""
     pm = create_plugin_manager(
         RecordingTerminalSessionTerminator(),
+        build_terminal_session_owner(),
+        build_terminal_session_registry(tmp_path),
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
+        build_terminal_session_watcher_factory(),
         terminal_plugin="subprocess",
         load_entry_points=False,
     )
@@ -28,8 +34,11 @@ def test_subprocess_plugin_receives_session_interaction_kwargs(tmp_path):
     session_terminator = RecordingTerminalSessionTerminator()
     pm = create_plugin_manager(
         session_terminator,
+        build_terminal_session_owner(),
+        build_terminal_session_registry(tmp_path),
         build_process_group_supervisor(),
         terminal_session_watcher_policy(),
+        build_terminal_session_watcher_factory(),
         terminal_plugin="subprocess",
         session_interactions_enabled=True,
         worktree_base=tmp_path,

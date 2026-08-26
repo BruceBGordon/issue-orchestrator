@@ -489,9 +489,6 @@ def test_phase_specification_converts_active_timeout_to_fixed_absolute_bound(
         active_timeout_minutes=45,
         interaction_intent=TerminalInteractionIntent.NONE,
         shell_command="run-agent --issue 42",
-        cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
-            destination.run_dir
-        ),
         destination=destination,
     )
 
@@ -518,10 +515,13 @@ def test_phase_specification_rejects_split_cancellation_identity(
         ValueError,
         match="cancellation must identify the destination run directory",
     ):
-        AgentPhaseRunSpecification.from_timeout_minutes(
+        AgentPhaseRunSpecification(
             work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
             fairness_group=ExecutorFairnessGroup("agent:run-1:coding-1"),
-            active_timeout_minutes=45,
+            deadline=ExecutorBoundedDeadline(
+                active_timeout_seconds=2700.0,
+                absolute_timeout_seconds=5400.0,
+            ),
             interaction_intent=TerminalInteractionIntent.NONE,
             shell_command="run-agent --issue 42",
             cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
@@ -664,9 +664,6 @@ def test_scheduler_renders_one_shell_safe_internal_invocation(tmp_path: Path) ->
         active_timeout_minutes=45,
         interaction_intent=TerminalInteractionIntent.NONE,
         shell_command="printf '%s\\n' 'human readable'",
-        cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
-            destination.run_dir
-        ),
         destination=destination,
     )
     scheduler = HostAgentPhaseCommandScheduler(
@@ -733,9 +730,6 @@ def test_scheduler_preserves_interaction_intent_hidden_by_executor_wrapper(
         active_timeout_minutes=45,
         interaction_intent=expected_intent,
         shell_command=command,
-        cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
-            destination.run_dir
-        ),
         destination=destination,
     )
 
@@ -771,9 +765,6 @@ def test_scheduled_phase_executes_bash_language_without_shell_drift(
         active_timeout_minutes=1,
         interaction_intent=TerminalInteractionIntent.NONE,
         shell_command="values=(alpha beta); [[ ${values[1]} == beta ]]",
-        cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
-            destination.run_dir
-        ),
         destination=destination,
     )
     scheduled = HostAgentPhaseCommandScheduler(
@@ -1036,11 +1027,14 @@ def test_descendant_is_gone_before_timed_out_phase_releases_lease(
         concurrency_range=ExecutorConcurrencyRange(1, 1),
         exclusive_resources=(),
     )
+    # Both bounds must dwarf real activation machinery (guardian and child
+    # launcher interpreters) so the deadline measures the pausing leader and
+    # the recovery command, never their startup.
     timed_out = executor.run(
         specification,
         ExecutorCommand(
             (sys.executable, "-c", leader_script),
-            ExecutorBoundedDeadline(1.0, 2.0),
+            ExecutorBoundedDeadline(10.0, 20.0),
             ExecutorCommandLifecycle.DETACHED,
             ExecutorNoCommandCancellation(),
         ),
@@ -1053,7 +1047,7 @@ def test_descendant_is_gone_before_timed_out_phase_releases_lease(
         specification,
         ExecutorCommand(
             (sys.executable, "-c", "print('LEASE-RECOVERED')"),
-            ExecutorBoundedDeadline(2.0, 4.0),
+            ExecutorBoundedDeadline(30.0, 60.0),
             ExecutorCommandLifecycle.DETACHED,
             ExecutorNoCommandCancellation(),
         ),
