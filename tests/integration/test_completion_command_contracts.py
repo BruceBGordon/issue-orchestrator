@@ -876,3 +876,275 @@ class TestEscalationRecordSurvivesTheOrchestrator:
 
         outcome = validator.validate_worktree_state(repo, record)
         assert not outcome.ok, "a completed record must still require a clean tree"
+
+
+class TestEscalationSurvivesTheEffectiveHookPath:
+    """The real pre-push hook must agree with the record validator.
+
+    Round 5: production wires `CompletionProcessor` with a `PrePublishGate`
+    whenever `enforce_hooks` is on (the default), and that gate runs the
+    worktree's *effective* pre-push hook, which is nothing but
+    `prepush-check --dirty-only`. The real push then runs the same hook again.
+    So fixing only `validate_worktree_state` left the escalation rejected two
+    boundaries later -- the third and fourth places the same policy is applied.
+
+    These tests run the actual hook script, with the actual interpreter, over a
+    real dirty repository.
+    """
+
+    @staticmethod
+    def _repo_with_real_hook(tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        # A tracked file, committed, then modified by someone else.
+        tracked = repo / "operator_notes.py"
+        tracked.write_text("operator work\n")
+        subprocess.run(
+            ["git", "add", "operator_notes.py"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "add notes"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        tracked.write_text("operator work\nedited after the agent started\n")
+
+        config_dir = repo / ".issue-orchestrator" / "config" / "modes" / "default"
+        config_dir.mkdir(parents=True)
+        (config_dir / "default.yaml").write_text(
+            'validation:\n  publish:\n    cmd: "echo ok"\n    dirty_check: "tracked"\n'
+        )
+
+        # Install the real hook exactly as production does: substitute the
+        # interpreter placeholder, make it executable.
+        source = (
+            Path(__file__).resolve().parents[2]
+            / "src"
+            / "issue_orchestrator"
+            / "hooks"
+            / "pre-push"
+        )
+        hooks_dir = repo / ".git" / "hooks"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hook = hooks_dir / "pre-push"
+        hook.write_text(
+            source.read_text().replace(
+                "@@ORCHESTRATOR_PYTHON@@", shlex.quote(sys.executable)
+            )
+        )
+        hook.chmod(0o755)
+        return repo
+
+    @staticmethod
+    def _gate_allows(repo: Path) -> bool:
+        from issue_orchestrator.control.pre_publish_gate import PrePublishGate
+        from issue_orchestrator.execution import LocalCommandRunner
+
+        result = PrePublishGate(LocalCommandRunner()).check(repo)
+        assert result.ran, f"hook did not run: {result.reason}\n{result.stderr}"
+        return result.allowed
+
+    def test_the_effective_hook_allows_a_dirty_escalation(self, tmp_path):
+        repo = self._repo_with_real_hook(tmp_path)
+        before = (repo / "operator_notes.py").read_text()
+
+        result = _run_completion_raw(
+            [
+                "blocked",
+                "--reason",
+                "cannot classify dirty file operator_notes.py",
+                "--attempted",
+                "inspected the file and its history",
+            ],
+            cwd=repo,
+        )
+        assert result.returncode == 0, result.stderr
+
+        assert self._gate_allows(repo), (
+            "the pre-publish gate rejected the escalation the CLI and the "
+            "record validator both accepted"
+        )
+        # The whole point: the file is still there, unchanged.
+        assert (repo / "operator_notes.py").read_text() == before
+
+    def test_the_effective_hook_still_blocks_a_dirty_non_escalation(self, tmp_path):
+        """No record at all means no exemption -- the guard stays armed."""
+        repo = self._repo_with_real_hook(tmp_path)
+
+        assert not self._gate_allows(repo)
+
+    def test_a_completed_record_does_not_earn_the_exemption(self, tmp_path):
+        """Only escalations are exempt; a completed record must still be blocked."""
+        repo = self._repo_with_real_hook(tmp_path)
+        record_dir = repo / ".issue-orchestrator"
+        record_dir.mkdir(exist_ok=True)
+        (record_dir / "completion.json").write_text(
+            json.dumps(
+                {
+                    "session_id": "s",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "outcome": "completed",
+                    "summary": "done",
+                    "requested_actions": ["push_branch"],
+                }
+            )
+        )
+
+        assert not self._gate_allows(repo)
+
+    def test_a_stale_completed_record_beside_an_escalation_keeps_the_guard(
+        self, tmp_path
+    ):
+        """Mixed intent is not an escalation. Fail closed."""
+        repo = self._repo_with_real_hook(tmp_path)
+        result = _run_completion_raw(
+            [
+                "blocked",
+                "--reason",
+                "cannot classify dirty file operator_notes.py",
+                "--attempted",
+                "inspected the file and its history",
+            ],
+            cwd=repo,
+        )
+        assert result.returncode == 0, result.stderr
+
+        (repo / ".issue-orchestrator" / "completion-agent_coder.json").write_text(
+            json.dumps(
+                {
+                    "session_id": "s",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "outcome": "completed",
+                    "summary": "done",
+                    "requested_actions": ["push_branch"],
+                }
+            )
+        )
+
+        assert not self._gate_allows(repo)
+
+    def test_an_unreadable_record_keeps_the_guard(self, tmp_path):
+        repo = self._repo_with_real_hook(tmp_path)
+        (repo / ".issue-orchestrator").mkdir(exist_ok=True)
+        (repo / ".issue-orchestrator" / "completion.json").write_text("{not json")
+
+        assert not self._gate_allows(repo)
+
+
+class TestEscalationReachesTheHumanThroughTheProductionGate:
+    """End to end: real hook, real record, real gate, real processor wiring.
+
+    The round-4 processor test omitted `pre_publish_gate`, so it proved the
+    escalation survived record validation and nothing more. Production always
+    supplies that gate when `enforce_hooks` is on, which is the default. This
+    composes the processor the way production does and asserts the escalation
+    reaches its human-routing label with the uncommitted file untouched.
+    """
+
+    def test_a_dirty_escalation_reaches_its_label_through_the_real_gate(self, tmp_path):
+        from unittest.mock import Mock
+
+        from issue_orchestrator.control.completion_processor import (
+            CompletionProcessor,
+        )
+        from issue_orchestrator.control.pre_publish_gate import PrePublishGate
+        from issue_orchestrator.domain.events import EventBus
+        from issue_orchestrator.execution import LocalCommandRunner
+        from issue_orchestrator.execution.session_output_adapter import (
+            FileSystemSessionOutput,
+        )
+        from issue_orchestrator.infra.config import Config
+        from tests.callback_endpoint_helpers import ready_callback_endpoint
+        from tests.unit.session_run_helpers import make_session_run_assets
+
+        repo = TestEscalationSurvivesTheEffectiveHookPath._repo_with_real_hook(tmp_path)
+        preserved = repo / "operator_notes.py"
+        before = preserved.read_text()
+
+        assert (
+            _run_completion_raw(
+                [
+                    "blocked",
+                    "--reason",
+                    "cannot classify dirty file operator_notes.py",
+                    "--attempted",
+                    "inspected the file and its history",
+                ],
+                cwd=repo,
+            ).returncode
+            == 0
+        )
+
+        from issue_orchestrator.control.completion_processor import GitAdapter
+        from issue_orchestrator.ports.working_copy import (
+            BranchPathsResult,
+            BranchTextFilesResult,
+            DiffResult,
+            PushResult,
+        )
+
+        git_adapter = Mock(spec=GitAdapter)
+        git_adapter.push = Mock(
+            return_value=PushResult(
+                success=True, branch="issue-123", remote="origin", message="Pushed"
+            )
+        )
+        git_adapter.get_current_branch = Mock(return_value="issue-123")
+        git_adapter.get_head_sha = Mock(return_value=None)
+        git_adapter.default_branch = Mock(return_value="main")
+        git_adapter.list_branch_names = Mock(return_value=["issue-123"])
+        # The tree really is dirty, and stays that way.
+        git_adapter.has_uncommitted_changes = Mock(return_value=True)
+        git_adapter.has_tracked_changes = Mock(return_value=True)
+        git_adapter.list_dirty_files = Mock(return_value=["operator_notes.py"])
+        git_adapter.diff_against_base = Mock(
+            return_value=DiffResult(success=True, diff_text="")
+        )
+        git_adapter.read_branch_text_files = Mock(
+            return_value=BranchTextFilesResult(success=True)
+        )
+        git_adapter.branch_post_image_paths_against_base = Mock(
+            return_value=BranchPathsResult(success=True, paths=())
+        )
+
+        label_adapter = Mock()
+        pr_adapter = Mock()
+
+        config = Config()
+        config.validation.publish.dirty_check = "tracked"
+
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=label_adapter,
+            pr_adapter=pr_adapter,
+            git_adapter=git_adapter,
+            event_bus=EventBus(),
+            session_output=FileSystemSessionOutput(),
+            label_config={"blocked": "blocked"},
+            config=config,
+            pre_publish_gate=PrePublishGate(LocalCommandRunner()),
+        )
+
+        result = processor.process(
+            repo,
+            run_assets=make_session_run_assets(repo),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert result.success, (
+            f"escalation blocked at the publish gate: "
+            f"{result.failure_kind}: {result.message}"
+        )
+        label_adapter.add_label.assert_any_call(123, "blocked")
+        # Only committed history was published, and the preserved file survived.
+        git_adapter.push.assert_called_once()
+        assert preserved.read_text() == before

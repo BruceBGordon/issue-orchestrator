@@ -12,6 +12,7 @@ Exit codes:
     2 = validation error
 """
 
+import json
 import logging
 import shutil
 import sys
@@ -21,7 +22,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from ...domain.dirty_remediation import guard_hint_lines
+from ...domain.dirty_remediation import (
+    DirtyTreeDisposition,
+    dirty_tree_disposition,
+    guard_hint_lines,
+)
 from ...control.validation import PublishGate
 from ...execution import GitWorkingCopy, LocalCommandRunner
 from ...infra.runtime_artifacts import filter_runtime_managed_dirty_paths
@@ -98,6 +103,108 @@ def _filter_guard_excluded_files(files: list[str], worktree: Path) -> list[str]:
     return filter_runtime_managed_dirty_paths(files, worktree)
 
 
+def _declared_dirty_disposition(worktree: Path) -> "DirtyTreeDisposition":
+    """What the completion records in this worktree say the push is for.
+
+    The dirty guard runs at three places -- record validation, the pre-publish
+    gate, and the real pre-push hook -- and all three must reach the same
+    answer, or an escalation accepted by one is rejected by the next. The
+    record is the only thing the hook can see, so the declared outcome is how
+    the disposition reaches this boundary.
+
+    Reading agent-written input to *relax* a guard deserves justification: a
+    record claiming an escalation buys nothing an agent would want. It forfeits
+    the PR (escalations request no CREATE_PR), routes the issue to a human, and
+    still publishes only committed history -- the preserved files are not in
+    HEAD and cannot be pushed by this or any other route. The orchestrator
+    separately validates the record it acts on.
+
+    Fail closed: no record, an unreadable one, or any record still claiming
+    ``completed`` all keep the guard armed.
+    """
+    candidates = sorted(_completion_record_paths(worktree))
+    outcomes: list[str] = []
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return DirtyTreeDisposition.REJECT
+        outcome = data.get("outcome")
+        if not isinstance(outcome, str):
+            return DirtyTreeDisposition.REJECT
+        outcomes.append(outcome)
+
+    if not outcomes:
+        return DirtyTreeDisposition.REJECT
+    if any(dirty_tree_disposition(o) is DirtyTreeDisposition.REJECT for o in outcomes):
+        return DirtyTreeDisposition.REJECT
+    return DirtyTreeDisposition.PRESERVE_AND_ESCALATE
+
+
+def _completion_record_paths(worktree: Path) -> list[Path]:
+    """Every completion record an orchestrator could be acting on here."""
+    root = worktree / ".issue-orchestrator"
+    if not root.is_dir():
+        return []
+    found = list(root.glob("completion*.json"))
+    found.extend(root.glob("sessions/*/completion*.json"))
+    return [p for p in found if p.is_file()]
+
+
+def _report_escalation_exemption(dirty_files: list[str], verbose: bool) -> None:
+    """Say plainly why a dirty tree was allowed through."""
+    if not verbose:
+        return
+    print(
+        "Dirty tree allowed: this completion is an escalation, and the files "
+        "below are preserved untouched for a human. Only committed history is "
+        "published."
+    )
+    _print_dirty_files(dirty_files)
+
+
+def _report_dirty_guard_failure(
+    mode: str, dirty_files: list[str], verbose: bool
+) -> None:
+    """Explain the block and how to resolve each file."""
+    if not verbose:
+        return
+    if mode == "all":
+        print(
+            "Working tree is dirty (tracked or untracked files); "
+            "resolve each file before running this gate. "
+            "Override with validation.publish.dirty_check."
+        )
+    else:
+        print(
+            "Tracked files are dirty; resolve each file before running "
+            "this gate. Ignored files are allowed. "
+            "Override with validation.publish.dirty_check."
+        )
+    for hint in guard_hint_lines(mode):
+        print(hint)
+    _print_dirty_files(dirty_files)
+
+
+def _enumerate_guarded_dirty_files(
+    worktree: Path, mode: str, verbose: bool
+) -> list[str] | None:
+    """Dirty paths the guard should act on, or ``None`` when enumeration failed.
+
+    ``None`` is fail-closed, not "nothing dirty": collapsing the two would let
+    a git error silently approve the push.
+    """
+    raw_dirty_files = GitWorkingCopy().list_dirty_files(worktree, mode)
+    if raw_dirty_files is None:
+        if verbose:
+            print(
+                "Could not enumerate dirty files; failing closed. "
+                f"(validation.publish.dirty_check={mode!r})"
+            )
+        return None
+    return _filter_guard_excluded_files(raw_dirty_files, worktree)
+
+
 def _run_dirty_guard(worktree: Path, mode: str, verbose: bool) -> Optional[int]:
     """Return exit code if dirty guard should block, else None."""
     if mode not in DIRTY_CHECK_MODES:
@@ -109,37 +216,20 @@ def _run_dirty_guard(worktree: Path, mode: str, verbose: bool) -> Optional[int]:
         return 1
     if mode == "off":
         return None
-    working_copy = GitWorkingCopy()
-    raw_dirty_files = working_copy.list_dirty_files(worktree, mode)
-    if raw_dirty_files is None:
-        # Enumeration failed — fail closed instead of silently passing
-        # the gate (which would happen if we collapsed None to []).
-        if verbose:
-            print(
-                "Could not enumerate dirty files; failing closed. "
-                f"(validation.publish.dirty_check={mode!r})"
-            )
+
+    dirty_files = _enumerate_guarded_dirty_files(worktree, mode, verbose)
+    if dirty_files is None:
         return 1
-    dirty_files = _filter_guard_excluded_files(raw_dirty_files, worktree)
-    if dirty_files:
-        if verbose:
-            if mode == "all":
-                print(
-                    "Working tree is dirty (tracked or untracked files); "
-                    "resolve each file before running this gate. "
-                    "Override with validation.publish.dirty_check."
-                )
-            else:
-                print(
-                    "Tracked files are dirty; resolve each file before running "
-                    "this gate. Ignored files are allowed. "
-                    "Override with validation.publish.dirty_check."
-                )
-            for hint in guard_hint_lines(mode):
-                print(hint)
-            _print_dirty_files(dirty_files)
-        return 1
-    return None
+    if not dirty_files:
+        return None
+
+    disposition = _declared_dirty_disposition(worktree)
+    if disposition is DirtyTreeDisposition.PRESERVE_AND_ESCALATE:
+        _report_escalation_exemption(dirty_files, verbose)
+        return None
+
+    _report_dirty_guard_failure(mode, dirty_files, verbose)
+    return 1
 
 
 def _run_validation_gate(

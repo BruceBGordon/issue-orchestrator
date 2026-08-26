@@ -3516,6 +3516,13 @@ class TestCompletionProcessorDirtyPolicy:
     ):
         """The escalation must survive the orchestrator, not just the CLI.
 
+        Scope: the record-validation boundary only -- no `pre_publish_gate` is
+        supplied here. The publish gate and the real pre-push hook are covered
+        against the production composition in
+        tests/integration/test_completion_command_contracts.py
+        (TestEscalationSurvivesTheEffectiveHookPath and
+        TestEscalationReachesTheHumanThroughTheProductionGate).
+
         `coding-done blocked` is rung 3 of the remediation ladder: what an agent
         runs when it finds a dirty file it must not resolve on its own. Round 3
         made the CLI accept it. That is only half the path -- STATUS_TO_ACTIONS
