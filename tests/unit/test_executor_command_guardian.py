@@ -133,7 +133,7 @@ def _guardian_with_components(
     return PosixExecutorCommandGuardian(
         program,
         _sentinel_program(),
-        ProcessGroupSentinelPolicy(0.1, 1.0),
+        ProcessGroupSentinelPolicy(0.1, 30.0),
         OsAtomicRecordStoreFactory(),
         process_launcher,
         PosixGuardianLaunchPipesFactory(OsPosixPipeFactory()),
@@ -428,7 +428,7 @@ def test_completed_terminal_record_wins_over_late_parent_sigterm(
             )
         ),
         _sentinel_program(),
-        ProcessGroupSentinelPolicy(0.1, 1.0),
+        ProcessGroupSentinelPolicy(0.1, 30.0),
         OsAtomicRecordStoreFactory(),
         build_posix_process_launcher(),
         PosixGuardianLaunchPipesFactory(OsPosixPipeFactory()),
@@ -609,7 +609,7 @@ def test_indeterminate_guardian_activation_gets_second_containment_attempt() -> 
             )
         ),
         _sentinel_program(),
-        ProcessGroupSentinelPolicy(0.1, 1.0),
+        ProcessGroupSentinelPolicy(0.1, 30.0),
         OsAtomicRecordStoreFactory(),
         launcher,
         PosixGuardianLaunchPipesFactory(OsPosixPipeFactory()),

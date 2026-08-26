@@ -58,9 +58,12 @@ def executor_command_guardian(
                 "issue_orchestrator.execution.process_group_sentinel",
             )
         ),
+        # Startup is an ordering signal, not the property under test: the
+        # bound must dwarf guardian+sentinel spawn machinery under a full
+        # xdist fork storm, or suite-load manufactures readiness timeouts.
         ProcessGroupSentinelPolicy(
             termination_policy.graceful_shutdown_seconds,
-            1.0,
+            30.0,
         ),
         OsAtomicRecordStoreFactory(),
         build_posix_process_launcher(),

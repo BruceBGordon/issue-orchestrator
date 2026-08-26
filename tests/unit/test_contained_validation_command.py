@@ -279,7 +279,7 @@ def _validation_process_guardian(
                 "issue_orchestrator.execution.process_group_sentinel",
             )
         ),
-        ProcessGroupSentinelPolicy(0.05, 2.0),
+        ProcessGroupSentinelPolicy(0.05, 30.0),
         process_launcher,
         supervisor,
         OsPosixPipeFactory(),
