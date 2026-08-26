@@ -79,7 +79,7 @@ from issue_orchestrator.entrypoints.bootstrap import (
     build_validation_command_runner,
 )
 from issue_orchestrator.infra.validation_timings import build_host_context
-from issue_orchestrator.execution.posix_file_lock import (
+from issue_orchestrator.infra.posix_file_lock import (
     PosixFileLockAcquisition,
     PosixFileLockFilePresence,
     PosixFileLockMode,
