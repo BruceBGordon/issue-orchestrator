@@ -147,10 +147,10 @@ from ..control.workflows import (
 from ..control.worktree_manager import extract_issue_branches
 from ..infra import runtime_identity
 from .bootstrap_adapters import (
-    _configure_gh_audit,
-    _create_github_adapter,
-    _create_github_auth,
-    _create_io_adapters,
+    configure_gh_audit,
+    create_github_adapter,
+    create_github_auth,
+    create_io_adapters,
     create_attempt_store,
 )
 from .bootstrap_tech_lead import (
@@ -471,9 +471,9 @@ def build_orchestrator(
 
     # Resolve repo and create GitHub adapter
     repo = resolve_repo(config, get_repo_from_git, GitRepoError)
-    github_auth = _create_github_auth(repo, config) if repo else None
+    github_auth = create_github_auth(repo, config) if repo else None
     github = (
-        _create_github_adapter(repo, config, github_auth)
+        create_github_adapter(repo, config, github_auth)
         if repo and github_auth
         else None
     )
@@ -482,7 +482,7 @@ def build_orchestrator(
     events, event_hub = _setup_event_sinks(base_events, github, timeline_sink)
 
     # Configure GitHub audit logging
-    _configure_gh_audit(config, events, github)
+    configure_gh_audit(config, events, github)
     if github:
         _check_github_token_scopes(config, github)
 
@@ -510,7 +510,7 @@ def build_orchestrator(
 
     # Create IO adapters
     worktree_manager, working_copy, command_runner, session_output = (
-        _create_io_adapters(github_auth)
+        create_io_adapters(github_auth)
     )
     coder_prompt_addendum = build_coder_prompt_addendum_provider(config)
 

@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _create_github_auth(repo: str, config: Config) -> GitHubAuth:
+def create_github_auth(repo: str, config: Config) -> GitHubAuth:
     """Create the shared GitHub auth owner for API and git transport."""
     return build_github_auth(
         **config.github_auth_kwargs(),
@@ -38,7 +38,7 @@ def _create_github_auth(repo: str, config: Config) -> GitHubAuth:
     )
 
 
-def _create_github_adapter(
+def create_github_adapter(
     repo: str, config: Config, auth: GitHubAuth
 ) -> GitHubAdapter:
     """Create GitHub adapter with cache and verification service."""
@@ -64,7 +64,7 @@ def _create_github_adapter(
     )
 
 
-def _configure_gh_audit(
+def configure_gh_audit(
     config: Config,
     events: EventSink,
     github: GitHubAdapter | None,
@@ -92,7 +92,7 @@ def _configure_gh_audit(
         )
 
 
-def _create_io_adapters(
+def create_io_adapters(
     github_auth: GitHubAuth | None = None,
 ) -> tuple[
     GitWorktreeManager,
