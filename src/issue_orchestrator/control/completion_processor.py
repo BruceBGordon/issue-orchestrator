@@ -104,6 +104,7 @@ from .completion_types import (
     ProcessingResult,
     REVIEW_EXCHANGE_ERROR_PREFIX,
 )
+from .push_authorization import authorized_push
 from .pre_publish_gate import PrePublishGate, PrePublishGateResult
 from .review_exchange_contracts import ReviewExchangeCanceller
 from .review_cache_boundary import review_cache_boundary_started_at
@@ -854,27 +855,29 @@ class CompletionProcessor:
             run_assets=run_assets,
         )
 
-        # Execute requested actions in order
-        (
-            branch,
-            pr_url,
-            review_exchange_completed,
-            deferred,
-            early_result,
-        ) = self._execute_actions(
-            worktree=worktree,
-            record=record,
-            issue_number=issue_number,
-            issue_title=issue_title,
-            label_target=label_target,
-            branch=branch,
-            session_name=session_name,
-            agent_label=agent_label,
-            actions_taken=actions_taken,
-            errors=errors,
-            error_details=error_details,
-            run_assets=run_assets,
-        )
+        # Execute requested actions in order, under an explicit statement of
+        # what this push is for — the real pre-push hook reads it.
+        with authorized_push(worktree, record):
+            (
+                branch,
+                pr_url,
+                review_exchange_completed,
+                deferred,
+                early_result,
+            ) = self._execute_actions(
+                worktree=worktree,
+                record=record,
+                issue_number=issue_number,
+                issue_title=issue_title,
+                label_target=label_target,
+                branch=branch,
+                session_name=session_name,
+                agent_label=agent_label,
+                actions_taken=actions_taken,
+                errors=errors,
+                error_details=error_details,
+                run_assets=run_assets,
+            )
         if early_result is not None:
             return early_result
 

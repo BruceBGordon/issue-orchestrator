@@ -10,7 +10,7 @@ of review details.
 
 1. **Make the requested changes** in the worktree.
 2. **Commit your changes** - the working tree must be clean.
-3. **Run `prepush-check --dirty-only -v`** and fix any dirty-worktree failure before continuing.
+3. **Run `prepush-check --dirty-only -v`** and fix any dirty-worktree failure before continuing. That check is the gate for *completing*; an escalation under rung 3 goes straight to the escalation command, which accepts the dirty tree on purpose.
 4. **Run `coding-done completed --implementation "..." --problems "..."`** to record your completion and run validation.
 5. **Then submit your verdict** by running the `exchange-respond` command:
 

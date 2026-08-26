@@ -215,3 +215,66 @@ def dirty_tree_disposition(status: str) -> DirtyTreeDisposition:
     if status in ESCALATION_STATUSES:
         return DirtyTreeDisposition.PRESERVE_AND_ESCALATE
     return DirtyTreeDisposition.REJECT
+
+
+#: Where the orchestrator states, for exactly one push, that it has read an
+#: escalation record and accepted its dirty tree. One fixed path, written by
+#: the orchestrator and removed when the push is done.
+#:
+#: The hook cannot be left to infer the active intent from stored artifacts.
+#: Run directories are retained (seven by default) and processed records are
+#: deliberately copied into them, so "is there a blocked record here?" answers
+#: a question about history, not about this push. Asking it both ways round is
+#: wrong: retained ``completed`` history blocked a live escalation, and a
+#: retained ``blocked`` record relaxed the guard for unrelated pushes long
+#: afterwards.
+PUSH_AUTHORIZATION_PATH = ".issue-orchestrator/push-authorization.json"
+
+#: An authorization is for the push being made now. The gate and the push that
+#: follows it take seconds; this bound only has to be short enough that a file
+#: left behind by a crash cannot authorize a later, unrelated push.
+PUSH_AUTHORIZATION_TTL_SECONDS = 600
+
+
+@dataclass(frozen=True)
+class PushAuthorization:
+    """The orchestrator's statement that one specific dirty push is intended."""
+
+    session_id: str
+    outcome: str
+    worktree: str
+    issued_at: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "session_id": self.session_id,
+            "outcome": self.outcome,
+            "worktree": self.worktree,
+            "issued_at": self.issued_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> "PushAuthorization | None":
+        """Parse, or return ``None`` for anything that is not a full statement."""
+        if not isinstance(data, dict):
+            return None
+        fields = ("session_id", "outcome", "worktree", "issued_at")
+        values = [data.get(name) for name in fields]
+        if not all(isinstance(value, str) and value for value in values):
+            return None
+        return cls(*values)  # type: ignore[arg-type]
+
+    def authorizes_dirty_push(self, worktree: str, age_seconds: float) -> bool:
+        """Whether this authorizes a dirty push of ``worktree`` right now.
+
+        Every clause is a way to say no: a different worktree, an outcome that
+        was never entitled to the exemption, or an authorization old enough to
+        be a leftover rather than a statement about this push.
+        """
+        if self.worktree != worktree:
+            return False
+        if age_seconds < 0 or age_seconds > PUSH_AUTHORIZATION_TTL_SECONDS:
+            return False
+        return dirty_tree_disposition(self.outcome) is (
+            DirtyTreeDisposition.PRESERVE_AND_ESCALATE
+        )

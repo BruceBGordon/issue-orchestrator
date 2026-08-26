@@ -16,7 +16,7 @@ Before calling `coding-done`, your working tree must be clean.
    2. **A disposable artifact you created yourself** → delete it, or add its path to `.gitignore`. Only take this path when you created the file during this session and can positively identify it as disposable, such as build output or a generated artifact you produced.
    3. **Anything else** — pre-existing edits, files you did not create, anything you cannot positively classify → preserve it and clear the guard without touching its contents. Never delete or revert a file you did not create. It may be operator or user work that cannot be recovered. An untracked path can be added to `.gitignore`, which clears the guard and leaves the file on disk untouched — that edit makes `.gitignore` itself dirty, and it belongs in your commit. If it cannot be cleared that way, stop and report `coding-done blocked --reason "cannot classify dirty file <path>" --attempted "inspected the file and its history"` rather than destroying it.
 3. Stage the paths you classified under rung 1 explicitly by name. Never stage every changed file at once.
-4. Run `prepush-check --dirty-only -v`; it must pass before `coding-done`.
+4. Run `prepush-check --dirty-only -v`; it must pass before `coding-done`. That check is the gate for *completing*; if you reached rung 3 and are escalating instead, go straight to the escalation command — it accepts the dirty tree on purpose.
 5. `coding-done` will **reject a dirty working tree** and exit non-zero.
 
 Generated sources, lock files, and schemas that *your* change produced are rung 1 — they belong in the same commit as the change that caused them.

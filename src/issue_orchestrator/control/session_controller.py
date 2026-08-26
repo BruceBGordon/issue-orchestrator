@@ -1743,7 +1743,7 @@ class SessionController:
 
 1. Run `git status --short`.
 {remediation}
-4. Run `prepush-check --dirty-only -v`; it must pass before `coding-done`.
+4. Run `prepush-check --dirty-only -v`; it must pass before `coding-done`. That check is the gate for *completing*; if you reached rung 3 and are escalating instead, go straight to the escalation command — it accepts the dirty tree on purpose.
 5. Run `coding-done completed --implementation "describe what you fixed" --problems "any remaining issues"`.
 
 Runtime note: orchestrator-managed metadata under `.issue-orchestrator/` and `.claude/` is ignored by the orchestrator dirty guard. Tracked project files, generated sources, lock files, and schemas that belong to this issue must still be committed; anything you did not create must be preserved, not deleted.

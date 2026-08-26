@@ -23,8 +23,9 @@ from pathlib import Path
 from typing import Optional
 
 from ...domain.dirty_remediation import (
+    PUSH_AUTHORIZATION_PATH,
     DirtyTreeDisposition,
-    dirty_tree_disposition,
+    PushAuthorization,
     guard_hint_lines,
 )
 from ...control.validation import PublishGate
@@ -104,51 +105,39 @@ def _filter_guard_excluded_files(files: list[str], worktree: Path) -> list[str]:
 
 
 def _declared_dirty_disposition(worktree: Path) -> "DirtyTreeDisposition":
-    """What the completion records in this worktree say the push is for.
+    """Whether the orchestrator authorized a dirty push of this worktree.
 
-    The dirty guard runs at three places -- record validation, the pre-publish
-    gate, and the real pre-push hook -- and all three must reach the same
-    answer, or an escalation accepted by one is rejected by the next. The
-    record is the only thing the hook can see, so the declared outcome is how
-    the disposition reaches this boundary.
+    The hook reads one fixed path that the orchestrator writes for the push it
+    is making, and nothing else. It deliberately does not look at completion
+    records: run directories are retained and processed records are copied into
+    them, so those answer a question about history rather than about this push.
+    Globbing them got it wrong in both directions -- retained ``completed``
+    history blocked a live escalation, and a retained ``blocked`` record
+    relaxed the guard for unrelated pushes indefinitely.
 
-    Reading agent-written input to *relax* a guard deserves justification: a
-    record claiming an escalation buys nothing an agent would want. It forfeits
-    the PR (escalations request no CREATE_PR), routes the issue to a human, and
-    still publishes only committed history -- the preserved files are not in
-    HEAD and cannot be pushed by this or any other route. The orchestrator
-    separately validates the record it acts on.
-
-    Fail closed: no record, an unreadable one, or any record still claiming
-    ``completed`` all keep the guard armed.
+    Fail closed on everything: no authorization, an unreadable or partial one,
+    one issued for a different worktree, one too old to be about this push, or
+    one naming an outcome that was never entitled to the exemption.
     """
-    candidates = sorted(_completion_record_paths(worktree))
-    outcomes: list[str] = []
-    for path in candidates:
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            return DirtyTreeDisposition.REJECT
-        outcome = data.get("outcome")
-        if not isinstance(outcome, str):
-            return DirtyTreeDisposition.REJECT
-        outcomes.append(outcome)
-
-    if not outcomes:
+    path = worktree / PUSH_AUTHORIZATION_PATH
+    try:
+        authorization = PushAuthorization.from_dict(json.loads(path.read_text()))
+    except (OSError, ValueError):
         return DirtyTreeDisposition.REJECT
-    if any(dirty_tree_disposition(o) is DirtyTreeDisposition.REJECT for o in outcomes):
+    if authorization is None:
         return DirtyTreeDisposition.REJECT
-    return DirtyTreeDisposition.PRESERVE_AND_ESCALATE
 
+    try:
+        issued_at = datetime.fromisoformat(authorization.issued_at)
+    except ValueError:
+        return DirtyTreeDisposition.REJECT
+    if issued_at.tzinfo is None:
+        issued_at = issued_at.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - issued_at).total_seconds()
 
-def _completion_record_paths(worktree: Path) -> list[Path]:
-    """Every completion record an orchestrator could be acting on here."""
-    root = worktree / ".issue-orchestrator"
-    if not root.is_dir():
-        return []
-    found = list(root.glob("completion*.json"))
-    found.extend(root.glob("sessions/*/completion*.json"))
-    return [p for p in found if p.is_file()]
+    if authorization.authorizes_dirty_push(str(worktree.resolve()), age_seconds):
+        return DirtyTreeDisposition.PRESERVE_AND_ESCALATE
+    return DirtyTreeDisposition.REJECT
 
 
 def _report_escalation_exemption(dirty_files: list[str], verbose: bool) -> None:
