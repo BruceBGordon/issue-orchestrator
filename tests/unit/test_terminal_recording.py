@@ -2,14 +2,110 @@ from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Callable
+from pathlib import Path
+from typing import TextIO, cast
+
+import pytest
 
 from issue_orchestrator.infra.terminal_recording import (
     MirroredTerminalRecordingWriter,
+    StructuredTerminalRecordingWriterFactory,
     TerminalRecordingWriter,
+    TerminalRecordingWriterFactory,
     append_output_event,
     first_terminal_geometry,
     iter_terminal_recording,
 )
+
+
+class _TrackingTextFile:
+    def __init__(self, delegate: TextIO) -> None:
+        self._delegate = delegate
+        self.close_calls = 0
+
+    @property
+    def closed(self) -> bool:
+        return self._delegate.closed
+
+    def write(self, value: str) -> int:
+        return self._delegate.write(value)
+
+    def flush(self) -> None:
+        self._delegate.flush()
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self._delegate.close()
+
+
+class _TrackingTextFileFactory:
+    def __init__(self) -> None:
+        self.opened: list[_TrackingTextFile] = []
+
+    def open_append(self, path: Path) -> TextIO:
+        tracked = _TrackingTextFile(path.open("a", encoding="utf-8"))
+        self.opened.append(tracked)
+        return cast(TextIO, tracked)
+
+
+class _FlushFailureTextFile(_TrackingTextFile):
+    def __init__(self, delegate: TextIO, flush_error: BaseException) -> None:
+        super().__init__(delegate)
+        self._flush_error = flush_error
+
+    def flush(self) -> None:
+        raise self._flush_error
+
+
+class _FlushFailureTextFileFactory:
+    def __init__(self, flush_error: BaseException) -> None:
+        self._flush_error = flush_error
+        self.opened: list[_FlushFailureTextFile] = []
+
+    def open_append(self, path: Path) -> TextIO:
+        tracked = _FlushFailureTextFile(
+            path.open("a", encoding="utf-8"),
+            self._flush_error,
+        )
+        self.opened.append(tracked)
+        return cast(TextIO, tracked)
+
+
+class _FailSecondRecordingWriterFactory:
+    def __init__(
+        self,
+        delegate: TerminalRecordingWriterFactory,
+        second_error: BaseException,
+    ) -> None:
+        self._delegate = delegate
+        self._second_error = second_error
+        self._calls = 0
+
+    def create(
+        self,
+        path: Path,
+        *,
+        started_at: float,
+        clock: Callable[[], float],
+    ) -> TerminalRecordingWriter:
+        self._calls += 1
+        if self._calls == 2:
+            raise self._second_error
+        return self._delegate.create(
+            path,
+            started_at=started_at,
+            clock=clock,
+        )
+
+
+class _MirrorOpenFailureFactory:
+    def __init__(self, open_error: BaseException) -> None:
+        self._open_error = open_error
+
+    def open_append(self, path: Path) -> TextIO:
+        del path
+        raise self._open_error
 
 
 def test_terminal_recording_writer_flushes_events_immediately(tmp_path) -> None:
@@ -208,6 +304,109 @@ class IncrementingClock:
             return self._now
         self._now += self._step_seconds
         return self._now
+
+
+def test_recording_clock_failure_closes_the_open_file(tmp_path: Path) -> None:
+    files = _TrackingTextFileFactory()
+    primary_error = RuntimeError("injected recording clock failure")
+
+    def failing_clock() -> float:
+        raise primary_error
+
+    with pytest.raises(RuntimeError) as raised:
+        TerminalRecordingWriter(
+            tmp_path / "clock-failure.jsonl",
+            clock=failing_clock,
+            text_files=files,
+        )
+
+    assert raised.value is primary_error
+    assert len(files.opened) == 1
+    assert files.opened[0].closed
+    assert files.opened[0].close_calls == 1
+
+
+def test_initial_resize_failure_closes_the_open_file(tmp_path: Path) -> None:
+    primary_error = RuntimeError("injected initial resize failure")
+    files = _FlushFailureTextFileFactory(primary_error)
+
+    with pytest.raises(RuntimeError) as raised:
+        TerminalRecordingWriter(
+            tmp_path / "resize-failure.jsonl",
+            initial_rows=40,
+            initial_cols=120,
+            text_files=files,
+        )
+
+    assert raised.value is primary_error
+    assert len(files.opened) == 1
+    assert files.opened[0].closed
+    assert files.opened[0].close_calls == 1
+
+
+def test_later_recording_failure_closes_every_earlier_writer(
+    tmp_path: Path,
+) -> None:
+    files = _TrackingTextFileFactory()
+    primary_error = RuntimeError("injected second recording failure")
+    writers = _FailSecondRecordingWriterFactory(
+        StructuredTerminalRecordingWriterFactory(files),
+        primary_error,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        MirroredTerminalRecordingWriter(
+            tmp_path / "primary.jsonl",
+            additional_recording_paths=(tmp_path / "secondary.jsonl",),
+            recording_writers=writers,
+        )
+
+    assert raised.value is primary_error
+    assert len(files.opened) == 1
+    assert files.opened[0].closed
+    assert files.opened[0].close_calls == 1
+
+
+def test_mirrored_initial_resize_failure_closes_every_writer(
+    tmp_path: Path,
+) -> None:
+    primary_error = RuntimeError("injected mirrored resize failure")
+    files = _FlushFailureTextFileFactory(primary_error)
+
+    with pytest.raises(RuntimeError) as raised:
+        MirroredTerminalRecordingWriter(
+            tmp_path / "primary.jsonl",
+            additional_recording_paths=(tmp_path / "secondary.jsonl",),
+            initial_rows=40,
+            initial_cols=120,
+            recording_writers=StructuredTerminalRecordingWriterFactory(files),
+        )
+
+    assert raised.value is primary_error
+    assert len(files.opened) == 2
+    assert all(file.closed for file in files.opened)
+    assert [file.close_calls for file in files.opened] == [1, 1]
+
+
+def test_plain_text_mirror_open_failure_closes_every_structured_writer(
+    tmp_path: Path,
+) -> None:
+    files = _TrackingTextFileFactory()
+    primary_error = RuntimeError("injected plain mirror open failure")
+
+    with pytest.raises(RuntimeError) as raised:
+        MirroredTerminalRecordingWriter(
+            tmp_path / "primary.jsonl",
+            additional_recording_paths=(tmp_path / "secondary.jsonl",),
+            mirror_path=tmp_path / "mirror.log",
+            recording_writers=StructuredTerminalRecordingWriterFactory(files),
+            mirror_files=_MirrorOpenFailureFactory(primary_error),
+        )
+
+    assert raised.value is primary_error
+    assert len(files.opened) == 2
+    assert all(file.closed for file in files.opened)
+    assert [file.close_calls for file in files.opened] == [1, 1]
 
 
 def test_mirrored_terminal_recording_writer_preserves_per_path_base_offsets(

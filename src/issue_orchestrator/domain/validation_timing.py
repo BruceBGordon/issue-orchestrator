@@ -1,0 +1,976 @@
+"""Strongly typed records for validation timing evidence."""
+
+from __future__ import annotations
+
+import math
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+from typing import Protocol, TypeAlias, runtime_checkable
+
+from .contained_command import (
+    ContainedCommandCaptureAborted,
+    ContainedCommandCaptureFailed,
+    ContainedCommandCaptureInterrupted,
+    ContainedCommandCaptureSucceeded,
+    ContainedCommandCleanupFailed,
+    ContainedCommandCleanupNotStarted,
+    ContainedCommandCompleted,
+    ContainedCommandFinalizationFailed,
+    ContainedCommandOutcomeUnavailable,
+    ContainedCommandExited,
+    ContainedCommandExitUnknown,
+    ContainedCommandNotStarted,
+    ContainedCommandResult,
+    ContainedCommandSupervised,
+)
+
+
+ValidationTimingScalar: TypeAlias = str | int | float | bool | None
+SerializedValidationTiming: TypeAlias = dict[str, ValidationTimingScalar]
+_CONFIG_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+@runtime_checkable
+class ValidationTimingPayload(Protocol):
+    """Typed timing entity serializable at the private JSONL boundary."""
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        """Return this entity's fields for the private JSON adapter."""
+        ...
+
+
+def _require_exact(owner: str, field: str, value: object, expected: type) -> None:
+    if type(value) is not expected:
+        raise ValueError(f"{owner}.{field} must have exact type {expected.__name__}")
+
+
+def _require_non_empty(owner: str, field: str, value: str) -> None:
+    _require_exact(owner, field, value, str)
+    if not value:
+        raise ValueError(f"{owner}.{field} must not be empty")
+
+
+def _require_optional_non_empty(
+    owner: str,
+    field: str,
+    value: str | None,
+) -> None:
+    if value is not None:
+        _require_non_empty(owner, field, value)
+
+
+def _require_integer(
+    owner: str,
+    field: str,
+    value: int,
+    *,
+    minimum: int,
+) -> None:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{owner}.{field} must be an integer >= {minimum}")
+
+
+def _require_optional_integer(
+    owner: str,
+    field: str,
+    value: int | None,
+    *,
+    minimum: int,
+) -> None:
+    if value is not None:
+        _require_integer(owner, field, value, minimum=minimum)
+
+
+def _require_float(
+    owner: str,
+    field: str,
+    value: float,
+    *,
+    minimum: float,
+) -> None:
+    if type(value) is not float or not math.isfinite(value) or value < minimum:
+        raise ValueError(f"{owner}.{field} must be finite and >= {minimum}")
+
+
+def _require_finite_float(owner: str, field: str, value: float) -> None:
+    if type(value) is not float or not math.isfinite(value):
+        raise ValueError(f"{owner}.{field} must be finite")
+
+
+def _require_optional_float(
+    owner: str,
+    field: str,
+    value: float | None,
+    *,
+    minimum: float,
+) -> None:
+    if value is not None:
+        _require_float(owner, field, value, minimum=minimum)
+
+
+def _require_optional_boolean(owner: str, field: str, value: bool | None) -> None:
+    if value is not None:
+        _require_exact(owner, field, value, bool)
+
+
+def _require_path(owner: str, field: str, value: object) -> None:
+    if not isinstance(value, Path):
+        raise ValueError(f"{owner}.{field} must be a Path")
+
+
+def merge_validation_timing_fields(
+    *payloads: ValidationTimingPayload | Mapping[str, ValidationTimingScalar],
+) -> SerializedValidationTiming:
+    """Combine typed timing fields and reject schema collisions."""
+    merged: SerializedValidationTiming = {}
+    for payload in payloads:
+        fields = payload if isinstance(payload, Mapping) else payload.timing_fields()
+        duplicate_keys = merged.keys() & fields.keys()
+        if duplicate_keys:
+            duplicates = ", ".join(sorted(duplicate_keys))
+            raise ValueError(f"duplicate validation timing fields: {duplicates}")
+        merged.update(fields)
+    return merged
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationTimingEnvelope:
+    """Two-clock elapsed observation for one completed operation."""
+
+    monotonic_elapsed_seconds: float
+    wall_started_at: str
+    wall_ended_at: str
+    wall_elapsed_seconds: float
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_float(
+            owner,
+            "monotonic_elapsed_seconds",
+            self.monotonic_elapsed_seconds,
+            minimum=0.0,
+        )
+        _require_non_empty(owner, "wall_started_at", self.wall_started_at)
+        _require_non_empty(owner, "wall_ended_at", self.wall_ended_at)
+        # Wall-clock adjustments are evidence, not elapsed-time authority. A
+        # negative value is valid and exposes a clock rollback rather than
+        # preventing the monotonic result from being recorded.
+        _require_finite_float(owner, "wall_elapsed_seconds", self.wall_elapsed_seconds)
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return {
+            "monotonic_elapsed_seconds": self.monotonic_elapsed_seconds,
+            "wall_started_at": self.wall_started_at,
+            "wall_ended_at": self.wall_ended_at,
+            "wall_elapsed_seconds": self.wall_elapsed_seconds,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationHostContext:
+    """Typed hardware identity attached to one machine timing record."""
+
+    name: str | None
+    system: str | None
+    release: str | None
+    machine: str | None
+    cpu_count: int | None
+    memory_bytes: int | None
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        for field_name, value in (
+            ("name", self.name),
+            ("system", self.system),
+            ("release", self.release),
+            ("machine", self.machine),
+        ):
+            _require_optional_non_empty(owner, field_name, value)
+        _require_optional_integer(owner, "cpu_count", self.cpu_count, minimum=1)
+        _require_optional_integer(
+            owner,
+            "memory_bytes",
+            self.memory_bytes,
+            minimum=1,
+        )
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return {
+            "host_name": self.name,
+            "host_system": self.system,
+            "host_release": self.release,
+            "host_machine": self.machine,
+            "host_cpu_count": self.cpu_count,
+            "host_memory_bytes": self.memory_bytes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationConfigurationEntry:
+    """One parsed, opaque make configuration field."""
+
+    name: str
+    value: str
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_non_empty(owner, "name", self.name)
+        _require_non_empty(owner, "value", self.value)
+        if not _CONFIG_KEY_RE.fullmatch(self.name):
+            raise ValueError(f"{owner}.name must be a configuration key")
+        if any(character.isspace() for character in self.value):
+            raise ValueError(f"{owner}.value must contain no whitespace")
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationConfiguration:
+    """Ordered, uniquely named configuration captured for one validation run."""
+
+    entries: tuple[ValidationConfigurationEntry, ...]
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_exact(owner, "entries", self.entries, tuple)
+        if any(
+            type(entry) is not ValidationConfigurationEntry for entry in self.entries
+        ):
+            raise ValueError(
+                f"{owner}.entries must contain ValidationConfigurationEntry values"
+            )
+        names = tuple(entry.name for entry in self.entries)
+        if len(names) != len(set(names)):
+            raise ValueError(f"{owner} entry names must be unique")
+
+    @classmethod
+    def parse(cls, fields: str) -> ValidationConfiguration:
+        _require_non_empty(cls.__name__, "fields", fields)
+        entries: list[ValidationConfigurationEntry] = []
+        for token in fields.split():
+            name, separator, value = token.partition("=")
+            if separator != "=":
+                raise ValueError(f"invalid validation configuration field: {token}")
+            entries.append(ValidationConfigurationEntry(name, value))
+        return cls(tuple(entries))
+
+    @classmethod
+    def empty(cls) -> ValidationConfiguration:
+        return cls(())
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return {entry.name: entry.value for entry in self.entries}
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationRunTimingContext:
+    """Shared identity and machine facts for records from one validate run."""
+
+    run_id: str
+    command: str
+    worktree: Path
+    branch: str | None
+    host: ValidationHostContext
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_non_empty(owner, "run_id", self.run_id)
+        _require_non_empty(owner, "command", self.command)
+        _require_path(owner, "worktree", self.worktree)
+        _require_optional_non_empty(owner, "branch", self.branch)
+        _require_exact(owner, "host", self.host, ValidationHostContext)
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return merge_validation_timing_fields(
+            {
+                "run_id": self.run_id,
+                "command": self.command,
+                "worktree": str(self.worktree),
+                "branch": self.branch,
+            },
+            self.host,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationTargetTiming:
+    """Completed timing for one named make target."""
+
+    context: ValidationRunTimingContext
+    configuration: ValidationConfiguration
+    target: str
+    status: int
+    elapsed_seconds: int
+    started_at: str
+    ended_at: str
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_exact(owner, "context", self.context, ValidationRunTimingContext)
+        _require_exact(
+            owner,
+            "configuration",
+            self.configuration,
+            ValidationConfiguration,
+        )
+        _require_non_empty(owner, "target", self.target)
+        _require_integer(owner, "status", self.status, minimum=-(2**63))
+        _require_integer(owner, "elapsed_seconds", self.elapsed_seconds, minimum=0)
+        _require_non_empty(owner, "started_at", self.started_at)
+        _require_non_empty(owner, "ended_at", self.ended_at)
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return merge_validation_timing_fields(
+            {"kind": "target_timing"},
+            self.context,
+            {
+                "target": self.target,
+                "status": self.status,
+                "elapsed_seconds": self.elapsed_seconds,
+                "started_at": self.started_at,
+                "ended_at": self.ended_at,
+            },
+            self.configuration,
+        )
+
+
+class ValidationTimingProtocolFailureKind(StrEnum):
+    """Closed set of profiler marker protocol defects."""
+
+    DUPLICATE_START = "duplicate-start"
+    END_WITHOUT_START = "end-without-start"
+    MALFORMED_MARKER = "malformed-marker"
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationTimingProtocolFailure:
+    """One typed profiler failure that cannot override validation semantics."""
+
+    context: ValidationRunTimingContext
+    configuration: ValidationConfiguration
+    failure_kind: ValidationTimingProtocolFailureKind
+    line: str
+    line_truncated: bool
+    target: str | None
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_exact(owner, "context", self.context, ValidationRunTimingContext)
+        _require_exact(
+            owner,
+            "configuration",
+            self.configuration,
+            ValidationConfiguration,
+        )
+        _require_exact(
+            owner,
+            "failure_kind",
+            self.failure_kind,
+            ValidationTimingProtocolFailureKind,
+        )
+        _require_non_empty(owner, "line", self.line)
+        _require_exact(owner, "line_truncated", self.line_truncated, bool)
+        _require_optional_non_empty(owner, "target", self.target)
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return merge_validation_timing_fields(
+            {"kind": "timing_protocol_failure"},
+            self.context,
+            {
+                "failure_kind": self.failure_kind.value,
+                "line": self.line,
+                "line_truncated": self.line_truncated,
+                "target": self.target,
+            },
+            self.configuration,
+        )
+
+
+class ValidationRunLifecycle(StrEnum):
+    """Terminal meaning of one validate-runner timing summary."""
+
+    COMPLETED = "completed"
+    CAPTURE_FAILED = "capture-failed"
+    FINALIZATION_FAILED = "finalization-failed"
+    CLEANUP_FAILED = "cleanup-failed"
+    OUTCOME_UNAVAILABLE = "outcome-unavailable"
+
+
+class ValidationProcessGroupCleanup(StrEnum):
+    """Terminal containment fact kept separate from command/capture outcome."""
+
+    SUPERVISED = "supervised"
+    CAPTURE_ABORTED = "capture-aborted"
+    NOT_STARTED = "not-started"
+    CLEANUP_FAILED = "cleanup-failed"
+    UNKNOWN = "unknown"
+
+
+class ValidationChildOutcome(StrEnum):
+    """Whether a real child status exists in a validation terminal result."""
+
+    EXITED = "exited"
+    NOT_STARTED = "not-started"
+    EXIT_UNKNOWN = "exit-unknown"
+    UNAVAILABLE = "unavailable"
+
+
+class ValidationCaptureStatus(StrEnum):
+    """Whether output capture itself completed before process cleanup."""
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+def _validation_child_fields(
+    child: ContainedCommandExited
+    | ContainedCommandNotStarted
+    | ContainedCommandExitUnknown,
+) -> SerializedValidationTiming:
+    if type(child) is ContainedCommandExited:
+        return {
+            "child_process_id": child.process_id,
+            "child_outcome": ValidationChildOutcome.EXITED.value,
+            "child_exit_code": child.exit_code,
+        }
+    if type(child) is ContainedCommandNotStarted:
+        return {
+            "child_process_id": None,
+            "child_outcome": ValidationChildOutcome.NOT_STARTED.value,
+            "child_exit_code": None,
+        }
+    if type(child) is ContainedCommandExitUnknown:
+        return {
+            "child_process_id": child.process_id,
+            "child_outcome": ValidationChildOutcome.EXIT_UNKNOWN.value,
+            "child_exit_code": None,
+        }
+    raise ValueError("validation child fields require a typed child fact")
+
+
+def _validation_cleanup_value(
+    cleanup: ContainedCommandSupervised
+    | ContainedCommandCaptureAborted
+    | ContainedCommandCleanupNotStarted,
+) -> str:
+    if type(cleanup) is ContainedCommandSupervised:
+        return ValidationProcessGroupCleanup.SUPERVISED.value
+    if type(cleanup) is ContainedCommandCaptureAborted:
+        return ValidationProcessGroupCleanup.CAPTURE_ABORTED.value
+    if type(cleanup) is ContainedCommandCleanupNotStarted:
+        return ValidationProcessGroupCleanup.NOT_STARTED.value
+    raise ValueError("validation cleanup fields require a typed cleanup fact")
+
+
+def _validation_command_fields(
+    result: ContainedCommandResult,
+) -> SerializedValidationTiming:
+    if type(result) is ContainedCommandCompleted:
+        return merge_validation_timing_fields(
+            {
+                "lifecycle": ValidationRunLifecycle.COMPLETED.value,
+                "exit_code": result.child.exit_code,
+                "process_group_cleanup": (
+                    ValidationProcessGroupCleanup.SUPERVISED.value
+                ),
+                "capture_status": ValidationCaptureStatus.SUCCEEDED.value,
+                "capture_error_type": None,
+                "capture_error_repr": None,
+                "cleanup_error_type": None,
+                "cleanup_error_repr": None,
+            },
+            _validation_child_fields(result.child),
+        )
+    if type(result) is ContainedCommandCaptureFailed:
+        return merge_validation_timing_fields(
+            {
+                "lifecycle": ValidationRunLifecycle.CAPTURE_FAILED.value,
+                "exit_code": 1,
+                "process_group_cleanup": _validation_cleanup_value(result.cleanup),
+                "capture_status": ValidationCaptureStatus.FAILED.value,
+                "capture_error_type": result.failure.error_type,
+                "capture_error_repr": result.failure.error_repr,
+                "cleanup_error_type": None,
+                "cleanup_error_repr": None,
+            },
+            _validation_child_fields(result.child),
+        )
+    if type(result) is ContainedCommandFinalizationFailed:
+        capture_fields: SerializedValidationTiming
+        if type(result.capture) is ContainedCommandCaptureSucceeded:
+            capture_fields = {
+                "capture_status": ValidationCaptureStatus.SUCCEEDED.value,
+                "capture_error_type": None,
+                "capture_error_repr": None,
+            }
+        elif type(result.capture) is ContainedCommandCaptureInterrupted:
+            capture_fields = {
+                "capture_status": ValidationCaptureStatus.FAILED.value,
+                "capture_error_type": result.capture.failure.error_type,
+                "capture_error_repr": result.capture.failure.error_repr,
+            }
+        else:
+            raise ValueError("finalization failure requires a typed capture fact")
+        return merge_validation_timing_fields(
+            {
+                "lifecycle": ValidationRunLifecycle.FINALIZATION_FAILED.value,
+                "exit_code": 1,
+                "process_group_cleanup": _validation_cleanup_value(result.cleanup),
+                "cleanup_error_type": result.finalization_failure.error_type,
+                "cleanup_error_repr": result.finalization_failure.error_repr,
+            },
+            capture_fields,
+            _validation_child_fields(result.child),
+        )
+    if type(result) is ContainedCommandOutcomeUnavailable:
+        return {
+            "lifecycle": ValidationRunLifecycle.OUTCOME_UNAVAILABLE.value,
+            "exit_code": 1,
+            "process_group_cleanup": ValidationProcessGroupCleanup.UNKNOWN.value,
+            "capture_status": ValidationCaptureStatus.FAILED.value,
+            "capture_error_type": result.failure.error_type,
+            "capture_error_repr": result.failure.error_repr,
+            "cleanup_error_type": None,
+            "cleanup_error_repr": None,
+            "child_process_id": None,
+            "child_outcome": ValidationChildOutcome.UNAVAILABLE.value,
+            "child_exit_code": None,
+        }
+    if type(result) is ContainedCommandCleanupFailed:
+        capture_fields: SerializedValidationTiming
+        if type(result.capture) is ContainedCommandCaptureSucceeded:
+            capture_fields = {
+                "capture_status": ValidationCaptureStatus.SUCCEEDED.value,
+                "capture_error_type": None,
+                "capture_error_repr": None,
+            }
+        elif type(result.capture) is ContainedCommandCaptureInterrupted:
+            capture_fields = {
+                "capture_status": ValidationCaptureStatus.FAILED.value,
+                "capture_error_type": result.capture.failure.error_type,
+                "capture_error_repr": result.capture.failure.error_repr,
+            }
+        else:
+            raise ValueError("cleanup failure requires a typed capture fact")
+        return merge_validation_timing_fields(
+            {
+                "lifecycle": ValidationRunLifecycle.CLEANUP_FAILED.value,
+                "exit_code": 1,
+                "process_group_cleanup": (
+                    ValidationProcessGroupCleanup.CLEANUP_FAILED.value
+                ),
+                "cleanup_error_type": result.cleanup_failure.error_type,
+                "cleanup_error_repr": result.cleanup_failure.error_repr,
+            },
+            capture_fields,
+            _validation_child_fields(result.child),
+        )
+    raise ValueError("validation command fields require a closed command result")
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationRunTimingSummary:
+    """Completed total timing for one validate-runner invocation."""
+
+    context: ValidationRunTimingContext
+    configuration: ValidationConfiguration
+    command_result: ContainedCommandResult
+    total_elapsed_seconds: float
+    recorded_at: str
+    envelope: ValidationTimingEnvelope
+    timing_protocol_failure_count: int
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_exact(owner, "context", self.context, ValidationRunTimingContext)
+        _require_exact(
+            owner,
+            "configuration",
+            self.configuration,
+            ValidationConfiguration,
+        )
+        if type(self.command_result) not in (
+            ContainedCommandCompleted,
+            ContainedCommandCaptureFailed,
+            ContainedCommandFinalizationFailed,
+            ContainedCommandOutcomeUnavailable,
+            ContainedCommandCleanupFailed,
+        ):
+            raise ValueError(
+                "ValidationRunTimingSummary.command_result must be a closed "
+                "contained-command result"
+            )
+        _require_float(
+            owner,
+            "total_elapsed_seconds",
+            self.total_elapsed_seconds,
+            minimum=0.0,
+        )
+        _require_non_empty(owner, "recorded_at", self.recorded_at)
+        _require_exact(owner, "envelope", self.envelope, ValidationTimingEnvelope)
+        _require_integer(
+            owner,
+            "timing_protocol_failure_count",
+            self.timing_protocol_failure_count,
+            minimum=0,
+        )
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return merge_validation_timing_fields(
+            {"kind": "run_summary"},
+            self.context,
+            _validation_command_fields(self.command_result),
+            {
+                "total_elapsed_seconds": self.total_elapsed_seconds,
+                "recorded_at": self.recorded_at,
+                "timing_protocol_status": (
+                    "complete"
+                    if self.timing_protocol_failure_count == 0
+                    else "partial"
+                ),
+                "timing_protocol_failure_count": (
+                    self.timing_protocol_failure_count
+                ),
+            },
+            self.envelope,
+            self.configuration,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationSwapUsage:
+    """One host swap observation in MiB."""
+
+    total_mb: float
+    used_mb: float
+    free_mb: float
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_float(owner, "total_mb", self.total_mb, minimum=0.0)
+        _require_float(owner, "used_mb", self.used_mb, minimum=0.0)
+        _require_float(owner, "free_mb", self.free_mb, minimum=0.0)
+        if self.used_mb + self.free_mb > self.total_mb + 0.01:
+            raise ValueError(f"{owner} used plus free swap exceeds total swap")
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return {
+            "swap_total_mb": self.total_mb,
+            "swap_used_mb": self.used_mb,
+            "swap_free_mb": self.free_mb,
+        }
+
+
+class ValidationDiskDeltaStatus(StrEnum):
+    """Whether one cumulative disk counter produced an interval delta."""
+
+    BASELINE_UNAVAILABLE = "baseline-unavailable"
+    AVAILABLE = "available"
+    COUNTER_RESET = "counter-reset"
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationDiskObservation:
+    """Cumulative and optional interval disk-I/O observation."""
+
+    transfers_total: float
+    megabytes_total: float
+    transfers_delta: float | None
+    megabytes_delta: float | None
+    transfers_delta_status: ValidationDiskDeltaStatus
+    megabytes_delta_status: ValidationDiskDeltaStatus
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_float(owner, "transfers_total", self.transfers_total, minimum=0.0)
+        _require_float(owner, "megabytes_total", self.megabytes_total, minimum=0.0)
+        _require_optional_float(
+            owner,
+            "transfers_delta",
+            self.transfers_delta,
+            minimum=0.0,
+        )
+        _require_optional_float(
+            owner,
+            "megabytes_delta",
+            self.megabytes_delta,
+            minimum=0.0,
+        )
+        self._require_delta_status(
+            "transfers",
+            self.transfers_delta,
+            self.transfers_delta_status,
+        )
+        self._require_delta_status(
+            "megabytes",
+            self.megabytes_delta,
+            self.megabytes_delta_status,
+        )
+
+    @staticmethod
+    def _require_delta_status(
+        counter: str,
+        delta: float | None,
+        status: ValidationDiskDeltaStatus,
+    ) -> None:
+        if type(status) is not ValidationDiskDeltaStatus:
+            raise ValueError(
+                f"ValidationDiskObservation.{counter}_delta_status must be typed"
+            )
+        if status is ValidationDiskDeltaStatus.AVAILABLE and delta is None:
+            raise ValueError(
+                f"ValidationDiskObservation.{counter}_delta must exist when available"
+            )
+        if status is not ValidationDiskDeltaStatus.AVAILABLE and delta is not None:
+            raise ValueError(
+                f"ValidationDiskObservation.{counter}_delta must be unavailable "
+                f"when status is {status.value}"
+            )
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return {
+            "disk_xfrs_total": self.transfers_total,
+            "disk_mb_total": self.megabytes_total,
+            "disk_xfrs_delta": self.transfers_delta,
+            "disk_mb_delta": self.megabytes_delta,
+            "disk_xfrs_delta_status": self.transfers_delta_status.value,
+            "disk_mb_delta_status": self.megabytes_delta_status.value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationResourceSample:
+    """One typed host-pressure observation during a validation run."""
+
+    recorded_at: str
+    loadavg_1m: float | None
+    loadavg_5m: float | None
+    loadavg_15m: float | None
+    memory_free_percent: int | None
+    swap: ValidationSwapUsage | None
+    disk: ValidationDiskObservation | None
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_non_empty(owner, "recorded_at", self.recorded_at)
+        for field_name, value in (
+            ("loadavg_1m", self.loadavg_1m),
+            ("loadavg_5m", self.loadavg_5m),
+            ("loadavg_15m", self.loadavg_15m),
+        ):
+            _require_optional_float(owner, field_name, value, minimum=0.0)
+        _require_optional_integer(
+            owner,
+            "memory_free_percent",
+            self.memory_free_percent,
+            minimum=0,
+        )
+        if self.memory_free_percent is not None and self.memory_free_percent > 100:
+            raise ValueError(f"{owner}.memory_free_percent must be <= 100")
+        if self.swap is not None:
+            _require_exact(owner, "swap", self.swap, ValidationSwapUsage)
+        if self.disk is not None:
+            _require_exact(owner, "disk", self.disk, ValidationDiskObservation)
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        base: SerializedValidationTiming = {
+            "recorded_at": self.recorded_at,
+            "loadavg_1m": self.loadavg_1m,
+            "loadavg_5m": self.loadavg_5m,
+            "loadavg_15m": self.loadavg_15m,
+            "memory_free_percent": self.memory_free_percent,
+        }
+        payloads: list[
+            ValidationTimingPayload | Mapping[str, ValidationTimingScalar]
+        ] = [base]
+        if self.swap is not None:
+            payloads.append(self.swap)
+        if self.disk is not None:
+            payloads.append(self.disk)
+        return merge_validation_timing_fields(*payloads)
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationResourceTiming:
+    """A resource sample associated with one validate-runner invocation."""
+
+    context: ValidationRunTimingContext
+    configuration: ValidationConfiguration
+    sample: ValidationResourceSample
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_exact(owner, "context", self.context, ValidationRunTimingContext)
+        _require_exact(
+            owner,
+            "configuration",
+            self.configuration,
+            ValidationConfiguration,
+        )
+        _require_exact(owner, "sample", self.sample, ValidationResourceSample)
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return merge_validation_timing_fields(
+            {"kind": "resource_sample"},
+            self.context,
+            self.sample,
+            self.configuration,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PublishGateTimingSummary:
+    """Typed outer timing outcome for the publish validation gate."""
+
+    gate: str
+    command: str | None
+    timeout_seconds: int
+    head_sha: str | None
+    cache_lookup: str
+    cache_hit: bool
+    allowed: bool
+    reason: str
+    record_passed: bool | None
+    record_exit_code: int | None
+    record_timed_out: bool | None
+    envelope: ValidationTimingEnvelope
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_non_empty(owner, "gate", self.gate)
+        _require_optional_non_empty(owner, "command", self.command)
+        _require_integer(owner, "timeout_seconds", self.timeout_seconds, minimum=0)
+        _require_optional_non_empty(owner, "head_sha", self.head_sha)
+        _require_non_empty(owner, "cache_lookup", self.cache_lookup)
+        _require_exact(owner, "cache_hit", self.cache_hit, bool)
+        _require_exact(owner, "allowed", self.allowed, bool)
+        _require_non_empty(owner, "reason", self.reason)
+        _require_optional_boolean(owner, "record_passed", self.record_passed)
+        _require_optional_integer(
+            owner,
+            "record_exit_code",
+            self.record_exit_code,
+            minimum=-(2**63),
+        )
+        _require_optional_boolean(owner, "record_timed_out", self.record_timed_out)
+        _require_exact(owner, "envelope", self.envelope, ValidationTimingEnvelope)
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return merge_validation_timing_fields(
+            {
+                "kind": "validation_gate_summary",
+                "gate": self.gate,
+                "command": self.command,
+                "timeout_seconds": self.timeout_seconds,
+                "head_sha": self.head_sha,
+                "cache_lookup": self.cache_lookup,
+                "cache_hit": self.cache_hit,
+                "allowed": self.allowed,
+                "reason": self.reason,
+                "record_passed": self.record_passed,
+                "record_exit_code": self.record_exit_code,
+                "record_timed_out": self.record_timed_out,
+            },
+            self.envelope,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PrepushGateTimingSummary:
+    """Typed outer timing outcome for one pre-push check."""
+
+    head_sha: str | None
+    command: str | None
+    timeout_seconds: int
+    dirty_check: str
+    dirty_only: bool
+    dirty_elapsed_seconds: float | None
+    dirty_exit_code: int | None
+    validation_elapsed_seconds: float | None
+    validation_cache_hit: bool | None
+    validation_allowed: bool | None
+    validation_reason: str | None
+    validation_record_exit_code: int | None
+    validation_record_timed_out: bool | None
+    final_exit_code: int | None
+    phase: str
+    error_type: str | None
+    envelope: ValidationTimingEnvelope
+
+    def __post_init__(self) -> None:
+        owner = type(self).__name__
+        _require_optional_non_empty(owner, "head_sha", self.head_sha)
+        _require_optional_non_empty(owner, "command", self.command)
+        _require_integer(owner, "timeout_seconds", self.timeout_seconds, minimum=0)
+        _require_non_empty(owner, "dirty_check", self.dirty_check)
+        _require_exact(owner, "dirty_only", self.dirty_only, bool)
+        _require_optional_float(
+            owner,
+            "dirty_elapsed_seconds",
+            self.dirty_elapsed_seconds,
+            minimum=0.0,
+        )
+        _require_optional_integer(
+            owner,
+            "dirty_exit_code",
+            self.dirty_exit_code,
+            minimum=-(2**63),
+        )
+        _require_optional_float(
+            owner,
+            "validation_elapsed_seconds",
+            self.validation_elapsed_seconds,
+            minimum=0.0,
+        )
+        _require_optional_boolean(
+            owner,
+            "validation_cache_hit",
+            self.validation_cache_hit,
+        )
+        _require_optional_boolean(owner, "validation_allowed", self.validation_allowed)
+        _require_optional_non_empty(owner, "validation_reason", self.validation_reason)
+        _require_optional_integer(
+            owner,
+            "validation_record_exit_code",
+            self.validation_record_exit_code,
+            minimum=-(2**63),
+        )
+        _require_optional_boolean(
+            owner,
+            "validation_record_timed_out",
+            self.validation_record_timed_out,
+        )
+        _require_optional_integer(
+            owner,
+            "final_exit_code",
+            self.final_exit_code,
+            minimum=-(2**63),
+        )
+        _require_non_empty(owner, "phase", self.phase)
+        _require_optional_non_empty(owner, "error_type", self.error_type)
+        _require_exact(owner, "envelope", self.envelope, ValidationTimingEnvelope)
+
+    def timing_fields(self) -> Mapping[str, ValidationTimingScalar]:
+        return merge_validation_timing_fields(
+            {
+                "kind": "prepush_gate_summary",
+                "head_sha": self.head_sha,
+                "command": self.command,
+                "timeout_seconds": self.timeout_seconds,
+                "dirty_check": self.dirty_check,
+                "dirty_only": self.dirty_only,
+                "dirty_elapsed_seconds": self.dirty_elapsed_seconds,
+                "dirty_exit_code": self.dirty_exit_code,
+                "validation_elapsed_seconds": self.validation_elapsed_seconds,
+                "validation_cache_hit": self.validation_cache_hit,
+                "validation_allowed": self.validation_allowed,
+                "validation_reason": self.validation_reason,
+                "validation_record_exit_code": self.validation_record_exit_code,
+                "validation_record_timed_out": self.validation_record_timed_out,
+                "final_exit_code": self.final_exit_code,
+                "phase": self.phase,
+                "error_type": self.error_type,
+            },
+            self.envelope,
+        )

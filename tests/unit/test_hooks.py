@@ -526,6 +526,38 @@ class TestClaudeCodeAdapter:
         assert success is False
         assert "timed out after 1s" in message
 
+    def test_ai_gate_uses_account_default_model(
+        self, adapter, temp_project, monkeypatch
+    ):
+        from issue_orchestrator.infra.hooks import hooks as hooks_module
+
+        adapter.install_hooks(temp_project)
+        captured: dict[str, list[str]] = {}
+
+        def capture_command(command, **_kwargs):  # noqa: ANN001
+            captured["command"] = command
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=1,
+                stdout="Cannot connect to the Anthropic API\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(
+            hooks_module,
+            "run_command_in_process_group",
+            capture_command,
+        )
+
+        adapter.test_ai_gate(temp_project)
+
+        assert captured["command"][:3] == [
+            "claude",
+            "--print",
+            "--output-format",
+        ]
+        assert "--model" not in captured["command"]
+
     def test_ai_gate_reports_claude_auth_remediation(
         self, adapter, temp_project, monkeypatch
     ):

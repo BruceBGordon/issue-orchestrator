@@ -101,5 +101,6 @@ graph TB
 - [ADRs](ADR/README.md) — Architectural Decision Records
 - [Internal Architecture](internal-architecture.md) — How this repo is built and enforced
 - [Hook Enforcement](hooks.md) — Multi-layer guardrail system
+- [Host Executor](host-executor.md) — Machine-wide adaptive command admission
 - [Review Workflow](../development/REVIEW_WORKFLOW.md) — Code review, rework cycles, exchange mechanisms
 - [Guardrails & Safety](../design/guardrails.md) — Safety model and trust boundaries

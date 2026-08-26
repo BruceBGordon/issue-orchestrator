@@ -14,6 +14,25 @@ from unittest.mock import MagicMock, Mock, patch, call
 
 import pytest
 
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalLaunch,
+    TerminalRunDestination,
+    TerminalShell,
+)
+
+
+def _launch(tmp_path: Path, command: str) -> TerminalLaunch:
+    run_dir = (tmp_path / "run").resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return TerminalLaunch.classified(
+        command,
+        TerminalShell.BASH,
+        TerminalRunDestination(
+            run_dir=run_dir,
+            recording_path=run_dir / "terminal-recording.jsonl",
+        ),
+    )
+
 
 class TestPluggySessionRunner:
     """Tests for PluggySessionRunner which wraps pluggy PluginManager.
@@ -35,14 +54,17 @@ class TestPluggySessionRunner:
         from issue_orchestrator.execution.session_runner_adapter import PluggySessionRunner
         return PluggySessionRunner(mock_plugin_manager)
 
-    def test_create_session_success(self, session_runner, mock_plugin_manager, caplog):
+    def test_create_session_success(
+        self, session_runner, mock_plugin_manager, caplog, tmp_path: Path
+    ):
         """create_session delegates to pluggy hook and returns result."""
         mock_plugin_manager.hook.create_session.return_value = True
 
+        launch = _launch(tmp_path, "claude --prompt issue.md")
         with caplog.at_level(logging.INFO):
             result = session_runner.create_session(
                 session_id=42,
-                command="claude --prompt issue.md",
+                launch=launch,
                 working_dir="/tmp/worktree",
                 title="Fix the bug",
                 session_name="issue-42",
@@ -51,7 +73,7 @@ class TestPluggySessionRunner:
         assert result is True
         mock_plugin_manager.hook.create_session.assert_called_once_with(
             session_id=42,
-            command="claude --prompt issue.md",
+            launch=launch,
             working_dir="/tmp/worktree",
             title="Fix the bug",
             session_name="issue-42",
@@ -59,13 +81,15 @@ class TestPluggySessionRunner:
         assert "Creating session via terminal hook" in caplog.text
         assert "id=42" in caplog.text
 
-    def test_create_session_returns_none(self, session_runner, mock_plugin_manager):
+    def test_create_session_returns_none(
+        self, session_runner, mock_plugin_manager, tmp_path: Path
+    ):
         """create_session returns False when hook returns None."""
         mock_plugin_manager.hook.create_session.return_value = None
 
         result = session_runner.create_session(
             session_id=42,
-            command="claude",
+            launch=_launch(tmp_path, "claude"),
             working_dir="/tmp/worktree",
             title=None,
             session_name="issue-42",
@@ -73,13 +97,15 @@ class TestPluggySessionRunner:
 
         assert result is False
 
-    def test_create_session_returns_false(self, session_runner, mock_plugin_manager):
+    def test_create_session_returns_false(
+        self, session_runner, mock_plugin_manager, tmp_path: Path
+    ):
         """create_session returns False when hook returns False."""
         mock_plugin_manager.hook.create_session.return_value = False
 
         result = session_runner.create_session(
             session_id=42,
-            command="claude",
+            launch=_launch(tmp_path, "claude"),
             working_dir="/tmp/worktree",
             title=None,
             session_name="issue-42",

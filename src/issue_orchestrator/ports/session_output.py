@@ -22,18 +22,60 @@ The principle is simple: all artifacts for a session go in one place.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Mapping, Protocol, TypeVar, cast
 
 
 if TYPE_CHECKING:
     from ..domain.artifact_contracts import ValidationOutcome
     from ..domain.exchange_chapter import ExchangeChapterSidecar
     from ..domain.review_exchange_run import ReviewExchangeRun
+    from ..domain.session_watchdog import ScheduledSessionWatchdog
 
 from ..domain.review_exchange_run import ReviewExchangeRunAssets
 from ..domain.review_exchange_summary import ReviewExchangeSummaryV1
 from ..domain.session_run import SessionRunAssets
+
+
+VALIDATION_RECORD_SCHEMA_VERSION = 1
+_VALIDATION_RECORD_FIELDS = frozenset(
+    {
+        "schema_version",
+        "suite",
+        "head_sha",
+        "passed",
+        "exit_code",
+        "command",
+        "started_at",
+        "ended_at",
+        "timed_out",
+        "stdout_path",
+        "stderr_path",
+    }
+)
+_ValidationField = TypeVar("_ValidationField")
+
+
+def _required_validation_field(
+    data: Mapping[str, object],
+    name: str,
+    expected_type: type[_ValidationField],
+) -> _ValidationField:
+    value = data[name]
+    if type(value) is not expected_type:
+        raise TypeError(
+            f"ValidationRecord.{name} must be {expected_type.__name__}, "
+            f"got {type(value).__name__}"
+        )
+    return cast(_ValidationField, value)
+
+
+def _optional_validation_path(data: Mapping[str, object], name: str) -> str | None:
+    value = data[name]
+    if value is not None and type(value) is not str:
+        raise TypeError(f"ValidationRecord.{name} must be str or None")
+    return value
 
 
 @dataclass(frozen=True)
@@ -55,7 +97,71 @@ class ValidationRecord:
     stdout_path: str | None = None
     stderr_path: str | None = None
 
-    def to_dict(self) -> dict[str, Any]:
+    def __post_init__(self) -> None:
+        self._validate_exact_types()
+        self._validate_identity_fields()
+        self._validate_optional_paths()
+        self._validate_timestamps()
+        self._validate_result_consistency()
+
+    def _validate_exact_types(self) -> None:
+        exact_fields: tuple[tuple[str, object, type[object]], ...] = (
+            ("schema_version", self.schema_version, cast(type[object], int)),
+            ("suite", self.suite, cast(type[object], str)),
+            ("head_sha", self.head_sha, cast(type[object], str)),
+            ("passed", self.passed, cast(type[object], bool)),
+            ("exit_code", self.exit_code, cast(type[object], int)),
+            ("command", self.command, cast(type[object], str)),
+            ("started_at", self.started_at, cast(type[object], str)),
+            ("ended_at", self.ended_at, cast(type[object], str)),
+            ("timed_out", self.timed_out, cast(type[object], bool)),
+        )
+        for name, value, expected_type in exact_fields:
+            if type(value) is not expected_type:
+                raise TypeError(
+                    f"ValidationRecord.{name} must be {expected_type.__name__}"
+                )
+
+    def _validate_identity_fields(self) -> None:
+        if self.schema_version != VALIDATION_RECORD_SCHEMA_VERSION:
+            raise ValueError(
+                "ValidationRecord.schema_version must be "
+                f"{VALIDATION_RECORD_SCHEMA_VERSION}"
+            )
+        for name, value in (
+            ("suite", self.suite),
+            ("head_sha", self.head_sha),
+            ("command", self.command),
+        ):
+            if not value.strip():
+                raise ValueError(f"ValidationRecord.{name} must not be blank")
+
+    def _validate_optional_paths(self) -> None:
+        for name, value in (
+            ("stdout_path", self.stdout_path),
+            ("stderr_path", self.stderr_path),
+        ):
+            if value is not None and (type(value) is not str or not value):
+                raise TypeError(f"ValidationRecord.{name} must be str or None")
+
+    def _validate_timestamps(self) -> None:
+        try:
+            datetime.fromisoformat(self.started_at)
+            datetime.fromisoformat(self.ended_at)
+        except ValueError as exc:
+            raise ValueError(
+                "ValidationRecord timestamps must be ISO-8601 datetime strings"
+            ) from exc
+
+    def _validate_result_consistency(self) -> None:
+        if self.passed is not (self.exit_code == 0):
+            raise ValueError(
+                "ValidationRecord.passed must exactly match exit_code == 0"
+            )
+        if self.timed_out and self.passed:
+            raise ValueError("ValidationRecord.timed_out cannot be true when passed")
+
+    def to_dict(self) -> dict[str, object]:
         """Convert to dictionary for JSON serialization."""
         return {
             "schema_version": self.schema_version,
@@ -72,20 +178,28 @@ class ValidationRecord:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> ValidationRecord:
-        """Create from dictionary (JSON deserialization)."""
+    def from_dict(cls, data: Mapping[str, object]) -> ValidationRecord:
+        """Strictly validate and deserialize the durable record contract."""
+        actual_fields = frozenset(data)
+        if actual_fields != _VALIDATION_RECORD_FIELDS:
+            missing = sorted(_VALIDATION_RECORD_FIELDS - actual_fields)
+            extra = sorted(actual_fields - _VALIDATION_RECORD_FIELDS)
+            raise ValueError(
+                "ValidationRecord fields must match the schema exactly; "
+                f"missing={missing} extra={extra}"
+            )
         return cls(
-            schema_version=data.get("schema_version", 1),
-            suite=data["suite"],
-            head_sha=data["head_sha"],
-            passed=data["passed"],
-            exit_code=data["exit_code"],
-            command=data["command"],
-            started_at=data["started_at"],
-            ended_at=data["ended_at"],
-            timed_out=data.get("timed_out", False),
-            stdout_path=data.get("stdout_path"),
-            stderr_path=data.get("stderr_path"),
+            schema_version=_required_validation_field(data, "schema_version", int),
+            suite=_required_validation_field(data, "suite", str),
+            head_sha=_required_validation_field(data, "head_sha", str),
+            passed=_required_validation_field(data, "passed", bool),
+            exit_code=_required_validation_field(data, "exit_code", int),
+            command=_required_validation_field(data, "command", str),
+            started_at=_required_validation_field(data, "started_at", str),
+            ended_at=_required_validation_field(data, "ended_at", str),
+            timed_out=_required_validation_field(data, "timed_out", bool),
+            stdout_path=_optional_validation_path(data, "stdout_path"),
+            stderr_path=_optional_validation_path(data, "stderr_path"),
         )
 
 
@@ -266,6 +380,14 @@ class SessionOutput(Protocol):
         ``validation_reason`` are how the stale-reason-on-success bug
         slipped in originally; the runtime guard prevents recurrence.
         """
+        ...
+
+    def record_scheduled_watchdog(
+        self,
+        run: SessionRunAssets,
+        watchdog: "ScheduledSessionWatchdog",
+    ) -> None:
+        """Persist the planner-owned outer timeout before terminal creation."""
         ...
 
     def update_validation_outcome(

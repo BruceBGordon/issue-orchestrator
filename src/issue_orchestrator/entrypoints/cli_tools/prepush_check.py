@@ -15,16 +15,22 @@ Exit codes:
 import logging
 import shutil
 import sys
-import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from ...control.validation import PublishGate
-from ...execution import GitWorkingCopy, LocalCommandRunner
+from ...entrypoints.bootstrap_executor import build_validation_command_runner
+from ...execution import GitWorkingCopy
 from ...infra.runtime_artifacts import filter_runtime_managed_dirty_paths
-from ...infra.validation_timings import append_validation_timing, build_timing_envelope
+from ...infra.validation_timings import (
+    SYSTEM_VALIDATION_TIMING_CLOCK,
+    PrepushGateTimingSummary,
+    ValidationTimingClock,
+    append_validation_timing,
+    build_timing_envelope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +150,7 @@ def _run_validation_gate(
     cmd: str,
     timeout: int,
     verbose: bool,
+    timing_clock: ValidationTimingClock,
 ) -> PrepushValidationOutcome:
     """Run the publish gate and return the pre-push validation outcome."""
     if verbose:
@@ -151,14 +158,15 @@ def _run_validation_gate(
 
     gate = PublishGate(
         worktree,
-        command_runner=LocalCommandRunner(),
+        command_runner=build_validation_command_runner(),
         working_copy=GitWorkingCopy(),
         command=cmd,
         timeout_seconds=timeout,
+        timing_clock=timing_clock,
     )
-    start = time.monotonic()
+    start = timing_clock.monotonic_now()
     result = gate.check(session_output_dir=_prepush_output_dir(worktree))
-    duration = time.monotonic() - start
+    duration = timing_clock.monotonic_now() - start
     logger.info(
         "Pre-push validation completed in %.2fs: allowed=%s cache_hit=%s",
         duration,
@@ -214,48 +222,46 @@ def _record_prepush_summary(
     final_exit_code: int | None,
     phase: str,
     error_type: str | None,
+    timing_clock: ValidationTimingClock,
 ) -> None:
     """Append an outer pre-push summary timing record."""
-    payload: dict[str, object] = {
-        "kind": "prepush_gate_summary",
-        "head_sha": head_sha,
-        "command": cmd,
-        "timeout_seconds": timeout,
-        "dirty_check": dirty_check,
-        "dirty_only": dirty_only,
-        "dirty_elapsed_seconds": (
+    summary = PrepushGateTimingSummary(
+        head_sha=head_sha,
+        command=cmd,
+        timeout_seconds=timeout,
+        dirty_check=dirty_check,
+        dirty_only=dirty_only,
+        dirty_elapsed_seconds=(
             round(dirty_elapsed_seconds, 3)
             if dirty_elapsed_seconds is not None
             else None
         ),
-        "dirty_exit_code": dirty_exit_code,
-        "validation_elapsed_seconds": (
+        dirty_exit_code=dirty_exit_code,
+        validation_elapsed_seconds=(
             round(validation_outcome.elapsed_seconds, 3) if validation_outcome else None
         ),
-        "validation_cache_hit": validation_outcome.cache_hit
-        if validation_outcome
-        else None,
-        "validation_allowed": validation_outcome.allowed
-        if validation_outcome
-        else None,
-        "validation_reason": validation_outcome.reason if validation_outcome else None,
-        "validation_record_exit_code": validation_outcome.record_exit_code
-        if validation_outcome
-        else None,
-        "validation_record_timed_out": validation_outcome.record_timed_out
-        if validation_outcome
-        else None,
-        "final_exit_code": final_exit_code,
-        "phase": phase,
-        "error_type": error_type,
-    }
-    payload.update(
-        build_timing_envelope(
+        validation_cache_hit=(
+            validation_outcome.cache_hit if validation_outcome else None
+        ),
+        validation_allowed=(validation_outcome.allowed if validation_outcome else None),
+        validation_reason=(validation_outcome.reason if validation_outcome else None),
+        validation_record_exit_code=(
+            validation_outcome.record_exit_code if validation_outcome else None
+        ),
+        validation_record_timed_out=(
+            validation_outcome.record_timed_out if validation_outcome else None
+        ),
+        final_exit_code=final_exit_code,
+        phase=phase,
+        error_type=error_type,
+        envelope=build_timing_envelope(
             wall_started_at=wall_started_at,
             monotonic_started_at=monotonic_started_at,
-        )
+            wall_ended_at=timing_clock.wall_now(),
+            monotonic_ended_at=timing_clock.monotonic_now(),
+        ),
     )
-    append_validation_timing(worktree, payload)
+    append_validation_timing(worktree, summary)
 
 
 def _prepush_output_dir(worktree: Path) -> Path:
@@ -294,7 +300,12 @@ def _prune_prepush_output_dirs(
             child.unlink(missing_ok=True)
 
 
-def run_prepush_check(verbose: bool = False, dirty_only: bool = False) -> int:
+def run_prepush_check(
+    verbose: bool = False,
+    dirty_only: bool = False,
+    *,
+    timing_clock: ValidationTimingClock = SYSTEM_VALIDATION_TIMING_CLOCK,
+) -> int:
     """Run pre-push validation check.
 
     This function:
@@ -312,8 +323,8 @@ def run_prepush_check(verbose: bool = False, dirty_only: bool = False) -> int:
         Exit code (0 = passed, 1 = failed, 2 = error)
     """
     worktree = find_worktree_root()
-    wall_started_at = datetime.now(timezone.utc)
-    monotonic_started_at = time.monotonic()
+    wall_started_at = timing_clock.wall_now()
+    monotonic_started_at = timing_clock.monotonic_now()
     cmd: str | None = None
     timeout = 0
     dirty_check = "tracked"
@@ -329,9 +340,9 @@ def run_prepush_check(verbose: bool = False, dirty_only: bool = False) -> int:
         cmd, timeout, dirty_check = load_validation_cmd(worktree)
         head_sha = GitWorkingCopy().get_head_sha(worktree)
 
-        dirty_started_at = time.monotonic()
+        dirty_started_at = timing_clock.monotonic_now()
         dirty_result = _run_dirty_guard(worktree, dirty_check, verbose)
-        dirty_elapsed_seconds = time.monotonic() - dirty_started_at
+        dirty_elapsed_seconds = timing_clock.monotonic_now() - dirty_started_at
         dirty_exit_code = dirty_result
         if dirty_result is not None:
             phase = "dirty_guard_failed"
@@ -352,7 +363,13 @@ def run_prepush_check(verbose: bool = False, dirty_only: bool = False) -> int:
             final_exit_code = 0
             return 0
 
-        validation_outcome = _run_validation_gate(worktree, cmd, timeout, verbose)
+        validation_outcome = _run_validation_gate(
+            worktree,
+            cmd,
+            timeout,
+            verbose,
+            timing_clock,
+        )
         phase = "validation_gate"
         final_exit_code = validation_outcome.exit_code
         return validation_outcome.exit_code
@@ -376,6 +393,7 @@ def run_prepush_check(verbose: bool = False, dirty_only: bool = False) -> int:
             final_exit_code=final_exit_code,
             phase=phase,
             error_type=error_type,
+            timing_clock=timing_clock,
         )
 
 

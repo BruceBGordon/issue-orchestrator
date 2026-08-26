@@ -5,7 +5,16 @@ from __future__ import annotations
 import sqlite3
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal, TypedDict
+
+
+SqliteIsolationLevel = Literal["DEFERRED", "IMMEDIATE", "EXCLUSIVE"]
+
+
+class _SqliteConnectOptions(TypedDict, total=False):
+    timeout: float
+    check_same_thread: bool
+    isolation_level: SqliteIsolationLevel | None
 
 
 
@@ -14,12 +23,12 @@ def open_sqlite(
     *,
     timeout: float | None = None,
     check_same_thread: bool | None = None,
-    isolation_level: str | None = None,
-    row_factory: Callable | None = None,
+    isolation_level: SqliteIsolationLevel | None = None,
+    row_factory: Callable[[sqlite3.Cursor, tuple[object, ...]], object] | None = None,
     pragmas: bool = True,
 ) -> sqlite3.Connection:
     """Open a SQLite connection with consistent pragmas and options."""
-    kwargs: dict = {}
+    kwargs = _SqliteConnectOptions()
     if timeout is not None:
         kwargs["timeout"] = timeout
     if check_same_thread is not None:

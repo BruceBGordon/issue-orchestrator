@@ -28,13 +28,14 @@ from pathlib import Path
 from typing import Generator
 
 import httpx
+import pytest
+from tests.process_completion_fixture import PROCESS_COMPLETION_WATCHDOG
 
 # Fixed admin bearer token used by the integration CC subprocess + its
 # HTTP client. Any deterministic non-empty value works; real tokens
 # live in ``~/.issue-orchestrator/api-token`` which we override via
 # env var on the subprocess.
 _INTEGRATION_ADMIN_TOKEN = "integration-test-admin-token"
-import pytest
 
 from .conftest import xdist_timeout
 
@@ -190,7 +191,10 @@ def control_center_process(
     # Wait for control center to be ready
     if not _wait_for_port(control_center_port, timeout=30):
         process.kill()
-        stdout, _ = process.communicate(timeout=5)
+        stdout, _ = PROCESS_COMPLETION_WATCHDOG.communicate(
+            process,
+            operation="failed control center startup cleanup",
+        )
         pytest.fail(f"Control center failed to start. Output:\n{stdout}")
 
     logger.info("Control center ready on port %d", control_center_port)
@@ -204,7 +208,10 @@ def control_center_process(
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait()
+        PROCESS_COMPLETION_WATCHDOG.wait(
+            process,
+            operation="forced control center shutdown",
+        )
 
 
 @pytest.fixture

@@ -22,6 +22,7 @@ from issue_orchestrator.execution.session_output_adapter import (
     VALIDATION_RECORD_NAME,
 )
 from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeSummaryV1
+from issue_orchestrator.domain.session_watchdog import ScheduledSessionWatchdog
 
 
 def _review_exchange_summary(
@@ -55,6 +56,20 @@ def _review_exchange_summary_payload(
         rounds=rounds,
         response_text=response_text,
     ).to_payload()
+
+
+def test_record_scheduled_watchdog_persists_exact_owner_value(tmp_path) -> None:
+    session_output = FileSystemSessionOutput()
+    run = session_output.start_run(tmp_path, "issue-123", issue_number=123)
+
+    session_output.record_scheduled_watchdog(
+        run,
+        ScheduledSessionWatchdog(timeout_minutes=92),
+    )
+
+    manifest = session_output.read_manifest(run.run_dir)
+    assert manifest is not None
+    assert manifest["scheduled_outer_watchdog_timeout_minutes"] == 92
 
 
 class TestListRuns:

@@ -42,6 +42,10 @@ class CLICommandHandlers:
     doctor: CommandHandler
     demo: CommandHandler
     trace: CommandHandler
+    executor_run: CommandHandler
+    executor_policy: CommandHandler
+    executor_events: CommandHandler
+    executor_status: CommandHandler
 
 
 class CLIStability(StrEnum):
@@ -98,6 +102,8 @@ CLI_COMMAND_SURFACE: tuple[CLICommandSpec, ...] = (
     CLICommandSpec("health-review", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
     CLICommandSpec("refresh", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
     CLICommandSpec("restart", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("executor-run", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("executor-policy", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
     # Setup
     CLICommandSpec("setup", CLIGroup.SETUP, CLIStability.SUPPORTED),
     CLICommandSpec("init", CLIGroup.SETUP, CLIStability.SUPPORTED),
@@ -111,6 +117,8 @@ CLI_COMMAND_SURFACE: tuple[CLICommandSpec, ...] = (
     CLICommandSpec("doctor", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
     CLICommandSpec("audit", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
     CLICommandSpec("trace", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
+    CLICommandSpec("executor-events", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
+    CLICommandSpec("executor-status", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
     CLICommandSpec("demo", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
     # Development only - these operate on test and E2E state and carry no
     # compatibility promise of any kind.
@@ -563,6 +571,93 @@ def _register_auth_commands(subparsers, handlers: CLICommandHandlers) -> None:
 
 
 def _register_utility_commands(subparsers, handlers: CLICommandHandlers) -> None:
+    executor_status_parser = subparsers.add_parser(
+        "executor-status",
+        help="Show machine-wide executor policy and learned work profiles",
+    )
+    executor_status_parser.add_argument(
+        "--repository",
+        help="Show only profiles with this exact repository label",
+    )
+    executor_status_parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Profile offset after filtering (default: 0)",
+    )
+    executor_status_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum profiles to show (1-1000; default: 20)",
+    )
+    executor_status_parser.set_defaults(func=handlers.executor_status)
+
+    events_parser = subparsers.add_parser(
+        "executor-events",
+        help="Show recent machine-wide executor activity",
+    )
+    events_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum events to show (1-1000; default: 50)",
+    )
+    events_parser.set_defaults(func=handlers.executor_events)
+
+    policy_parser = subparsers.add_parser(
+        "executor-policy",
+        help="Inspect or change machine-wide executor aggressiveness",
+    )
+    policy_parser.add_argument(
+        "--aggressiveness",
+        type=int,
+        metavar="PERCENT",
+        help="Scale learned admission pressure (default: 100)",
+    )
+    policy_parser.set_defaults(func=handlers.executor_policy)
+
+    executor_parser = subparsers.add_parser(
+        "executor-run",
+        help="Run a scheduling specification under the machine-wide executor",
+    )
+    executor_parser.add_argument(
+        "--min-concurrency",
+        type=int,
+        help="Smallest concurrency grant an adaptive command accepts",
+    )
+    executor_parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        help="Largest concurrency grant an adaptive command accepts",
+    )
+    executor_parser.add_argument(
+        "--work-key",
+        required=True,
+        help="Required human-readable repository-scoped history key",
+    )
+    executor_parser.add_argument(
+        "--exclusive",
+        action="append",
+        default=[],
+        metavar="RESOURCE",
+        help="Also hold a named exclusive host resource (repeatable)",
+    )
+    executor_parser.add_argument(
+        "--group",
+        dest="executor_group",
+        help=(
+            "Fairness group for related work; alternatively set "
+            "ISSUE_ORCHESTRATOR_EXECUTOR_GROUP"
+        ),
+    )
+    executor_parser.add_argument(
+        "executor_command",
+        nargs=argparse.REMAINDER,
+        help="Command to run, preceded by --",
+    )
+    executor_parser.set_defaults(func=handlers.executor_run)
+
     doctor_parser = subparsers.add_parser(
         "doctor", help="Run diagnostics on configuration and environment"
     )

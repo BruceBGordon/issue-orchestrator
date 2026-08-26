@@ -1472,6 +1472,14 @@
       "rule_id": "oversized_control_hotspots",
       "value": 1649
     },
+    "oversized_control_hotspots:src/issue_orchestrator/entrypoints/cli_tools/validate_runner.py": {
+      "detail": "1094 lines exceeds budget 800",
+      "kind": "file_line_budget",
+      "metric_id": "src/issue_orchestrator/entrypoints/cli_tools/validate_runner.py",
+      "path": "src/issue_orchestrator/entrypoints/cli_tools/validate_runner.py",
+      "rule_id": "oversized_control_hotspots",
+      "value": 1094
+    },
     "oversized_control_hotspots:src/issue_orchestrator/entrypoints/control_api.py": {
       "detail": "1291 lines exceeds budget 800",
       "kind": "file_line_budget",
@@ -1528,6 +1536,22 @@
       "rule_id": "oversized_control_hotspots",
       "value": 1321
     },
+    "oversized_control_hotspots:src/issue_orchestrator/execution/contained_command_capture.py": {
+      "detail": "1158 lines exceeds budget 800",
+      "kind": "file_line_budget",
+      "metric_id": "src/issue_orchestrator/execution/contained_command_capture.py",
+      "path": "src/issue_orchestrator/execution/contained_command_capture.py",
+      "rule_id": "oversized_control_hotspots",
+      "value": 1158
+    },
+    "oversized_control_hotspots:src/issue_orchestrator/execution/contained_validation_command.py": {
+      "detail": "1124 lines exceeds budget 800",
+      "kind": "file_line_budget",
+      "metric_id": "src/issue_orchestrator/execution/contained_validation_command.py",
+      "path": "src/issue_orchestrator/execution/contained_validation_command.py",
+      "rule_id": "oversized_control_hotspots",
+      "value": 1124
+    },
     "oversized_control_hotspots:src/issue_orchestrator/execution/git_working_copy.py": {
       "detail": "847 lines exceeds budget 800",
       "kind": "file_line_budget",
@@ -1543,6 +1567,38 @@
       "path": "src/issue_orchestrator/execution/goal_pilot_store.py",
       "rule_id": "oversized_control_hotspots",
       "value": 910
+    },
+    "oversized_control_hotspots:src/issue_orchestrator/execution/host_executor/_journal.py": {
+      "detail": "1106 lines exceeds budget 800",
+      "kind": "file_line_budget",
+      "metric_id": "src/issue_orchestrator/execution/host_executor/_journal.py",
+      "path": "src/issue_orchestrator/execution/host_executor/_journal.py",
+      "rule_id": "oversized_control_hotspots",
+      "value": 1106
+    },
+    "oversized_control_hotspots:src/issue_orchestrator/execution/host_executor/adapter.py": {
+      "detail": "833 lines exceeds budget 800",
+      "kind": "file_line_budget",
+      "metric_id": "src/issue_orchestrator/execution/host_executor/adapter.py",
+      "path": "src/issue_orchestrator/execution/host_executor/adapter.py",
+      "rule_id": "oversized_control_hotspots",
+      "value": 833
+    },
+    "oversized_control_hotspots:src/issue_orchestrator/execution/host_executor/guardian.py": {
+      "detail": "841 lines exceeds budget 800",
+      "kind": "file_line_budget",
+      "metric_id": "src/issue_orchestrator/execution/host_executor/guardian.py",
+      "path": "src/issue_orchestrator/execution/host_executor/guardian.py",
+      "rule_id": "oversized_control_hotspots",
+      "value": 841
+    },
+    "oversized_control_hotspots:src/issue_orchestrator/execution/host_executor/guardian_launcher.py": {
+      "detail": "1059 lines exceeds budget 800",
+      "kind": "file_line_budget",
+      "metric_id": "src/issue_orchestrator/execution/host_executor/guardian_launcher.py",
+      "path": "src/issue_orchestrator/execution/host_executor/guardian_launcher.py",
+      "rule_id": "oversized_control_hotspots",
+      "value": 1059
     },
     "oversized_control_hotspots:src/issue_orchestrator/execution/persistent_round_runner.py": {
       "detail": "824 lines exceeds budget 800",
@@ -1560,6 +1616,30 @@
       "rule_id": "oversized_control_hotspots",
       "value": 3238
     },
+    "oversized_control_hotspots:src/issue_orchestrator/execution/posix_process.py": {
+      "detail": "1241 lines exceeds budget 800",
+      "kind": "file_line_budget",
+      "metric_id": "src/issue_orchestrator/execution/posix_process.py",
+      "path": "src/issue_orchestrator/execution/posix_process.py",
+      "rule_id": "oversized_control_hotspots",
+      "value": 1241
+    },
+    "oversized_control_hotspots:src/issue_orchestrator/execution/process_cancellation_endpoint.py": {
+      "detail": "1196 lines exceeds budget 800",
+      "kind": "file_line_budget",
+      "metric_id": "src/issue_orchestrator/execution/process_cancellation_endpoint.py",
+      "path": "src/issue_orchestrator/execution/process_cancellation_endpoint.py",
+      "rule_id": "oversized_control_hotspots",
+      "value": 1196
+    },
+    "oversized_control_hotspots:src/issue_orchestrator/execution/process_group_sentinel.py": {
+      "detail": "1001 lines exceeds budget 800",
+      "kind": "file_line_budget",
+      "metric_id": "src/issue_orchestrator/execution/process_group_sentinel.py",
+      "path": "src/issue_orchestrator/execution/process_group_sentinel.py",
+      "rule_id": "oversized_control_hotspots",
+      "value": 1001
+    },
     "oversized_control_hotspots:src/issue_orchestrator/execution/session_output_adapter.py": {
       "detail": "1641 lines exceeds budget 800",
       "kind": "file_line_budget",
@@ -1567,6 +1647,14 @@
       "path": "src/issue_orchestrator/execution/session_output_adapter.py",
       "rule_id": "oversized_control_hotspots",
       "value": 1641
+    },
+    "oversized_control_hotspots:src/issue_orchestrator/execution/validation_process_guardian.py": {
+      "detail": "1041 lines exceeds budget 800",
+      "kind": "file_line_budget",
+      "metric_id": "src/issue_orchestrator/execution/validation_process_guardian.py",
+      "path": "src/issue_orchestrator/execution/validation_process_guardian.py",
+      "rule_id": "oversized_control_hotspots",
+      "value": 1041
     },
     "oversized_control_hotspots:src/issue_orchestrator/infra/config.py": {
       "detail": "1459 lines exceeds budget 800",
@@ -1615,6 +1703,14 @@
       "path": "src/issue_orchestrator/infra/supervisor.py",
       "rule_id": "oversized_control_hotspots",
       "value": 984
+    },
+    "oversized_control_hotspots:src/issue_orchestrator/infra/validation_timings.py": {
+      "detail": "1077 lines exceeds budget 800",
+      "kind": "file_line_budget",
+      "metric_id": "src/issue_orchestrator/infra/validation_timings.py",
+      "path": "src/issue_orchestrator/infra/validation_timings.py",
+      "rule_id": "oversized_control_hotspots",
+      "value": 1077
     },
     "oversized_control_hotspots:src/issue_orchestrator/view_models/dashboard.py": {
       "detail": "1460 lines exceeds budget 800",

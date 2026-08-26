@@ -12,7 +12,6 @@ import functools
 import os
 import signal
 import subprocess
-import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -24,6 +23,7 @@ from tests.process_group_run import (
     ProcessGroupUnsupportedError,
     run_in_process_group,
 )
+from tests.process_tree_fixture import ProcessTreeMember
 from tests.sandbox_probe_retry import decode_stream, run_until_paths_created
 
 
@@ -77,23 +77,6 @@ def test_a_platform_without_process_groups_refuses_before_spawning(
         run_in_process_group(["/bin/sh", "-c", "true"], cwd=tmp_path, timeout=1)
 
     assert "os.killpg" in str(excinfo.value)
-
-
-def _pid_has_exited(pid: int, *, deadline_seconds: float = 10.0) -> bool:
-    """Bounded wait for ``pid`` to disappear.
-
-    Reaping a reparented grandchild is done by init, so it is observable but
-    not synchronous with our kill. ``tests/AGENTS.md`` permits a bounded wait
-    on a real external system; there is no ack channel from init to poll.
-    """
-    deadline = time.monotonic() + deadline_seconds
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except (ProcessLookupError, PermissionError):
-            return True
-        time.sleep(0.05)
-    return False
 
 
 def _grandchild_script(*, pid_file: Path, evidence: Path) -> str:
@@ -224,10 +207,7 @@ def test_a_grandchild_cannot_outlive_the_timeout_cleanup(
     assert pid_file.exists(), "the probe never spawned its descendant"
     grandchild_pid = int(pid_file.read_text(encoding="utf-8").strip())
 
-    assert _pid_has_exited(grandchild_pid), (
-        f"grandchild {grandchild_pid} survived the timeout cleanup; it can still "
-        "write result files after the harness resets the attempt"
-    )
+    ProcessTreeMember(grandchild_pid).assert_contained()
     assert not evidence.exists()
 
 
@@ -271,7 +251,9 @@ def test_a_surviving_grandchild_cannot_supply_the_next_attempt_s_evidence(
 
     assert attempts == 2
     assert pid_file.exists(), "the first attempt never spawned its descendant"
-    assert _pid_has_exited(int(pid_file.read_text(encoding="utf-8").strip()))
+    ProcessTreeMember(
+        int(pid_file.read_text(encoding="utf-8").strip())
+    ).assert_contained()
     assert probe.completed_attempt is None, (
         "a run whose only evidence came from a killed attempt must not be accepted"
     )

@@ -10,17 +10,53 @@ only manages session lifecycle (registry, existence checks, cleanup).
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import re
-import signal
-import sqlite3
-import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import NoReturn
+
 from ..control.isolation import build_agent_tool_path, build_isolation_prefix
+from ..domain.process_group import (
+    ProcessIdentityAbsent,
+    ProcessIdentityPermissionDenied,
+    ProcessIdentityPresent,
+)
+from ..domain.retained_thread import (
+    RetainedThreadActivated,
+    RetainedThreadActivationIndeterminate,
+    RetainedThreadActivationInterrupted,
+    RetainedThreadActivationRejected,
+)
+from ..domain.terminal_session_registry import (
+    PendingTerminalSessionRecord,
+    TerminalSessionRecord,
+)
+from ..domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalLaunch,
+)
+from ..domain.executor import ExecutorInteractiveSessionCancellation
+from ..domain.terminal_session_termination import (
+    TerminalSessionOwnerCancellation,
+    TerminalSessionProcess,
+    UnregisteredTerminalSessionOwnership,
+)
+from ..domain.terminal_session_termination import TerminalSessionStatus
+from ..domain.terminal_session_lifecycle import (
+    TerminalSessionWatcherCompleted,
+    TerminalSessionWatcherFailed,
+    TerminalSessionWatcherPolicy,
+    TerminalSessionWatcherTimedOut,
+)
+from ..ports.process_group_supervisor import ProcessGroupSupervisor
+from ..ports.terminal_session_terminator import TerminalSessionTerminator
+from ..ports.terminal_session_owner import (
+    TerminalSessionLaunchLease,
+    TerminalSessionOwner,
+)
+from ..ports.terminal_session_registry import TerminalSessionRegistry
 from .agent_runner import AgentRunner, AgentSession, AgentSpec
 from .session_interactions import (
     SessionInteractionHandler,
@@ -28,212 +64,47 @@ from .session_interactions import (
 )
 from ..infra.env import get_env
 from ..infra.hooks.hookspec import hookimpl
-from ..infra.repo_identity import state_dir
-from ..infra.sqlite_connection import open_sqlite
-from ..infra.terminal_recording import TERMINAL_RECORDING_FILENAME
+from .terminal_session_lifecycle import (
+    PendingTerminalSession,
+    TerminalSessionWatcher,
+    TerminalSessionWatcherFactory,
+    TerminalSessionWatcherShutdownError,
+)
+from .terminal_session_registry import TerminalSessionRegistryError
 
 logger = logging.getLogger(__name__)
-_RUN_DIR_ENV_RE = re.compile(r"ISSUE_ORCHESTRATOR_RUN_DIR=(['\"]?)([^'\"\s]+)\1")
 
 
-@dataclass
-class _SessionRecord:
-    session_name: str
-    issue_number: int
-    worktree_path: str
-    pid: int
-    started_at: str
-    log_path: str
-    tab_name: str
-    is_review: bool
+@dataclass(frozen=True, slots=True)
+class _StartedTerminalSession:
+    session: AgentSession
+    launch_lease: TerminalSessionLaunchLease
 
-
-class _SubprocessRegistry:
-    """Persist subprocess sessions for restart discovery."""
-
-    def __init__(self, repo_root: Path) -> None:
-        self._state_dir = state_dir(repo_root)
-        self._state_dir.mkdir(parents=True, exist_ok=True)
-        self._db_path = self._state_dir / "session_registry.sqlite"
-        self._legacy_db_path = self._state_dir / "subprocess_sessions.sqlite"
-        self._legacy_dir = self._state_dir / "subprocess_sessions"
-        self._legacy_index = self._state_dir / "subprocess_sessions.json"
-        self._legacy_backup = self._legacy_index.with_suffix(".json.bak")
-        self._migrate_legacy_db_if_needed()
-        self._ensure_db()
-        self._migrate_legacy_if_needed()
-
-    def _connect(self) -> sqlite3.Connection:
-        return open_sqlite(self._db_path)
-        return open_sqlite(self._db_path)
-
-    def _ensure_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sessions (
-                    session_name TEXT PRIMARY KEY,
-                    issue_number INTEGER NOT NULL,
-                    worktree_path TEXT NOT NULL,
-                    pid INTEGER NOT NULL,
-                    started_at TEXT NOT NULL,
-                    log_path TEXT NOT NULL,
-                    tab_name TEXT NOT NULL,
-                    is_review INTEGER NOT NULL
-                )
-                """
+    def __post_init__(self) -> None:
+        if type(self.session) is not AgentSession:
+            raise ValueError("started terminal session must contain AgentSession")
+        if not isinstance(self.launch_lease, TerminalSessionLaunchLease):
+            raise ValueError(
+                "started terminal session must contain a typed launch lease"
             )
-            conn.commit()
-        try:
-            inode = os.stat(self._db_path).st_ino
-        except FileNotFoundError:
-            inode = None
-        logger.info(
-            "Session registry initialized: db=%s inode=%s pid=%d",
-            self._db_path,
-            inode,
-            os.getpid(),
-        )
 
-    def _migrate_legacy_db_if_needed(self) -> None:
-        if not self._legacy_db_path.exists() or self._db_path.exists():
-            return
-        try:
-            self._legacy_db_path.replace(self._db_path)
-        except Exception as exc:
-            logger.warning("Failed to migrate legacy session DB: %s", exc)
 
-    def _migrate_legacy_if_needed(self) -> None:
-        if self._db_path.exists() and self._has_rows():
-            return
-        legacy_records = self._load_legacy_records()
-        if not legacy_records:
-            return
-        for record in legacy_records.values():
-            self.upsert(record)
+@dataclass(frozen=True, slots=True)
+class _CommittedTerminalSession:
+    """Durably identified session whose watcher has not activated yet."""
 
-    def _has_rows(self) -> bool:
-        try:
-            with self._connect() as conn:
-                cur = conn.execute("SELECT 1 FROM sessions LIMIT 1")
-                return cur.fetchone() is not None
-        except sqlite3.DatabaseError:
-            self._handle_corrupt_db()
-            return False
+    record: TerminalSessionRecord
+    pending_session: PendingTerminalSession
 
-    def _handle_corrupt_db(self) -> None:
-        corrupt_path = self._db_path.with_suffix(".sqlite.corrupt")
-        try:
-            if self._db_path.exists():
-                self._db_path.replace(corrupt_path)
-        except Exception:
-            pass
-        self._ensure_db()
-
-    def _load_legacy_records(self) -> dict[str, _SessionRecord]:
-        if self._legacy_index.exists() or self._legacy_backup.exists():
-            for path in (self._legacy_index, self._legacy_backup):
-                if not path.exists():
-                    continue
-                try:
-                    raw = json.loads(path.read_text())
-                except Exception:
-                    continue
-                records = self._records_from_payload(raw)
-                if records:
-                    return records
-        if self._legacy_dir.exists():
-            records: dict[str, _SessionRecord] = {}
-            for path in sorted(self._legacy_dir.glob("*.json")):
-                try:
-                    raw = json.loads(path.read_text())
-                    record = _SessionRecord(**raw)
-                    records[record.session_name] = record
-                except Exception:
-                    continue
-            return records
-        return {}
-
-    def _records_from_payload(self, raw: dict) -> dict[str, _SessionRecord]:
-        records: dict[str, _SessionRecord] = {}
-        for name, data in raw.items():
-            try:
-                records[name] = _SessionRecord(**data)
-            except TypeError:
-                continue
-        return records
-
-    def load(self) -> dict[str, _SessionRecord]:
-        try:
-            with self._connect() as conn:
-                cur = conn.execute(
-                    "SELECT session_name, issue_number, worktree_path, pid, started_at, log_path, tab_name, is_review "
-                    "FROM sessions"
-                )
-                records = {}
-                for row in cur.fetchall():
-                    records[row[0]] = _SessionRecord(
-                        session_name=row[0],
-                        issue_number=row[1],
-                        worktree_path=row[2],
-                        pid=row[3],
-                        started_at=row[4],
-                        log_path=row[5],
-                        tab_name=row[6],
-                        is_review=bool(row[7]),
-                    )
-                return records
-        except sqlite3.DatabaseError:
-            logger.warning("Failed to read subprocess registry db: %s", self._db_path)
-            self._handle_corrupt_db()
-            return {}
-
-    def upsert(self, record: _SessionRecord) -> None:
-        try:
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO sessions (session_name, issue_number, worktree_path, pid, started_at, log_path, tab_name, is_review)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(session_name) DO UPDATE SET
-                        issue_number=excluded.issue_number,
-                        worktree_path=excluded.worktree_path,
-                        pid=excluded.pid,
-                        started_at=excluded.started_at,
-                        log_path=excluded.log_path,
-                        tab_name=excluded.tab_name,
-                        is_review=excluded.is_review
-                    """,
-                    (
-                        record.session_name,
-                        record.issue_number,
-                        record.worktree_path,
-                        record.pid,
-                        record.started_at,
-                        record.log_path,
-                        record.tab_name,
-                        1 if record.is_review else 0,
-                    ),
-                )
-                conn.commit()
-        except sqlite3.DatabaseError:
-            self._handle_corrupt_db()
-
-    def remove(self, session_name: str) -> None:
-        try:
-            with self._connect() as conn:
-                conn.execute("DELETE FROM sessions WHERE session_name = ?", (session_name,))
-                conn.commit()
-        except sqlite3.DatabaseError:
-            self._handle_corrupt_db()
-
-    def clear(self) -> None:
-        try:
-            with self._connect() as conn:
-                conn.execute("DELETE FROM sessions")
-                conn.commit()
-        except sqlite3.DatabaseError:
-            self._handle_corrupt_db()
+    def __post_init__(self) -> None:
+        if type(self.record) is not TerminalSessionRecord:
+            raise ValueError(
+                "committed terminal session must contain TerminalSessionRecord"
+            )
+        if type(self.pending_session) is not PendingTerminalSession:
+            raise ValueError(
+                "committed terminal session must contain PendingTerminalSession"
+            )
 
 
 class SubprocessPlugin:
@@ -246,65 +117,92 @@ class SubprocessPlugin:
 
     def __init__(
         self,
+        session_terminator: TerminalSessionTerminator,
+        terminal_session_owner: TerminalSessionOwner,
+        registry: TerminalSessionRegistry,
+        process_group_supervisor: ProcessGroupSupervisor,
+        watcher_policy: TerminalSessionWatcherPolicy,
+        watcher_factory: TerminalSessionWatcherFactory,
         *,
         session_interactions_enabled: bool = False,
         worktree_base: Path | None = None,
     ) -> None:
-        repo_root = Path(get_env("REPO_ROOT") or Path.cwd()).resolve()
-        self._registry = _SubprocessRegistry(repo_root)
+        if not isinstance(session_terminator, TerminalSessionTerminator):
+            raise ValueError(
+                "SubprocessPlugin.session_terminator must be a "
+                "TerminalSessionTerminator"
+            )
+        if not isinstance(process_group_supervisor, ProcessGroupSupervisor):
+            raise ValueError(
+                "SubprocessPlugin.process_group_supervisor must implement "
+                "ProcessGroupSupervisor"
+            )
+        if not isinstance(terminal_session_owner, TerminalSessionOwner):
+            raise ValueError(
+                "SubprocessPlugin.terminal_session_owner must implement "
+                "TerminalSessionOwner"
+            )
+        if not isinstance(registry, TerminalSessionRegistry):
+            raise ValueError(
+                "SubprocessPlugin.registry must implement TerminalSessionRegistry"
+            )
+        if type(watcher_policy) is not TerminalSessionWatcherPolicy:
+            raise ValueError(
+                "SubprocessPlugin.watcher_policy must be TerminalSessionWatcherPolicy"
+            )
+        if not isinstance(watcher_factory, TerminalSessionWatcherFactory):
+            raise ValueError(
+                "SubprocessPlugin.watcher_factory must implement "
+                "TerminalSessionWatcherFactory"
+            )
+        self._session_terminator = session_terminator
+        self._terminal_session_owner = terminal_session_owner
+        self._registry = registry
+        self._process_group_supervisor = process_group_supervisor
+        self._watcher_policy = watcher_policy
+        self._watcher_factory = watcher_factory
+        self._recover_pending_launches()
         self._sessions: dict[str, AgentSession] = {}
-        self._watcher_threads: dict[str, threading.Thread] = {}
+        self._session_watchers: dict[str, TerminalSessionWatcher] = {}
         deny_stdin_val = get_env("SUBPROCESS_DENY_STDIN") or ""
         self._allow_stdin = deny_stdin_val.lower() not in {"1", "true", "yes"}
         self._session_interactions_enabled = session_interactions_enabled
-        self._worktree_base = worktree_base.resolve() if worktree_base is not None else None
+        self._worktree_base = (
+            worktree_base.resolve() if worktree_base is not None else None
+        )
         self._warned_missing_worktree_base = False
 
-    def _session_log_path(self, working_dir: Path, session_name: str, command: str | None = None) -> Path:
-        if command:
-            match = _RUN_DIR_ENV_RE.search(command)
-            if match:
-                run_dir = Path(match.group(2))
-                if not run_dir.is_absolute():
-                    run_dir = (working_dir / run_dir).resolve()
-                run_dir.mkdir(parents=True, exist_ok=True)
-                return run_dir / TERMINAL_RECORDING_FILENAME
-        raise ValueError(
-            "terminal session creation requires ISSUE_ORCHESTRATOR_RUN_DIR in command"
-        )
+    def _recover_pending_launches(self) -> None:
+        committed_names = frozenset(self._registry.load())
+        for pending in self._registry.load_pending():
+            if pending.session_name in committed_names:
+                raise TerminalSessionRegistryError(
+                    "session cannot be both pending and committed: "
+                    f"{pending.session_name!r}"
+                )
+            report = self._session_terminator.recover_unregistered(
+                UnregisteredTerminalSessionOwnership.for_run_dir(pending.run_dir)
+            )
+            self._registry.remove_pending(pending.session_name)
+            logger.warning(
+                "[subprocess] recovered pending launch: session_name=%s "
+                "terminal_owner=%s guardian_owner=%s",
+                pending.session_name,
+                report.terminal_owner.value,
+                report.guardian_owner.value,
+            )
 
     def _build_process_command(self, command: str, working_dir: Path) -> str:
         """Build the full command with path and isolation prefix."""
         path_prefix = build_agent_tool_path(working_dir, os.environ.get("PATH", ""))
-        isolation_prefix = build_isolation_prefix(working_dir, scrub_env=True, isolate_home=False)
+        isolation_prefix = build_isolation_prefix(
+            working_dir, scrub_env=True, isolate_home=False
+        )
         return f'cd "{working_dir}" && export PATH="{path_prefix}" && {isolation_prefix}{command}'
-
-    def _start_session_watcher(self, session: AgentSession, session_name: str) -> None:
-        """Start a thread that waits for the session to complete."""
-
-        def _watch() -> None:
-            logger.info(
-                "[subprocess] watcher started: session_name=%s pid=%s",
-                session_name,
-                session.pid,
-            )
-            result = session.wait()  # Blocks until exit; auto-flushes log
-            logger.info(
-                "[subprocess] watcher completed: session_name=%s pid=%s exit_code=%s timed_out=%s duration=%.1fs",
-                session_name,
-                session.pid,
-                result.exit_code,
-                result.timed_out,
-                result.duration_seconds,
-            )
-
-        thread = threading.Thread(target=_watch, daemon=True)
-        self._watcher_threads[session_name] = thread
-        thread.start()
 
     def _interaction_handler(
         self,
-        command: str,
+        intent: TerminalInteractionIntent,
         session_name: str,
         working_dir: Path,
     ) -> SessionInteractionHandler | None:
@@ -319,30 +217,67 @@ class SubprocessPlugin:
             return None
         if not working_dir.resolve().is_relative_to(self._worktree_base):
             return None
-        rules = builtin_session_interaction_rules(command)
+        rules = builtin_session_interaction_rules(intent)
         if not rules:
             return None
         return SessionInteractionHandler(session_name=session_name, rules=rules)
 
-    def _start_process(self, command: str, working_dir: Path, session_name: str) -> AgentSession:
+    def _start_process(
+        self,
+        launch: TerminalLaunch,
+        working_dir: Path,
+        session_name: str,
+    ) -> _StartedTerminalSession:
         """Start an agent session via :class:`AgentRunner`.
 
         Builds the full command with isolation prefix, constructs an
         :class:`AgentSpec`, and delegates to ``AgentRunner.start()``.
         """
-        full_cmd = self._build_process_command(command, working_dir)
-        log_path = self._session_log_path(working_dir, session_name, command)
-        interaction_handler = self._interaction_handler(command, session_name, working_dir)
+        full_cmd = self._build_process_command(launch.shell_command, working_dir)
+        run_dir = launch.destination.run_dir
+        log_path = launch.destination.recording_path
+        if not run_dir.is_relative_to(working_dir.resolve()):
+            raise ValueError(
+                "terminal run destination must belong to the session worktree"
+            )
+        if not run_dir.is_dir():
+            raise FileNotFoundError(
+                f"terminal run destination does not exist: {run_dir}"
+            )
+        interaction_handler = self._interaction_handler(
+            launch.interaction_intent,
+            session_name,
+            working_dir,
+        )
 
+        owner_cancellation = TerminalSessionOwnerCancellation.for_run_dir(run_dir)
+        launch_lease = self._terminal_session_owner.prepare(
+            (launch.shell.value, "-lc", full_cmd),
+            owner_cancellation,
+        )
         spec = AgentSpec(
-            command=["/bin/bash", "-lc", full_cmd],
+            command=list(launch_lease.command),
             working_dir=working_dir,
             timeout_seconds=7200,  # Sessions manage their own timeout via provider_runner
             log_path=log_path,
             output_dir=log_path.parent,
         )
-        runner = AgentRunner()
-        session = runner.start(spec, interaction_handler=interaction_handler)
+        runner = AgentRunner(self._process_group_supervisor)
+        try:
+            session = runner.start_direct_with_file_descriptors(
+                spec,
+                launch_lease.inherited_file_descriptors,
+                interaction_handler=interaction_handler,
+            )
+        except BaseException as primary_error:
+            try:
+                launch_lease.abandon_after_spawn_uncertainty()
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "terminal spawn and uncertain-owner release failed",
+                    (primary_error, cleanup_error),
+                )
+            raise
         logger.info(
             "[subprocess] session started: session_name=%s pid=%s log_path=%s run_dir=%s",
             session_name,
@@ -351,42 +286,62 @@ class SubprocessPlugin:
             log_path.parent,
         )
 
-        self._sessions[session_name] = session
-        self._start_session_watcher(session, session_name)
-        return session
+        return _StartedTerminalSession(session, launch_lease)
 
-    def _process_alive(self, pid: int, session_name: str | None = None) -> bool:
-        """Check if a process is still running."""
-        session = self._sessions.get(session_name) if session_name else None
-        if session is not None:
-            return session.is_alive()
-        # Fall back to kill(0) check for recovered sessions without a handle
-        try:
-            os.kill(pid, 0)
+    def _identify_started_process(
+        self,
+        process_id: int,
+        run_dir: Path,
+    ) -> TerminalSessionProcess:
+        identity = self._session_terminator.identify(process_id)
+        if type(identity) is ProcessIdentityAbsent:
+            raise TerminalSessionRegistryError(
+                "new terminal process disappeared before its birth identity "
+                f"could be persisted: pid={process_id}"
+            )
+        if type(identity) is ProcessIdentityPermissionDenied:
+            raise TerminalSessionRegistryError(
+                "permission denied while identifying a new terminal process: "
+                f"pid={process_id} detail={identity.detail}"
+            )
+        if type(identity) is not ProcessIdentityPresent:
+            raise AssertionError("process identity observation is a closed union")
+        if identity.process_group_id != process_id:
+            raise TerminalSessionRegistryError(
+                "new terminal process is not its process-group leader: "
+                f"pid={process_id} pgid={identity.process_group_id}"
+            )
+        return TerminalSessionProcess(
+            process_id=process_id,
+            birth_identity=identity.birth_identity,
+            terminal_cancellation=(
+                TerminalSessionOwnerCancellation.for_run_dir(run_dir)
+            ),
+            executor_cancellation=(
+                ExecutorInteractiveSessionCancellation.for_run_dir(run_dir)
+            ),
+        )
+
+    def _record_is_active(self, record: TerminalSessionRecord) -> bool:
+        """Resolve liveness without ever treating a recycled PID as the session."""
+        session = self._sessions.get(record.session_name)
+        if session is not None and session.is_alive():
             return True
-        except OSError:
-            return False
+        status = self._session_terminator.status(record.process)
+        if status is TerminalSessionStatus.ACTIVE:
+            return True
+        self._session_terminator.terminate(record.process)
+        return False
 
-    def _kill_process(self, pid: int, session_name: str | None = None) -> None:
-        """Kill a process, trying AgentSession first."""
-        session = self._sessions.get(session_name) if session_name else None
-        if session is not None:
-            session.kill()
-            return
-        # Fall back to manual kill for recovered sessions without a handle
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                return
+    def _kill_process(self, record: TerminalSessionRecord) -> None:
+        """Contain a live or recovered session before reporting it stopped."""
+        self._session_terminator.terminate(record.process)
 
     @hookimpl
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
@@ -396,11 +351,36 @@ class SubprocessPlugin:
             session_id,
             session_name,
         )
+        if type(launch) is not TerminalLaunch:
+            raise ValueError("SubprocessPlugin.create_session requires TerminalLaunch")
         worktree = Path(working_dir)
         if self.session_exists(session_id, session_name):
             return False
+        pending_record = self._build_pending_record(
+            session_id,
+            launch,
+            worktree,
+            title,
+            session_name,
+        )
+        pending_session = self._start_pending_session(
+            pending_record,
+            launch,
+            worktree,
+        )
+        committed = self._commit_pending_session(pending_record, pending_session)
+        self._activate_committed_watcher(committed)
+        return True
 
-        session = self._start_process(command, worktree, session_name)
+    @staticmethod
+    def _build_pending_record(
+        session_id: int,
+        launch: TerminalLaunch,
+        worktree: Path,
+        title: str | None,
+        session_name: str,
+    ) -> PendingTerminalSessionRecord:
+        """Construct exact durable launch intent before any process can start."""
         is_review = session_name.startswith("review-")
         tab_name = title or session_name
         if is_review:
@@ -409,32 +389,281 @@ class SubprocessPlugin:
                 tab_name = f"Review PR #{pr_num}"
             except ValueError:
                 tab_name = session_name
-
-        assert session.pid is not None, "AgentSession has no pid"
-        record = _SessionRecord(
+        return PendingTerminalSessionRecord(
             session_name=session_name,
             issue_number=session_id,
-            worktree_path=str(worktree.resolve()),
-            pid=session.pid,
-            started_at=datetime.now().isoformat(),
-            log_path=str(self._session_log_path(worktree, session_name, command)),
+            worktree_path=worktree.resolve(),
+            run_dir=launch.destination.run_dir,
+            registered_at=datetime.now().astimezone(),
+            recording_path=launch.destination.recording_path,
             tab_name=tab_name,
             is_review=is_review,
         )
-        self._registry.upsert(record)
-        return True
 
-    def _wait_for_watcher_thread(self, session_name: str, timeout: float = 2.0) -> None:
-        """Wait for the watcher thread to finish and clean up resources."""
-        thread = self._watcher_threads.get(session_name)
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=timeout)
-        self._watcher_threads.pop(session_name, None)
+    def _start_pending_session(
+        self,
+        pending_record: PendingTerminalSessionRecord,
+        launch: TerminalLaunch,
+        worktree: Path,
+    ) -> PendingTerminalSession:
+        """Own launch intent through spawn and child-side owner readiness."""
+        self._registry.begin_launch(pending_record)
+        try:
+            started_session = self._start_process(
+                launch,
+                worktree,
+                pending_record.session_name,
+            )
+        except BaseException as error:
+            self._fail_pending_launch(pending_record, error)
+            raise AssertionError("unreachable after pending-launch recovery")
+        pending_session = PendingTerminalSession(
+            started_session.session,
+            self._process_group_supervisor,
+            started_session.launch_lease,
+        )
+        try:
+            pending_session.require_owner_ready()
+        except BaseException as error:
+            self._abort_identified_pending_launch(
+                pending_record,
+                pending_session,
+                error,
+            )
+            raise AssertionError("unreachable after owner-readiness cleanup")
+        return pending_session
+
+    def _commit_pending_session(
+        self,
+        pending_record: PendingTerminalSessionRecord,
+        pending_session: PendingTerminalSession,
+    ) -> _CommittedTerminalSession:
+        """Identify and atomically promote a launch to durable session state."""
+        session = pending_session.session
+        try:
+            process = self._identify_started_process(
+                session.pid,
+                pending_record.run_dir,
+            )
+        except BaseException as error:
+            self._abort_identified_pending_launch(
+                pending_record,
+                pending_session,
+                error,
+            )
+            raise AssertionError("unreachable after unregistered-session cleanup")
+        record = TerminalSessionRecord(
+            session_name=pending_record.session_name,
+            issue_number=pending_record.issue_number,
+            worktree_path=pending_record.worktree_path,
+            process=process,
+            registered_at=pending_record.registered_at,
+            recording_path=pending_record.recording_path,
+            tab_name=pending_record.tab_name,
+            is_review=pending_record.is_review,
+        )
+        try:
+            self._registry.commit_launch(pending_record, record)
+        except BaseException as error:
+            self._abort_identified_pending_launch(
+                pending_record,
+                pending_session,
+                error,
+            )
+            raise AssertionError("unreachable after identified-session cleanup")
+        return _CommittedTerminalSession(record, pending_session)
+
+    def _activate_committed_watcher(
+        self,
+        committed: _CommittedTerminalSession,
+    ) -> None:
+        """Retain the watcher before crossing its ambiguous activation boundary."""
+        record = committed.record
+        pending_session = committed.pending_session
+        session = pending_session.session
+        try:
+            watcher = self._watcher_factory.create(record.session_name, session)
+        except BaseException as watcher_error:
+            try:
+                pending_session.abort(watcher_error)
+            except BaseException as abort_outcome:
+                if abort_outcome is not watcher_error:
+                    # The committed row remains authoritative whenever exact
+                    # group containment or PTY finalization is unproven.
+                    raise
+            try:
+                self._registry.remove(record.session_name)
+            except BaseException as rollback_error:
+                raise BaseExceptionGroup(
+                    "contained terminal watcher startup and registry rollback failed",
+                    (watcher_error, rollback_error),
+                )
+            raise watcher_error
+        self._sessions[record.session_name] = session
+        self._session_watchers[record.session_name] = watcher
+        activation = watcher.activate()
+        if type(activation) is RetainedThreadActivationRejected:
+            self._rollback_rejected_watcher(
+                record,
+                pending_session,
+                activation.error,
+            )
+            raise AssertionError("unreachable after rejected watcher rollback")
+        if type(activation) is RetainedThreadActivationInterrupted:
+            self._recover_interrupted_watcher(record, watcher, activation.error)
+            raise AssertionError("unreachable after interrupted watcher recovery")
+        if type(activation) is RetainedThreadActivationIndeterminate:
+            self._recover_interrupted_watcher(record, watcher, activation.error)
+            raise AssertionError("unreachable after indeterminate watcher recovery")
+        if type(activation) is not RetainedThreadActivated:
+            raise AssertionError("watcher activation is a closed union")
+
+    def _rollback_rejected_watcher(
+        self,
+        record: TerminalSessionRecord,
+        pending_session: PendingTerminalSession,
+        activation_error: BaseException,
+    ) -> NoReturn:
+        """Rollback a committed row only when the watcher never executed."""
+        failures: list[BaseException] = [activation_error]
+        try:
+            pending_session.abort(activation_error)
+        except BaseException as abort_outcome:
+            if abort_outcome is not activation_error:
+                failures.append(abort_outcome)
+        if len(failures) == 1:
+            self._sessions.pop(record.session_name)
+            self._session_watchers.pop(record.session_name)
+            try:
+                self._registry.remove(record.session_name)
+            except BaseException as rollback_error:
+                failures.append(rollback_error)
+        if len(failures) == 1:
+            raise activation_error
+        raise BaseExceptionGroup(
+            "terminal watcher activation was rejected and rollback failed",
+            failures,
+        )
+
+    def _recover_interrupted_watcher(
+        self,
+        record: TerminalSessionRecord,
+        watcher: TerminalSessionWatcher,
+        activation_error: BaseException,
+    ) -> NoReturn:
+        """Contain an ambiguously activated watcher through its retained owner."""
+        failures: list[BaseException] = [activation_error]
+        try:
+            self._kill_process(record)
+        except BaseException as containment_error:
+            containment_error.add_note(
+                "terminal watcher activation recovery could not contain session"
+            )
+            failures.append(containment_error)
+        outcome = watcher.await_completion(self._watcher_policy)
+        if type(outcome) is TerminalSessionWatcherTimedOut:
+            shutdown_error = TerminalSessionWatcherShutdownError(
+                "interrupted terminal watcher remained live after containment: "
+                f"session_name={outcome.session_name!r} "
+                f"pid={outcome.process_id} timeout={outcome.timeout_seconds:.3f}s"
+            )
+            shutdown_error.__cause__ = outcome.error
+            failures.append(shutdown_error)
+            raise BaseExceptionGroup(
+                "terminal watcher activation recovery was incomplete",
+                failures,
+            )
+        if type(outcome) is TerminalSessionWatcherFailed:
+            failures.append(outcome.error)
+        elif type(outcome) is not TerminalSessionWatcherCompleted:
+            raise AssertionError("terminal watcher outcome is a closed union")
+        self._sessions.pop(record.session_name)
+        self._session_watchers.pop(record.session_name)
+        try:
+            self._registry.remove(record.session_name)
+        except BaseException as registry_error:
+            failures.append(registry_error)
+        if len(failures) == 1:
+            raise activation_error
+        raise BaseExceptionGroup(
+            "terminal watcher activation was interrupted",
+            failures,
+        )
+
+    def _fail_pending_launch(
+        self,
+        pending: PendingTerminalSessionRecord,
+        primary_error: BaseException,
+    ) -> NoReturn:
+        try:
+            self._session_terminator.recover_unregistered(
+                UnregisteredTerminalSessionOwnership.for_run_dir(pending.run_dir)
+            )
+        except BaseException as recovery_error:
+            raise BaseExceptionGroup(
+                "terminal launch failed and durable owner recovery failed",
+                (primary_error, recovery_error),
+            )
+        try:
+            self._registry.remove_pending(pending.session_name)
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "terminal launch failed after recovery but intent cleanup failed",
+                (primary_error, cleanup_error),
+            )
+        raise primary_error
+
+    def _abort_identified_pending_launch(
+        self,
+        pending: PendingTerminalSessionRecord,
+        pending_session: PendingTerminalSession,
+        primary_error: BaseException,
+    ) -> NoReturn:
+        try:
+            pending_session.abort(primary_error)
+        except BaseException as abort_outcome:
+            if abort_outcome is not primary_error:
+                raise
+        try:
+            self._registry.remove_pending(pending.session_name)
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "contained terminal launch retained a pending registry row",
+                (primary_error, cleanup_error),
+            )
+        raise primary_error
 
     def _cleanup_session(self, session_name: str) -> None:
-        """Clean up all resources for a session."""
-        self._wait_for_watcher_thread(session_name)
-        self._sessions.pop(session_name, None)
+        """Retire local resources only after the watcher proves completion."""
+        owns_session = session_name in self._sessions
+        owns_watcher = session_name in self._session_watchers
+        if owns_session != owns_watcher:
+            raise RuntimeError(
+                "terminal session and watcher ownership diverged: "
+                f"session_name={session_name!r} owns_session={owns_session} "
+                f"owns_watcher={owns_watcher}"
+            )
+        if not owns_session:
+            # Recovered sessions have only durable process ownership; their
+            # prior process's in-memory PTY watcher cannot survive a restart.
+            return
+        watcher = self._session_watchers[session_name]
+        outcome = watcher.await_completion(self._watcher_policy)
+        if type(outcome) is TerminalSessionWatcherTimedOut:
+            raise TerminalSessionWatcherShutdownError(
+                "terminal session watcher remained live after containment: "
+                f"session_name={outcome.session_name!r} pid={outcome.process_id} "
+                f"timeout={outcome.timeout_seconds:.3f}s"
+            ) from outcome.error
+        if type(outcome) is TerminalSessionWatcherFailed:
+            raise TerminalSessionWatcherShutdownError(
+                "terminal session watcher failed during PTY finalization: "
+                f"session_name={outcome.session_name!r} pid={outcome.process_id}"
+            ) from outcome.error
+        if type(outcome) is not TerminalSessionWatcherCompleted:
+            raise AssertionError("terminal watcher outcome is a closed union")
+        self._session_watchers.pop(session_name)
+        self._sessions.pop(session_name)
 
     @hookimpl
     def session_exists(self, session_id: int, session_name: str) -> bool | None:
@@ -442,14 +671,14 @@ class SubprocessPlugin:
         record = records.get(session_name)
         if not record:
             return False
-        if self._process_alive(record.pid, session_name):
+        if self._record_is_active(record):
             return True
         # Process is dead - wait for watcher thread to finish flushing output
         logger.info(
             "[subprocess] session no longer alive: session_name=%s pid=%s log_path=%s",
             session_name,
             record.pid,
-            record.log_path,
+            record.recording_path,
         )
         self._cleanup_session(session_name)
         self._registry.remove(session_name)
@@ -465,7 +694,7 @@ class SubprocessPlugin:
         record = records.get(session_name)
         if not record:
             return False
-        self._kill_process(record.pid, session_name)
+        self._kill_process(record)
         self._cleanup_session(session_name)
         self._registry.remove(session_name)
         return True
@@ -475,14 +704,16 @@ class SubprocessPlugin:
         records = self._registry.load()
         running: list[dict] = []
         for record in records.values():
-            if self._process_alive(record.pid, record.session_name):
-                running.append({
-                    "issue_number": record.issue_number,
-                    "tab_name": record.tab_name,
-                    "is_review": record.is_review,
-                    "session_name": record.session_name,
-                    "run_dir": str(Path(record.log_path).parent),
-                })
+            if self._record_is_active(record):
+                running.append(
+                    {
+                        "issue_number": record.issue_number,
+                        "tab_name": record.tab_name,
+                        "is_review": record.is_review,
+                        "session_name": record.session_name,
+                        "run_dir": str(record.run_dir),
+                    }
+                )
             else:
                 self._cleanup_session(record.session_name)
                 self._registry.remove(record.session_name)
@@ -493,18 +724,20 @@ class SubprocessPlugin:
         records = self._registry.load()
         cleaned = 0
         for record in list(records.values()):
-            if not self._process_alive(record.pid, record.session_name):
+            if not self._record_is_active(record):
                 self._cleanup_session(record.session_name)
                 self._registry.remove(record.session_name)
                 cleaned += 1
         return cleaned
 
     @hookimpl
-    def get_session_output(self, session_id: int, lines: int, session_name: str) -> str | None:
+    def get_session_output(
+        self, session_id: int, lines: int, session_name: str
+    ) -> str | None:
         record = self._registry.load().get(session_name)
         if not record:
             return None
-        log_path = Path(record.log_path)
+        log_path = record.recording_path
         if not log_path.exists():
             return ""
         try:
@@ -515,7 +748,9 @@ class SubprocessPlugin:
         return "\n".join(output_lines[-lines:]) if output_lines else ""
 
     @hookimpl
-    def send_to_session(self, session_id: int, text: str, session_name: str) -> bool | None:
+    def send_to_session(
+        self, session_id: int, text: str, session_name: str
+    ) -> bool | None:
         if not self._allow_stdin:
             return False
         session = self._sessions.get(session_name)
@@ -538,14 +773,20 @@ class SubprocessPlugin:
     @hookimpl
     def on_orchestrator_shutdown(self) -> None:
         records = self._registry.load()
+        failures: list[BaseException] = []
         for record in records.values():
-            if self._process_alive(record.pid, record.session_name):
-                self._kill_process(record.pid, record.session_name)
-        # Wait for all watcher threads to finish
-        for session_name in list(self._watcher_threads.keys()):
-            self._wait_for_watcher_thread(session_name, timeout=1.0)
-        self._sessions.clear()
-        self._registry.clear()
+            try:
+                self._kill_process(record)
+                self._cleanup_session(record.session_name)
+                self._registry.remove(record.session_name)
+            except BaseException as error:
+                error.add_note(f"terminal shutdown session: {record.session_name}")
+                failures.append(error)
+        if failures:
+            raise BaseExceptionGroup(
+                "one or more terminal sessions could not be contained",
+                failures,
+            )
 
     @hookimpl
     def terminal_health_check(self) -> dict | None:

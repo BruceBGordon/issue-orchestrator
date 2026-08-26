@@ -17,6 +17,11 @@ from typing import Optional
 from unittest.mock import MagicMock, PropertyMock, patch
 from fastapi.testclient import TestClient
 from issue_orchestrator.domain.models import AgentConfig, Issue, Session
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalLaunch,
+    TerminalShell,
+)
 from issue_orchestrator.infra.config import Config, DangerousConfig
 from issue_orchestrator.infra.hooks.hookspec import hookimpl
 from issue_orchestrator.ports.pull_request_tracker import (
@@ -30,6 +35,10 @@ from issue_orchestrator.ports.repository_host import DependencyIssueSnapshot
 from issue_orchestrator.domain.issue_key import FakeIssueKey, IssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+from issue_orchestrator.execution.unsupported_session_run_containment import (
+    SessionRunnerUnsupportedSessionRunContainment,
+)
+from tests.agent_phase_scheduler_helpers import host_agent_phase_command_scheduler
 
 TEST_ADMIN_TOKEN = "test-admin-token"
 TEST_AGENT_CALLBACK_TOKEN = "test-agent-callback-token"
@@ -587,21 +596,29 @@ class MockTerminalPlugin:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
     ) -> bool:
         """Track session creation."""
-        self.create_session_calls.append({
-            "session_id": session_id,
-            "session_name": session_name,
-            "command": command,
-            "working_dir": working_dir,
-            "title": title,
-        })
+        self.create_session_calls.append(
+            {
+                "session_id": session_id,
+                "session_name": session_name,
+                "launch": launch,
+                "command": launch.shell_command,
+                "interaction_intent": launch.interaction_intent,
+                "shell": launch.shell,
+                "working_dir": working_dir,
+                "title": title,
+            }
+        )
         self.sessions[session_id] = {
-            "command": command,
+            "launch": launch,
+            "command": launch.shell_command,
+            "interaction_intent": launch.interaction_intent,
+            "shell": launch.shell,
             "working_dir": working_dir,
             "title": title,
             "session_name": session_name,
@@ -656,14 +673,14 @@ class MockPluginManager:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
     ) -> bool:
         return self._plugin.create_session(
             session_id=session_id,
-            command=command,
+            launch=launch,
             working_dir=working_dir,
             title=title,
             session_name=session_name,
@@ -730,14 +747,14 @@ class MockSessionRunner:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
     ) -> bool:
         return self._plugin.create_session(
             session_id=session_id,
-            command=command,
+            launch=launch,
             working_dir=working_dir,
             title=title,
             session_name=session_name,
@@ -881,6 +898,9 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.entrypoints.bootstrap_operator_commands import (
         build_operator_issue_command_factory,
     )
+    from issue_orchestrator.entrypoints.bootstrap_executor import (
+        build_validation_command_runner,
+    )
     from issue_orchestrator.entrypoints.bootstrap_session_launcher import (
         build_session_launcher_factory,
     )
@@ -936,7 +956,11 @@ def build_test_orchestrator_deps(
         events=events,
         session_output=session_output,
         working_copy=working_copy,
-        command_runner=command_runner if config.validation.quick.cmd else None,
+        command_runner=(
+            build_validation_command_runner()
+            if config.validation.quick.cmd
+            else None
+        ),
         validation_cmd=config.validation.quick.cmd,
         validation_timeout_seconds=config.validation.quick.timeout_seconds,
         max_validation_retries=config.retry.max_validation_retries,
@@ -966,6 +990,9 @@ def build_test_orchestrator_deps(
         config=config,
         repository_host=repo_host,
         working_copy=working_copy,
+        unsupported_session_run_containment=(
+            SessionRunnerUnsupportedSessionRunContainment(runner)
+        ),
     )
 
     _label_sync = label_sync or LabelSync(labels=repo_host, events=events, pr_tracker=repo_host)
@@ -1159,6 +1186,7 @@ def build_test_orchestrator_deps(
             agent_callback_endpoint=agent_callback_endpoint,
             provider_readiness_probe=readiness_probe,
             needs_human_block=needs_human_block,
+            agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
         ),
         # Same shape again for the completion handler (#6999 A4).
         completion_handler_factory=build_completion_handler_factory(

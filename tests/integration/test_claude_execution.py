@@ -11,6 +11,7 @@ from collections.abc import Mapping
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.live,
+    pytest.mark.provider_claude,
     # Run PTY tests sequentially in one worker to avoid Python 3.14 forkpty warning
     # (forkpty() in multi-threaded processes can deadlock)
     pytest.mark.xdist_group("pty"),
@@ -21,6 +22,11 @@ from pathlib import Path
 from uuid import uuid4
 
 from issue_orchestrator.infra.env import ENV_PREFIX
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalLaunch,
+    TerminalShell,
+)
 from tests.process_group_run import run_in_process_group
 from tests.unit.session_run_helpers import make_session_run_assets
 
@@ -123,6 +129,8 @@ class TestClaudeExecution:
             [
                 "claude",
                 "--print",  # Output response and exit (non-interactive)
+                "--model",
+                "haiku",
                 f"Reply with exactly this token and nothing else: {expected_token}",
             ],
             timeout=xdist_timeout(60),  # Give Claude time to respond
@@ -141,7 +149,9 @@ class TestClaudeExecution:
         This is the actual pattern used by the orchestrator.
         """
         # Build a command similar to what orchestrator generates
-        inner_command = "claude --print 'Reply with just the word: hello'"
+        inner_command = (
+            "claude --print --model haiku 'Reply with just the word: hello'"
+        )
 
         # Escape single quotes for zsh wrapper (the fix we just made)
         escaped_command = inner_command.replace("'", "'\\''")
@@ -172,6 +182,8 @@ class TestClaudeExecution:
                 [
                     "claude",
                     "--print",
+                    "--model",
+                    "haiku",
                     "--dangerously-skip-permissions",  # Bypass permission prompts
                     f"Read the file at {test_file} and tell me what the title is. Reply with just the title text.",
                 ],
@@ -206,6 +218,8 @@ class TestClaudeExecution:
                 [
                     "claude",
                     "--print",
+                    "--model",
+                    "haiku",
                     "--dangerously-skip-permissions",
                     f"Read {instruction_file} and confirm you can see 'Agent Instructions' in it. Reply YES or NO.",
                 ],
@@ -247,6 +261,8 @@ class TestClaudeWithEnvironmentIsolation:
             [
                 "claude",
                 "--print",
+                "--model",
+                "haiku",
                 "Reply with just the word: working",
             ],
             timeout=xdist_timeout(60),
@@ -280,6 +296,8 @@ class TestClaudeWithEnvironmentIsolation:
             [
                 "claude",
                 "--print",
+                "--model",
+                "haiku",
                 "hello",
             ],
             capture_output=True,
@@ -415,7 +433,7 @@ class TestClaudeViaAdapterPath:
         # Build the claude command - ask Claude to create a file we can verify
         # This proves Claude actually ran and executed tools, not just responded
         claude_cmd = (
-            f"claude --print --dangerously-skip-permissions "
+            f"claude --print --model haiku --dangerously-skip-permissions "
             f"'Create a file at {verify_file} containing exactly the text VERIFIED. "
             f"Use the Write tool. Reply with DONE when complete.'"
         )
@@ -453,6 +471,16 @@ class TestClaudeViaAdapterPath:
     def test_claude_via_subprocess_backend(self, tmp_path, require_claude, monkeypatch):
         """Run Claude via subprocess backend in a real git worktree."""
         from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
+        from issue_orchestrator.entrypoints.bootstrap import (
+            build_process_group_supervisor,
+            build_terminal_session_terminator,
+        )
+        from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_owner,
+    build_terminal_session_registry,
+    build_terminal_session_watcher_factory,
+            terminal_session_watcher_policy,
+        )
 
         source_repo_root = Path(__file__).resolve().parents[2]
         worktree = tmp_path / f"real-worktree-{uuid4().hex[:8]}"
@@ -476,14 +504,28 @@ class TestClaudeViaAdapterPath:
             run_assets = make_session_run_assets(worktree, session_name=session_name)
             claude_cmd = (
                 f"export {ENV_PREFIX}RUN_DIR='{run_assets.run_dir}' && "
-                "claude --print --dangerously-skip-permissions "
+                "claude --print --model haiku --dangerously-skip-permissions "
                 f"\"{escaped_prompt}\""
             )
 
-            plugin = SubprocessPlugin()
+            plugin = SubprocessPlugin(
+                build_terminal_session_terminator(),
+                build_terminal_session_owner(),
+                build_terminal_session_registry((worktree).resolve()),
+                build_process_group_supervisor(),
+                terminal_session_watcher_policy(),
+                build_terminal_session_watcher_factory(),
+            )
             created = plugin.create_session(
                 session_id=999,
-                command=claude_cmd,
+                launch=TerminalLaunch(
+                    shell_command=claude_cmd,
+                    interaction_intent=(
+                        TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE
+                    ),
+                    shell=TerminalShell.BASH,
+                    destination=run_assets.terminal_destination,
+                ),
                 working_dir=str(worktree),
                 title="Claude subprocess integration",
                 session_name=session_name,
@@ -548,7 +590,7 @@ class TestClaudeViaAdapterPath:
             isolate_home=True,  # This breaks Keychain auth!
         )
 
-        claude_cmd = "claude --print 'hello'"
+        claude_cmd = "claude --print --model haiku 'hello'"
         escaped_cmd = claude_cmd.replace("'", "'\\''")
         full_cmd = f'{isolation_prefix}cd "{worktree}" && {escaped_cmd}'
         zsh_wrapped = f"zsh -l -c '{full_cmd}'"
@@ -625,6 +667,7 @@ class TestAgentDoneInvocation:
             [
                 "claude",
                 "-p",
+                "--model", "haiku",
                 "--permission-mode", "bypassPermissions",
                 prompt,
             ],

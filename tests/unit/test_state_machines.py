@@ -13,6 +13,17 @@ from issue_orchestrator.domain.state_machines import (
     InvalidStateTransition,
 )
 from issue_orchestrator.domain.models import Issue
+from issue_orchestrator.domain.session_watchdog import SessionWatchdogClock
+
+
+def _watchdog_clock(
+    wall_now: list[datetime],
+    monotonic_now: list[float],
+) -> SessionWatchdogClock:
+    return SessionWatchdogClock(
+        wall_now=lambda: wall_now[0],
+        monotonic_now=lambda: monotonic_now[0],
+    )
 
 
 @pytest.fixture
@@ -555,17 +566,24 @@ class TestSessionStateMachine:
 
     def test_check_timeout_exceeded(self):
         """Test check_timeout when timeout has been exceeded."""
+        wall_now = [datetime(2026, 8, 25, 1, 0, 0)]
+        monotonic_now = [100.0]
         machine = SessionStateMachine(
             session_id="session-123",
             issue_number=456,
-            timeout_minutes=60
+            timeout_minutes=60,
+            watchdog_clock=_watchdog_clock(wall_now, monotonic_now),
         )
 
         machine.launch()
         machine.started()
 
-        # Manually set started_at to 61 minutes ago
-        machine.started_at = datetime.now() - timedelta(minutes=61)
+        # Wall time can jump in either direction without changing authority.
+        wall_now[0] += timedelta(days=30)
+        monotonic_now[0] += 59 * 60
+        assert machine.check_timeout() is False
+        wall_now[0] -= timedelta(days=60)
+        monotonic_now[0] += 2 * 60
 
         result = machine.check_timeout()
         assert result is True
@@ -573,10 +591,13 @@ class TestSessionStateMachine:
 
     def test_check_timeout_only_affects_running_or_slow(self):
         """Test that check_timeout only triggers for RUNNING or SLOW states."""
+        wall_now = [datetime(2026, 8, 25, 1, 0, 0)]
+        monotonic_now = [100.0]
         machine = SessionStateMachine(
             session_id="session-123",
             issue_number=456,
-            timeout_minutes=60
+            timeout_minutes=60,
+            watchdog_clock=_watchdog_clock(wall_now, monotonic_now),
         )
 
         machine.launch()
@@ -584,8 +605,7 @@ class TestSessionStateMachine:
         machine.block()
         assert machine.get_state() == SessionState.BLOCKED
 
-        # Set started_at to past timeout
-        machine.started_at = datetime.now() - timedelta(minutes=61)
+        monotonic_now[0] += 61 * 60
 
         # Should not timeout from BLOCKED state
         result = machine.check_timeout()
@@ -668,15 +688,18 @@ class TestSessionStateMachine:
 
     def test_transition_result_on_timed_out(self):
         """Test that TransitionResult is stored on timed_out."""
+        wall_now = [datetime(2026, 8, 25, 1, 0, 0)]
+        monotonic_now = [100.0]
         machine = SessionStateMachine(
             session_id="session-123",
             issue_number=456,
-            timeout_minutes=60
+            timeout_minutes=60,
+            watchdog_clock=_watchdog_clock(wall_now, monotonic_now),
         )
 
         machine.launch()
         machine.started()
-        machine.started_at = datetime.now() - timedelta(minutes=61)
+        monotonic_now[0] += 61 * 60
         machine.check_timeout()
 
         assert machine.last_transition.event_name == "session.timeout"

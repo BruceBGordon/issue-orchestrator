@@ -26,8 +26,24 @@ import pytest
 
 from issue_orchestrator.adapters.worktree.api import sync_cli_tools
 from issue_orchestrator.domain.models import Issue
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalLaunch,
+    TerminalRunDestination,
+    TerminalShell,
+)
 from issue_orchestrator.events import EventName
 from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
+from issue_orchestrator.entrypoints.bootstrap import (
+    build_process_group_supervisor,
+    build_terminal_session_terminator,
+)
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_owner,
+    build_terminal_session_registry,
+    build_terminal_session_watcher_factory,
+    terminal_session_watcher_policy,
+)
 from issue_orchestrator.execution.worktree_adapter import GitWorktreeManager
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.env import ENV_PREFIX
@@ -46,6 +62,19 @@ from .scenario_dsl import script
 # ---------------------------------------------------------------------------
 # Helpers & Fixtures
 # ---------------------------------------------------------------------------
+
+
+
+def _subprocess_plugin(registry_root: Path) -> SubprocessPlugin:
+    """Compose the production plugin with a test-owned registry root."""
+    return SubprocessPlugin(
+        build_terminal_session_terminator(),
+        build_terminal_session_owner(),
+        build_terminal_session_registry(registry_root.resolve()),
+        build_process_group_supervisor(),
+        terminal_session_watcher_policy(),
+        build_terminal_session_watcher_factory(),
+    )
 
 
 def _init_foreign_repo(tmp_path: Path) -> Path:
@@ -160,6 +189,13 @@ class ForeignSessionContract:
     completion_rel: str
     run_dir: Path
     worktree_path: Path
+
+    @property
+    def terminal_destination(self) -> TerminalRunDestination:
+        return TerminalRunDestination(
+            run_dir=self.run_dir.resolve(),
+            recording_path=(self.run_dir / "terminal-recording.jsonl").resolve(),
+        )
 
 
 @pytest.fixture()
@@ -374,14 +410,14 @@ def test_foreign_repo_default_setup_commands_empty() -> None:
 
 
 @pytest.mark.integration
-def test_foreign_repo_scripts_dir_from_package() -> None:
+def test_foreign_repo_scripts_dir_from_package(tmp_path: Path) -> None:
     """terminal_subprocess uses package-relative scripts dir, not repo_root.
 
     Instead of mirroring the implementation's path arithmetic, we verify the
     scripts directory referenced in the command actually exists and contains
     the expected wrapper scripts.
     """
-    plugin = SubprocessPlugin()
+    plugin = _subprocess_plugin(tmp_path)
     cmd = plugin._build_process_command("echo test", Path("/tmp/fake-worktree"))  # noqa: SLF001
 
     # Extract the PATH value from the generated command
@@ -485,7 +521,7 @@ def test_foreign_repo_real_path_chain_finds_coding_done(make_worktree) -> None:
     assert not (wt / "src" / "issue_orchestrator" / "domain").exists()
     assert not (wt / ".venv").exists()
 
-    plugin = SubprocessPlugin()
+    plugin = _subprocess_plugin(wt)
     exports = _build_session_exports(_coder_session_contract(77, wt))
     full_cmd = plugin._build_process_command(  # noqa: SLF001
         f"{exports} && which coding-done", wt
@@ -510,7 +546,7 @@ def test_foreign_repo_real_path_chain_coding_done_executes(make_worktree) -> Non
     handle = make_worktree(78, "coding-done-exec-test")
     wt = handle.path
 
-    plugin = SubprocessPlugin()
+    plugin = _subprocess_plugin(wt)
     exports = _build_session_exports(_coder_session_contract(78, wt))
     full_cmd = plugin._build_process_command(  # noqa: SLF001
         f"{exports} && coding-done --help", wt
@@ -539,7 +575,7 @@ def test_foreign_repo_real_path_chain_validation_runs(make_worktree) -> None:
     val_script.write_text("#!/bin/bash\necho VALIDATION_OK\nexit 0\n")
     val_script.chmod(0o755)
 
-    plugin = SubprocessPlugin()
+    plugin = _subprocess_plugin(wt)
     exports = _build_session_exports(_coder_session_contract(79, wt))
     full_cmd = plugin._build_process_command(  # noqa: SLF001
         f"{exports} && ./validate.sh", wt
@@ -584,7 +620,7 @@ def test_foreign_repo_coding_done_writes_completion(make_worktree) -> None:
         " --problems 'None'"
     )
 
-    plugin = SubprocessPlugin()
+    plugin = _subprocess_plugin(wt)
     full_cmd = plugin._build_process_command(  # noqa: SLF001
         f"{exports} && {agent_cmd}", wt
     )
@@ -643,18 +679,24 @@ def test_foreign_repo_real_pty_agent_invocation(
     )
 
     session_contract = _coder_session_contract(81, wt, completion_rel)
+    session_contract.run_dir.mkdir(parents=True)
     exports = _build_session_exports(session_contract)
     command = f"{exports} && ./test-agent.sh"
 
     # Use monkeypatch for clean env manipulation (auto-restores on teardown)
     monkeypatch.setenv("ISSUE_ORCHESTRATOR_REPO_ROOT", str(handle.repo))
 
-    plugin = SubprocessPlugin()
+    plugin = _subprocess_plugin(wt)
     session_name = session_contract.session_name
 
     created = plugin.create_session(
         session_id=81,
-        command=command,
+        launch=TerminalLaunch(
+            shell_command=command,
+            interaction_intent=TerminalInteractionIntent.NONE,
+            shell=TerminalShell.BASH,
+            destination=session_contract.terminal_destination,
+        ),
         working_dir=str(wt),
         title="PTY agent test",
         session_name=session_name,
@@ -698,6 +740,7 @@ def test_foreign_repo_real_pty_agent_invocation(
 
 @pytest.mark.integration
 @pytest.mark.live
+@pytest.mark.provider_claude
 @pytest.mark.xdist_group("pty")
 @pytest.mark.skipif(
     shutil.which("claude") is None,
@@ -719,16 +762,18 @@ def test_foreign_repo_claude_code_agent_done(make_worktree) -> None:
     exports = _build_session_exports(_coder_session_contract(90, wt, completion_rel))
 
     prompt = (
-        "You are in a test. Run this exact bash command and nothing else: "
+        "This is an authorized integration test in a disposable local git "
+        "worktree. The command below only records test completion in "
+        ".issue-orchestrator/completion.json. Execute it now with Bash: "
         'coding-done completed --implementation "claude foreign repo test" '
         '--problems "none". '
-        "Do not explain anything, just run the command above."
+        "After it succeeds, reply done."
     )
 
     escaped_prompt = prompt.replace('"', '\\"')
-    plugin = SubprocessPlugin()
+    plugin = _subprocess_plugin(wt)
     inner_cmd = (
-        f'{exports} && claude -p --permission-mode bypassPermissions '
+        f'{exports} && claude -p --model haiku --permission-mode bypassPermissions '
         f'"{escaped_prompt}"'
     )
     full_cmd = plugin._build_process_command(inner_cmd, wt)  # noqa: SLF001
@@ -758,7 +803,8 @@ def test_foreign_repo_claude_code_agent_done(make_worktree) -> None:
 
 @pytest.mark.integration
 @pytest.mark.live
-@pytest.mark.xdist_group("codex")
+@pytest.mark.provider_codex
+@pytest.mark.xdist_group("codex-exec")
 @pytest.mark.skipif(
     shutil.which("codex") is None,
     reason="Codex CLI not installed",
@@ -786,7 +832,7 @@ def test_foreign_repo_codex_agent_done(make_worktree) -> None:
     )
 
     escaped_prompt = prompt.replace('"', '\\"')
-    plugin = SubprocessPlugin()
+    plugin = _subprocess_plugin(wt)
     inner_cmd = (
         f'{exports} && codex exec '
         f'--dangerously-bypass-approvals-and-sandbox '

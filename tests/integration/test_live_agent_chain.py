@@ -27,7 +27,18 @@ import pytest
 
 from issue_orchestrator.execution.agent_runner import AgentRunner
 from issue_orchestrator.execution.agent_runner_types import AgentSpec, RetryPolicy
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_process_group_supervisor,
+)
 from tests.fixtures.live_agent_cli import is_claude_authenticated
+
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.live,
+    pytest.mark.provider_claude,
+    pytest.mark.xdist_group("pty"),
+]
 
 
 def _decoded_output(path: Path) -> str:
@@ -138,7 +149,7 @@ class TestLiveAgentChain:
             retry_policy=_live_provider_retry_policy(),
         )
 
-        result = AgentRunner().run(spec)
+        result = AgentRunner(build_process_group_supervisor()).run(spec)
 
         assert result.exit_code == 0, (
             f"exit_code={result.exit_code}, "
@@ -185,7 +196,7 @@ class TestLiveAgentChain:
             output_dir=run_dir,
         )
 
-        result = AgentRunner().run(spec)
+        result = AgentRunner(build_process_group_supervisor()).run(spec)
         raw_log = log_path.read_text() if log_path.exists() else "<missing>"
         decoded = _decoded_output(log_path)
 
@@ -254,7 +265,7 @@ class TestLiveAgentChain:
             output_dir=run_dir,
         )
 
-        runner = AgentRunner()
+        runner = AgentRunner(build_process_group_supervisor())
         session = runner.start(spec)
 
         # Mimic terminal_subprocess._start_session_watcher

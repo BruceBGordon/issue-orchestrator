@@ -22,7 +22,12 @@ def _wrapper() -> ProviderCommandWrapper:
 def test_codex_default_interactive_skips_provider_runner(tmp_path: Path) -> None:
     agent = AgentConfig(prompt_path=tmp_path / "prompt.md", provider="codex")
 
-    wrapped = _wrapper().wrap("codex 'task'", agent, tmp_path)
+    wrapped = _wrapper().wrap(
+        "codex 'task'",
+        agent,
+        tmp_path,
+        extra_provider_args={},
+    )
 
     assert wrapped == "codex 'task'"
 
@@ -34,7 +39,12 @@ def test_codex_exec_mode_uses_provider_runner(tmp_path: Path) -> None:
         provider_args={"execution_mode": "exec"},
     )
 
-    wrapped = _wrapper().wrap("codex exec 'task'", agent, tmp_path)
+    wrapped = _wrapper().wrap(
+        "codex exec 'task'",
+        agent,
+        tmp_path,
+        extra_provider_args={},
+    )
 
     argv = shlex.split(wrapped)
     assert argv[0]

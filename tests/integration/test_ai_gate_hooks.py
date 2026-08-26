@@ -303,6 +303,7 @@ class TestHookBlocking:
         assert result.returncode == 0, f"Expected exit code 0 (allowed), got {result.returncode}"
 
 
+@pytest.mark.provider_claude
 @pytest.mark.xdist_group("claude")
 class TestAiGate:
     """Tests that spawn Claude to verify end-to-end AI gate enforcement.

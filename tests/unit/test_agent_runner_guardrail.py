@@ -192,11 +192,17 @@ class TestPtyAgentRunnerImplementation:
 
     def test_uses_pexpect_not_subprocess(self) -> None:
         """AgentRunner must use pexpect (PTY), not raw subprocess."""
-        from issue_orchestrator.execution.agent_runner import AgentRunner
+        from issue_orchestrator.execution import agent_runner
+
+        AgentRunner = agent_runner.AgentRunner
 
         source = inspect.getsource(AgentRunner)
-        assert "pexpect.spawn" in source, (
-            "AgentRunner must use pexpect.spawn for PTY-based output capture"
+        module_source = inspect.getsource(agent_runner)
+        assert "class _PexpectSpawnWithFileDescriptors(pexpect.spawn)" in module_source, (
+            "AgentRunner's PTY process must derive from pexpect.spawn"
+        )
+        assert "_PexpectSpawnWithFileDescriptors(" in source, (
+            "AgentRunner must acquire its PTY through the descriptor-owning spawn type"
         )
         assert "subprocess.Popen" not in source, (
             "AgentRunner must not use subprocess.Popen — use pexpect.spawn"

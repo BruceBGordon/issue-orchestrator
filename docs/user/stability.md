@@ -88,6 +88,8 @@ and this table is the same set with the tier each command carries:
 | `health-review` | Runtime | Supported |
 | `refresh` | Runtime | Supported |
 | `restart` | Runtime | Supported |
+| `executor-run` | Runtime | Supported |
+| `executor-policy` | Runtime | Supported |
 | `setup` | Setup | Supported |
 | `init` | Setup | Supported |
 | `verify` | Setup | Supported |
@@ -98,6 +100,8 @@ and this table is the same set with the tier each command carries:
 | `doctor` | Diagnostics | Supported |
 | `audit` | Diagnostics | Supported |
 | `trace` | Diagnostics | Supported |
+| `executor-events` | Diagnostics | Supported |
+| `executor-status` | Diagnostics | Supported |
 | `demo` | Diagnostics | Supported |
 | `test-reset` | Development | Internal |
 | `e2e-reset` | Development | Internal |

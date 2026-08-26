@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from .path_guards import require_absolute_path, require_path_under
+from .session_watchdog import ScheduledSessionWatchdog
+from .terminal_launch import TerminalRunDestination
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +136,7 @@ class SessionRunAssets:
         cls,
         *,
         run_dir: Path,
-        manifest: Mapping[str, Any],
+        manifest: Mapping[str, object],
     ) -> "SessionRunAssets":
         session_name = _required_manifest_string(manifest, "session_name")
         run_id = _required_manifest_string(manifest, "run_id")
@@ -198,6 +200,13 @@ class SessionRunAssets:
         return self.terminal_recording.path
 
     @property
+    def terminal_destination(self) -> TerminalRunDestination:
+        return TerminalRunDestination(
+            run_dir=self.run_dir,
+            recording_path=self.terminal_recording.path,
+        )
+
+    @property
     def manifest_path(self) -> Path:
         return self.manifest.path
 
@@ -224,6 +233,37 @@ class SessionRunAssets:
                 f"diagnostic filename must not contain path separators: {filename}"
             )
         return DiagnosticArtifactPath(run_dir=self.run_dir, path=self.run_dir / filename)
+
+
+@dataclass(frozen=True, slots=True)
+class RestoredSessionRun:
+    """Verified active-run assets and their exact persisted outer watchdog."""
+
+    assets: SessionRunAssets
+    watchdog: ScheduledSessionWatchdog
+
+    def __post_init__(self) -> None:
+        if type(self.assets) is not SessionRunAssets:
+            raise ValueError("RestoredSessionRun.assets must be SessionRunAssets")
+        if type(self.watchdog) is not ScheduledSessionWatchdog:
+            raise ValueError(
+                "RestoredSessionRun.watchdog must be ScheduledSessionWatchdog"
+            )
+
+    @classmethod
+    def from_manifest_payload(
+        cls,
+        *,
+        run_dir: Path,
+        manifest: Mapping[str, object],
+    ) -> "RestoredSessionRun":
+        return cls(
+            assets=SessionRunAssets.from_manifest_payload(
+                run_dir=run_dir,
+                manifest=manifest,
+            ),
+            watchdog=ScheduledSessionWatchdog.from_manifest_payload(manifest),
+        )
 
 
 def _required_manifest_string(manifest: Mapping[str, Any], key: str) -> str:

@@ -1,5 +1,7 @@
 """Unit tests for the observer module."""
 
+import time
+
 import pytest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
@@ -20,6 +22,12 @@ from issue_orchestrator.ports.fresh_issue_reader import FreshIssueReadError
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from tests.unit.session_run_helpers import make_session_run_assets
+
+
+def _set_session_age(session: Session, *, seconds: float) -> None:
+    """Set diagnostic wall age and authoritative monotonic watchdog age."""
+    session.started_at = datetime.now() - timedelta(seconds=seconds)
+    session.watchdog_started_at_monotonic = time.monotonic() - seconds
 
 
 @pytest.fixture
@@ -169,8 +177,7 @@ class TestCheckSession:
     def test_check_session_timed_out(self, monitor, sample_session):
         """Test check_session returns TIMED_OUT when session times out."""
         # Set up session that has timed out
-        old_time = datetime.now() - timedelta(minutes=60)
-        sample_session.started_at = old_time
+        _set_session_age(sample_session, seconds=60 * 60)
         sample_session.agent_config.timeout_minutes = 30
 
         status = monitor.check_session(sample_session)
@@ -208,8 +215,7 @@ class TestCheckSession:
 
     def test_check_session_fallback_timeout_when_no_machine(self, monitor, sample_session):
         """Test check_session uses session.is_timed_out when no state machine."""
-        old_time = datetime.now() - timedelta(minutes=60)
-        sample_session.started_at = old_time
+        _set_session_age(sample_session, seconds=60 * 60)
         sample_session.agent_config.timeout_minutes = 30
 
         status = monitor.check_session(sample_session)
@@ -434,8 +440,7 @@ class TestSessionObserverIntegration:
     ):
         """Test full workflow for timed out session."""
         # Session has timed out
-        old_time = datetime.now() - timedelta(minutes=60)
-        sample_session.started_at = old_time
+        _set_session_age(sample_session, seconds=60 * 60)
         sample_session.agent_config.timeout_minutes = 30
 
         # Check and handle
@@ -554,8 +559,7 @@ class TestObserveSession:
         from issue_orchestrator.observation.observation import SessionObservation
 
         # Set up session that has timed out
-        old_time = datetime.now() - timedelta(minutes=60)
-        sample_session.started_at = old_time
+        _set_session_age(sample_session, seconds=60 * 60)
         sample_session.agent_config.timeout_minutes = 30
 
         mock_session_runner.session_exists_by_name.return_value = True
@@ -593,7 +597,7 @@ class TestObserveSession:
 
         set_session_worktree(sample_session, tmp_path)
         # Set session to be older than the 60-second grace period
-        sample_session.started_at = datetime.now() - timedelta(seconds=120)
+        _set_session_age(sample_session, seconds=120.0)
         mock_session_runner.session_exists_by_name.return_value = False
 
         result = monitor.observe_session(sample_session)
@@ -613,7 +617,7 @@ class TestObserveSession:
 
         set_session_worktree(sample_session, tmp_path)
         # Session just started (within grace period)
-        sample_session.started_at = datetime.now()
+        _set_session_age(sample_session, seconds=0.0)
         mock_session_runner.session_exists_by_name.return_value = False
 
         result = monitor.observe_session(sample_session)
@@ -636,7 +640,7 @@ class TestObserveSession:
 
         set_session_worktree(sample_session, tmp_path)
         # Session is older than grace period
-        sample_session.started_at = datetime.now() - timedelta(seconds=120)
+        _set_session_age(sample_session, seconds=120.0)
         mock_session_runner.session_exists_by_name.return_value = False
 
         # Create an active session log (recently modified)
@@ -726,8 +730,9 @@ class TestObserveSession:
         worktree = tmp_path / "worktree"
         worktree.mkdir(parents=True)
         set_session_worktree(sample_session, worktree)
-        sample_session.started_at = datetime.now() - timedelta(
-            minutes=sample_session.agent_config.timeout_minutes + 2
+        _set_session_age(
+            sample_session,
+            seconds=(sample_session.agent_config.timeout_minutes + 2) * 60.0,
         )
         completion_dir = worktree / ".issue-orchestrator"
         completion_dir.mkdir(parents=True, exist_ok=True)

@@ -315,7 +315,7 @@ class SessionObserver:
         """
         grace_period = self.config.session_grace_period_seconds
         log_activity_threshold = self.config.session_log_activity_seconds
-        session_age = (datetime.now() - session.started_at).total_seconds()
+        session_age = session.runtime_seconds
 
         log_path = (
             self._session_output.get_log_path(
@@ -558,7 +558,7 @@ class SessionObserver:
         if not readiness.human_fixable:
             return None
 
-        session_age = (datetime.now() - session.started_at).total_seconds()
+        session_age = session.runtime_seconds
         logger.error(
             issue_log(
                 session.issue.number,

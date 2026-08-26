@@ -37,6 +37,7 @@ from tests.callback_endpoint_helpers import (
     published_callback_endpoint,
     ready_callback_endpoint,
 )
+from tests.process_completion_fixture import PROCESS_COMPLETION_WATCHDOG
 from issue_orchestrator.control.completion_review_exchange import (
     CompletionReviewExchange,
 )
@@ -332,7 +333,10 @@ def _review_exchange_mailbox_server(
     finally:
         server.shutdown()
         server.server_close()
-        server_thread.join(timeout=2)
+        PROCESS_COMPLETION_WATCHDOG.join_thread(
+            server_thread,
+            operation="review callback server shutdown",
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -736,7 +740,10 @@ def test_synthetic_tui_writes_bootstrap_response_when_guard_missing(
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait(timeout=5)
+            PROCESS_COMPLETION_WATCHDOG.wait(
+                proc,
+                operation="forced synthetic review TUI shutdown",
+            )
         os.close(master_fd)
 
     assert len(spawn_records) == 1
@@ -847,6 +854,8 @@ def test_synthetic_raw_tui_review_exchange_suppresses_bootstrap_response(
 
 @pytest.mark.skipif(not _CODEX_READY, reason="codex CLI not installed or not logged in")
 @pytest.mark.live_codex
+@pytest.mark.provider_codex
+@pytest.mark.xdist_group("codex-interactive")
 def test_real_interactive_codex_reviewer_round_trips_through_exchange(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -608,11 +608,12 @@ def run_validation(
     if verbose:
         print(f"Running quick validation: {cmd}")
 
-    from ...execution import LocalCommandRunner, GitWorkingCopy
+    from ...entrypoints.bootstrap_executor import build_validation_command_runner
+    from ...execution import GitWorkingCopy
 
     gate = AgentGate(
         worktree,
-        command_runner=LocalCommandRunner(),
+        command_runner=build_validation_command_runner(),
         working_copy=GitWorkingCopy(),
         command=cmd,
         timeout_seconds=timeout,

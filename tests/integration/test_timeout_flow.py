@@ -6,6 +6,7 @@ appropriate SessionDecision without requiring full e2e orchestration.
 
 from datetime import datetime, timedelta
 from pathlib import Path
+import time
 
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.control.completion_processor import CompletionProcessor
@@ -115,6 +116,8 @@ def _make_session(worktree: Path, timeout_minutes: int = 1) -> Session:
         worktree_path=worktree,
         branch_name=terminal_id,
         started_at=datetime.now() - timedelta(minutes=timeout_minutes + 1),
+        watchdog_started_at_monotonic=time.monotonic()
+        - ((timeout_minutes + 1) * 60),
         run_assets=make_session_run_assets(worktree, session_name=terminal_id),
     )
 

@@ -12,6 +12,11 @@ import sys
 from pathlib import Path
 
 import pluggy
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalLaunch,
+    TerminalShell,
+)
 import pytest
 
 # Run PTY tests sequentially in one worker to avoid Python 3.14 forkpty warning
@@ -19,15 +24,30 @@ import pytest
 pytestmark = pytest.mark.xdist_group("pty")
 
 from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
+from issue_orchestrator.entrypoints.bootstrap import (
+    build_process_group_supervisor,
+    build_terminal_session_terminator,
+)
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_owner,
+    build_terminal_session_registry,
+    build_terminal_session_watcher_factory,
+    terminal_session_watcher_policy,
+)
 from issue_orchestrator.infra.hooks.hookspec import PROJECT_NAME, TerminalSpec
 from tests.unit.session_run_helpers import make_session_run_assets
 
 
-def _long_running_command(worktree: Path, session_name: str) -> str:
+def _long_running_launch(worktree: Path, session_name: str) -> TerminalLaunch:
     """Keep subprocess sessions alive long enough to assert registry state."""
     run_assets = make_session_run_assets(worktree, session_name=session_name)
     command = f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'"
-    return f"export ISSUE_ORCHESTRATOR_RUN_DIR='{run_assets.run_dir}' && {command}"
+    return TerminalLaunch(
+        shell_command=command,
+        shell=TerminalShell.BASH,
+        interaction_intent=TerminalInteractionIntent.NONE,
+        destination=run_assets.terminal_destination,
+    )
 
 
 @pytest.fixture
@@ -53,7 +73,14 @@ def plugin_manager(temp_repo_root: Path, monkeypatch: pytest.MonkeyPatch) -> plu
     pm.add_hookspecs(TerminalSpec)
 
     # Create and register the subprocess plugin
-    plugin = SubprocessPlugin()
+    plugin = SubprocessPlugin(
+        build_terminal_session_terminator(),
+        build_terminal_session_owner(),
+        build_terminal_session_registry((temp_repo_root).resolve()),
+        build_process_group_supervisor(),
+        terminal_session_watcher_policy(),
+        build_terminal_session_watcher_factory(),
+    )
     pm.register(plugin, name="terminal_subprocess")
 
     return pm
@@ -78,7 +105,7 @@ class TestSessionNameFlow:
         # This is what the orchestrator does for review sessions
         result = plugin_manager.hook.create_session(
             session_id=3865,
-            command=_long_running_command(worktree, "review-3865"),
+            launch=_long_running_launch(worktree, "review-3865"),
             working_dir=str(worktree),
             title="Review PR #3865",
             session_name="review-3865",  # This is the key parameter!
@@ -117,7 +144,7 @@ class TestSessionNameFlow:
         # Caller provides explicit session name (no fallbacks)
         result = plugin_manager.hook.create_session(
             session_id=123,
-            command=_long_running_command(worktree, "issue-123"),
+            launch=_long_running_launch(worktree, "issue-123"),
             working_dir=str(worktree),
             title="Issue #123",
             session_name="issue-123",  # Caller computes name

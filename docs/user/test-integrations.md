@@ -105,6 +105,198 @@ details, and captured `system-out` / `system-err`.
   `test` task does), a later run can leave the manifest pointing at deleted files;
   the UI then shows "no case data" instead of erroring.
 
+### Bound validation concurrency across repositories
+
+Test frameworks can limit one process, but they do not coordinate separate
+repositories, worktrees, or issue sessions. The executor is a processless,
+per-user host facility that provides that missing boundary. It has three levels:
+
+- The **machine** detects its CPU capacity internally and exposes one
+  aggressiveness dial.
+- A **validation run** owns a unique fairness group.
+- A repository describes each independently runnable command with an opaque,
+  human-readable work key and the concurrency range it can accept.
+
+The public contract is deliberately small: construct an
+`ExecutorRunSpecification`, then invoke `Executor.run(specification, command)`.
+CLI clients express the same contract directly:
+
+```bash
+export ISSUE_ORCHESTRATOR_EXECUTOR_GROUP="porchpin-validate-$$"
+
+# xdist-aware work: the executor chooses from 1 through 8 workers.
+issue-orchestrator executor-run \
+  --work-key porchpin:unit \
+  --min-concurrency 1 \
+  --max-concurrency 8 \
+  -- pytest -n auto tests/unit
+
+# A command without xdist still learns its CPU demand under concurrency 1.
+issue-orchestrator executor-run \
+  --work-key porchpin:checks \
+  --min-concurrency 1 \
+  --max-concurrency 1 \
+  -- make checks
+```
+
+`--work-key` is required and repository-local. Use a stable name such as
+`io:unit`, not a generated hash: it is the identity under which resource history
+is learned and the name shown in diagnostics. Printable Unicode and embedded
+spaces are valid, so existing human-facing names do not require a lossy alias.
+The fairness group is also
+required, either through `--group` or
+`ISSUE_ORCHESTRATOR_EXECUTOR_GROUP`. Give all commands from one top-level
+validation the same unique group. No global meanings such as "unit",
+"integration", or "browser" are imposed; those words are only local names a
+repository may choose.
+
+The executor learns successful commands' occupied CPU cores per granted
+concurrency unit. It combines that repository-and-work-specific estimate with
+currently active leases. A bounded internal coalescing window lets concurrently
+launched work become visible as a burst. The scheduler reserves each compatible
+queued command's learned minimum demand before expanding earlier commands
+toward their maxima. Thus a heavy IO xdist worker and a light Porchpin command
+are not assumed to cost the same, and one early wide command cannot consume the
+whole machine when every visible minimum fits. Suite duration is not the
+normalization unit; observed CPU occupancy is. Failed commands are logged but
+do not teach the scheduler that an early failure is a cheap successful run.
+
+Before each admission decision the executor also samples current host CPU busy
+time from native counters: Mach per-processor ticks on macOS and `/proc/stat`
+on Linux. At the internal 95% saturation threshold, it holds new work and
+retries after the host has had time to drain. This instantaneous feedback is
+how unmanaged work such as an editor, another agent process, or a repository
+that has not adopted the executor can attenuate new admissions. It does not
+kill or resize commands already running.
+
+For xdist, `-n auto` is essential. The executor exports its grant as
+`PYTEST_XDIST_AUTO_NUM_WORKERS`; an explicit `pytest -n 8` bypasses that grant.
+Framework-neutral clients can read
+`ISSUE_ORCHESTRATOR_EXECUTOR_CONCURRENCY`. Commands without an internal worker
+pool declare a range of `1` through `1`; their CPU demand is still observed and
+learned. Repositories never estimate or declare admission capacity.
+
+No new YAML setting is required for queue-aware validation deadlines. The
+existing validation timeout remains the active command budget, so a command
+that does not use `executor-run` still times out at that exact value. Issue
+Orchestrator gives nested executor admission a separate equal allowance, making
+its absolute deadline twice the configured timeout, and gives the outer
+process-containment observer another 30-second margin. The nested CLI explicitly
+acknowledges its inherited deadline before admission; no repository flag or
+command-name detection is involved. That acknowledgement starts the outer
+watchdog, so queue wait receives the nested executor's full absolute deadline
+plus its containment margin. Queue wait therefore does not consume expected test
+time, while a broken queue and a stuck wrapper remain bounded. The
+validation-start event records all three clocks. If containment is required, the
+human timeout log records the exact expired phase so a post-run diagnosis can
+distinguish queueing, command execution, and outer containment.
+
+The executor derives its internal CPU-slot capacity from the machine. Every
+repository and worktree for the same OS user shares the pool automatically.
+The percentage below is the only host-pressure control exposed to users.
+
+One user-facing percentage scales the learned recommendation:
+
+```bash
+# Inspect the effective value and its source.
+issue-orchestrator executor-policy
+
+# 100% is the learned recommendation; 75% is more conservative;
+# 125% permits more overlap.
+issue-orchestrator executor-policy --aggressiveness 125
+```
+
+The accepted range is 25–400%. The persisted value is machine-wide. The
+environment variable
+`ISSUE_ORCHESTRATOR_EXECUTOR_AGGRESSIVENESS_PERCENT` is an explicit override;
+the policy command reports when it overrides the saved value.
+
+Repeated `--exclusive NAME` declarations serialize correctness-sensitive host
+resources such as one provider CLI identity, browser fixture, emulator, or
+future repository mutation boundary. These locks are independent of work-key
+names. CPU and exclusive leases transfer to a transient guardian and survive an
+executor-wrapper crash until the complete opaque command group is contained.
+The command itself receives no lease descriptors.
+
+There are no new YAML settings. Capacity is machine policy in the environment;
+work specifications belong to repository commands. The orchestrator does not
+need to be running: `executor-run` is a local command that coordinates through
+locks and strict state records.
+
+Issue-orchestrator's own code, validation-retry, rework, review, and
+retrospective-review agent sessions participate automatically; repository
+owners do not configure them. Each complete terminal session is one safe phase.
+When it ends, its lease is released, and any later lifecycle phase re-enters
+the fair host queue. Queue time is excluded from the agent's active timeout,
+while a fixed submission-to-exit deadline prevents unbounded waiting. The
+planner persists that exact outer watchdog before terminal creation, and a
+restart requires the persisted value instead of recomputing from current
+configuration. The executor never suspends a live agent at an arbitrary
+instruction.
+
+An agent process launched outside issue-orchestrator is unmanaged work: it has
+no lease, but its CPU use is visible to native host-pressure sampling and can
+hold back later managed admissions. To receive fairness and bounded admission,
+launch a generic command through `executor-run` with its own human work key and
+fairness group.
+
+The executor writes a bounded typed event store at
+`<pool>/executor-events-v4.jsonl`; on macOS the default pool is under
+`~/Library/Application Support/issue-orchestrator/executor-pools/host-v2`.
+Enqueue, changing wait reasons, grants, policy source, command observations and
+lifecycle failures, learned-demand changes, successful learning-sample counts,
+native CPU busy samples and their intervals, admission/command watchdog
+expirations, and host load averages are recorded with human work and repository
+names. Inspect recent activity without reading that persistence directly:
+
+```bash
+issue-orchestrator executor-events --limit 50
+```
+
+`issue-orchestrator executor-status` shows the detected host CPU slots, the
+effective percentage and its source, global successful/excluded sample totals,
+the exact global learning fingerprint, and a bounded page of human-readable
+repository/work profiles. Use `--repository`, `--offset`, and `--limit` to
+navigate retained profiles. Failed commands are recorded in `executor-events`
+by repository and work key but never enter learning history; the status
+failure total exists for valid migrated history that contains explicit failed
+samples. This is the compact view; `executor-events` is the detailed
+after-the-fact decision trail.
+
+The CLI queries the typed `ExecutorMonitor` port used as the future UI seam.
+Accurate live-state projection and a polished UI remain deferred to the
+executor visibility TODO (#7105).
+
+Host *load average* is diagnostic rather than an admission input because it
+lags both the start and end of work. Short-interval native CPU busy percentage
+is the immediate admission input: saturation pauses new commands without
+changing an already selected grant. Managed work also adapts across runs from
+learned CPU occupancy and current live leases. If the automatic attenuation
+still leaves too little interactive headroom, turn down the one percentage
+explicitly.
+
+Repositories can keep the same lane commands usable without installing the
+issue-orchestrator package by checking in the standalone
+[`scripts/executor-run-direct`](../../scripts/executor-run-direct) adapter and
+selecting it as their executor command:
+
+```make
+EXECUTOR_RUN ?= issue-orchestrator executor-run
+
+# Standalone invocation, with no issue-orchestrator package or service:
+# make test-unit EXECUTOR_RUN=./scripts/executor-run-direct
+```
+
+The direct adapter executes the command itself and exports the largest accepted
+concurrency as `PYTEST_XDIST_AUTO_NUM_WORKERS`, so
+`pytest -n auto` remains bounded within that invocation. It requires the same
+work key, group, and demand declaration, but applies no cross-process fairness
+or learning. It fails if an exclusive resource is requested because it cannot
+honor that safety contract. Selecting direct mode must be explicit; it is never
+an automatic degradation path. Neither executor requires a running
+orchestrator service; the pooled form only requires the `issue-orchestrator`
+CLI to be installed.
+
 ---
 
 ## Step 3: Wire the async E2E runner

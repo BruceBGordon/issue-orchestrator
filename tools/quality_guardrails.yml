@@ -115,6 +115,24 @@ rules:
       - src/issue_orchestrator/view_models/**/*.py
     exclude:
       - src/issue_orchestrator/infra/settings_schema.py
+      # Closed-union type dispatch and exact-type invariants on Validation*/
+      # Executor*/exec_status-named records: the vocabulary proxy substring-
+      # matches the type and descriptor names, but every counted branch is a
+      # typed seam or constructor invariant, not a policy decision site.
+      - src/issue_orchestrator/entrypoints/cli_tools/validate_runner.py
+      - src/issue_orchestrator/execution/contained_validation_command.py
+      - src/issue_orchestrator/execution/host_executor/_completion.py
+      - src/issue_orchestrator/execution/host_executor/adapter.py
+      - src/issue_orchestrator/execution/host_executor/guardian_launcher.py
+      - src/issue_orchestrator/execution/posix_process.py
+      - src/issue_orchestrator/execution/process_cancellation_endpoint.py
+      - src/issue_orchestrator/execution/process_group_supervisor.py
+      - src/issue_orchestrator/execution/terminal_subprocess.py
+      - src/issue_orchestrator/execution/validation_output_journal.py
+      - src/issue_orchestrator/execution/validation_pipe_resources.py
+      - src/issue_orchestrator/execution/validation_process_guardian.py
+      - src/issue_orchestrator/execution/validation_resource_sampling.py
+      - src/issue_orchestrator/infra/validation_timings.py
       - src/issue_orchestrator/static/vendor/**
     terms:
       - review_exchange

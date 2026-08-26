@@ -18,9 +18,15 @@ from ..control.claim_gate import ClaimLostError
 from ..control.queue_cache import QueueCache
 from ..control.reconciliation import ReconciliationRequired, build_expected_for_mutation
 from ..control.worktree_manager import get_worktree_path
-from ..domain.models import get_completion_path
+from ..domain.models import AgentConfig, get_completion_path
 from ..domain.review_exchange_verdict import ExchangeVerdict
 from ..domain.session_run import SessionRunAssets
+from ..domain.session_watchdog import ScheduledSessionWatchdog
+from ..domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalLaunch,
+    TerminalShell,
+)
 from ..ports.operator_issue_commands import (
     OperatorCommandIntent,
     OperatorCommandOutcome,
@@ -446,8 +452,167 @@ def _completion_path_from_resume_manifest(manifest: Mapping[str, object]) -> str
     return completion_path
 
 
+@dataclass(frozen=True, slots=True)
+class _DebugSessionLaunchRequest:
+    """Complete non-null input for creating one interactive debug session."""
+
+    issue_number: int
+    issue_title: str
+    worktree: Path
+    session_name: str
+    agent_label: str
+    agent_config: AgentConfig
+
+    def __post_init__(self) -> None:
+        if type(self.issue_number) is not int or self.issue_number <= 0:
+            raise ValueError("debug issue number must be positive")
+        if type(self.issue_title) is not str or not self.issue_title:
+            raise ValueError("debug issue title must not be empty")
+        if not self.worktree.is_absolute():
+            raise ValueError("debug worktree must be absolute")
+        for field_name, value in (
+            ("session_name", self.session_name),
+            ("agent_label", self.agent_label),
+        ):
+            if type(value) is not str or not value:
+                raise ValueError(f"debug {field_name} must not be empty")
+        if type(self.agent_config) is not AgentConfig:
+            raise ValueError("debug agent_config must be AgentConfig")
+
+
+def _resolve_debug_issue(
+    orchestrator: "Orchestrator",
+    deps: ControlApiIssueDependency,
+    issue_number: int,
+) -> "IssueProtocol | None":
+    """Resolve the issue snapshot through the state owner's locking boundary."""
+    state = orchestrator.state
+
+    def _cached_issue() -> "IssueProtocol | None":
+        for cached_issue in state.cached_queue_issues:
+            if cached_issue.number == issue_number:
+                return cached_issue
+        return None
+
+    issue: IssueProtocol | None = deps.with_state_lock(_cached_issue)
+    if issue is not None:
+        return issue
+    try:
+        return orchestrator.deps.repository_host.get_issue(issue_number)
+    except Exception as exc:
+        logger.warning("Could not fetch issue #%d: %s", issue_number, exc)
+        return None
+
+
+def _launch_validated_debug_session(
+    orchestrator: "Orchestrator",
+    request: _DebugSessionLaunchRequest,
+) -> JSONResponse:
+    """Own debug run creation after the route validates issue-level inputs."""
+    debug_context = (
+        "This is an INTERACTIVE DEBUG SESSION. A previous automated run failed or "
+        "was blocked. Work with the user to investigate and fix the issue. When "
+        "done, the user will run 'coding-done --resume' to continue the "
+        "orchestrator flow."
+    )
+    base_command = request.agent_config.get_command(
+        issue_number=request.issue_number,
+        issue_title=request.issue_title,
+        worktree=request.worktree,
+        existing_work=debug_context,
+        task_kind="code",
+    )
+    try:
+        interaction_intent = TerminalInteractionIntent.classify(base_command)
+    except ValueError as exc:
+        return JSONResponse(
+            {
+                "success": False,
+                "error": f"Invalid configured agent command: {exc}",
+                "hint": "Correct the agent command quoting in orchestrator "
+                "configuration.",
+            },
+            status_code=400,
+        )
+
+    config = orchestrator.config
+    run_assets = orchestrator.deps.session_output.start_run(
+        request.worktree,
+        request.session_name,
+        issue_number=request.issue_number,
+        agent_label=request.agent_label,
+        backend=config.terminal_adapter or "subprocess",
+    )
+    completion_path = get_completion_path(
+        request.agent_label,
+        run_dir=run_assets.run_dir.name,
+    )
+    orchestrator.deps.session_output.update_manifest(
+        run_assets.run_dir,
+        {
+            "completion_path": completion_path,
+            "issue_number": request.issue_number,
+            "agent_label": request.agent_label,
+        },
+    )
+    orchestrator.deps.session_output.record_scheduled_watchdog(
+        run_assets,
+        ScheduledSessionWatchdog(request.agent_config.timeout_minutes),
+    )
+
+    env_exports = f"export ORCHESTRATOR_ISSUE_NUMBER='{request.issue_number}'"
+    env_exports += f" ORCHESTRATOR_API_PORT='{config.control_api_port}'"
+    env_exports += f" ORCHESTRATOR_AGENT_LABEL='{request.agent_label}'"
+    env_exports += f" ORCHESTRATOR_SESSION_ID='{request.session_name}'"
+    env_exports += f" {ENV_PREFIX}COMPLETION_PATH='{completion_path}'"
+    env_exports += f" {ENV_PREFIX}VALIDATION_OUTPUT_DIR='{run_assets.run_dir}'"
+    env_exports += f" {ENV_PREFIX}RUN_DIR='{run_assets.run_dir}'"
+    orch_bin = Path(sys.executable).parent
+    env_exports += f' PATH="{orch_bin}:$PATH"'
+    command = f"{env_exports} && {base_command}"
+
+    logger.info(
+        "[debug-session] Launching for issue #%d: session=%s worktree=%s agent=%s",
+        request.issue_number,
+        request.session_name,
+        request.worktree,
+        request.agent_label,
+    )
+    session_created = orchestrator.deps.runner.create_session(
+        session_id=request.issue_number,
+        launch=TerminalLaunch(
+            shell_command=command,
+            shell=TerminalShell.BASH,
+            interaction_intent=interaction_intent,
+            destination=run_assets.terminal_destination,
+        ),
+        working_dir=str(request.worktree),
+        title=f"Debug #{request.issue_number}",
+        session_name=request.session_name,
+    )
+    if not session_created:
+        return JSONResponse(
+            {
+                "success": False,
+                "error": "Failed to create terminal session",
+                "hint": "Check if tmux is running and accessible.",
+            },
+            status_code=500,
+        )
+    return JSONResponse(
+        {
+            "success": True,
+            "session_name": request.session_name,
+            "worktree_path": str(request.worktree),
+            "agent": request.agent_label.replace("agent:", ""),
+            "hint": "Debug session launched. When done, run "
+            "'coding-done --resume' to process completion.",
+        }
+    )
+
+
 @control_issue_router.post("/api/issues/{issue_number}/debug-session")
-async def launch_debug_session(  # noqa: C901 - debug session with validation and setup phases
+async def launch_debug_session(
     issue_number: int,
     deps: ControlApiIssueDependency,
 ) -> JSONResponse:
@@ -460,7 +625,6 @@ async def launch_debug_session(  # noqa: C901 - debug session with validation an
         )
 
     config = orchestrator.config
-    state = orchestrator.state
     worktree = get_worktree_path(config, issue_number)
     if not worktree.exists():
         return JSONResponse({
@@ -469,20 +633,8 @@ async def launch_debug_session(  # noqa: C901 - debug session with validation an
             "hint": "The worktree may have been cleaned up. The issue needs to be re-run first.",
         }, status_code=404)
 
-    def _cached_issue() -> "IssueProtocol | None":
-        for cached_issue in state.cached_queue_issues:
-            if cached_issue.number == issue_number:
-                return cached_issue
-        return None
-
-    issue: IssueProtocol | None = deps.with_state_lock(_cached_issue)
-    if not issue:
-        try:
-            issue = orchestrator.deps.repository_host.get_issue(issue_number)
-        except Exception as exc:
-            logger.warning("Could not fetch issue #%d: %s", issue_number, exc)
-
-    if not issue:
+    issue = _resolve_debug_issue(orchestrator, deps, issue_number)
+    if issue is None:
         return JSONResponse({
             "success": False,
             "error": f"Issue #{issue_number} not found",
@@ -513,76 +665,17 @@ async def launch_debug_session(  # noqa: C901 - debug session with validation an
             "hint": "A debug session is already running. Focus on it or kill it first.",
         }, status_code=409)
 
-    debug_context = (
-        "This is an INTERACTIVE DEBUG SESSION. A previous automated run failed or was blocked. "
-        "Work with the user to investigate and fix the issue. When done, the user will run "
-        "'coding-done --resume' to continue the orchestrator flow."
+    return _launch_validated_debug_session(
+        orchestrator,
+        _DebugSessionLaunchRequest(
+            issue_number=issue_number,
+            issue_title=issue.title,
+            worktree=worktree.resolve(),
+            session_name=session_name,
+            agent_label=agent_type,
+            agent_config=agent_config,
+        ),
     )
-    base_command = agent_config.get_command(
-        issue_number=issue_number,
-        issue_title=issue.title,
-        worktree=worktree,
-        existing_work=debug_context,
-        task_kind="code",
-    )
-
-    run_assets = orchestrator.deps.session_output.start_run(
-        worktree,
-        session_name,
-        issue_number=issue_number,
-        agent_label=agent_type,
-        backend=config.terminal_adapter or "subprocess",
-    )
-    completion_path = get_completion_path(agent_type, run_dir=run_assets.run_dir.name)
-    orchestrator.deps.session_output.update_manifest(
-        run_assets.run_dir,
-        {
-            "completion_path": completion_path,
-            "issue_number": issue_number,
-            "agent_label": agent_type,
-        },
-    )
-
-    env_exports = f"export ORCHESTRATOR_ISSUE_NUMBER='{issue_number}'"
-    env_exports += f" ORCHESTRATOR_API_PORT='{config.control_api_port}'"
-    env_exports += f" ORCHESTRATOR_AGENT_LABEL='{agent_type}'"
-    env_exports += f" ORCHESTRATOR_SESSION_ID='{session_name}'"
-    env_exports += f" {ENV_PREFIX}COMPLETION_PATH='{completion_path}'"
-    env_exports += f" {ENV_PREFIX}VALIDATION_OUTPUT_DIR='{run_assets.run_dir}'"
-    env_exports += f" {ENV_PREFIX}RUN_DIR='{run_assets.run_dir}'"
-    orch_bin = Path(sys.executable).parent
-    env_exports += f' PATH="{orch_bin}:$PATH"'
-    command = f"{env_exports} && {base_command}"
-
-    logger.info(
-        "[debug-session] Launching for issue #%d: session=%s worktree=%s agent=%s",
-        issue_number,
-        session_name,
-        worktree,
-        agent_type,
-    )
-    session_created = orchestrator.deps.runner.create_session(
-        session_id=issue_number,
-        command=command,
-        working_dir=str(worktree),
-        title=f"Debug #{issue_number}",
-        session_name=session_name,
-    )
-
-    if not session_created:
-        return JSONResponse({
-            "success": False,
-            "error": "Failed to create terminal session",
-            "hint": "Check if tmux is running and accessible.",
-        }, status_code=500)
-
-    return JSONResponse({
-        "success": True,
-        "session_name": session_name,
-        "worktree_path": str(worktree),
-        "agent": agent_type.replace("agent:", ""),
-        "hint": "Debug session launched. When done, run 'coding-done --resume' to process completion.",
-    })
 
 
 @control_issue_router.post("/api/issues/{issue_number}/retry")

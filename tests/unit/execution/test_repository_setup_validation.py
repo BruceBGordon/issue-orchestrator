@@ -11,7 +11,12 @@ from issue_orchestrator.control.validation import (
     ValidationRecordStore,
     ValidationRunner,
 )
-from issue_orchestrator.execution.command_runner import LocalCommandRunner
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_validation_command_runner,
+)
+from issue_orchestrator.infra.validation_timings import (
+    SYSTEM_VALIDATION_TIMING_CLOCK,
+)
 from issue_orchestrator.execution.repository_setup_github_authorization import (
     repository_setup_github_authorization_codec,
 )
@@ -50,7 +55,8 @@ def test_makefile_defaults_run_a_repository_gate_and_catch_failure(
 
     record = ValidationRunner(
         ValidationRecordStore(tmp_path),
-        LocalCommandRunner(),
+        build_validation_command_runner(),
+        SYSTEM_VALIDATION_TIMING_CLOCK,
     ).run(
         "agent_gate",
         "deliberate-failure",

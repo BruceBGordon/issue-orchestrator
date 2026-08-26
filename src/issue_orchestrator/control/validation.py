@@ -11,25 +11,33 @@ Storage location: .issue-orchestrator/validation/<suite>/<HEAD_SHA>.json
 
 import json
 import logging
-import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from ..domain.attempt import Attempt, AttemptKey
+from ..domain.validation_execution import (
+    ContainedValidationCommand,
+    ValidationCommandOutputCapture,
+    ValidationExecutionDeadline,
+)
+from ..infra.executor_deadline_environment import EXECUTOR_DEADLINE_ENVIRONMENT
 from ..infra import validation_timings as timings
 from ..infra.atomic_json import atomic_write_json
 from ..infra.emit import emit_event
-from ..ports import CommandRunner, CommandResult, WorkingCopy
+from ..ports import WorkingCopy
 from ..ports.attempt_store import AttemptStore
-from ..ports.session_output import ValidationRecord
+from ..ports.session_output import VALIDATION_RECORD_SCHEMA_VERSION, ValidationRecord
+from ..ports.validation_command_runner import ValidationCommandRunner
 from .isolation import build_runtime_tool_env
+from .validation_record_store import ValidationRecordStore
 
 logger = logging.getLogger(__name__)
 
 # Schema version for validation records
-VALIDATION_SCHEMA_VERSION = 1
+VALIDATION_SCHEMA_VERSION = VALIDATION_RECORD_SCHEMA_VERSION
+_VALIDATION_RETAINED_TAIL_BYTES = 4_194_304
 
 
 def _normalize_head_sha(head_sha: str | None) -> str | None:
@@ -63,98 +71,15 @@ class ValidationResult:
     command: str
 
 
-class ValidationRecordStore:
-    """Reads and writes validation records to disk.
-
-    Storage layout (simplified - one location per SHA):
-        <worktree>/.issue-orchestrator/validation/<sha>.json
-
-    This allows validation caching across gates - if agent_gate and publish_gate
-    use the same command, the result can be shared.
-    """
-
-    VALIDATION_DIR = ".issue-orchestrator/validation"
-
-    def __init__(self, worktree: Path):
-        """Initialize store for a specific worktree.
-
-        Args:
-            worktree: Path to the git worktree
-        """
-        self.worktree = worktree
-        self.base_dir = worktree / self.VALIDATION_DIR
-
-    def get_record_path(self, sha: str) -> Path:
-        """Get the path for a validation record (one per SHA)."""
-        return self.base_dir / f"{sha}.json"
-
-    def write(self, record: ValidationRecord) -> Path:
-        """Write a validation record to disk atomically.
-
-        Atomicity matters because two gates (agent_gate, publish_gate) may
-        write the same per-SHA file concurrently in different threads, and
-        readers (cache lookups, the review-exchange predicate) parse the
-        file as JSON — a torn write would surface as JSONDecodeError or,
-        worse, a partial-but-syntactically-valid prefix.
-
-        Args:
-            record: The validation record to write
-
-        Returns:
-            Path to the written file
-        """
-        path = self.get_record_path(record.head_sha)
-        atomic_write_json(path, record.to_dict())
-        logger.debug("Wrote validation record to %s", path)
-        return path
-
-    def read(self, sha: str) -> Optional[ValidationRecord]:
-        """Read a validation record from disk.
-
-        Args:
-            sha: The HEAD SHA
-
-        Returns:
-            ValidationRecord if found, None otherwise
-        """
-        path = self.get_record_path(sha)
-
-        if not path.exists():
-            return None
-
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            return ValidationRecord.from_dict(data)
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning("Failed to read validation record at %s: %s", path, e)
-            return None
-
-    # Legacy methods for backwards compatibility with old suite-based paths
-    def _get_legacy_record_path(self, suite: str, sha: str) -> Path:
-        """Get the legacy path for a validation record (per-suite)."""
-        return self.base_dir / suite / f"{sha}.json"
-
-    def read_legacy(self, suite: str, sha: str) -> Optional[ValidationRecord]:
-        """Read from legacy per-suite location for backwards compatibility."""
-        path = self._get_legacy_record_path(suite, sha)
-
-        if not path.exists():
-            return None
-
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            return ValidationRecord.from_dict(data)
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning("Failed to read legacy validation record at %s: %s", path, e)
-            return None
-
-
 class ValidationRunner:
     """Runs validation commands and produces records."""
 
-    def __init__(self, store: ValidationRecordStore, command_runner: CommandRunner):
+    def __init__(
+        self,
+        store: ValidationRecordStore,
+        command_runner: ValidationCommandRunner,
+        timing_clock: timings.ValidationTimingClock,
+    ):
         """Initialize runner with a record store.
 
         Args:
@@ -163,6 +88,7 @@ class ValidationRunner:
         """
         self.store = store
         self.command_runner = command_runner
+        self.timing_clock = timings.ValidationTimingClock.required(timing_clock)
 
     def run(
         self,
@@ -191,10 +117,21 @@ class ValidationRunner:
         """
         if session_output_dir is None:
             raise ValueError("session_output_dir is required")
-        cwd = cwd or self.store.worktree
-        started_at = datetime.now(timezone.utc)
+        cwd = (cwd or self.store.worktree).resolve()
+        started_at = self.timing_clock.wall_now()
+        monotonic_started_at = self.timing_clock.monotonic_now()
+        execution_deadline = ValidationExecutionDeadline.for_active_timeout(
+            timeout_seconds
+        )
 
-        logger.info("Running validation suite '%s': %s", suite, command)
+        logger.info(
+            "Running validation suite '%s': %s (active=%ss absolute=%ss outer=%ss)",
+            suite,
+            command,
+            execution_deadline.executor_deadline.active_timeout_seconds,
+            execution_deadline.executor_deadline.absolute_timeout_seconds,
+            execution_deadline.outer_timeout_seconds,
+        )
 
         # Emit validation started event
         emit_event(
@@ -204,43 +141,62 @@ class ValidationRunner:
                 "sha": head_sha,
                 "command": command,
                 "timeout_seconds": timeout_seconds,
+                "executor_active_timeout_seconds": (
+                    execution_deadline.executor_deadline.active_timeout_seconds
+                ),
+                "executor_absolute_timeout_seconds": (
+                    execution_deadline.executor_deadline.absolute_timeout_seconds
+                ),
+                "outer_timeout_seconds": execution_deadline.outer_timeout_seconds,
             },
         )
 
-        try:
-            result = self.command_runner.run(
-                command,
-                shell=True,
-                cwd=cwd,
-                env=build_runtime_tool_env(self.store.worktree),
-                timeout_seconds=timeout_seconds,
+        command_environment = EXECUTOR_DEADLINE_ENVIRONMENT.encode(
+            build_runtime_tool_env(self.store.worktree),
+            execution_deadline.executor_deadline,
+        )
+        session_output_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = (session_output_dir / "validation-stdout.log").resolve()
+        stderr_path = (session_output_dir / "validation-stderr.log").resolve()
+        output_capture = ValidationCommandOutputCapture(
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            retained_tail_bytes=_VALIDATION_RETAINED_TAIL_BYTES,
+        )
+        execution = self.command_runner.run(
+            ContainedValidationCommand(
+                command=command,
+                working_directory=cwd,
+                environment=command_environment,
+                deadline=execution_deadline,
+                output_capture=output_capture,
             )
-        except Exception as exc:
-            logger.exception("Validation command runner failed")
-            result = CommandResult(
-                returncode=-1,
-                stdout="",
-                stderr=f"Validation runner error: {exc}",
-                timed_out=False,
-            )
-        exit_code = result.returncode
-        stdout = result.stdout
-        stderr = result.stderr
-        timed_out = result.timed_out
+        )
+        evidence = execution.evidence(execution_deadline)
+        exit_code = evidence.exit_code
+        timed_out = evidence.timed_out
         if timed_out:
-            stderr += f"\n\n[TIMEOUT after {timeout_seconds}s]"
-            logger.warning("Validation command timed out after %ds", timeout_seconds)
+            logger.warning(
+                "Validation timed out: phase=%s active=%ds absolute=%ss outer=%ss",
+                execution.timeout_phase.value,
+                timeout_seconds,
+                execution_deadline.executor_deadline.absolute_timeout_seconds,
+                execution_deadline.outer_timeout_seconds,
+            )
 
-        ended_at = datetime.now(timezone.utc)
+        ended_at = self.timing_clock.wall_now()
+        monotonic_ended_at = self.timing_clock.monotonic_now()
+        timing_envelope = timings.build_timing_envelope(
+            wall_started_at=started_at,
+            monotonic_started_at=monotonic_started_at,
+            wall_ended_at=ended_at,
+            monotonic_ended_at=monotonic_ended_at,
+        )
         passed = exit_code == 0
 
-        # Write stdout/stderr files to session output dir
-        session_output_dir.mkdir(parents=True, exist_ok=True)
-        stdout_path = session_output_dir / "validation-stdout.log"
-        stderr_path = session_output_dir / "validation-stderr.log"
-        stdout_path.write_text(stdout)
-        stderr_path.write_text(stderr)
-        logger.debug("Wrote validation output to session dir: %s", session_output_dir)
+        logger.debug(
+            "Validation output journaled to session dir: %s", session_output_dir
+        )
 
         # Store paths - relative to worktree if possible, otherwise absolute
         # (prepush_check uses a temp dir outside the worktree)
@@ -284,7 +240,7 @@ class ValidationRunner:
         )
 
         # Emit validation completed event
-        duration_seconds = (ended_at - started_at).total_seconds()
+        duration_seconds = timing_envelope.monotonic_elapsed_seconds
         emit_event(
             "validation.completed",
             {
@@ -296,7 +252,12 @@ class ValidationRunner:
                 "duration_seconds": duration_seconds,
             },
         )
-        timings.record_gate_timings(suite, self.store.worktree, command, stdout, stderr)
+        timings.record_gate_timing_journals(
+            suite,
+            self.store.worktree,
+            command,
+            output_capture,
+        )
 
         return record
 
@@ -422,12 +383,13 @@ class PublishGate:
     def __init__(
         self,
         worktree: Path,
-        command_runner: CommandRunner,
+        command_runner: ValidationCommandRunner,
         working_copy: WorkingCopy,
         command: Optional[str] = None,
         timeout_seconds: int = 1800,
         attempt_store: AttemptStore | None = None,
         attempt_key: AttemptKey | None = None,
+        timing_clock: timings.ValidationTimingClock = timings.SYSTEM_VALIDATION_TIMING_CLOCK,
     ):
         """Initialize publish gate for a worktree.
 
@@ -449,9 +411,10 @@ class PublishGate:
         self.timeout_seconds = timeout_seconds
         self.attempt_store = attempt_store
         self.attempt_key = attempt_key
+        self.timing_clock = timing_clock
         self.store = ValidationRecordStore(worktree)
         self.cache = ValidationCache(self.store)
-        self.runner = ValidationRunner(self.store, command_runner)
+        self.runner = ValidationRunner(self.store, command_runner, timing_clock)
 
     def _get_head_sha(self) -> Optional[str]:
         """Get the current HEAD SHA."""
@@ -471,27 +434,26 @@ class PublishGate:
     ) -> None:
         """Append an outer publish-gate timing record."""
         record = result.record
-        payload: dict[str, object] = {
-            "kind": "validation_gate_summary",
-            "gate": self.SUITE_NAME,
-            "command": self.command,
-            "timeout_seconds": self.timeout_seconds,
-            "head_sha": head_sha,
-            "cache_lookup": cache_lookup,
-            "cache_hit": result.cache_hit,
-            "allowed": result.allowed,
-            "reason": result.reason,
-            "record_passed": record.passed if record else None,
-            "record_exit_code": record.exit_code if record else None,
-            "record_timed_out": record.timed_out if record else None,
-        }
-        payload.update(
-            timings.build_timing_envelope(
+        summary = timings.PublishGateTimingSummary(
+            gate=self.SUITE_NAME,
+            command=self.command,
+            timeout_seconds=self.timeout_seconds,
+            head_sha=head_sha,
+            cache_lookup=cache_lookup,
+            cache_hit=result.cache_hit,
+            allowed=result.allowed,
+            reason=result.reason,
+            record_passed=record.passed if record else None,
+            record_exit_code=record.exit_code if record else None,
+            record_timed_out=record.timed_out if record else None,
+            envelope=timings.build_timing_envelope(
                 wall_started_at=wall_started_at,
                 monotonic_started_at=monotonic_started_at,
-            )
+                wall_ended_at=self.timing_clock.wall_now(),
+                monotonic_ended_at=self.timing_clock.monotonic_now(),
+            ),
         )
-        timings.append_validation_timing(self.worktree, payload)
+        timings.append_validation_timing(self.worktree, summary)
 
     def _validate_attempt_key_head(self, head_sha: str) -> None:
         if self.attempt_key is None:
@@ -508,8 +470,10 @@ class PublishGate:
                 logger.warning("Validation cache record must be an object: %s", path)
                 return None
             return ValidationRecord.from_dict(payload)
-        except (json.JSONDecodeError, KeyError, TypeError, OSError) as exc:
-            logger.warning("Failed to read validation cache record at %s: %s", path, exc)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as exc:
+            logger.warning(
+                "Failed to read validation cache record at %s: %s", path, exc
+            )
             return None
 
     def _resolve_attempt_validation_record_path(self, raw_path: str) -> Path:
@@ -639,8 +603,8 @@ class PublishGate:
         Returns:
             PublishGateResult with allowed status and reason
         """
-        wall_started_at = datetime.now(timezone.utc)
-        monotonic_started_at = time.monotonic()
+        wall_started_at = self.timing_clock.wall_now()
+        monotonic_started_at = self.timing_clock.monotonic_now()
         head_sha: str | None = None
         cache_lookup = "not_checked"
 
@@ -774,10 +738,11 @@ class AgentGate:
     def __init__(
         self,
         worktree: Path,
-        command_runner: CommandRunner,
+        command_runner: ValidationCommandRunner,
         working_copy: WorkingCopy,
         command: Optional[str] = None,
         timeout_seconds: int = 1800,
+        timing_clock: timings.ValidationTimingClock = timings.SYSTEM_VALIDATION_TIMING_CLOCK,
     ):
         """Initialize agent gate for a worktree.
 
@@ -792,7 +757,7 @@ class AgentGate:
         self.command = command
         self.timeout_seconds = timeout_seconds
         self.store = ValidationRecordStore(worktree)
-        self.runner = ValidationRunner(self.store, command_runner)
+        self.runner = ValidationRunner(self.store, command_runner, timing_clock)
 
     def _get_head_sha(self) -> Optional[str]:
         """Get the current HEAD SHA."""

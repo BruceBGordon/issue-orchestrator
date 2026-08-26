@@ -2,15 +2,27 @@
 
 import json
 import pytest
+import shlex
+import socket
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 import subprocess
 
-from issue_orchestrator.execution import GitWorkingCopy, LocalCommandRunner
-from issue_orchestrator.ports.command_runner import CommandResult
-
+from issue_orchestrator.execution import GitWorkingCopy
+from issue_orchestrator.domain.executor import ExecutorBoundedDeadline
+from issue_orchestrator.domain.validation_execution import (
+    ContainedValidationCommand,
+    ValidationCommandCompleted,
+    ValidationCommandExecution,
+    ValidationCommandExited,
+    ValidationCommandOutput,
+    ValidationCommandTimedOut,
+    ValidationCommandTimeoutPhase,
+    ValidationExecutionDeadline,
+)
 from issue_orchestrator.control.validation import (
     ValidationRecord,
     ValidationRecordStore,
@@ -23,6 +35,54 @@ from issue_orchestrator.control.validation import (
     VALIDATION_SCHEMA_VERSION,
 )
 from issue_orchestrator.control.isolation import GRADLE_USER_HOME_ENV
+from issue_orchestrator.infra.validation_timings import (
+    SYSTEM_VALIDATION_TIMING_CLOCK,
+    ValidationTimingClock,
+)
+from issue_orchestrator.infra.executor_deadline_environment import (
+    EXECUTOR_DEADLINE_ENVIRONMENT,
+)
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_validation_command_runner,
+)
+from tests.unit.threading_helpers import join_or_fail, run_in_thread
+
+
+def _validation_execution(
+    *,
+    returncode: int,
+    stdout: str = "",
+    stderr: str = "",
+    timed_out: bool = False,
+) -> ValidationCommandExecution:
+    return ValidationCommandExecution(
+        child=ValidationCommandExited(process_id=42_424, exit_code=returncode),
+        cleanup=(
+            ValidationCommandTimedOut(ValidationCommandTimeoutPhase.ACTIVE)
+            if timed_out
+            else ValidationCommandCompleted()
+        ),
+        output=ValidationCommandOutput(stdout, stderr),
+    )
+
+
+def _journaled_validation_execution(
+    command: ContainedValidationCommand,
+    *,
+    returncode: int,
+    stdout: str = "",
+    stderr: str = "",
+    timed_out: bool = False,
+) -> ValidationCommandExecution:
+    """Honor the command-runner contract while returning deterministic evidence."""
+    command.output_capture.stdout_path.write_text(stdout, encoding="utf-8")
+    command.output_capture.stderr_path.write_text(stderr, encoding="utf-8")
+    return _validation_execution(
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+        timed_out=timed_out,
+    )
 
 
 def _shared_timing_records(worktree: Path) -> list[dict[str, object]]:
@@ -105,6 +165,68 @@ class TestValidationRecord:
         assert record.head_sha == "def456"
         assert record.passed is False
 
+    @pytest.mark.parametrize(
+        ("field", "invalid_value"),
+        (
+            ("schema_version", 2),
+            ("suite", 7),
+            ("head_sha", False),
+            ("passed", "false"),
+            ("exit_code", "0"),
+            ("command", None),
+            ("started_at", "not-a-timestamp"),
+            ("ended_at", 1_700_000_000),
+            ("timed_out", 0),
+            ("stdout_path", 42),
+            ("stderr_path", False),
+        ),
+    )
+    def test_from_dict_rejects_type_corrupt_persisted_fields(
+        self,
+        field: str,
+        invalid_value: object,
+    ) -> None:
+        data: dict[str, object] = {
+            "schema_version": 1,
+            "suite": "agent_gate",
+            "head_sha": "def456",
+            "passed": False,
+            "exit_code": 1,
+            "command": "npm test",
+            "started_at": "2024-01-01T12:00:00",
+            "ended_at": "2024-01-01T12:01:00",
+            "timed_out": False,
+            "stdout_path": None,
+            "stderr_path": None,
+        }
+        data[field] = invalid_value
+
+        with pytest.raises((TypeError, ValueError)):
+            ValidationRecord.from_dict(data)
+
+    @pytest.mark.parametrize("removed_field", ("schema_version", "timed_out"))
+    def test_from_dict_rejects_missing_persisted_fields(
+        self,
+        removed_field: str,
+    ) -> None:
+        data: dict[str, object] = {
+            "schema_version": 1,
+            "suite": "agent_gate",
+            "head_sha": "def456",
+            "passed": False,
+            "exit_code": 1,
+            "command": "npm test",
+            "started_at": "2024-01-01T12:00:00",
+            "ended_at": "2024-01-01T12:01:00",
+            "timed_out": False,
+            "stdout_path": None,
+            "stderr_path": None,
+        }
+        del data[removed_field]
+
+        with pytest.raises(ValueError, match="missing="):
+            ValidationRecord.from_dict(data)
+
     def test_record_is_immutable(self):
         """Test that record is frozen/immutable."""
         record = ValidationRecord(
@@ -182,14 +304,36 @@ class TestValidationRunner:
     """Tests for ValidationRunner."""
 
     class _TimeoutRunner:
-        def run(self, *args, **kwargs):
-            return CommandResult(returncode=-1, stdout="", stderr="", timed_out=True)
+        def run(
+            self,
+            command: ContainedValidationCommand,
+        ) -> ValidationCommandExecution:
+            return _journaled_validation_execution(
+                command,
+                returncode=-15,
+                timed_out=True,
+            )
+
+    class _DeadlineRecordingRunner:
+        def __init__(self) -> None:
+            self.environment: dict[str, str] | None = None
+            self.deadline: ValidationExecutionDeadline | None = None
+
+        def run(
+            self,
+            command: ContainedValidationCommand,
+        ) -> ValidationCommandExecution:
+            self.environment = dict(command.environment)
+            self.deadline = command.deadline
+            return _journaled_validation_execution(command, returncode=0)
 
     @pytest.fixture
     def temp_worktree(self):
-        """Create a temporary worktree directory."""
+        """Create a temporary worktree with timing persistence available."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
+            worktree = Path(tmpdir)
+            (worktree / ".git").mkdir()
+            yield worktree
 
     @pytest.fixture
     def session_output_dir(self, temp_worktree):
@@ -206,7 +350,11 @@ class TestValidationRunner:
     @pytest.fixture
     def runner(self, store):
         """Create a runner with the store."""
-        return ValidationRunner(store, LocalCommandRunner())
+        return ValidationRunner(
+            store,
+            build_validation_command_runner(),
+            SYSTEM_VALIDATION_TIMING_CLOCK,
+        )
 
     def test_run_passing_command(self, runner, session_output_dir):
         """Test running a passing command."""
@@ -224,6 +372,48 @@ class TestValidationRunner:
         assert record.suite == "publish_gate"
         assert record.head_sha == "abc123"
 
+    def test_queue_budget_does_not_consume_nested_active_validation_budget(
+        self,
+        store: ValidationRecordStore,
+        session_output_dir: Path,
+    ) -> None:
+        command_runner = self._DeadlineRecordingRunner()
+        runner = ValidationRunner(
+            store,
+            command_runner,
+            SYSTEM_VALIDATION_TIMING_CLOCK,
+        )
+
+        runner.run(
+            suite="publish_gate",
+            head_sha="queue-aware",
+            command="make validate-pr-raw",
+            timeout_seconds=10,
+            session_output_dir=session_output_dir,
+        )
+
+        assert command_runner.environment is not None
+        assert EXECUTOR_DEADLINE_ENVIRONMENT.decode(
+            command_runner.environment
+        ) == ExecutorBoundedDeadline(10.0, 20.0)
+        assert command_runner.deadline == ValidationExecutionDeadline(
+            ExecutorBoundedDeadline(10.0, 20.0),
+            50.0,
+        )
+
+    def test_validation_deadline_requires_outer_containment_margin(self) -> None:
+        with pytest.raises(ValueError, match="must exceed"):
+            ValidationExecutionDeadline(
+                executor_deadline=ExecutorBoundedDeadline(10.0, 20.0),
+                outer_timeout_seconds=20.0,
+            )
+
+    def test_validation_deadline_preserves_subsecond_probe_bound(self) -> None:
+        deadline = ValidationExecutionDeadline.for_active_timeout(0.25)
+
+        assert deadline.executor_deadline == ExecutorBoundedDeadline(0.25, 0.5)
+        assert deadline.outer_timeout_seconds == 30.5
+
     def test_run_records_offset_aware_utc_timestamps(self, runner, session_output_dir):
         record = runner.run(
             suite="publish_gate",
@@ -239,6 +429,78 @@ class TestValidationRunner:
         assert ended_at.tzinfo is not None
         assert started_at.utcoffset() == timezone.utc.utcoffset(started_at)
         assert ended_at.utcoffset() == timezone.utc.utcoffset(ended_at)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="uses a Unix event socket")
+    def test_completed_duration_is_monotonic_when_wall_clock_rolls_back(
+        self,
+        store: ValidationRecordStore,
+        session_output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        socket_root = Path(tempfile.mkdtemp(prefix="io-validation-", dir="/tmp"))
+        socket_path = socket_root / "events.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(socket_path))
+        server.listen(2)
+
+        def receive_events() -> tuple[dict[str, object], ...]:
+            events: list[dict[str, object]] = []
+            for _event_index in range(2):
+                connection, _address = server.accept()
+                with connection:
+                    payload = b""
+                    while not payload.endswith(b"\n"):
+                        chunk = connection.recv(4096)
+                        if not chunk:
+                            raise AssertionError("validation event socket closed early")
+                        payload += chunk
+                decoded = json.loads(payload)
+                if type(decoded) is not dict:
+                    raise AssertionError("validation event must be an object")
+                events.append(decoded)
+            return tuple(events)
+
+        event_thread, event_result = run_in_thread(receive_events)
+        monkeypatch.setenv("ORCHESTRATOR_IPC_SOCKET", str(socket_path))
+        wall_reads = iter(
+            (
+                datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+                datetime(2026, 8, 25, 11, tzinfo=timezone.utc),
+            )
+        )
+        monotonic_reads = iter((100.0, 105.0))
+        runner = ValidationRunner(
+            store,
+            self._DeadlineRecordingRunner(),
+            ValidationTimingClock(
+                wall_now=lambda: next(wall_reads),
+                monotonic_now=lambda: next(monotonic_reads),
+            ),
+        )
+        try:
+            record = runner.run(
+                suite="agent_gate",
+                head_sha="wall-rollback",
+                command="true",
+                timeout_seconds=10,
+                session_output_dir=session_output_dir,
+            )
+            join_or_fail(event_thread, 2.0, label="validation event receiver")
+            events = event_result.unwrap()
+        finally:
+            server.close()
+            socket_path.unlink(missing_ok=True)
+            socket_root.rmdir()
+
+        completed = next(
+            event for event in events if event["name"] == "validation.completed"
+        )
+        data = completed["data"]
+        assert type(data) is dict
+        assert data["duration_seconds"] == 5.0
+        assert datetime.fromisoformat(record.ended_at) < datetime.fromisoformat(
+            record.started_at
+        )
 
     def test_run_failing_command(self, runner, session_output_dir):
         """Test running a failing command."""
@@ -256,7 +518,11 @@ class TestValidationRunner:
 
     def test_run_timeout(self, runner, session_output_dir):
         """Test command timeout."""
-        fast_runner = ValidationRunner(runner.store, self._TimeoutRunner())
+        fast_runner = ValidationRunner(
+            runner.store,
+            self._TimeoutRunner(),
+            SYSTEM_VALIDATION_TIMING_CLOCK,
+        )
         record = fast_runner.run(
             suite="publish_gate",
             head_sha="abc123",
@@ -269,27 +535,31 @@ class TestValidationRunner:
         assert record.timed_out is True
         assert record.exit_code == -1
 
-    def test_run_handles_command_runner_exception(self, store, session_output_dir):
-        """Test that runner records failures when command runner raises."""
+    def test_run_fails_fast_on_validation_runner_contract_breach(
+        self,
+        store,
+        session_output_dir,
+    ):
+        """A port implementation that raises has violated its closed contract."""
 
         class FailingRunner:
             def run(self, *args, **kwargs):
                 raise RuntimeError("boom")
 
-        runner = ValidationRunner(store, FailingRunner())
-
-        record = runner.run(
-            suite="publish_gate",
-            head_sha="abc123",
-            command="echo 'test'",
-            timeout_seconds=10,
-            session_output_dir=session_output_dir,
+        runner = ValidationRunner(
+            store,
+            FailingRunner(),
+            SYSTEM_VALIDATION_TIMING_CLOCK,
         )
 
-        assert record.passed is False
-        assert record.exit_code == -1
-        stderr_path = store.worktree / record.stderr_path
-        assert "Validation runner error: boom" in stderr_path.read_text()
+        with pytest.raises(RuntimeError, match="boom"):
+            runner.run(
+                suite="publish_gate",
+                head_sha="abc123",
+                command="echo 'test'",
+                timeout_seconds=10,
+                session_output_dir=session_output_dir,
+            )
 
     def test_run_writes_record_to_store(self, runner, store, session_output_dir):
         """Test that running writes the record to the store."""
@@ -330,7 +600,7 @@ class TestValidationRunner:
         session_output_dir,
     ):
         """Raw publish commands should still emit structured per-target timings."""
-        (temp_worktree / ".git").mkdir()
+        (temp_worktree / ".git").mkdir(exist_ok=True)
         command = _timing_marker_command()
 
         runner.run(
@@ -353,6 +623,40 @@ class TestValidationRunner:
         assert target_record["started_at"] == "2026-03-14T09:10:13-0600"
         assert target_record["ended_at"] == "2026-03-14T09:10:25-0600"
 
+    def test_run_reads_timing_markers_that_precede_more_than_retained_tail(
+        self,
+        runner: ValidationRunner,
+        temp_worktree: Path,
+        session_output_dir: Path,
+    ) -> None:
+        """Timing evidence comes from full journals, not bounded result tails."""
+        noisy_bytes = 4_194_304 + 65_536
+        noise_command = shlex.join(
+            (
+                sys.executable,
+                "-c",
+                f"import os; os.write(1, b'x' * {noisy_bytes})",
+            )
+        )
+        command = f"{_timing_marker_command()} && {noise_command}"
+
+        runner.run(
+            suite="publish_gate",
+            head_sha="timing-before-tail",
+            command=command,
+            timeout_seconds=10,
+            session_output_dir=session_output_dir,
+        )
+
+        assert (session_output_dir / "validation-stdout.log").stat().st_size > 4_194_304
+        target_record = next(
+            record
+            for record in _shared_timing_records(temp_worktree)
+            if record["kind"] == "target_timing"
+        )
+        assert target_record["target"] == "test-unit"
+        assert target_record["elapsed_seconds"] == 12
+
     def test_run_does_not_append_target_timing_records_for_agent_gate(
         self,
         runner,
@@ -360,7 +664,7 @@ class TestValidationRunner:
         session_output_dir,
     ):
         """Captured timing markers only produce target timings for publish gate."""
-        (temp_worktree / ".git").mkdir()
+        (temp_worktree / ".git").mkdir(exist_ok=True)
 
         runner.run(
             suite="agent_gate",
@@ -372,6 +676,96 @@ class TestValidationRunner:
 
         records = _shared_timing_records(temp_worktree)
         assert not [record for record in records if record["kind"] == "target_timing"]
+
+    @pytest.mark.parametrize(
+        ("markers", "failure_kind"),
+        (
+            (
+                "[validate-timing] START target=duplicate at=one\\n"
+                "[validate-timing] START target=duplicate at=two\\n",
+                "duplicate-start",
+            ),
+            (
+                "[validate-timing] END target=missing status=0 elapsed=1s at=now\\n",
+                "end-without-start",
+            ),
+            (
+                "[validate-timing] CONFIG host_cpus=18 host_cpus=19\\n",
+                "malformed-marker",
+            ),
+            (
+                "[validate-timing] START target=invalid-status at=one\\n"
+                "[validate-timing] END target=invalid-status "
+                "status=-9223372036854775809 elapsed=1s at=two\\n",
+                "malformed-marker",
+            ),
+            ("[validate-timing] malformed\\n", "malformed-marker"),
+        ),
+    )
+    def test_replayed_profiler_failure_does_not_replace_publish_result(
+        self,
+        runner,
+        temp_worktree: Path,
+        session_output_dir: Path,
+        markers: str,
+        failure_kind: str,
+    ) -> None:
+        (temp_worktree / ".git").mkdir(exist_ok=True)
+        command = f"printf '{markers}'"
+
+        record = runner.run(
+            suite="publish_gate",
+            head_sha=f"profiler-{failure_kind}",
+            command=command,
+            timeout_seconds=10,
+            session_output_dir=session_output_dir,
+        )
+
+        assert record.passed is True
+        diagnostics = [
+            item
+            for item in _shared_timing_records(temp_worktree)
+            if item["kind"] == "timing_protocol_failure"
+        ]
+        assert diagnostics[-1]["failure_kind"] == failure_kind
+        if "invalid-status" in markers:
+            assert diagnostics[-1]["target"] == "invalid-status"
+        assert not [
+            item
+            for item in _shared_timing_records(temp_worktree)
+            if item["kind"] == "target_timing"
+        ]
+
+    def test_oversized_profiler_marker_is_bounded_without_replacing_gate_result(
+        self,
+        runner: ValidationRunner,
+        temp_worktree: Path,
+        session_output_dir: Path,
+    ) -> None:
+        source = (
+            "import os; os.write(1, b'[validate-timing] ' + (b'x' * 20000) + b'\\n')"
+        )
+
+        record = runner.run(
+            suite="publish_gate",
+            head_sha="oversized-profiler-marker",
+            command=shlex.join((sys.executable, "-c", source)),
+            timeout_seconds=10,
+            session_output_dir=session_output_dir,
+        )
+
+        assert record.passed is True
+        failures = [
+            item
+            for item in _shared_timing_records(temp_worktree)
+            if item["kind"] == "timing_protocol_failure"
+        ]
+        assert len(failures) == 1
+        assert failures[0]["failure_kind"] == "malformed-marker"
+        assert failures[0]["line_truncated"] is True
+        bounded_line = failures[0]["line"]
+        assert type(bounded_line) is str
+        assert len(bounded_line) == 16_384
 
     def test_run_does_not_write_record_to_non_session_dir(self, runner, temp_worktree):
         """Non-session output dirs should not get run-scoped validation-record.json."""
@@ -394,16 +788,21 @@ class TestValidationRunner:
 
         class RecordingRunner:
             def __init__(self):
-                self.kwargs = {}
+                self.command: ContainedValidationCommand | None = None
 
-            def run(self, *args, **kwargs):
-                self.kwargs = kwargs
-                return CommandResult(
-                    returncode=0, stdout="", stderr="", timed_out=False
-                )
+            def run(
+                self,
+                command: ContainedValidationCommand,
+            ) -> ValidationCommandExecution:
+                self.command = command
+                return _journaled_validation_execution(command, returncode=0)
 
         command_runner = RecordingRunner()
-        runner = ValidationRunner(store, command_runner)
+        runner = ValidationRunner(
+            store,
+            command_runner,
+            SYSTEM_VALIDATION_TIMING_CLOCK,
+        )
 
         runner.run(
             suite="agent_gate",
@@ -413,7 +812,8 @@ class TestValidationRunner:
             session_output_dir=session_output_dir,
         )
 
-        env = command_runner.kwargs["env"]
+        assert command_runner.command is not None
+        env = command_runner.command.environment
         assert env[GRADLE_USER_HOME_ENV] == str(
             temp_worktree / ".issue-orchestrator" / "tool-homes" / "gradle"
         )
@@ -631,7 +1031,7 @@ class TestPublishGate:
         """Test gate is disabled when no command is configured."""
         gate = PublishGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command=None,
         )
@@ -649,13 +1049,85 @@ class TestPublishGate:
         assert summary["allowed"] is True
         assert summary["record_exit_code"] is None
 
+    def test_type_corrupt_cached_pass_cannot_authorize_publish(
+        self,
+        temp_worktree: Path,
+        session_output_dir: Path,
+    ) -> None:
+        head_sha = GitWorkingCopy().get_head_sha(temp_worktree)
+        assert head_sha is not None
+        command_ran = temp_worktree / "validation-command-ran"
+        command = f"touch {shlex.quote(str(command_ran))}; exit 9"
+        cache_path = ValidationRecordStore(temp_worktree).get_record_path(head_sha)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": VALIDATION_SCHEMA_VERSION,
+                    "suite": "publish_gate",
+                    "head_sha": head_sha,
+                    "passed": "false",
+                    "exit_code": 9,
+                    "command": command,
+                    "started_at": "2026-08-25T12:00:00+00:00",
+                    "ended_at": "2026-08-25T12:00:01+00:00",
+                    "timed_out": False,
+                    "stdout_path": None,
+                    "stderr_path": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        gate = PublishGate(
+            temp_worktree,
+            command_runner=build_validation_command_runner(),
+            working_copy=GitWorkingCopy(),
+            command=command,
+        )
+
+        result = gate.check(session_output_dir=session_output_dir)
+
+        assert result.allowed is False
+        assert result.cache_hit is False
+        assert command_ran.exists()
+
+    def test_gate_summary_survives_wall_clock_rollback(self, temp_worktree):
+        wall_values = iter(
+            (
+                datetime(2026, 8, 24, 12, tzinfo=timezone.utc),
+                datetime(2026, 8, 24, 11, tzinfo=timezone.utc),
+            )
+        )
+        monotonic_values = iter((100.0, 105.0))
+        gate = PublishGate(
+            temp_worktree,
+            command_runner=build_validation_command_runner(),
+            working_copy=GitWorkingCopy(),
+            command=None,
+            timing_clock=ValidationTimingClock(
+                wall_now=lambda: next(wall_values),
+                monotonic_now=lambda: next(monotonic_values),
+            ),
+        )
+
+        result = gate.check()
+
+        assert result.allowed is True
+        summary = next(
+            record
+            for record in _shared_timing_records(temp_worktree)
+            if record["kind"] == "validation_gate_summary"
+        )
+        assert summary["monotonic_elapsed_seconds"] == 5.0
+        assert summary["wall_elapsed_seconds"] == -3600.0
+
     def test_gate_appends_summary_when_head_sha_missing(self, temp_worktree):
         """Publish gate summaries should pin HEAD lookup failures."""
         working_copy = MagicMock()
         working_copy.get_head_sha.return_value = None
         gate = PublishGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=working_copy,
             command="echo 'ok'",
             timeout_seconds=10,
@@ -679,7 +1151,7 @@ class TestPublishGate:
         """Test gate passes when validation command succeeds."""
         gate = PublishGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command="echo 'ok'",
             timeout_seconds=10,
@@ -697,7 +1169,7 @@ class TestPublishGate:
         """Publish gate checks should append an outer summary record."""
         gate = PublishGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command="echo 'ok'",
             timeout_seconds=10,
@@ -732,7 +1204,7 @@ class TestPublishGate:
         """Test gate fails when validation command fails."""
         gate = PublishGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command="exit 1",
             timeout_seconds=10,
@@ -748,7 +1220,7 @@ class TestPublishGate:
         """Test gate uses cache on subsequent calls."""
         gate = PublishGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command="echo 'ok'",
             timeout_seconds=10,
@@ -768,19 +1240,23 @@ class TestPublishGate:
         self, temp_worktree, session_output_dir
     ):
         """Attempt-scoped validation reuses a pass for the same issue and SHA."""
-        from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+        from issue_orchestrator.adapters.sidecar_attempt_store import (
+            SidecarAttemptStore,
+        )
 
         class CountingRunner:
             def __init__(self) -> None:
                 self.calls = 0
 
-            def run(self, *args, **kwargs):
+            def run(
+                self,
+                command: ContainedValidationCommand,
+            ) -> ValidationCommandExecution:
                 self.calls += 1
-                return CommandResult(
+                return _journaled_validation_execution(
+                    command,
                     returncode=0,
                     stdout="ok",
-                    stderr="",
-                    timed_out=False,
                 )
 
         attempt_store = SidecarAttemptStore(temp_worktree)
@@ -819,19 +1295,23 @@ class TestPublishGate:
         self, temp_worktree, session_output_dir
     ):
         """Different issues at the same SHA must not share validation cache."""
-        from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+        from issue_orchestrator.adapters.sidecar_attempt_store import (
+            SidecarAttemptStore,
+        )
 
         class CountingRunner:
             def __init__(self) -> None:
                 self.calls = 0
 
-            def run(self, *args, **kwargs):
+            def run(
+                self,
+                command: ContainedValidationCommand,
+            ) -> ValidationCommandExecution:
                 self.calls += 1
-                return CommandResult(
+                return _journaled_validation_execution(
+                    command,
                     returncode=0,
                     stdout="ok",
-                    stderr="",
-                    timed_out=False,
                 )
 
         attempt_store = SidecarAttemptStore(temp_worktree)
@@ -869,7 +1349,7 @@ class TestPublishGate:
         """Publish gate summaries should distinguish cache hits from validation runs."""
         gate = PublishGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command="echo 'ok'",
             timeout_seconds=10,
@@ -893,9 +1373,14 @@ class TestPublishGate:
         """Test gate fails when command times out."""
 
         class TimeoutRunner:
-            def run(self, *args, **kwargs):
-                return CommandResult(
-                    returncode=-1, stdout="", stderr="", timed_out=True
+            def run(
+                self,
+                command: ContainedValidationCommand,
+            ) -> ValidationCommandExecution:
+                return _journaled_validation_execution(
+                    command,
+                    returncode=-15,
+                    timed_out=True,
                 )
 
         gate = PublishGate(
@@ -922,7 +1407,7 @@ class TestPublishGate:
         inline run and disagree with the gate's authoritative result."""
         gate = PublishGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command="echo 'ok'",
             timeout_seconds=10,
@@ -969,7 +1454,7 @@ class TestPublishGate:
         """
         gate = PublishGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command="exit 1",
             timeout_seconds=10,
@@ -1035,7 +1520,7 @@ class TestAgentGate:
         """Test gate is disabled when no command is configured."""
         gate = AgentGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command=None,
         )
@@ -1049,7 +1534,7 @@ class TestAgentGate:
         """Test gate passes when validation command succeeds."""
         gate = AgentGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command="echo 'ok'",
             timeout_seconds=10,
@@ -1067,7 +1552,7 @@ class TestAgentGate:
         """Agent gate should not write PublishGate-only timing summaries."""
         gate = AgentGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command="echo 'ok'",
             timeout_seconds=10,
@@ -1085,7 +1570,7 @@ class TestAgentGate:
         """Test gate fails when validation command fails."""
         gate = AgentGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command="exit 1",
             timeout_seconds=10,
@@ -1101,7 +1586,7 @@ class TestAgentGate:
         """Test gate always runs validation (no caching)."""
         gate = AgentGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command="echo 'ok'",
             timeout_seconds=10,
@@ -1123,9 +1608,14 @@ class TestAgentGate:
         """Test gate fails when command times out."""
 
         class TimeoutRunner:
-            def run(self, *args, **kwargs):
-                return CommandResult(
-                    returncode=-1, stdout="", stderr="", timed_out=True
+            def run(
+                self,
+                command: ContainedValidationCommand,
+            ) -> ValidationCommandExecution:
+                return _journaled_validation_execution(
+                    command,
+                    returncode=-15,
+                    timed_out=True,
                 )
 
         gate = AgentGate(
@@ -1146,7 +1636,7 @@ class TestAgentGate:
         """Test gate writes validation record to store."""
         gate = AgentGate(
             temp_worktree,
-            command_runner=LocalCommandRunner(),
+            command_runner=build_validation_command_runner(),
             working_copy=GitWorkingCopy(),
             command="echo 'ok'",
             timeout_seconds=10,

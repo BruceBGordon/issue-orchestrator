@@ -11,6 +11,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from ..ports.session_runner import DiscoveredSession
+from ..domain.terminal_launch import TerminalLaunch
 
 if TYPE_CHECKING:
     import pluggy
@@ -38,7 +39,7 @@ class PluggySessionRunner:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
@@ -50,11 +51,11 @@ class PluggySessionRunner:
             session_name,
             title,
             working_dir,
-            command,
+            launch.shell_command,
         )
         result = self._pm.hook.create_session(
             session_id=session_id,
-            command=command,
+            launch=launch,
             working_dir=working_dir,
             title=title,
             session_name=session_name,

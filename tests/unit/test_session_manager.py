@@ -14,6 +14,19 @@ from issue_orchestrator.control.session_manager import (
     rework_session_context,
 )
 from issue_orchestrator.ports import NullEventSink, TraceEvent
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalLaunch,
+    TerminalRunDestination,
+    TerminalShell,
+)
+
+
+def _destination(worktree: Path = Path("/path/to/worktree")) -> TerminalRunDestination:
+    run_dir = worktree / ".issue-orchestrator" / "sessions" / "test-run"
+    return TerminalRunDestination(
+        run_dir=run_dir,
+        recording_path=run_dir / "terminal-recording.jsonl",
+    )
 
 
 class CollectingEventSink:
@@ -37,20 +50,22 @@ class MockSessionRunner:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None = None,
         session_name: str | None = None,
     ) -> bool:
-        self.create_calls.append({
-            "session_id": session_id,
-            "session_name": session_name,
-            "command": command,
-            "working_dir": working_dir,
-            "title": title,
-        })
+        self.create_calls.append(
+            {
+                "session_id": session_id,
+                "session_name": session_name,
+                "launch": launch,
+                "working_dir": working_dir,
+                "title": title,
+            }
+        )
         self.sessions[session_id] = {
-            "command": command,
+            "launch": launch,
             "working_dir": working_dir,
             "title": title,
             "session_name": session_name,
@@ -214,7 +229,9 @@ class TestSessionManager:
         """Test that start creates a session via runner."""
         ctx = SessionContext(
             ref=SessionRef.for_issue(123),
-            command="claude",
+            launch=TerminalLaunch.classified(
+                "claude", TerminalShell.BASH, _destination()
+            ),
             working_dir=Path("/path/to/worktree"),
             title="Issue #123",
         )
@@ -225,7 +242,7 @@ class TestSessionManager:
         assert len(mock_runner.create_calls) == 1
         call = mock_runner.create_calls[0]
         assert call["session_id"] == 123
-        assert call["command"] == "claude"
+        assert call["launch"].shell_command == "claude"
         assert call["working_dir"] == "/path/to/worktree"
         assert call["title"] == "Issue #123"
 
@@ -233,7 +250,9 @@ class TestSessionManager:
         """Test that start emits session.launched event."""
         ctx = SessionContext(
             ref=SessionRef.for_issue(123),
-            command="claude",
+            launch=TerminalLaunch.classified(
+                "claude", TerminalShell.BASH, _destination()
+            ),
             working_dir=Path("/path/to/worktree"),
         )
 
@@ -334,12 +353,13 @@ class TestSessionContextFactories:
         ctx = issue_session_context(
             issue_number=123,
             command="claude",
+            destination=_destination(),
             working_dir=Path("/path/to/worktree"),
         )
 
         assert ctx.ref.session_type == SessionType.ISSUE
         assert ctx.ref.number == 123
-        assert ctx.command == "claude"
+        assert ctx.launch.shell_command == "claude"
         assert ctx.working_dir == Path("/path/to/worktree")
         assert ctx.title == "Issue #123"
 
@@ -348,12 +368,13 @@ class TestSessionContextFactories:
         ctx = review_session_context(
             pr_number=456,
             command="claude --review",
+            destination=_destination(),
             working_dir=Path("/path/to/worktree"),
         )
 
         assert ctx.ref.session_type == SessionType.REVIEW
         assert ctx.ref.number == 456
-        assert ctx.command == "claude --review"
+        assert ctx.launch.shell_command == "claude --review"
         assert ctx.title == "Review PR #456"
 
     def test_rework_session_context(self):
@@ -361,6 +382,7 @@ class TestSessionContextFactories:
         ctx = rework_session_context(
             issue_number=789,
             command="claude --rework",
+            destination=_destination(),
             working_dir=Path("/path/to/worktree"),
         )
 
@@ -373,6 +395,7 @@ class TestSessionContextFactories:
         ctx = issue_session_context(
             issue_number=123,
             command="claude",
+            destination=_destination(Path("/path")),
             working_dir=Path("/path"),
             title="Custom Title",
         )

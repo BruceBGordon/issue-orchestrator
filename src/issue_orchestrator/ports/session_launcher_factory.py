@@ -14,7 +14,6 @@ layer instead — worse, not better (#6924 A3/A3-R2).
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 if TYPE_CHECKING:
@@ -39,13 +38,8 @@ class SessionLauncherFactory(Protocol):
         *,
         board_snapshot_provider: "BoardSnapshotProvider",
         session_exists_fn: Callable[[str], bool],
-        create_session_fn: Callable[[str, str, Path, str | None], bool],
-        get_issue_machine: Callable[
-            ["IssueProtocol"], Optional["IssueStateMachine"]
-        ],
-        get_session_machine: Callable[
-            [str, int, int], Optional["SessionStateMachine"]
-        ],
+        get_issue_machine: Callable[["IssueProtocol"], Optional["IssueStateMachine"]],
+        get_session_machine: Callable[[str, int, int], Optional["SessionStateMachine"]],
         get_review_machine: Callable[[int, int], Optional["ReviewStateMachine"]],
         refresh_issue_fn: Optional[
             Callable[[int], Optional["IssueProtocol"]]

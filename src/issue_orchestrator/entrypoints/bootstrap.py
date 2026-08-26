@@ -15,9 +15,10 @@ Principle: "No Nulls in Orchestrator"
            - Tests explicitly pass fakes/nulls
 """
 
+from __future__ import annotations
+
 import logging
 import os
-import time
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
@@ -33,11 +34,36 @@ from .bootstrap_environment import (
     ISSUE_ORCHESTRATOR_PYTHON_ENV as ISSUE_ORCHESTRATOR_PYTHON_ENV,
     export_orchestrator_python as export_orchestrator_python,
 )
-from .bootstrap_claims import ClaimComponents, assemble_claim_components, lease_config_from
+from .bootstrap_claims import (
+    ClaimComponents,
+    assemble_claim_components,
+    lease_config_from,
+)
+from .bootstrap_dependencies import Dependencies as Dependencies
+from .bootstrap_executor import (
+    build_agent_phase_command_scheduler,
+    build_executor as build_executor,
+    build_executor_child_resource_observer as build_executor_child_resource_observer,
+    build_terminal_session_terminator as build_terminal_session_terminator,
+    build_contained_command_capture as build_contained_command_capture,
+    build_executor_monitor as build_executor_monitor,
+    build_process_group_supervisor as build_process_group_supervisor,
+    build_posix_process_launcher as build_posix_process_launcher,
+    build_terminal_session_owner,
+    build_terminal_session_registry,
+    build_terminal_session_watcher_factory,
+    build_validation_command_runner as build_validation_command_runner,
+    terminal_session_watcher_policy,
+)
 from .bootstrap_pair_registry import build_pair_registry_with_worktree_hook
 from .bootstrap_pending_work import (
     build_pending_work_wiring,
     require_repository_host,
+)
+from .bootstrap_repository_identity import resolve_repo
+from .bootstrap_validation import (
+    check_github_token_scopes as _check_github_token_scopes,
+    validate_required_dependencies,
 )
 from .bootstrap_session_launcher import build_session_launcher_factory
 from .bootstrap_operator_commands import build_operator_issue_command_factory
@@ -48,7 +74,7 @@ from .bootstrap_completion import (
 )
 from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
-from ..adapters.github.repo import get_repo_from_git, GitRepoError
+from ..adapters.github.repo import GitRepoError, get_repo_from_git
 from ..ports.event_sink import EventSink, NullEventSink
 from ..ports.issue_tracker import IssueTracker
 from ..ports.session_runner import SessionRunner, NullSessionRunner
@@ -86,13 +112,13 @@ from ..control.action_applier import ActionApplier
 from ..control.governed_label_set import GovernedLabelSet
 from ..control.fact_gatherer import FactGatherer
 from ..control.health_gate import HealthGate
-from ..adapters.github import GitHubAuth, GitHubIssueResolver, GitHubCache, build_github_auth
+from ..adapters.github import (
+    GitHubIssueResolver,
+)
 from ..adapters.github.ref_claim_adapter import (
     GitHubRefClaimAdapter,
     GitHubRefRunLedgerAdapter,
 )
-from ..execution.verification_service import DefaultVerificationService
-from ..ports.verification import VerificationBudget
 from ..execution.worktree_adapter import GitWorktreeManager
 from ..execution.git_working_copy import GitWorkingCopy
 from ..execution.command_runner import LocalCommandRunner
@@ -101,6 +127,9 @@ from ..ports.provider_readiness import (
     ProviderReadinessProbe,
 )
 from ..execution.session_output_adapter import FileSystemSessionOutput
+from ..execution.unsupported_session_run_containment import (
+    SessionRunnerUnsupportedSessionRunContainment,
+)
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ..execution.internal_review_prompt import build_coder_prompt_addendum_provider
 from ..execution.thread_background_job_runner import ThreadBackgroundJobRunner
@@ -109,9 +138,21 @@ from ..control.completion_dispatcher import (
     SynchronousCompletionDispatcher,
 )
 from ..control.dependency_evaluator import DependencyEvaluator
-from ..control.workflows import ReviewWorkflow, RetrospectiveReviewWorkflow, ReworkWorkflow, TechLeadWorkflow
+from ..control.workflows import (
+    ReviewWorkflow,
+    RetrospectiveReviewWorkflow,
+    ReworkWorkflow,
+    TechLeadWorkflow,
+)
 from ..control.worktree_manager import extract_issue_branches
-from ..infra import gh_audit, runtime_identity
+from ..infra import runtime_identity
+from .bootstrap_adapters import (
+    configure_gh_audit,
+    create_github_adapter,
+    create_github_auth,
+    create_io_adapters,
+    create_attempt_store,
+)
 from .bootstrap_tech_lead import (
     create_board_snapshot_builder,
     create_tech_lead_composition,
@@ -130,67 +171,18 @@ if TYPE_CHECKING:
     from ..ports.label_set import LabelSet
     from ..control.label_manager import LabelManager
     from ..infra.orchestrator import Orchestrator
-    from ..ports.attempt_store import AttemptStore
-    from ..control.pr_scanner import PRScanner
-    from ..control.session_restorer import SessionRestorer
     from ..control.completion_processor import CompletionProcessor
     from ..control.publish_recovery import PublishRecoveryService
-    from ..control.session_controller import SessionController
-    from ..adapters.github.fresh_issue_reader import GitHubFreshIssueReader
     from ..ports.fresh_issue_reader import FreshIssueReader
-    from ..ports.e2e_issue_tracker import E2EIssueTracker
-    from ..ports.attempt_store import AttemptStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_repo(config: Config) -> str | None:
-    """Resolve repo name from config or auto-detect from git remote."""
-    repo = config.repo
-    if not repo:
-        try:
-            repo = get_repo_from_git()
-            logger.info("Auto-detected repository from git remote: %s", repo)
-            config.repo = repo
-        except GitRepoError as e:
-            logger.warning("Could not auto-detect repository: %s", e)
-            repo = None
-    return repo
 
 
-def _create_github_auth(repo: str, config: Config) -> GitHubAuth:
-    """Create the shared GitHub auth owner for API and git transport."""
-    return build_github_auth(
-        **config.github_auth_kwargs(),
-        repo=repo,
-        api_url=config.github_api_url,
-        timeout_seconds=float(config.github_http_timeout_seconds),
-    )
 
-
-def _create_github_adapter(repo: str, config: Config, auth: GitHubAuth) -> GitHubAdapter:
-    """Create GitHub adapter with cache and verification service."""
-    cache_ttl = float(max(0, getattr(config, "fetch_layer_network_sync_seconds", 0)))
-    github_cache = GitHubCache(default_ttl=cache_ttl)
-
-    default_budget = VerificationBudget(
-        timeout_seconds=config.gh_write_verify_timeout_seconds,
-        max_attempts=20,
-        initial_delay_ms=config.gh_write_verify_initial_delay_ms,
-        max_delay_ms=config.gh_write_verify_max_delay_ms,
-        backoff_factor=config.gh_write_verify_backoff,
-        jitter_ms=config.gh_write_verify_jitter_ms,
-    )
-    verification_service = DefaultVerificationService(default_budget=default_budget)
-
-    return GitHubAdapter(
-        repo,
-        config=config,
-        cache=github_cache,
-        verification_service=verification_service,
-        auth=auth,
-    )
+_AGENT_PHASE_COMMAND_SCHEDULER = build_agent_phase_command_scheduler()
 
 
 def _setup_event_sinks(
@@ -212,34 +204,6 @@ def _setup_event_sinks(
     return events, event_hub
 
 
-def _configure_gh_audit(
-    config: Config,
-    events: EventSink,
-    github: GitHubAdapter | None,
-) -> None:
-    """Configure GitHub audit logging."""
-    gh_audit.set_event_sink(events)
-    if github:
-        gh_audit.set_rate_limit_fetcher(github.get_rate_limit_snapshot)
-    gh_audit.configure(
-        enabled=config.gh_audit_enabled,
-        include_events=config.gh_audit_events,
-        audit_path=config.gh_audit_file,
-    )
-    gh_audit.configure_rate_limit(
-        every_calls=config.gh_rate_limit_every_calls,
-        warn_fraction=config.gh_rate_limit_warn_fraction,
-        warn_remaining=config.gh_rate_limit_warn_remaining,
-    )
-    if config.gh_rate_limit_startup:
-        rl_start = time.time()
-        gh_audit.check_rate_limit("startup")
-        logger.info(
-            "[STARTUP_TIMING] phase=gh_rate_limit_probe elapsed=%.3fs",
-            time.time() - rl_start,
-        )
-
-
 def _create_claim_components(
     config: Config,
     github: GitHubAdapter | None,
@@ -247,17 +211,29 @@ def _create_claim_components(
     io_claimed_label: str = "io:claimed",
 ) -> ClaimComponents:
     """Choose both coordination stores from one deployment setting."""
-    lease = lease_config_from(config) if github and config.claims.enabled else LeaseConfig()
+    lease = (
+        lease_config_from(config) if github and config.claims.enabled else LeaseConfig()
+    )
     if github and config.claims.enabled:
         claimant_id = config.claims.claimant_id or f"orchestrator-{os.getpid()}"
         manager = GitHubRefClaimAdapter(
-            client=github.http_client, claimant_id=claimant_id, config=lease,
-            events=events, label_adapter=github, io_claimed_label=io_claimed_label,
+            client=github.http_client,
+            claimant_id=claimant_id,
+            config=lease,
+            events=events,
+            label_adapter=github,
+            io_claimed_label=io_claimed_label,
         )
         ledger = GitHubRefRunLedgerAdapter(
-            client=github.http_client, claimant_id=claimant_id, config=lease,
+            client=github.http_client,
+            claimant_id=claimant_id,
+            config=lease,
         )
-        logger.info("Claims enabled: claimant_id=%s, lease=%ds", claimant_id, lease.lease_seconds)
+        logger.info(
+            "Claims enabled: claimant_id=%s, lease=%ds",
+            claimant_id,
+            lease.lease_seconds,
+        )
     else:
         manager = NullClaimManager()
         ledger = SingleInstanceRunLedgerStore(lease_seconds=lease.lease_seconds)
@@ -290,30 +266,48 @@ def _create_planner(
         from ..execution.stack_predecessor_facts import GitStackPredecessorFactsProvider
 
         predecessor_facts_provider = GitStackPredecessorFactsProvider(
-            github, label_manager or LabelManager(config), repo=config.repo,
+            github,
+            label_manager or LabelManager(config),
+            repo=config.repo,
         )
 
-    dependency_evaluator = DependencyEvaluator(
-        issue_checker=github,
-        events=events,
-        issue_resolver=issue_resolver,
-        repo=config.repo,
-        foundation_milestone=config.foundation_milestone,
-        predecessor_facts_provider=predecessor_facts_provider,
-    ) if github else None
+    dependency_evaluator = (
+        DependencyEvaluator(
+            issue_checker=github,
+            events=events,
+            issue_resolver=issue_resolver,
+            repo=config.repo,
+            foundation_milestone=config.foundation_milestone,
+            predecessor_facts_provider=predecessor_facts_provider,
+        )
+        if github
+        else None
+    )
 
     scheduler = Scheduler(config=config, dependency_evaluator=dependency_evaluator)
 
     # The governed block is refused BY VALUE here, so a computed sync
     # collection cannot smuggle it past its owner (#6999 F2 round 4).
-    label_sync = LabelSync(
-        labels=GovernedLabelSet(labels=github, governed_label=label_manager.needs_human),
-        events=events, pr_tracker=github, label_manager=label_manager,
-    ) if github and label_manager else None
+    label_sync = (
+        LabelSync(
+            labels=GovernedLabelSet(
+                labels=github, governed_label=label_manager.needs_human
+            ),
+            events=events,
+            pr_tracker=github,
+            label_manager=label_manager,
+        )
+        if github and label_manager
+        else None
+    )
 
     review_workflow = ReviewWorkflow(config=config, events=events)
-    retrospective_review_workflow = RetrospectiveReviewWorkflow(config=config, events=events)
-    rework_workflow = ReworkWorkflow(config=config, events=events, label_manager=label_manager)
+    retrospective_review_workflow = RetrospectiveReviewWorkflow(
+        config=config, events=events
+    )
+    rework_workflow = ReworkWorkflow(
+        config=config, events=events, label_manager=label_manager
+    )
     tech_lead_workflow = TechLeadWorkflow(config=config, events=events)
 
     planner = Planner(
@@ -328,28 +322,6 @@ def _create_planner(
         label_manager=label_manager,
     )
     return planner, scheduler, dependency_evaluator, label_sync
-
-
-def _create_io_adapters(github_auth: GitHubAuth | None = None) -> tuple[
-    GitWorktreeManager,
-    GitWorkingCopy,
-    LocalCommandRunner,
-    FileSystemSessionOutput,
-]:
-    """Create IO adapter instances."""
-    return (
-        GitWorktreeManager(),
-        GitWorkingCopy(git_auth=github_auth),
-        LocalCommandRunner(),
-        FileSystemSessionOutput(),
-    )
-
-
-def create_attempt_store(config: Config) -> "AttemptStore":
-    """Create the attempt store for this repository."""
-    from ..adapters.sidecar_attempt_store import SidecarAttemptStore
-
-    return SidecarAttemptStore(config.repo_root)
 
 
 def _wire_stack_publish_gate(
@@ -420,62 +392,6 @@ def _build_publish_recovery(
     )
 
 
-def _validate_required_deps(
-    github: GitHubAdapter | None,
-    event_hub: EventHub | None,
-    planner: Planner | None,
-    session_manager: SessionManager | None,
-    label_sync: LabelSync | None,
-    action_applier: ActionApplier | None,
-    fact_gatherer: FactGatherer | None,
-    pr_scanner: "PRScanner | None",
-    session_restorer: "SessionRestorer | None",
-    completion_processor: "CompletionProcessor | None",
-    session_controller_instance: "SessionController | None",
-    fresh_issue_reader: "GitHubFreshIssueReader | None",
-    e2e_issue_tracker: "E2EIssueTracker | None",
-) -> None:
-    """Validate all required dependencies are present."""
-    # GitHub requires special error message
-    require_repository_host(github)
-    # Check all other required deps with a data-driven approach
-    deps_to_check = [
-        (event_hub, "EventHub"),
-        (planner, "Planner"),
-        (session_manager, "SessionManager"),
-        (label_sync, "LabelSync"),
-        (action_applier, "ActionApplier"),
-        (fact_gatherer, "FactGatherer"),
-        (pr_scanner, "PRScanner"),
-        (session_restorer, "SessionRestorer"),
-        (completion_processor, "CompletionProcessor"),
-        (session_controller_instance, "SessionController"),
-        (fresh_issue_reader, "FreshIssueReader"),
-        (e2e_issue_tracker, "E2EIssueTracker"),
-    ]
-    for dep, name in deps_to_check:
-        if dep is None:
-            raise ValueError(f"{name} is required")
-
-
-class Dependencies:
-    """Container for all injected dependencies.
-
-    This keeps the orchestrator constructor signature clean by bundling
-    all dependencies into a single object.
-    """
-
-    def __init__(
-        self,
-        events: EventSink,
-        runner: SessionRunner,
-        github: GitHubAdapter | None = None,
-    ):
-        self.events = events
-        self.runner = runner
-        self.github = github
-
-
 def build_orchestrator(
     config: Config,
     enable_ipc: bool = True,
@@ -517,6 +433,12 @@ def build_orchestrator(
 
     # Create the pluggy plugin manager and register SSE plugin
     pm = create_plugin_manager(
+        terminal_session_terminator=build_terminal_session_terminator(),
+        terminal_session_owner=build_terminal_session_owner(),
+        terminal_session_registry=build_terminal_session_registry(config.repo_root),
+        process_group_supervisor=build_process_group_supervisor(),
+        watcher_policy=terminal_session_watcher_policy(),
+        watcher_factory=build_terminal_session_watcher_factory(),
         terminal_plugin=config.terminal_adapter,
         ui_mode=config.ui_mode,
         session_interactions_enabled=config.session_interactions.enabled,
@@ -548,25 +470,35 @@ def build_orchestrator(
     timeline_sink = TimelineEventSink(timeline_writer)
 
     # Resolve repo and create GitHub adapter
-    repo = _resolve_repo(config)
-    github_auth = _create_github_auth(repo, config) if repo else None
-    github = _create_github_adapter(repo, config, github_auth) if repo and github_auth else None
+    repo = resolve_repo(config, get_repo_from_git, GitRepoError)
+    github_auth = create_github_auth(repo, config) if repo else None
+    github = (
+        create_github_adapter(repo, config, github_auth)
+        if repo and github_auth
+        else None
+    )
 
     # Set up event sinks
     events, event_hub = _setup_event_sinks(base_events, github, timeline_sink)
 
     # Configure GitHub audit logging
-    _configure_gh_audit(config, events, github)
+    configure_gh_audit(config, events, github)
     if github:
         _check_github_token_scopes(config, github)
 
     # Create label manager (shared instance for all control-layer components)
     from ..control.label_manager import LabelManager as _LabelManager
+
     label_manager = _LabelManager(config)
 
     # Create claim management components
-    claim_gate, lease_renewer, _lease_config, claim_manager, run_ownership = _create_claim_components(
-        config, github, events, io_claimed_label=label_manager.io_claimed,
+    claim_gate, lease_renewer, _lease_config, claim_manager, run_ownership = (
+        _create_claim_components(
+            config,
+            github,
+            events,
+            io_claimed_label=label_manager.io_claimed,
+        )
     )
 
     queue_cache_store = QueueCacheStore(
@@ -577,7 +509,9 @@ def build_orchestrator(
     )
 
     # Create IO adapters
-    worktree_manager, working_copy, command_runner, session_output = _create_io_adapters(github_auth)
+    worktree_manager, working_copy, command_runner, session_output = (
+        create_io_adapters(github_auth)
+    )
     coder_prompt_addendum = build_coder_prompt_addendum_provider(config)
 
     provider_readiness_probe = build_provider_readiness_probe(command_runner)
@@ -586,49 +520,66 @@ def build_orchestrator(
     )
 
     # Create planner and control plane components
-    planner, _scheduler, _dependency_evaluator, label_sync = _create_planner(config, github, events, provider_resilience, label_manager=label_manager)
+    planner, _scheduler, _dependency_evaluator, label_sync = _create_planner(
+        config, github, events, provider_resilience, label_manager=label_manager
+    )
     session_manager = SessionManager(runner=runner, events=events, config=config)
 
     goal_pilot_store = SqliteGoalPilotStore(repo_root=config.repo_root)
     attempt_store = create_attempt_store(config)
 
     # Create manifest downloader for tech_lead sessions
-    manifest_downloader = TechLeadDownloader(
-        repository_host=github,
-        command_runner=command_runner,
-    ) if github else None
+    manifest_downloader = (
+        TechLeadDownloader(
+            repository_host=github,
+            command_runner=command_runner,
+        )
+        if github
+        else None
+    )
 
     # Create cache-bypassing reader
-    fresh_issue_reader = GitHubFreshIssueReader(repo=config.repo, config=config) if github else None
+    fresh_issue_reader = (
+        GitHubFreshIssueReader(repo=config.repo, config=config) if github else None
+    )
 
     e2e_issue_tracker = GitHubE2EIssueTracker(github.http_client) if github else None
 
     # Every label writer EXCEPT the shared-block owner gets a capability that
     # refuses the governed label by value (#6999 F2 round 4): a check the caller
     # never received cannot be routed around.
-    governed_labels = GovernedLabelSet(
-        labels=github, governed_label=label_manager.needs_human
-    ) if github else None
+    governed_labels = (
+        GovernedLabelSet(labels=github, governed_label=label_manager.needs_human)
+        if github
+        else None
+    )
 
     # Create action applier (IO boundary)
-    action_applier = ActionApplier(
-        # ``github`` is None only on the no-repository path, which fails with a
-        # ValueError further down; the applier is never used before then.
-        labels=cast("LabelSet", governed_labels),
-        sessions=session_manager,
-        events=events,
-        repository_host=github,
-        worktree_manager=worktree_manager,
-        fresh_issue_reader=fresh_issue_reader,
-        label_manager=label_manager,
-        reconcile=True,
-        # A whole-repository anchor must be RESERVED before it is created, so
-        # the applier that owns the create owns the reservation too (#6994).
-        run_ownership=run_ownership,
-    ) if github else None
+    action_applier = (
+        ActionApplier(
+            # ``github`` is None only on the no-repository path, which fails with a
+            # ValueError further down; the applier is never used before then.
+            labels=cast("LabelSet", governed_labels),
+            sessions=session_manager,
+            events=events,
+            repository_host=github,
+            worktree_manager=worktree_manager,
+            fresh_issue_reader=fresh_issue_reader,
+            label_manager=label_manager,
+            reconcile=True,
+            # A whole-repository anchor must be RESERVED before it is created, so
+            # the applier that owns the create owns the reservation too (#6994).
+            run_ownership=run_ownership,
+        )
+        if github
+        else None
+    )
 
     tech_lead = create_tech_lead_composition(
-        config, github, events, queue_cache_store=queue_cache_store,
+        config,
+        github,
+        events,
+        queue_cache_store=queue_cache_store,
         provider_resilience=provider_resilience,
     )
     tech_lead_authority = tech_lead.authority
@@ -641,17 +592,26 @@ def build_orchestrator(
             config=config,
             repository=github,
             events=events,
-            issue_branches_fn=lambda: extract_issue_branches(working_copy, config.repo_root),
+            issue_branches_fn=lambda: extract_issue_branches(
+                working_copy, config.repo_root
+            ),
         )
         if github
         else None
     )
-    session_restorer = SessionRestorer(
-        config=config,
-        repository_host=github,
-        working_copy=working_copy,
-        tech_lead_authority=tech_lead_authority,
-    ) if github else None
+    session_restorer = (
+        SessionRestorer(
+            config=config,
+            repository_host=github,
+            working_copy=working_copy,
+            unsupported_session_run_containment=(
+                SessionRunnerUnsupportedSessionRunContainment(runner)
+            ),
+            tech_lead_authority=tech_lead_authority,
+        )
+        if github
+        else None
+    )
 
     # Create state machine manager
     state_machine_manager = StateMachineManager(config=config)
@@ -677,6 +637,7 @@ def build_orchestrator(
     # shared by the runner (which opens/awaits slots) and InfraServices
     # (which the Control API reads to deliver verdicts).
     from ..execution.review_exchange_turn_mailbox import InMemoryTurnMailbox
+
     turn_mailbox = InMemoryTurnMailbox()
 
     # One instance per orchestrator, shared by everything that needs to
@@ -684,7 +645,6 @@ def build_orchestrator(
     # launcher, and the server-started hook that publishes the bound
     # port into it (#6924).
     agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
-
 
     # Built here, before the completion pipeline, because that pipeline needs
     # the shared-block owner: the agent's typed needs_human outcome routes
@@ -695,25 +655,39 @@ def build_orchestrator(
         repository_host=repository_host,
         action_applier=cast("ActionApplier", action_applier),
         label_writer=repository_host,
-        label_manager=label_manager, events=events)
-
-    completion_processor, session_controller_instance, completion_handler_factory = create_completion_components(
-        config, github, events, working_copy, session_output, command_runner, provider_resilience,
         label_manager=label_manager,
-        background_job_supervisor=background_job_supervisor,
-        agent_callback_endpoint=agent_callback_endpoint,
-        pair_registry=pair_registry,
-        attempt_store=attempt_store,
-        turn_mailbox=turn_mailbox,
-        tech_lead_authority=tech_lead_authority,
-        tech_lead_run_activity=tech_lead.run_activity,
-        open_issue_corpus=tech_lead.open_issue_corpus,
-        repository_host=github,
-        needs_human_block=pending_work.needs_human_block,
-        coder_prompt_addendum=coder_prompt_addendum,
+        events=events,
+    )
+
+    completion_processor, session_controller_instance, completion_handler_factory = (
+        create_completion_components(
+            config,
+            github,
+            events,
+            working_copy,
+            session_output,
+            command_runner,
+            provider_resilience,
+            label_manager=label_manager,
+            background_job_supervisor=background_job_supervisor,
+            agent_callback_endpoint=agent_callback_endpoint,
+            pair_registry=pair_registry,
+            attempt_store=attempt_store,
+            turn_mailbox=turn_mailbox,
+            tech_lead_authority=tech_lead_authority,
+            tech_lead_run_activity=tech_lead.run_activity,
+            open_issue_corpus=tech_lead.open_issue_corpus,
+            repository_host=github,
+            needs_human_block=pending_work.needs_human_block,
+            coder_prompt_addendum=coder_prompt_addendum,
+        )
     )
     _wire_stack_publish_gate(
-        completion_processor, _dependency_evaluator, github, command_runner, config,
+        completion_processor,
+        _dependency_evaluator,
+        github,
+        command_runner,
+        config,
     )
 
     # Create health gate
@@ -722,10 +696,19 @@ def build_orchestrator(
     )
 
     # Validate all dependencies are present
-    _validate_required_deps(
-        github, event_hub, planner, session_manager, label_sync,
-        action_applier, fact_gatherer, pr_scanner, session_restorer,
-        completion_processor, session_controller_instance, fresh_issue_reader,
+    validate_required_dependencies(
+        github,
+        event_hub,
+        planner,
+        session_manager,
+        label_sync,
+        action_applier,
+        fact_gatherer,
+        pr_scanner,
+        session_restorer,
+        completion_processor,
+        session_controller_instance,
+        fresh_issue_reader,
         e2e_issue_tracker,
     )
 
@@ -759,6 +742,7 @@ def build_orchestrator(
     # Build infrastructure services bundle
     from ..control.infra_services import InfraServices
     from ..execution.label_store import LabelStore
+
     label_store = LabelStore(state_dir(config.repo_root) / "label_store.sqlite")
 
     # Wire post-construction collaborators into action_applier: the pair
@@ -822,6 +806,7 @@ def build_orchestrator(
         provider_readiness_probe=provider_readiness_probe,
         needs_human_block=pending_work.needs_human_block,
         coder_prompt_addendum=coder_prompt_addendum,
+        agent_phase_command_scheduler=_AGENT_PHASE_COMMAND_SCHEDULER,
     )
     deps = OrchestratorDeps(
         events=events,
@@ -850,7 +835,9 @@ def build_orchestrator(
         session_controller=session_controller_instance,
         # Run completion decisions (publish gate + push + PR) off the tick thread
         # on a dedicated runner so a slow publish never blocks the heartbeat.
-        completion_dispatcher=BackgroundCompletionDispatcher(ThreadBackgroundJobRunner()),
+        completion_dispatcher=BackgroundCompletionDispatcher(
+            ThreadBackgroundJobRunner()
+        ),
         health_gate=health_gate,
         agent_callback_endpoint=agent_callback_endpoint,
         session_launcher_factory=session_launcher_factory,
@@ -878,32 +865,6 @@ def build_orchestrator(
     # Act-level executor wiring closes over live orchestrator state (#6764/#6778).
     wire_tech_lead_act_executors(orchestrator)
     return orchestrator
-
-
-def _check_github_token_scopes(config: Config, github: GitHubAdapter) -> None:
-    if getattr(github, "auth_kind", None) == "github_app":
-        logger.info("Skipping OAuth scope check for GitHub App installation auth")
-        return
-    required = {scope.strip() for scope in (config.github_required_scopes or []) if scope.strip()}
-    allowed = {scope.strip() for scope in (config.github_allowed_scopes or []) if scope.strip()}
-    try:
-        scopes = set(github.get_token_scopes())
-    except Exception as exc:
-        logger.warning("Failed to fetch GitHub token scopes: %s", exc)
-        return
-
-    if required and not required.issubset(scopes):
-        missing = sorted(required - scopes)
-        raise ValueError(f"GitHub token missing required scopes: {missing}")
-
-    if allowed and not scopes.issubset(allowed):
-        extra = sorted(scopes - allowed)
-        raise ValueError(f"GitHub token has disallowed scopes: {extra}")
-
-    if scopes:
-        logger.info("GitHub token scopes: %s", ", ".join(sorted(scopes)))
-    else:
-        logger.info("GitHub token scopes unavailable (fine-grained token or missing header)")
 
 
 def build_orchestrator_for_testing(
@@ -958,6 +919,7 @@ def build_orchestrator_for_testing(
 
     # Create label manager (shared instance for all control-layer components)
     from ..control.label_manager import LabelManager as _LabelManager
+
     label_manager = _LabelManager(config)
 
     default_label_sync = None
@@ -982,12 +944,14 @@ def build_orchestrator_for_testing(
 
     # Create default planner if not provided
     if planner is None:
-        planner, _scheduler, _dependency_evaluator, default_label_sync = _create_planner(
-            config=config,
-            github=github,
-            events=events,
-            provider_resilience=provider_resilience,
-            label_manager=label_manager,
+        planner, _scheduler, _dependency_evaluator, default_label_sync = (
+            _create_planner(
+                config=config,
+                github=github,
+                events=events,
+                provider_resilience=provider_resilience,
+                label_manager=label_manager,
+            )
         )
 
     # Create default session manager if not provided
@@ -998,6 +962,7 @@ def build_orchestrator_for_testing(
 
     from ..execution.tech_lead_downloader import TechLeadDownloader
     from unittest.mock import MagicMock
+
     manifest_downloader = TechLeadDownloader(
         repository_host=github,
         command_runner=command_runner,
@@ -1043,24 +1008,32 @@ def build_orchestrator_for_testing(
 
     # Create PRScanner for testing
     from ..control.pr_scanner import PRScanner
+
     pr_scanner = PRScanner(
         config=config,
         repository=github,
         events=events,
-        issue_branches_fn=lambda: extract_issue_branches(working_copy, config.repo_root),
+        issue_branches_fn=lambda: extract_issue_branches(
+            working_copy, config.repo_root
+        ),
     )
 
     # Create SessionRestorer for testing
     from ..control.session_restorer import SessionRestorer
+
     session_restorer = SessionRestorer(
         config=config,
         repository_host=github,
         working_copy=working_copy,
+        unsupported_session_run_containment=(
+            SessionRunnerUnsupportedSessionRunContainment(runner)
+        ),
         tech_lead_authority=tech_lead_authority_for_testing,
     )
 
     # Create StateMachineManager for testing
     from ..control.state_machine_manager import StateMachineManager
+
     state_machine_manager = StateMachineManager(config=config)
 
     # Create CompletionProcessor for testing
@@ -1073,8 +1046,10 @@ def build_orchestrator_for_testing(
         ReviewExchangeCancellation,
         cancel_issue_review_exchange,
     )
+
     pair_registry_for_testing = build_pair_registry_with_worktree_hook()
     from ..execution.review_exchange_turn_mailbox import InMemoryTurnMailbox
+
     turn_mailbox = InMemoryTurnMailbox()
 
     # One instance per orchestrator, shared by everything that needs to
@@ -1106,9 +1081,13 @@ def build_orchestrator_for_testing(
         )
 
     pending_work = build_pending_work_wiring(
-        repo_root=config.repo_root, repository_host=github,
-        action_applier=action_applier, label_writer=github,
-        label_manager=label_manager, events=events)
+        repo_root=config.repo_root,
+        repository_host=github,
+        action_applier=action_applier,
+        label_writer=github,
+        label_manager=label_manager,
+        events=events,
+    )
 
     completion_processor = CompletionProcessor(
         label_adapter=GovernedLabelSet(
@@ -1125,7 +1104,9 @@ def build_orchestrator_for_testing(
         ),
         event_bus=None,
         label_config=label_manager.to_label_config_dict(),
-        pre_publish_gate=PrePublishGate(command_runner) if config.enforce_hooks else None,
+        pre_publish_gate=PrePublishGate(command_runner)
+        if config.enforce_hooks
+        else None,
         config=config,
         background_job_supervisor=background_job_supervisor,
         agent_callback_endpoint=agent_callback_endpoint,
@@ -1136,17 +1117,24 @@ def build_orchestrator_for_testing(
         needs_human_block=pending_work.needs_human_block,
     )
     _wire_stack_publish_gate(
-        completion_processor, _dependency_evaluator, github, command_runner, config,
+        completion_processor,
+        _dependency_evaluator,
+        github,
+        command_runner,
+        config,
     )
 
     # Create SessionController for testing (with optional validation gate)
     from ..control.session_controller import SessionController
+
     session_controller = SessionController(
         completion_processor=completion_processor,
         events=events,
         session_output=session_output,
         working_copy=working_copy,
-        command_runner=command_runner if config.validation.quick.cmd else None,
+        command_runner=(
+            build_validation_command_runner() if config.validation.quick.cmd else None
+        ),
         validation_cmd=config.validation.quick.cmd,
         validation_timeout_seconds=config.validation.quick.timeout_seconds,
         attempt_store=attempt_store,
@@ -1155,7 +1143,14 @@ def build_orchestrator_for_testing(
     )
 
     # Create LabelSync for testing
-    label_sync = default_label_sync or LabelSync(labels=GovernedLabelSet(labels=github, governed_label=label_manager.needs_human), events=events, pr_tracker=github, label_manager=label_manager)
+    label_sync = default_label_sync or LabelSync(
+        labels=GovernedLabelSet(
+            labels=github, governed_label=label_manager.needs_human
+        ),
+        events=events,
+        pr_tracker=github,
+        label_manager=label_manager,
+    )
 
     # Create EventHub for testing
     event_hub = EventHub()
@@ -1193,6 +1188,7 @@ def build_orchestrator_for_testing(
     # Build infrastructure services bundle
     from ..control.infra_services import InfraServices
     from ..execution.label_store import LabelStore
+
     label_store = LabelStore(state_dir(config.repo_root) / "label_store.sqlite")
 
     # Wire post-construction collaborators into action_applier (same as the
@@ -1250,6 +1246,7 @@ def build_orchestrator_for_testing(
         provider_readiness_probe=provider_readiness_probe,
         needs_human_block=pending_work.needs_human_block,
         coder_prompt_addendum=coder_prompt_addendum,
+        agent_phase_command_scheduler=_AGENT_PHASE_COMMAND_SCHEDULER,
     )
     completion_handler_factory = build_completion_handler_factory(
         config,

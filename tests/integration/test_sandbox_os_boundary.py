@@ -392,6 +392,7 @@ def _is_permission_denial(text: str) -> bool:
     sys.platform.startswith("win"),
     reason="claude sandbox is unsupported on native Windows (needs WSL2)",
 )
+@pytest.mark.provider_claude
 def test_generated_sandbox_settings_enforced_by_os(tmp_path: Path) -> None:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -698,6 +699,7 @@ def test_generated_sandbox_settings_enforced_by_os(tmp_path: Path) -> None:
     reason="the raw TCP probe uses /bin/bash; native Windows needs a PowerShell probe",
 )
 @pytest.mark.usefixtures("isolated_codex_home")
+@pytest.mark.provider_codex
 def test_generated_codex_profile_enforced_by_os(tmp_path: Path) -> None:
     isolated_home = Path(os.environ["CODEX_HOME"])
     if not (isolated_home / "auth.json").is_file():

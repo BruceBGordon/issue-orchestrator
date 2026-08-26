@@ -3,6 +3,15 @@
 # ruff: noqa: F403,F405,SLF001
 
 from issue_orchestrator.events.catalog import EVENT_SCHEMA_VERSION
+from issue_orchestrator.entrypoints.bootstrap import build_process_group_supervisor
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_owner,
+    build_terminal_session_registry,
+    build_terminal_session_watcher_factory,
+)
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    terminal_session_watcher_policy,
+)
 from issue_orchestrator.ports.tech_lead_run_record_store import (
     NO_TECH_LEAD_RUN_HISTORY,
 )
@@ -10,6 +19,9 @@ from issue_orchestrator.ports.provider_resilience import NO_PROVIDER_CIRCUIT_STA
 from tests.unit import test_web as _support
 from tests.unit.route_helpers import iter_route_paths
 from tests.unit.test_web import *  # noqa: F403
+from tests.unit.terminal_session_termination_helpers import (
+    RecordingTerminalSessionTerminator,
+)
 
 globals().update(
     {name: value for name, value in vars(_support).items() if not name.startswith("__")}
@@ -310,7 +322,7 @@ class TestSSEFunctionality:
 class TestEmitEventHelper:
     """Test the trace event emission via PluginManager.emit()."""
 
-    def test_plugin_manager_emit_broadcasts_to_hooks(self):
+    def test_plugin_manager_emit_broadcasts_to_hooks(self, tmp_path: Path):
         """Test that PluginManager.emit() broadcasts to on_trace_event hooks."""
         from issue_orchestrator.execution.manager import PluginManager
         from issue_orchestrator.infra.hooks.hookspec import hookimpl
@@ -324,7 +336,15 @@ class TestEmitEventHelper:
                 events_received.append((event, data))
 
         # Create plugin manager and register test plugin
-        pm = PluginManager(terminal_plugin="subprocess")
+        pm = PluginManager(
+            RecordingTerminalSessionTerminator(),
+            build_terminal_session_owner(),
+            build_terminal_session_registry(tmp_path),
+            build_process_group_supervisor(),
+            terminal_session_watcher_policy(),
+            build_terminal_session_watcher_factory(),
+            terminal_plugin="subprocess",
+        )
         pm.register_plugin(TestPlugin(), name="test_plugin")
 
         # Emit an event
@@ -466,7 +486,7 @@ class TestIssueRowsEndpoint:
         finally:
             set_orchestrator(original)
 
-    def test_plugin_manager_emit_with_empty_data(self):
+    def test_plugin_manager_emit_with_empty_data(self, tmp_path: Path):
         """Test that emit() works with no data argument."""
         from issue_orchestrator.execution.manager import PluginManager
         from issue_orchestrator.infra.hooks.hookspec import hookimpl
@@ -478,7 +498,15 @@ class TestIssueRowsEndpoint:
             def on_trace_event(self, event: str, data: dict) -> None:
                 events_received.append((event, data))
 
-        pm = PluginManager(terminal_plugin="subprocess")
+        pm = PluginManager(
+            RecordingTerminalSessionTerminator(),
+            build_terminal_session_owner(),
+            build_terminal_session_registry(tmp_path),
+            build_process_group_supervisor(),
+            terminal_session_watcher_policy(),
+            build_terminal_session_watcher_factory(),
+            terminal_plugin="subprocess",
+        )
         pm.register_plugin(TestPlugin(), name="test_plugin")
 
         # Emit without data

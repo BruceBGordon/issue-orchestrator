@@ -9,6 +9,8 @@ This abstraction keeps terminal backend details out of the core.
 
 from typing import NotRequired, Protocol, TypedDict
 
+from ..domain.terminal_launch import TerminalLaunch
+
 
 class DiscoveredSession(TypedDict):
     """Session info discovered during orchestrator restart recovery."""
@@ -32,7 +34,7 @@ class SessionRunner(Protocol):
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
@@ -41,7 +43,7 @@ class SessionRunner(Protocol):
 
         Args:
             session_id: Numeric ID (typically issue number)
-            command: Shell command to execute
+            launch: Typed shell command and interaction semantics
             working_dir: Working directory path
             title: Optional human-readable title
             session_name: Full session name (e.g., "issue-123", "review-456")
@@ -186,7 +188,7 @@ class NullSessionRunner:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,

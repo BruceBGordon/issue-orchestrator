@@ -192,17 +192,194 @@ To view: cat /path/to/worktree/.issue-orchestrator/diagnostics/validation-output
 
 **How it works:** The `make validate` target runs validation through a Python wrapper (`validate_runner.py`) that captures all output while also streaming it to the terminal. This ensures agents can find failure details without re-running tests.
 
-**Fallback:** If the Python wrapper fails, use `make validate-raw` for direct execution (no output capture).
+**Explicit diagnostic path:** `make validate-raw` runs directly without output
+capture. It is never selected automatically when the Python wrapper fails.
 
-**Tuning local PR validation parallelism:** `make validate-pr` is phased so
-pytest suites that already use xdist do not also compete with each other at the
-Makefile level. `VALIDATE_JOBS` still controls the static-check phase by
-default. Use `VALIDATE_TEST_JOBS`, `VALIDATE_WEB_JOBS`,
-`VALIDATE_AGENT_JOBS`, or `VALIDATE_E2E_JOBS` when debugging local contention;
-the default `1` for these heavier phases is a deliberate stability/walltime
-tradeoff.
+**Tuning local PR validation parallelism:** `make validate-pr` launches static
+analysis and six test commands concurrently. Each command declares an accepted
+concurrency range under a human-readable IO work key. The measured defaults on
+the 18-core host are static 1–3, unit 8–24, simulated 4–8, local integration
+2–4, Claude 1–2, Codex 2–3, and browser 4–12. Those are accepted ranges, not
+simultaneous reservations. The host executor learns CPU occupancy for each key
+and grants the largest value that fits the active machine-wide leases.
 
-**Environment variable:** The orchestrator sets `ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR` to direct output to the session directory. For direct runs, this is unset and output goes to the diagnostics fallback.
+Every range-based pytest command uses `-n auto`. This is required: xdist reads the
+executor grant from `PYTEST_XDIST_AUTO_NUM_WORKERS`, while a numeric `-n N`
+would bypass the grant. `--dist=loadgroup` preserves serial tests within each
+declared provider interaction group without collapsing the entire provider lane
+to one xdist worker.
+
+For a repeatable experiment, set a numeric `UNIT_PARALLEL`,
+`SIMULATED_PARALLEL`, `INTEGRATION_PARALLEL`, `CLAUDE_PROVIDER_PARALLEL`,
+`CODEX_PROVIDER_PARALLEL`, or `WEB_PARALLEL`. The Make target converts that
+number to a fixed minimum/maximum executor grant while keeping xdist on `auto`.
+Set a value to `0` to disable xdist for that command. `PROVIDER_PARALLEL`
+remains the shared override for both provider commands. `VALIDATE_LANE_JOBS`
+only controls how many commands Make may submit; the executor owns admission.
+
+All repositories and worktrees under the same OS user share the host pool. The
+executor detects its internal CPU-slot capacity; the aggressiveness percentage
+is the one host-pressure dial. Provider and browser lanes also hold named
+exclusive leases so two
+orchestrated issues cannot run the same scarce local integration concurrently.
+Every top-level IO validation gives all its lanes one fairness group. The pool
+accounts admitted CPU slots per live group, so a newly waiting light Porchpin
+validation runs before more lanes from an already-served heavy IO validation.
+An old request that needs several CPU slots drains enough capacity to run
+instead of being starved by a stream of small work.
+See [Client Test Integrations](../user/test-integrations.md#bound-validation-concurrency-across-repositories)
+for the generic repository wrapper.
+
+Each queued command also samples native host CPU busy time over its admission
+interval. A `waiting reason=host-pressure` event means the sample reached the
+internal 95% threshold, so the executor stopped admitting new commands until a
+later sample showed recovery. Use `executor-events` to distinguish this from
+capacity, fairness, exclusive-resource, and lease-race waits. Load average is
+recorded for context but does not drive this decision.
+
+The 2026-08-24 backtracking calibration on the 18-core, 64 GiB host measured the
+full validation-result-cache-miss gate at 95.86s with 100% aggressiveness,
+84.24s at 125%, and 96.76s at 150%. The 125% point improved on 100% by about
+12%, while 150% gave the gain back and slowed local static and unit work as well
+as the variable provider path. That places 125% at the measured knee; more
+parallelism was not a credible further 5% win. Use
+`issue-orchestrator executor-policy --aggressiveness 125` on this host.
+
+Two exact clean committed `make validate-pr` runs then passed in **83.888s** at
+`443ecdd` and **81.71s** at `5b10693` (82.80s mean). The latter's seven-lane
+phase took 79s: browser 20s, static 38s, simulated scenarios 42s, unit 48s,
+local integration 55s, Codex 55s, and Claude 79s; VS Code took 1s afterwards.
+The executor granted xdist-aware work between 2 and 12 workers according to
+learned demand, rather than the historical accidental single-worker behavior.
+These are the normal-response confirmations for the approximately 85-second
+goal.
+
+After process-group, restart-watchdog, profiler-cleanup, and crash-safe
+persistence hardening, an exact clean committed gate at `4e35b20` passed in
+**85.09s** retained validation time (**85.41s** measured wall time), with zero
+swaps. This is the representative approximately-85-second confirmation rather
+than an earlier cache-only measurement.
+
+After the later command-guardian hardening, a clean committed `make validate-pr`
+at `db7b83d` passed in **92.12s** retained validation time (**92.43s** measured
+wall time). Every lane was admitted within 0.181s. The dominant Claude command
+spent 88.856s wall time while using 36.588 child CPU seconds; local unit work
+took 52.826s. The seven-second delta is therefore consistent with the observed
+remote-provider range, not queue starvation or measurable guardian admission
+overhead. The practical result is an approximately 85-second gate with ordinary
+provider-driven variation into the low 90s, not a hard 85-second ceiling.
+
+Timing rows live in the repository's shared Git directory and can therefore
+survive a machine migration. For calibration, select records by the captured
+host name, OS, architecture, CPU count, and physical-memory bytes; a date alone
+does not prove which machine produced a row. Records without the new host
+identity, or with the previous machine's identity, are historical context
+rather than evidence for this calibration.
+
+Across 222 resource samples recorded on this 18-core/64 GiB host, memory-free
+pressure never fell below 86% and swap use remained 0 MiB. The largest observed
+single lane was static at about 1.2 GiB RSS. There is therefore no evidence that
+64 GiB makes this gate faster than 48 GiB would; the measured workload had ample
+headroom at 48 GiB. The extra memory is still useful headroom for simultaneous
+repositories, browsers, worktrees, IDEs, and agent sessions, but current data
+does not justify memory-aware admission or another RAM upgrade for this use
+case.
+
+This is repeatable scheduler behavior, not a hard wall-clock upper bound on
+remote services. A later exact fresh-pool profile of clean commit `b38378e`
+passed both aggregates but took 146.39s cold and 148.09s learned. The retained
+evidence attributes the result: Claude was admitted after at most 0.124s, then
+spent 141.18s cold and 143.36s learned in its command while using only
+30.93–33.36 child CPU seconds. Learning changed aggregate time by just 1.70s,
+well inside provider variance. The same profile's isolated lanes were Claude
+77.02s, Codex 62.70s, unit 41.37s, integration 27.47s, static 27.80s, web
+21.16s, simulated 18.82s, and VS Code 2.40s. More CPU concurrency cannot remove
+an external response tail.
+
+One otherwise-identical earlier confirmation took 128.8s because the real
+interactive Codex smoke alone varied to 122.02s; its executor admission took
+0.12s and its entire lane consumed only about 20 child CPU seconds. An
+instrumented isolated run split 42.5s into 9.0s of interactive startup, 4.1s of
+safe prompt submission, and 29.4s awaiting the review response. Faster-model
+experiments were not retained: Spark was fast but emitted an invalid protocol
+value in one of three runs, while Luna and Terra were slower in measured
+samples. A larger future optimization could start an idle interactive provider
+and make the first real review specification its first model turn, instead of
+paying for a bootstrap "waiting" turn; that changes the production session
+contract and belongs outside executor tuning.
+
+Removing any remaining lane-arrival-order component requires an explicit
+batch-submission contract; do not simulate one with lane priorities or startup
+sleeps. "Uncached" here bypasses the validation-result cache only. Normal OS
+filesystem, installed dependency, browser, CLI, and external-service caches
+remain part of the real-world measurement.
+
+`make -f repo-specific/Makefile validate-profile` resolves one exact commit SHA
+before discovery, then measures detached fresh worktrees pinned to that SHA.
+Moving `HEAD` or dirtying the source worktree during the profile cannot change
+its target inventory or measured code. Each profile invocation creates one
+fresh executor-learning pool shared by its cold aggregate, isolated lane
+training, and learned aggregate, while normal external caches remain enabled. Its
+`VALIDATE_JOBS` value controls both aggregate GNU make fan-out and the inner
+validation-lane fan-out; the JSON report records both facts explicitly. The
+profiler runs every Git query, worktree mutation, setup, discovery, and measured
+Make command through the process-tree containment owner. The
+`--command-timeout-seconds` dial (default: 3600) is the active deadline for each
+of those commands; its queue-independent outer bound is derived by the same
+typed validation deadline contract and the selected value is recorded in the
+report. The Make wrapper exposes the same dial as `COMMAND_TIMEOUT_SECONDS`.
+Command logs are streamed outside disposable worktrees. If a command
+terminates but its footer, flush, file sync, or close fails, the failure report
+retains the command's exact exit code and wall time alongside the named log
+finalization failures.
+
+The default report name includes UTC microseconds, the profiler PID, and a full
+run UUID. Explicitly named reports are also safe to share: a sibling POSIX file
+lock serializes the complete two-generation publish or rollback transaction.
+The profiler atomically writes and file-syncs its report, replaces the requested
+path, and syncs the containing directory before removing the temporary session
+root or executor pool. A failed report write, file sync, or replacement leaves
+an older report at that path unchanged. Successful replacement retains that
+generation at the sibling `<report>.previous` path; a failed post-replacement
+directory sync restores it to the requested path before failing loudly. If
+session cleanup adds failure evidence, the profiler atomically republishes the
+amended report. If that amendment cannot be published, the initial durable
+report remains and the profiler raises a typed failure carrying the unpublished
+cleanup evidence. Artifact-directory initialization failures produce a typed
+report whenever the requested report directory remains writable.
+
+The headline serial sum includes the aggregate static lane exactly once; nested
+typecheck, architecture, and quality components are not double-counted as
+independent execution lanes. A sibling `*-artifacts` directory retains one
+combined-output log per command and the exact fairness-group event suffix for
+each aggregate, serialized as explicitly discriminated typed executor events.
+`total_matching_event_count` says how many events belonged to that aggregate;
+check `possibly_truncated` before treating the retained suffix as complete.
+The profiler stops on its first failed stage and writes a typed partial report
+with the failed command and every completed predecessor. It never prints or
+persists learned/cold comparisons after an incomplete experiment.
+
+Use `issue-orchestrator executor-events --limit 100` to inspect the durable
+typed decision trail after a run. It reports human repository/work identities,
+wait reasons, grants, internal CPU-slot arithmetic, native CPU busy samples and
+sample intervals, resource observations, and learned-estimate changes. It
+reads through the executor monitoring port rather than parsing logs or private
+state.
+
+To exercise an IO lane that has no exclusive resource without the host pool,
+use the standalone direct executor with the same command contract:
+
+```bash
+make test-unit EXECUTOR_RUN=./scripts/executor-run-direct
+```
+
+The direct executor grants the declared maximum but performs no cross-process
+coordination or learning. It fails rather than silently ignoring an exclusive
+resource, so it cannot replace the pooled executor for IO's complete PR gate.
+
+**Environment variable:** The orchestrator sets
+`ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR` to direct output to the session
+directory. Direct runs use the repository diagnostics directory by default.
 
 ### Pre-Push Hook Infinite Recursion
 

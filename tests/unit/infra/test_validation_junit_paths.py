@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -15,6 +15,7 @@ from issue_orchestrator.ports.session_output import ValidationRecord
 
 
 def _validation_record(*, started_at: str) -> ValidationRecord:
+    ended_at = (datetime.fromisoformat(started_at) + timedelta(seconds=1)).isoformat()
     return ValidationRecord(
         schema_version=1,
         suite="publish_gate",
@@ -23,7 +24,7 @@ def _validation_record(*, started_at: str) -> ValidationRecord:
         exit_code=0,
         command="pytest",
         started_at=started_at,
-        ended_at="2026-05-07T00:00:01+00:00",
+        ended_at=ended_at,
     )
 
 

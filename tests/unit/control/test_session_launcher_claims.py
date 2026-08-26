@@ -12,6 +12,7 @@ from issue_orchestrator.domain.coder_prompt import PreparedCoderPromptAddendum
 from issue_orchestrator.domain.lease_config import LeaseConfig
 from issue_orchestrator.domain.models import Session, SessionStatus
 from tests.callback_endpoint_helpers import ready_callback_endpoint
+from tests.agent_phase_scheduler_helpers import host_agent_phase_command_scheduler
 from issue_orchestrator.ports import NullBoardSnapshotProvider
 from tests.unit.session_run_helpers import make_session_run_assets
 
@@ -120,6 +121,7 @@ class TestSessionLauncherClaimAcquisition:
             claim_manager=mock_claim_manager,
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
         )
 
         claim = launcher._acquire_issue_claim(MockIssue())  # noqa: SLF001
@@ -178,17 +180,18 @@ class TestSessionLauncherClaimAcquisition:
                 get_completion_path=lambda *args, **kwargs: "completion.json",
             ):
                 from issue_orchestrator.control.session_launcher import SessionLauncher
+                from issue_orchestrator.domain.models import AgentConfig
                 from issue_orchestrator.infra.config import Config
 
                 mock_config = MagicMock(spec=Config)
                 mock_config.claims = MagicMock(lease_seconds=900)
                 mock_config.repo = "test/repo"
-                mock_config.agents = {"test-agent": MagicMock(
-                    timeout_minutes=30,
-                    get_command=lambda **kwargs: "test-command",
-                    get_command_for_prompt=lambda *args, **kwargs: "test-command",
-                    provider=None,
-                )}
+                mock_config.agents = {
+                    "test-agent": AgentConfig(
+                        prompt_path=Path("/tmp/prompt.md"),
+                        timeout_minutes=30,
+                    )
+                }
                 mock_config.setup_worktree = []
                 mock_config.get_label_in_progress.return_value = "in-progress"
                 mock_config.enforce_hooks = False
@@ -237,6 +240,9 @@ class TestSessionLauncherClaimAcquisition:
                     claim_manager=mock_claim_manager,
                     board_snapshot_provider=NullBoardSnapshotProvider(),
                     agent_callback_endpoint=ready_callback_endpoint(),
+                    agent_phase_command_scheduler=(
+                        host_agent_phase_command_scheduler()
+                    ),
                     coder_prompt_addendum=prompt_provider,
                 )
 
@@ -299,6 +305,7 @@ class TestSessionLauncherClaimAcquisition:
             claim_manager=mock_claim_manager,
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
         )
 
         issue = MockIssue()
@@ -349,6 +356,7 @@ class TestSessionLauncherClaimAcquisition:
             claim_manager=mock_claim_manager,
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
         )
 
         issue = MockIssue()

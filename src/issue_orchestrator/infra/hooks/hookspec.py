@@ -19,6 +19,8 @@ Entry points are registered in pyproject.toml:
 
 import pluggy
 
+from ...domain.terminal_launch import TerminalLaunch
+
 # Project name for hook markers
 PROJECT_NAME = "issue_orchestrator"
 
@@ -41,7 +43,7 @@ class TerminalSpec:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
@@ -50,7 +52,7 @@ class TerminalSpec:
 
         Args:
             session_id: Numeric ID (typically issue number)
-            command: Shell command to execute
+            launch: Complete typed terminal launch contract
             working_dir: Working directory path
             title: Optional human-readable title
             session_name: Full session name (e.g., "issue-123", "review-456")

@@ -14,12 +14,36 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Protocol, Sequence, TextIO, cast, runtime_checkable
+
+from ..domain.independent_cleanup import (
+    CleanupAction,
+    IndependentCleanupPlan,
+    raise_cleanup_failures,
+    raise_primary_with_cleanup,
+)
 
 
 TERMINAL_RECORDING_FILENAME = "terminal-recording.jsonl"
 TERMINAL_RECORDING_SCHEMA_VERSION = 1
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class TerminalRecordingTextFileFactory(Protocol):
+    """Open append-only text handles owned by terminal recordings."""
+
+    def open_append(self, path: Path) -> TextIO: ...
+
+
+class OsTerminalRecordingTextFileFactory:
+    """Production append-only text-file acquisition."""
+
+    def open_append(self, path: Path) -> TextIO:
+        return path.open("a", encoding="utf-8")
+
+
+_OS_TERMINAL_RECORDING_TEXT_FILES = OsTerminalRecordingTextFileFactory()
 
 
 @dataclass(frozen=True)
@@ -59,15 +83,44 @@ class TerminalRecordingWriter:
         initial_cols: int | None = None,
         started_at: float | None = None,
         clock: Callable[[], float] | None = None,
+        text_files: TerminalRecordingTextFileFactory = (
+            _OS_TERMINAL_RECORDING_TEXT_FILES
+        ),
     ) -> None:
+        if not isinstance(
+            cast(object, text_files),
+            TerminalRecordingTextFileFactory,
+        ):
+            raise ValueError(
+                "TerminalRecordingWriter.text_files must implement "
+                "TerminalRecordingTextFileFactory"
+            )
         self._path = path
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._base_offset_ms = _next_recording_offset(path)
-        self._file = open(path, "a", encoding="utf-8")  # noqa: SIM115
-        self._clock = time.monotonic if clock is None else clock
-        self._started = self._clock() if started_at is None else started_at
-        if initial_rows is not None and initial_cols is not None:
-            self.write_resize(rows=initial_rows, cols=initial_cols, elapsed_ms=0)
+        self._file = text_files.open_append(path)
+        try:
+            self._clock = time.monotonic if clock is None else clock
+            self._started = self._clock() if started_at is None else started_at
+            if initial_rows is not None and initial_cols is not None:
+                self.write_resize(
+                    rows=initial_rows,
+                    cols=initial_cols,
+                    elapsed_ms=0,
+                )
+        except BaseException as primary_error:
+            raise_primary_with_cleanup(
+                "terminal recording setup and file cleanup failed",
+                primary_error,
+                IndependentCleanupPlan(
+                    (
+                        CleanupAction(
+                            "terminal-recording-file-close",
+                            self._file.close,
+                        ),
+                    )
+                ).run(),
+            )
 
     @property
     def name(self) -> str:
@@ -123,6 +176,53 @@ class TerminalRecordingWriter:
         self._file.flush()
 
 
+@runtime_checkable
+class TerminalRecordingWriterFactory(Protocol):
+    """Acquire one fully initialized structured terminal recording."""
+
+    def create(
+        self,
+        path: Path,
+        *,
+        started_at: float,
+        clock: Callable[[], float],
+    ) -> TerminalRecordingWriter: ...
+
+
+class StructuredTerminalRecordingWriterFactory:
+    """Production factory for structured terminal recording writers."""
+
+    def __init__(self, text_files: TerminalRecordingTextFileFactory) -> None:
+        if not isinstance(
+            cast(object, text_files),
+            TerminalRecordingTextFileFactory,
+        ):
+            raise ValueError(
+                "StructuredTerminalRecordingWriterFactory.text_files must "
+                "implement TerminalRecordingTextFileFactory"
+            )
+        self._text_files = text_files
+
+    def create(
+        self,
+        path: Path,
+        *,
+        started_at: float,
+        clock: Callable[[], float],
+    ) -> TerminalRecordingWriter:
+        return TerminalRecordingWriter(
+            path,
+            started_at=started_at,
+            clock=clock,
+            text_files=self._text_files,
+        )
+
+
+_STRUCTURED_TERMINAL_RECORDINGS = StructuredTerminalRecordingWriterFactory(
+    _OS_TERMINAL_RECORDING_TEXT_FILES
+)
+
+
 class MirroredTerminalRecordingWriter:
     """Write canonical terminal replay events and optionally mirror plain text."""
 
@@ -136,11 +236,34 @@ class MirroredTerminalRecordingWriter:
         initial_rows: int | None = None,
         initial_cols: int | None = None,
         clock: Callable[[], float] | None = None,
+        recording_writers: TerminalRecordingWriterFactory = (
+            _STRUCTURED_TERMINAL_RECORDINGS
+        ),
+        mirror_files: TerminalRecordingTextFileFactory = (
+            _OS_TERMINAL_RECORDING_TEXT_FILES
+        ),
     ) -> None:
+        if not isinstance(
+            cast(object, recording_writers),
+            TerminalRecordingWriterFactory,
+        ):
+            raise ValueError(
+                "MirroredTerminalRecordingWriter.recording_writers must "
+                "implement TerminalRecordingWriterFactory"
+            )
+        if not isinstance(
+            cast(object, mirror_files),
+            TerminalRecordingTextFileFactory,
+        ):
+            raise ValueError(
+                "MirroredTerminalRecordingWriter.mirror_files must implement "
+                "TerminalRecordingTextFileFactory"
+            )
         effective_clock = time.monotonic if clock is None else clock
         self._clock = effective_clock
         self._started = effective_clock()
         self._on_output = on_output
+        self._recording_writers = recording_writers
         # Public so heartbeat/diagnostic logging in
         # ``persistent_round_runner.send_round`` can sample the
         # recording's growth without parsing the writer's name.
@@ -156,29 +279,44 @@ class MirroredTerminalRecordingWriter:
         for extra_path in additional_recording_paths or ():
             if extra_path not in recording_paths:
                 recording_paths.append(extra_path)
-        self._recordings = [
-            TerminalRecordingWriter(
-                path,
-                started_at=self._started,
-                clock=effective_clock,
+        self._recordings: list[TerminalRecordingWriter] = []
+        self._recording_by_path: dict[Path, TerminalRecordingWriter] = {}
+        self._mirror: TextIO | None = None
+        try:
+            for path in recording_paths:
+                writer = recording_writers.create(
+                    path,
+                    started_at=self._started,
+                    clock=effective_clock,
+                )
+                self._recordings.append(writer)
+                self._recording_by_path[path] = writer
+            if initial_rows is not None and initial_cols is not None:
+                self._write_resize(
+                    rows=initial_rows,
+                    cols=initial_cols,
+                    elapsed_ms=0,
+                )
+            if mirror_path is not None:
+                mirror_path.parent.mkdir(parents=True, exist_ok=True)
+                self._mirror = mirror_files.open_append(mirror_path)
+        except BaseException as primary_error:
+            cleanup_actions = [
+                CleanupAction(
+                    f"structured-recording-{index}-close",
+                    recording.close,
+                )
+                for index, recording in enumerate(self._recordings)
+            ]
+            if self._mirror is not None:
+                cleanup_actions.append(
+                    CleanupAction("plain-text-mirror-close", self._mirror.close)
+                )
+            raise_primary_with_cleanup(
+                "mirrored terminal recording setup and cleanup failed",
+                primary_error,
+                IndependentCleanupPlan(tuple(cleanup_actions)).run(),
             )
-            for path in recording_paths
-        ]
-        # Map path → writer for the dynamic-mirror API. Initial writers
-        # are registered here; ``add_mirror_recording`` and
-        # ``remove_mirror_recording`` mutate this map alongside
-        # ``_recordings`` so list order (used by ``write``) and lookup
-        # by path (used by ``remove``) stay in lockstep.
-        self._recording_by_path: dict[Path, TerminalRecordingWriter] = {
-            path: writer
-            for path, writer in zip(recording_paths, self._recordings, strict=True)
-        }
-        if initial_rows is not None and initial_cols is not None:
-            self._write_resize(rows=initial_rows, cols=initial_cols, elapsed_ms=0)
-        self._mirror = None
-        if mirror_path is not None:
-            mirror_path.parent.mkdir(parents=True, exist_ok=True)
-            self._mirror = open(mirror_path, "a", encoding="utf-8")  # noqa: SIM115
 
     def add_mirror_recording(
         self,
@@ -208,7 +346,7 @@ class MirroredTerminalRecordingWriter:
         if path in self._recording_by_path:
             return False
         path.parent.mkdir(parents=True, exist_ok=True)
-        writer = TerminalRecordingWriter(
+        writer = self._recording_writers.create(
             path,
             started_at=self._started,
             clock=self._clock,
@@ -295,10 +433,26 @@ class MirroredTerminalRecordingWriter:
             self._mirror.flush()
 
     def close(self) -> None:
-        for recording in self._recordings:
-            recording.close()
-        if self._mirror is not None:
-            self._mirror.close()
+        mirror_actions = (
+            ()
+            if self._mirror is None
+            else (CleanupAction("plain-text-mirror-close", self._mirror.close),)
+        )
+        raise_cleanup_failures(
+            "terminal recording resource cleanup failed",
+            IndependentCleanupPlan(
+                (
+                    *(
+                        CleanupAction(
+                            f"structured-recording-{index}-close",
+                            recording.close,
+                        )
+                        for index, recording in enumerate(self._recordings)
+                    ),
+                    *mirror_actions,
+                )
+            ).run(),
+        )
 
     def _elapsed_ms(self) -> int:
         return int((self._clock() - self._started) * 1000)

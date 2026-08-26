@@ -10,6 +10,14 @@ from typing import Mapping, Optional, TypedDict
 
 import pluggy
 
+from ..domain.terminal_launch import TerminalLaunch
+from ..domain.terminal_session_lifecycle import TerminalSessionWatcherPolicy
+from ..ports.process_group_supervisor import ProcessGroupSupervisor
+from ..ports.terminal_session_terminator import TerminalSessionTerminator
+from ..ports.terminal_session_owner import TerminalSessionOwner
+from ..ports.terminal_session_registry import TerminalSessionRegistry
+from .terminal_session_lifecycle import TerminalSessionWatcherFactory
+
 from ..infra.hooks.hookspec import PROJECT_NAME, TerminalSpec, LifecycleSpec
 
 logger = logging.getLogger(__name__)
@@ -25,7 +33,13 @@ UI_MODE_PLUGINS = {
 }
 
 
-class _BuiltinPluginKwargs(TypedDict, total=False):
+class _BuiltinPluginKwargs(TypedDict):
+    session_terminator: TerminalSessionTerminator
+    terminal_session_owner: TerminalSessionOwner
+    registry: TerminalSessionRegistry
+    process_group_supervisor: ProcessGroupSupervisor
+    watcher_policy: TerminalSessionWatcherPolicy
+    watcher_factory: TerminalSessionWatcherFactory
     session_interactions_enabled: bool
     worktree_base: Path | None
 
@@ -56,7 +70,54 @@ def _load_plugin_class(
     return plugin_class(**dict(constructor_kwargs or {}))
 
 
+def _require_terminal_session_collaborators(
+    terminal_session_terminator: TerminalSessionTerminator,
+    terminal_session_owner: TerminalSessionOwner,
+    terminal_session_registry: TerminalSessionRegistry,
+    process_group_supervisor: ProcessGroupSupervisor,
+    watcher_policy: TerminalSessionWatcherPolicy,
+    watcher_factory: TerminalSessionWatcherFactory,
+) -> None:
+    """Reject untyped composition before any plugin owns a session."""
+    if not isinstance(terminal_session_terminator, TerminalSessionTerminator):
+        raise ValueError(
+            "create_plugin_manager.terminal_session_terminator must be a "
+            "TerminalSessionTerminator"
+        )
+    if not isinstance(terminal_session_owner, TerminalSessionOwner):
+        raise ValueError(
+            "create_plugin_manager.terminal_session_owner must implement "
+            "TerminalSessionOwner"
+        )
+    if not isinstance(terminal_session_registry, TerminalSessionRegistry):
+        raise ValueError(
+            "create_plugin_manager.terminal_session_registry must implement "
+            "TerminalSessionRegistry"
+        )
+    if not isinstance(process_group_supervisor, ProcessGroupSupervisor):
+        raise ValueError(
+            "create_plugin_manager.process_group_supervisor must implement "
+            "ProcessGroupSupervisor"
+        )
+    if type(watcher_policy) is not TerminalSessionWatcherPolicy:
+        raise ValueError(
+            "create_plugin_manager.watcher_policy must be "
+            "TerminalSessionWatcherPolicy"
+        )
+    if not isinstance(watcher_factory, TerminalSessionWatcherFactory):
+        raise ValueError(
+            "create_plugin_manager.watcher_factory must implement "
+            "TerminalSessionWatcherFactory"
+        )
+
+
 def create_plugin_manager(
+    terminal_session_terminator: TerminalSessionTerminator,
+    terminal_session_owner: TerminalSessionOwner,
+    terminal_session_registry: TerminalSessionRegistry,
+    process_group_supervisor: ProcessGroupSupervisor,
+    watcher_policy: TerminalSessionWatcherPolicy,
+    watcher_factory: TerminalSessionWatcherFactory,
     terminal_plugin: Optional[str] = None,
     ui_mode: str = "web",
     session_interactions_enabled: bool = False,
@@ -66,6 +127,14 @@ def create_plugin_manager(
     """Create and configure a plugin manager.
 
     Args:
+        terminal_session_terminator: Required behavior-level owner for stopping
+            persisted terminal sessions.
+        terminal_session_owner: Required pre-registry process-group owner.
+        terminal_session_registry: Required durable pending/session owner.
+        process_group_supervisor: Required child-process owner for containing
+            sessions that fail before durable registry publication.
+        watcher_policy: Required shutdown watchdog for the PTY completion owner.
+        watcher_factory: Required construction boundary for PTY completion owners.
         terminal_plugin: Explicit terminal plugin to load.
             Can be: "tmux" or a class path like "mypackage:MyPlugin"
         ui_mode: Fallback UI mode if terminal_plugin not specified.
@@ -75,6 +144,14 @@ def create_plugin_manager(
         Configured PluginManager with hooks ready to call.
     """
     pm = pluggy.PluginManager(PROJECT_NAME)
+    _require_terminal_session_collaborators(
+        terminal_session_terminator,
+        terminal_session_owner,
+        terminal_session_registry,
+        process_group_supervisor,
+        watcher_policy,
+        watcher_factory,
+    )
 
     # Register hook specifications
     pm.add_hookspecs(TerminalSpec)
@@ -94,10 +171,18 @@ def create_plugin_manager(
         class_path = plugin_ref
 
     try:
-        plugin_kwargs: _BuiltinPluginKwargs = {}
+        plugin_kwargs: _BuiltinPluginKwargs | None = None
         if plugin_ref in BUILTIN_PLUGINS:
-            plugin_kwargs["session_interactions_enabled"] = session_interactions_enabled
-            plugin_kwargs["worktree_base"] = worktree_base
+            plugin_kwargs = _BuiltinPluginKwargs(
+                session_terminator=terminal_session_terminator,
+                terminal_session_owner=terminal_session_owner,
+                registry=terminal_session_registry,
+                process_group_supervisor=process_group_supervisor,
+                watcher_policy=watcher_policy,
+                watcher_factory=watcher_factory,
+                session_interactions_enabled=session_interactions_enabled,
+                worktree_base=worktree_base,
+            )
         plugin = _load_plugin_class(class_path, constructor_kwargs=plugin_kwargs)
         pm.register(plugin, name=f"terminal_{plugin_ref}")
         logger.info("Loaded terminal plugin: %s", plugin_ref)
@@ -122,6 +207,12 @@ class PluginManager:
 
     def __init__(
         self,
+        terminal_session_terminator: TerminalSessionTerminator,
+        terminal_session_owner: TerminalSessionOwner,
+        terminal_session_registry: TerminalSessionRegistry,
+        process_group_supervisor: ProcessGroupSupervisor,
+        watcher_policy: TerminalSessionWatcherPolicy,
+        watcher_factory: TerminalSessionWatcherFactory,
         terminal_plugin: Optional[str] = None,
         ui_mode: str = "web",
         session_interactions_enabled: bool = False,
@@ -130,10 +221,18 @@ class PluginManager:
         """Initialize the plugin manager.
 
         Args:
+            terminal_session_terminator: Required behavior-level owner for
+                stopping persisted terminal sessions.
             terminal_plugin: Explicit terminal plugin to load.
             ui_mode: Fallback UI mode for backwards compatibility.
         """
         self._pm = create_plugin_manager(
+            terminal_session_terminator=terminal_session_terminator,
+            terminal_session_owner=terminal_session_owner,
+            terminal_session_registry=terminal_session_registry,
+            process_group_supervisor=process_group_supervisor,
+            watcher_policy=watcher_policy,
+            watcher_factory=watcher_factory,
             terminal_plugin=terminal_plugin,
             ui_mode=ui_mode,
             session_interactions_enabled=session_interactions_enabled,
@@ -150,7 +249,7 @@ class PluginManager:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
@@ -158,7 +257,7 @@ class PluginManager:
         """Create a terminal session."""
         result = self._pm.hook.create_session(
             session_id=session_id,
-            command=command,
+            launch=launch,
             working_dir=working_dir,
             title=title,
             session_name=session_name,

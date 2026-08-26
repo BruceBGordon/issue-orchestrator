@@ -18,6 +18,7 @@ from issue_orchestrator.entrypoints.bootstrap_session_launcher import (
     build_session_launcher_factory,
 )
 from tests.callback_endpoint_helpers import ready_callback_endpoint
+from tests.agent_phase_scheduler_helpers import host_agent_phase_command_scheduler
 
 
 def create_mock_issue(number, priority=None, milestone=None, state="open", milestone_number=None, milestone_due_on=None, title=None):
@@ -1409,7 +1410,7 @@ class TestLaunchSessionDependencyCAS:
         evaluator = DependencyEvaluator(issue_checker=checker, events=events)
 
         # Create orchestrator with mocked dependencies
-        config = MagicMock(spec=Config)
+        config = Config()
         config.repo = "test/repo"
         config.repo_root = "/tmp"
         config.worktree_base = "/tmp"  # Top-level worktree_base
@@ -1461,6 +1462,7 @@ class TestLaunchSessionDependencyCAS:
                 agent_callback_endpoint=ready_callback_endpoint(),
                 provider_readiness_probe=orch.deps.provider_readiness_probe,
                 needs_human_block=NO_OTHER_NEEDS_HUMAN_CAUSES,
+                agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
             )
 
         # Original issue had no dependencies
@@ -1498,7 +1500,7 @@ class TestLaunchSessionDependencyCAS:
 
         evaluator = DependencyEvaluator(issue_checker=checker, events=events)
 
-        config = MagicMock(spec=Config)
+        config = Config()
         config.repo = "test/repo"
         config.repo_root = "/tmp/repo"
         config.worktree_base = "/tmp"  # Top-level worktree_base
@@ -1554,6 +1556,7 @@ class TestLaunchSessionDependencyCAS:
                 agent_callback_endpoint=ready_callback_endpoint(),
                 provider_readiness_probe=orch.deps.provider_readiness_probe,
                 needs_human_block=NO_OTHER_NEEDS_HUMAN_CAUSES,
+                agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
             )
 
         issue = Issue(

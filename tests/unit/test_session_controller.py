@@ -8,6 +8,7 @@ No external mocking needed - pure logic tests.
 
 import json
 import pytest
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -49,6 +50,15 @@ from issue_orchestrator.domain.models import (
     RequestedAction,
 )
 from issue_orchestrator.domain.session_run import SessionRunAssets
+from issue_orchestrator.domain.validation_execution import (
+    ContainedValidationCommand,
+    ValidationCommandCompleted,
+    ValidationCommandExecution,
+    ValidationCommandExited,
+    ValidationCommandOutput,
+    ValidationCommandTimedOut,
+    ValidationCommandTimeoutPhase,
+)
 from issue_orchestrator.ports import NullEventSink
 from issue_orchestrator.ports.event_sink import TraceEvent
 from issue_orchestrator.ports.provider_resilience import ProviderErrorType
@@ -106,6 +116,14 @@ def make_session_run_assets(
     """Allocate the run contract the active-session owner would inject."""
     worktree = worktree.resolve()
     worktree.mkdir(parents=True, exist_ok=True)
+    if not (worktree / ".git").exists():
+        # The validation timing journal fail-fasts without a Git common
+        # directory; every controller-owned worktree is a real repository.
+        subprocess.run(
+            ("git", "init", "--quiet", str(worktree)),
+            check=True,
+            capture_output=True,
+        )
     return session_output.start_run(
         worktree,
         session_name,
@@ -164,7 +182,9 @@ class MockCompletionProcessor:
     ) -> CompletionRecordLoadResult:
         if self.completion_load_result is not None:
             return self.completion_load_result
-        path = worktree_path / (completion_path or ".issue-orchestrator/completion.json")
+        path = worktree_path / (
+            completion_path or ".issue-orchestrator/completion.json"
+        )
         if self.completion_record is None:
             return CompletionRecordLoadResult(
                 path=path,
@@ -442,7 +462,9 @@ class TestSessionControllerTerminated:
         assert decision.provider_error_type is ProviderErrorType.TRANSIENT
         assert decision.provider_transient_failure is not None
         assert decision.provider_transient_failure.provider == "codex"
-        assert decision.provider_transient_failure.error_summary == "provider overloaded"
+        assert (
+            decision.provider_transient_failure.error_summary == "provider overloaded"
+        )
         assert decision.provider_transient_failure.attempts == 3
         assert decision.provider_transient_failure.observed_at == datetime.fromisoformat(
             attempted_at
@@ -618,7 +640,10 @@ class TestSessionControllerTerminated:
         assert decision.completion_detail is not None
         assert decision.completion_detail["failure_kind"] == "invalid_completion_record"
         assert decision.completion_detail["completion_load_failure"] == "invalid_schema"
-        assert "follow_up_issues exceeds" in decision.completion_detail["completion_parse_error"]
+        assert (
+            "follow_up_issues exceeds"
+            in decision.completion_detail["completion_parse_error"]
+        )
         assert decision.diagnostic_path is not None
         diagnostic_path = Path(decision.diagnostic_path)
         assert diagnostic_path.exists()
@@ -667,7 +692,9 @@ class TestSessionControllerTerminated:
         assert decision.completion_processed
         assert not decision.recovered_from_timeout
 
-    def test_pre_publish_validation_failure_becomes_validation_failed(self, tmp_path: Path):
+    def test_pre_publish_validation_failure_becomes_validation_failed(
+        self, tmp_path: Path
+    ):
         processor = MockCompletionProcessor()
         processor.completion_record = make_record(
             CompletionOutcome.COMPLETED,
@@ -676,7 +703,9 @@ class TestSessionControllerTerminated:
         )
         processor.process_result.success = False
         processor.process_result.failure_kind = "validation_failed"
-        processor.process_result.message = "Validation failed: ERROR: Test-skipping patterns detected"
+        processor.process_result.message = (
+            "Validation failed: ERROR: Test-skipping patterns detected"
+        )
         event_sink = RecordingEventSink()
         controller = SessionController(
             completion_processor=processor,
@@ -698,7 +727,8 @@ class TestSessionControllerTerminated:
         assert decision.status == SessionStatus.VALIDATION_FAILED
         assert decision.completion_processed
         validation_events = [
-            event for event in event_sink.events
+            event
+            for event in event_sink.events
             if event.name == EventName.SESSION_VALIDATION_FAILED
         ]
         assert len(validation_events) == 1
@@ -713,9 +743,7 @@ class TestSessionControllerTerminated:
             requested_actions=[RequestedAction.PUSH_BRANCH, RequestedAction.CREATE_PR],
         )
         processor.process_result.success = True
-        processor.process_result.message = (
-            "Validation failed after review approval; review exchange resumed to rework the failure"
-        )
+        processor.process_result.message = "Validation failed after review approval; review exchange resumed to rework the failure"
         processor.process_result.review_exchange_deferred = True
         processor.process_result.validation_failed_rerouted = True
         event_sink = RecordingEventSink()
@@ -739,7 +767,8 @@ class TestSessionControllerTerminated:
         assert decision.status == SessionStatus.RUNNING
         assert decision.completion_processed is False
         validation_events = [
-            event for event in event_sink.events
+            event
+            for event in event_sink.events
             if event.name == EventName.SESSION_VALIDATION_FAILED
         ]
         assert len(validation_events) == 1
@@ -1299,26 +1328,26 @@ class MockCommandRunner:
         self.stdout = stdout
         self.stderr = stderr
         self.timed_out = timed_out
-        self.run_calls: list[dict] = []
+        self.run_calls: list[ContainedValidationCommand] = []
 
-    def run(self, command, *, cwd=None, env=None, timeout_seconds=None, shell=False):
+    def run(self, command: ContainedValidationCommand) -> ValidationCommandExecution:
         """Record the call and return configured result."""
-        self.run_calls.append(
-            {
-                "command": command,
-                "cwd": cwd,
-                "timeout_seconds": timeout_seconds,
-                "shell": shell,
-            }
-        )
-        # Return a result-like object
-        from types import SimpleNamespace
-
-        return SimpleNamespace(
-            returncode=self.returncode,
-            stdout=self.stdout,
-            stderr=self.stderr,
-            timed_out=self.timed_out,
+        self.run_calls.append(command)
+        # The contained runner's contract includes durable output journals at
+        # the capture paths; downstream gate-timing recording reads them.
+        command.output_capture.stdout_path.write_text(self.stdout, encoding="utf-8")
+        command.output_capture.stderr_path.write_text(self.stderr, encoding="utf-8")
+        return ValidationCommandExecution(
+            child=ValidationCommandExited(
+                process_id=42_424,
+                exit_code=self.returncode,
+            ),
+            cleanup=(
+                ValidationCommandTimedOut(ValidationCommandTimeoutPhase.ACTIVE)
+                if self.timed_out
+                else ValidationCommandCompleted()
+            ),
+            output=ValidationCommandOutput(self.stdout, self.stderr),
         )
 
 
@@ -1440,9 +1469,7 @@ class TestSessionControllerValidationCaching:
         assert decision.validation_passed is False
         assert len(command_runner.run_calls) == 1
 
-    def test_dirty_preflight_defers_while_review_exchange_running(
-        self, tmp_path: Path
-    ):
+    def test_dirty_preflight_defers_while_review_exchange_running(self, tmp_path: Path):
         processor = MockCompletionProcessor()
         processor.completion_record = make_record(
             CompletionOutcome.COMPLETED,
@@ -1754,7 +1781,7 @@ class TestSessionControllerValidationCaching:
 
         # Command should have been run
         assert len(command_runner.run_calls) == 1
-        assert command_runner.run_calls[0]["command"] == "make test"
+        assert command_runner.run_calls[0].command == "make test"
 
         # SHA should have been fetched
         assert len(working_copy.get_head_sha_calls) >= 1
@@ -1790,7 +1817,9 @@ class TestSessionControllerValidationCaching:
         junit_path = worktree / "reports" / "junit.xml"
 
         class JUnitWritingCommandRunner(MockCommandRunner):
-            def run(self, command, *, cwd=None, env=None, timeout_seconds=None, shell=False):
+            def run(
+                self, command: ContainedValidationCommand
+            ) -> ValidationCommandExecution:
                 junit_path.parent.mkdir()
                 junit_path.write_text(
                     """<?xml version="1.0" encoding="utf-8"?>
@@ -1800,13 +1829,7 @@ class TestSessionControllerValidationCaching:
 """,
                     encoding="utf-8",
                 )
-                return super().run(
-                    command,
-                    cwd=cwd,
-                    env=env,
-                    timeout_seconds=timeout_seconds,
-                    shell=shell,
-                )
+                return super().run(command)
 
         controller = SessionController(
             completion_processor=processor,
@@ -1866,7 +1889,7 @@ class TestSessionControllerValidationCaching:
 
         for issue_number, session_name in ((123, "issue-123"), (124, "issue-124")):
             decision = decide_with_run_assets(
-            controller,
+                controller,
                 observation=SessionObservationResult.terminated(runtime_minutes=10.0),
                 worktree_path=worktree,
                 issue_number=issue_number,
@@ -1898,7 +1921,9 @@ class TestSessionControllerValidationCaching:
 
     def test_attempt_cache_reuses_validation_for_same_issue(self, tmp_path: Path):
         """Attempt-scoped cache reuses validation within the same issue and SHA."""
-        from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+        from issue_orchestrator.adapters.sidecar_attempt_store import (
+            SidecarAttemptStore,
+        )
         from issue_orchestrator.domain.attempt import AttemptKey
         from issue_orchestrator.domain.issue_key import GitHubIssueKey
 
@@ -1938,7 +1963,7 @@ class TestSessionControllerValidationCaching:
 
         for session_name in ("issue-123-a", "issue-123-b"):
             decision = decide_with_run_assets(
-            controller,
+                controller,
                 observation=SessionObservationResult.terminated(runtime_minutes=10.0),
                 worktree_path=worktree,
                 issue_number=123,
@@ -1955,7 +1980,9 @@ class TestSessionControllerValidationCaching:
         self, tmp_path: Path
     ):
         """Attempt-scoped cache blocks SHA-only reuse across different issues."""
-        from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+        from issue_orchestrator.adapters.sidecar_attempt_store import (
+            SidecarAttemptStore,
+        )
         from issue_orchestrator.domain.attempt import AttemptKey
         from issue_orchestrator.domain.issue_key import GitHubIssueKey
 
@@ -1995,7 +2022,7 @@ class TestSessionControllerValidationCaching:
 
         for issue_number in (123, 124):
             decision = decide_with_run_assets(
-            controller,
+                controller,
                 observation=SessionObservationResult.terminated(runtime_minutes=10.0),
                 worktree_path=worktree,
                 issue_number=issue_number,
@@ -2010,11 +2037,11 @@ class TestSessionControllerValidationCaching:
 
         assert len(command_runner.run_calls) == 2
 
-    def test_attempt_cache_requires_issue_key_when_store_is_wired(
-        self, tmp_path: Path
-    ):
+    def test_attempt_cache_requires_issue_key_when_store_is_wired(self, tmp_path: Path):
         """Attempt cache wiring must not silently fall back to SHA-only caching."""
-        from issue_orchestrator.adapters.sidecar_attempt_store import SidecarAttemptStore
+        from issue_orchestrator.adapters.sidecar_attempt_store import (
+            SidecarAttemptStore,
+        )
         from issue_orchestrator.domain.attempt import AttemptKey
 
         processor = MockCompletionProcessor()
@@ -2050,7 +2077,7 @@ class TestSessionControllerValidationCaching:
 
         with pytest.raises(RuntimeError, match="stable IssueKey"):
             decide_with_run_assets(
-            controller,
+                controller,
                 observation=SessionObservationResult.terminated(runtime_minutes=10.0),
                 worktree_path=worktree,
                 issue_number=123,
@@ -2090,7 +2117,7 @@ class TestSessionControllerValidationCaching:
             match="validation-record.json missing for passed validation event",
         ):
             decide_with_run_assets(
-            controller,
+                controller,
                 observation=SessionObservationResult.terminated(runtime_minutes=10.0),
                 worktree_path=worktree,
                 issue_number=123,

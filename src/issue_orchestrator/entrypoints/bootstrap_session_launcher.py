@@ -9,9 +9,9 @@ rather than handing the whole bundle across a layer boundary
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
+from ..control.named_session_creator import NamedSessionCreator
 from ..control.needs_human_block import SharedNeedsHumanBlock
 from ..control.session_launcher import SessionLauncher
 from ..ports.coder_prompt import (
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from ..domain.state_machines.session_machine import SessionStateMachine
     from ..infra.config import Config
     from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
+    from ..ports.agent_phase_command_scheduler import AgentPhaseCommandScheduler
     from ..ports.board_snapshot_provider import BoardSnapshotProvider
     from ..ports.issue import Issue as IssueProtocol
     from ..ports.session_launcher_factory import SessionLauncherFactory
@@ -53,20 +54,17 @@ def build_session_launcher_factory(
     provider_readiness_probe: ProviderReadinessProbe,
     needs_human_block: SharedNeedsHumanBlock,
     coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
+    agent_phase_command_scheduler: "AgentPhaseCommandScheduler",
 ) -> "SessionLauncherFactory":
     """Bind the application dependencies; return the facade-facing factory."""
+    create_session = NamedSessionCreator(session_manager, events)
 
     def _factory(
         *,
         board_snapshot_provider: "BoardSnapshotProvider",
         session_exists_fn: Callable[[str], bool],
-        create_session_fn: Callable[[str, str, Path, str | None], bool],
-        get_issue_machine: Callable[
-            ["IssueProtocol"], Optional["IssueStateMachine"]
-        ],
-        get_session_machine: Callable[
-            [str, int, int], Optional["SessionStateMachine"]
-        ],
+        get_issue_machine: Callable[["IssueProtocol"], Optional["IssueStateMachine"]],
+        get_session_machine: Callable[[str, int, int], Optional["SessionStateMachine"]],
         get_review_machine: Callable[[int, int], Optional["ReviewStateMachine"]],
         refresh_issue_fn: Optional[Callable[[int], Optional["IssueProtocol"]]],
         dependency_evaluator: Optional["DependencyEvaluator"],
@@ -76,7 +74,7 @@ def build_session_launcher_factory(
             worktree_manager, working_copy, command_runner, session_output,
             manifest_downloader, tech_lead_authority,
             session_exists_fn,
-            create_session_fn, get_issue_machine, get_session_machine,
+            create_session, get_issue_machine, get_session_machine,
             get_review_machine, refresh_issue_fn, dependency_evaluator,
             claim_manager=claim_manager,
             provider_resilience=provider_resilience,
@@ -87,6 +85,7 @@ def build_session_launcher_factory(
             ),
             board_snapshot_provider=board_snapshot_provider,
             agent_callback_endpoint=agent_callback_endpoint,
+            agent_phase_command_scheduler=agent_phase_command_scheduler,
             provider_readiness_probe=provider_readiness_probe,
             needs_human_block=needs_human_block,
             coder_prompt_addendum=coder_prompt_addendum,

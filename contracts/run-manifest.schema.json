@@ -68,6 +68,19 @@
       "title": "Run Id",
       "type": "string"
     },
+    "scheduled_outer_watchdog_timeout_minutes": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Scheduled Outer Watchdog Timeout Minutes"
+    },
     "session_name": {
       "title": "Session Name",
       "type": "string"

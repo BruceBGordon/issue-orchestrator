@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import re
-import shlex
 from dataclasses import dataclass
 from typing import Callable, Sequence
+
+from ..domain.terminal_launch import TerminalInteractionIntent
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +15,6 @@ _MAX_BUFFER_CHARS = 12000
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _OSC_ESCAPE_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 _WHITESPACE_RE = re.compile(r"\s+")
-_SHELL_COMMAND_SEPARATORS = frozenset({"&&", ";", "||"})
 
 
 def _normalize_terminal_text(text: str) -> str:
@@ -123,18 +123,16 @@ class SessionInteractionHandler:
                 self._fired_rules.add(rule.name)
 
 
-def builtin_session_interaction_rules(command: str) -> tuple[SessionInteractionRule, ...]:
-    """Return built-in rules that apply to a specific session command.
-
-    This intentionally targets the raw interactive Claude launch shape that the
-    subprocess plugin receives from SessionLauncher, plus the interactive Codex
-    launch shape used by persistent review exchange. It accepts leading shell
-    environment assignments such as ``FOO=bar && claude ...``. It assumes those
-    shell separators are whitespace-delimited, which matches the orchestrator's
-    SessionLauncher command shape.
-    """
+def builtin_session_interaction_rules(
+    intent: TerminalInteractionIntent,
+) -> tuple[SessionInteractionRule, ...]:
+    """Return built-in rules for one already-classified terminal launch."""
+    if type(intent) is not TerminalInteractionIntent:
+        raise ValueError(
+            "builtin_session_interaction_rules requires TerminalInteractionIntent"
+        )
     rules: list[SessionInteractionRule] = []
-    if _looks_like_claude_command(command):
+    if intent is TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE:
         rules.append(
             SessionInteractionRule(
                 name="claude-trust-worktree",
@@ -146,7 +144,7 @@ def builtin_session_interaction_rules(command: str) -> tuple[SessionInteractionR
                 response="",
             ),
         )
-    if _looks_like_interactive_codex_command(command):
+    if intent is TerminalInteractionIntent.CODEX_TRUST_WORKTREE:
         rules.append(
             SessionInteractionRule(
                 name="codex-trust-worktree",
@@ -159,152 +157,3 @@ def builtin_session_interaction_rules(command: str) -> tuple[SessionInteractionR
             ),
         )
     return tuple(rules)
-
-
-def _looks_like_claude_command(command: str) -> bool:
-    return _claude_command_tokens(command) is not None
-
-
-def _looks_like_interactive_codex_command(command: str) -> bool:
-    tokens = _codex_command_tokens(command)
-    return tokens is not None and _is_codex_interactive_command_tokens(tokens)
-
-
-def _claude_command_tokens(command: str) -> list[str] | None:
-    """Extract the whitespace-delimited Claude command segment from a shell command."""
-    return _matching_command_tokens(command, _is_claude_command_tokens)
-
-
-def _codex_command_tokens(command: str) -> list[str] | None:
-    """Extract the whitespace-delimited Codex command segment from a shell command."""
-    return _matching_command_tokens(command, _is_codex_command_tokens)
-
-
-def _matching_command_tokens(
-    command: str,
-    predicate: Callable[[Sequence[str] | None], bool],
-) -> list[str] | None:
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
-
-    current: list[str] = []
-    for token in tokens:
-        if token in _SHELL_COMMAND_SEPARATORS:
-            command_tokens = _trim_command_prefix(current)
-            if predicate(command_tokens):
-                return command_tokens
-            current = []
-            continue
-        current.append(token)
-
-    command_tokens = _trim_command_prefix(current)
-    if predicate(command_tokens):
-        return command_tokens
-    return None
-
-
-def _trim_command_prefix(tokens: Sequence[str]) -> list[str] | None:
-    trimmed = list(tokens)
-    while trimmed and (trimmed[0] == "exec" or _looks_like_env_assignment(trimmed[0])):
-        trimmed = trimmed[1:]
-    return trimmed or None
-
-
-def _is_claude_command_tokens(tokens: Sequence[str] | None) -> bool:
-    if not tokens:
-        return False
-    executable = tokens[0].rsplit("/", 1)[-1]
-    return executable == "claude"
-
-
-def _is_codex_command_tokens(tokens: Sequence[str] | None) -> bool:
-    if not tokens:
-        return False
-    executable = tokens[0].rsplit("/", 1)[-1]
-    return executable == "codex"
-
-
-_CODEX_SUBCOMMANDS = frozenset(
-    {
-        "exec",
-        "e",
-        "review",
-        "login",
-        "logout",
-        "mcp",
-        "plugin",
-        "mcp-server",
-        "app-server",
-        "remote-control",
-        "app",
-        "completion",
-        "update",
-        "doctor",
-        "sandbox",
-        "debug",
-        "apply",
-        "a",
-        "resume",
-        "archive",
-        "delete",
-        "unarchive",
-        "fork",
-        "cloud",
-        "exec-server",
-        "features",
-        "help",
-    }
-)
-_CODEX_OPTIONS_WITH_VALUES = frozenset(
-    {
-        "-a",
-        "--add-dir",
-        "--ask-for-approval",
-        "-c",
-        "--cd",
-        "-C",
-        "-i",
-        "--image",
-        "-m",
-        "--model",
-        "-p",
-        "--profile",
-        "--remote",
-        "--remote-auth-token-env",
-        "-s",
-        "--sandbox",
-        "--local-provider",
-    }
-)
-
-
-def _is_codex_interactive_command_tokens(tokens: Sequence[str]) -> bool:
-    if not _is_codex_command_tokens(tokens):
-        return False
-    skip_next = False
-    for token in tokens[1:]:
-        if skip_next:
-            skip_next = False
-            continue
-        if token == "--":
-            return True
-        if token in _CODEX_SUBCOMMANDS:
-            return False
-        if token.startswith("--") and "=" in token:
-            continue
-        if token in _CODEX_OPTIONS_WITH_VALUES:
-            skip_next = True
-            continue
-        if token.startswith("-"):
-            continue
-        return True
-    return True
-
-
-def _looks_like_env_assignment(token: str) -> bool:
-    if "=" not in token or token.startswith("-") or "/" in token:
-        return False
-    key, _, _ = token.partition("=")
-    return bool(key)

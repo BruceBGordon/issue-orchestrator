@@ -29,7 +29,7 @@ class ProviderCommandWrapper:
         self,
         agent_config: AgentConfig,
         *,
-        extra_provider_args: Mapping[str, object] | None = None,
+        extra_provider_args: Mapping[str, str],
     ) -> bool:
         """Return whether this specific provider invocation is interactive."""
         if not agent_config.provider:
@@ -41,8 +41,7 @@ class ProviderCommandWrapper:
             return False
 
         kwargs: dict[str, object] = dict(agent_config.provider_args)
-        if extra_provider_args:
-            kwargs.update(extra_provider_args)
+        kwargs.update(extra_provider_args)
         return get_provider(agent_config.provider).runs_interactively(**kwargs)
 
     def wrap(
@@ -51,7 +50,7 @@ class ProviderCommandWrapper:
         agent_config: AgentConfig,
         run_dir: Path,
         *,
-        extra_provider_args: Mapping[str, object] | None = None,
+        extra_provider_args: Mapping[str, str],
     ) -> str:
         """Wrap one-shot provider commands with retry/circuit reporting."""
         if self.runs_interactively(

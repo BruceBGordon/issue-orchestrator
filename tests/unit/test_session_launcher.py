@@ -21,6 +21,10 @@ from typing import Optional, cast
 from unittest.mock import MagicMock, patch
 
 from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalLaunch,
+)
 from issue_orchestrator.domain.claim import ClaimResult
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
 from issue_orchestrator.control.launch_transaction import PendingWorkLaunchClaim
@@ -49,6 +53,10 @@ from issue_orchestrator.control.session_launch_types import (
     LaunchResult,
 )
 from tests.callback_endpoint_helpers import ready_callback_endpoint
+from tests.agent_phase_scheduler_helpers import (
+    host_agent_phase_command_scheduler,
+    scheduled_agent_shell_command,
+)
 from issue_orchestrator.control.session_launcher import (
     SessionLauncher,
     detect_existing_work,
@@ -591,10 +599,20 @@ def _build_launcher_bundle(
 
     create_session_override = [None]  # List so tests can replace the callable
 
-    def mock_create_session(name: str, cmd: str, wd: Path, title: str | None) -> bool:
-        create_session_calls.append({"name": name, "cmd": cmd, "wd": wd, "title": title})
+    def mock_create_session(
+        name: str, launch: TerminalLaunch, wd: Path, title: str | None
+    ) -> bool:
+        create_session_calls.append(
+            {
+                "name": name,
+                "launch": launch,
+                "cmd": launch.shell_command,
+                "wd": wd,
+                "title": title,
+            }
+        )
         if create_session_override[0] is not None:
-            return create_session_override[0](name, cmd, wd, title)
+            return create_session_override[0](name, launch, wd, title)
         return True
 
     issue_machines: dict[int, IssueStateMachine] = {}
@@ -647,6 +665,7 @@ def _build_launcher_bundle(
         remove_session_machine=remove_session_machine,
         board_snapshot_provider=board_snapshot_provider,
         agent_callback_endpoint=ready_callback_endpoint(),
+        agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
         claim_manager=claim_manager,
         **launcher_kwargs,
     )
@@ -876,6 +895,78 @@ class TestLaunchIssueSession:
         assert result.session.key.task == TaskKind.CODE
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__coding-1")
+        assert result.session.agent_config.timeout_minutes == 92
+
+    def test_issue_phase_has_human_identity_and_run_fairness_group(
+        self,
+        launcher_bundle,
+        sample_issue,
+    ):
+        result = launcher_bundle.launcher.launch_issue_session(
+            sample_issue,
+            active_sessions=[],
+        )
+
+        assert result.success is True
+        arguments = shlex.split(launcher_bundle.create_session_calls[0]["cmd"])
+        assert arguments[arguments.index("--work-key") + 1] == (
+            "agent-phase:agent:web:code"
+        )
+        group = arguments[arguments.index("--group") + 1]
+        assert group.startswith("agent:")
+        assert group.endswith(":coding-1")
+        launch = launcher_bundle.create_session_calls[0]["launch"]
+        assert (
+            launch.interaction_intent is TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE
+        )
+        assert TerminalInteractionIntent.classify(launch.shell_command) is (
+            TerminalInteractionIntent.NONE
+        )
+        assert arguments[arguments.index("--active-timeout-seconds") + 1] == ("2700.0")
+        assert arguments[arguments.index("--absolute-timeout-seconds") + 1] == (
+            "5400.0"
+        )
+
+    @pytest.mark.parametrize(
+        ("provider", "custom_command", "expected_intent"),
+        [
+            (
+                "claude-code",
+                None,
+                TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE,
+            ),
+            (
+                "codex",
+                None,
+                TerminalInteractionIntent.CODEX_TRUST_WORKTREE,
+            ),
+            (None, "custom-agent '{initial_prompt}'", TerminalInteractionIntent.NONE),
+        ],
+    )
+    def test_issue_phase_classifies_the_provider_built_command_before_wrapping(
+        self,
+        launcher_bundle,
+        sample_issue,
+        provider,
+        custom_command,
+        expected_intent,
+    ):
+        agent_config = launcher_bundle.launcher.config.agents["agent:web"]
+        agent_config.provider = provider
+        if custom_command is not None:
+            agent_config.command = custom_command
+
+        result = launcher_bundle.launcher.launch_issue_session(
+            sample_issue,
+            active_sessions=[],
+        )
+
+        assert result.success is True
+        launch = launcher_bundle.create_session_calls[0]["launch"]
+        assert launch.interaction_intent is expected_intent
+        assert TerminalInteractionIntent.classify(launch.shell_command) is (
+            TerminalInteractionIntent.NONE
+        )
 
     def test_internal_review_instructions_reach_initial_coder_command(
         self,
@@ -1525,6 +1616,7 @@ class TestLaunchIssueSession:
             dependency_evaluator=_Evaluator(),
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
         )
 
         result = launcher.launch_issue_session(sample_issue, active_sessions=[])
@@ -1972,7 +2064,10 @@ class TestLaunchValidationRetrySession:
         assert result.session.original_prompt == "Work on issue #123: Fix checkout"
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__coding-2")
-        assert mock_worktree_manager.create_calls[0]["branch_name"] == "123-fix-checkout"
+        assert result.session.agent_config.timeout_minutes == 92
+        assert (
+            mock_worktree_manager.create_calls[0]["branch_name"] == "123-fix-checkout"
+        )
         command = launcher_bundle.create_session_calls[0]["cmd"]
         assert "Validation Retry" in command
         assert "dirty worktree" in command
@@ -2088,6 +2183,7 @@ class TestLaunchReviewSession:
         assert result.session.key.task == TaskKind.REVIEW
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__review-1")
+        assert result.session.agent_config.timeout_minutes == 62
 
     def test_internal_coder_instructions_do_not_change_reviewer_command(
         self,
@@ -2124,7 +2220,7 @@ class TestLaunchReviewSession:
 
         assert result.success is True
         command = launcher_bundle.create_session_calls[0]["cmd"]
-        assert "--verbose" in shlex.split(command)
+        assert "--verbose" in shlex.split(scheduled_agent_shell_command(command))
 
     def test_fails_when_no_review_agent_configured(self, session_launcher):
         """Verify fails when no code review agent configured (line 418)."""
@@ -2337,6 +2433,7 @@ class TestLaunchRetrospectiveReviewSession:
         assert "RETROSPECTIVE REVIEW MODE" in result.session.original_prompt
         assert "issue #365" in result.session.original_prompt
         assert "Prior orchestrator PR: #512" in result.session.original_prompt
+        assert result.session.agent_config.timeout_minutes == 62
 
         create_call = mock_worktree_manager.create_calls[0]
         assert create_call["issue_number"] == 365
@@ -2371,7 +2468,7 @@ class TestLaunchRetrospectiveReviewSession:
 
         assert result.success is True
         command = launcher_bundle.create_session_calls[0]["cmd"]
-        assert "--verbose" in shlex.split(command)
+        assert "--verbose" in shlex.split(scheduled_agent_shell_command(command))
 
     def test_unset_prior_pr_is_resolved_lazily_at_launch(
         self,
@@ -2573,6 +2670,7 @@ class TestLaunchReworkSession:
         assert result.session.key.task == TaskKind.REWORK
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__coding-2")
+        assert result.session.agent_config.timeout_minutes == 92
         started = next(e for e in mock_events.events if str(e.name) == "rework.started")
         assert started.data["agent"] == "agent:web"
         assert started.data["task"] == "rework"
@@ -7331,7 +7429,9 @@ class TestValidationOutputDir:
         launcher_bundle.launcher.launch_issue_session(sample_issue, active_sessions=[])
 
         assert len(launcher_bundle.create_session_calls) == 1
-        command = launcher_bundle.create_session_calls[0]["cmd"]
+        command = scheduled_agent_shell_command(
+            launcher_bundle.create_session_calls[0]["cmd"]
+        )
         assert "ISSUE_ORCHESTRATOR_CONFIG_NAME='main.yaml'" in command
 
 
@@ -7342,13 +7442,13 @@ class TestExtraProviderArgsFromLabels:
         result = SessionLauncher._extra_provider_args_from_labels(["verbose", "priority:high"])  # noqa: SLF001 - unit test targets internal label parser
         assert result == {"verbose": "true"}
 
-    def test_no_verbose_label_returns_none(self):
+    def test_no_verbose_label_returns_empty_arguments(self):
         result = SessionLauncher._extra_provider_args_from_labels(["priority:high", "agent:web"])  # noqa: SLF001 - unit test targets internal label parser
-        assert result is None
+        assert result == {}
 
-    def test_empty_labels_returns_none(self):
+    def test_empty_labels_returns_empty_arguments(self):
         result = SessionLauncher._extra_provider_args_from_labels([])  # noqa: SLF001 - unit test targets internal label parser
-        assert result is None
+        assert result == {}
 
 
 class TestStackRelaunchGate:
@@ -7437,6 +7537,7 @@ class TestStackRelaunchGate:
             dependency_evaluator=self._CannedWorkEvaluator(report_fn),
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
+            agent_phase_command_scheduler=host_agent_phase_command_scheduler(),
         )
 
     @pytest.fixture

@@ -41,6 +41,10 @@ class RunManifestContract(BaseModel):
     run_id: str
     run_dir: str
     artifacts: dict[str, RunManifestArtifact] = Field(default_factory=dict)
+    scheduled_outer_watchdog_timeout_minutes: int | None = Field(
+        default=None,
+        gt=0,
+    )
 
     @model_validator(mode="after")
     def _validate_required_artifacts(self, info: ValidationInfo) -> "RunManifestContract":
