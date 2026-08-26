@@ -79,9 +79,14 @@ def test_main_config_uses_raw_validate_pr_as_publish_gate() -> None:
 
     config = Config.load(config_path)
 
-    assert config.validation.quick.cmd == "make validate-quick"
+    # This repo opts its lanes into the condor backend; the publish gate
+    # must still target the RAW suite so pre-push validation cannot
+    # re-enter the cache-aware verify-pr wrapper.
+    assert config.validation.quick.cmd == "LANE_EXECUTOR=condor make validate-quick"
     assert config.validation.quick.timeout_seconds == 600
-    assert config.validation.publish.cmd == "make validate-pr-raw"
+    assert (
+        config.validation.publish.cmd == "LANE_EXECUTOR=condor make validate-pr-raw"
+    )
     assert config.validation.publish.timeout_seconds == 1800
 
 

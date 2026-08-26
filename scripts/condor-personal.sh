@@ -38,9 +38,15 @@ CONCURRENCY_LIMIT_DEFAULT = 1
 EOF
 }
 
+# Per-job scratch directories become the job's TMPDIR. They must live
+# OUTSIDE $HOME: the repo's home-isolation guardrails wall agent work
+# off from real home configs, and a scratch dir under $HOME would put
+# every lane's tmp files inside the walled-off area.
+EXECUTE_DIR="/private/tmp/issue-orchestrator-condor-execute-$(id -u)"
+
 darwin_install() {
   mkdir -p "$POOL_HOME"
-  if [ ! -x "$POOL_HOME/$TARBALL_DIR_NAME/bin/condor_master" ]; then
+  if [ ! -x "$POOL_HOME/$TARBALL_DIR_NAME/sbin/condor_master" ]; then
     echo "condor-personal: downloading HTCondor ${CONDOR_VERSION} (x86_64, runs under Rosetta 2)"
     arch -x86_64 /usr/bin/true 2>/dev/null || {
       echo "condor-personal: Rosetta 2 is required: softwareupdate --install-rosetta" >&2
@@ -52,6 +58,9 @@ darwin_install() {
     (cd "$POOL_HOME/$TARBALL_DIR_NAME" && ./bin/make-personal-from-tarball)
   fi
   write_lane_config "$POOL_HOME/$TARBALL_DIR_NAME/local/config.d"
+  mkdir -p "$EXECUTE_DIR"
+  printf 'EXECUTE = %s\n' "$EXECUTE_DIR" \
+    >> "$POOL_HOME/$TARBALL_DIR_NAME/local/config.d/90-issue-orchestrator-lanes.conf"
   export CONDOR_CONFIG="$POOL_HOME/$TARBALL_DIR_NAME/etc/condor_config"
   export PATH="$POOL_HOME/$TARBALL_DIR_NAME/bin:$POOL_HOME/$TARBALL_DIR_NAME/sbin:$PATH"
 }
@@ -108,7 +117,9 @@ case "${1:-}" in
       linux_configure
     fi
     if condor_status -total >/dev/null 2>&1; then
-      echo "condor-personal: pool already running"
+      echo "condor-personal: pool already running; applying configuration"
+      condor_reconfig >/dev/null 2>&1 || true
+      condor_restart -startd >/dev/null 2>&1 || true
     else
       if ! pgrep -x condor_master >/dev/null 2>&1; then
         condor_master

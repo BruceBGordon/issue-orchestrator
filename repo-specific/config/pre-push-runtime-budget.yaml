@@ -9,7 +9,8 @@
 # records; running the raw target directly bypasses the cache-aware wrapper.
 pre_push_runtime:
   enabled: true
-  command: "make validate-pr-raw"
+  # Matches validation.publish.cmd in the io config (condor lane opt-in).
+  command: "LANE_EXECUTOR=condor make validate-pr-raw"
   metric: "validation_elapsed_seconds"
   baseline_seconds: 540
   # Raised 240 -> 330 (cap 780 -> 870s, still < the 900s hard max_seconds):

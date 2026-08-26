@@ -69,6 +69,14 @@ Use `validation.quick` for fast coding/review feedback and
 `validation.publish` for the authoritative pre-push/pre-publish gate. The
 publish dirty-tree policy lives at `validation.publish.dirty_check`.
 
+Validation lanes can optionally run through a personal HTCondor pool for
+admission control, per-lane deadlines, and machine-wide exclusivity:
+prefix the command with `LANE_EXECUTOR=condor` (as this repository's own
+config does) after starting the pool once with
+`scripts/condor-personal.sh up`. The default is direct execution with no
+scheduler; a condor opt-in without a reachable pool fails loudly rather
+than falling back. See [condor_lanes.md](condor_lanes.md).
+
 ### Control Center Repository Setup
 
 For a discovered repository that needs configuration, select **Setup** in the

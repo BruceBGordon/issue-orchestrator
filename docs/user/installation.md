@@ -58,6 +58,20 @@ and alternative auth methods. If your repo enforces required PR approvals and
 you need to approve agent-created PRs yourself, read the GitHub App section
 before relying on a personal token.
 
+## Optional: HTCondor for validation lanes
+
+Validation lanes run as direct subprocesses by default — nothing extra
+to install. Optionally, they can run through a personal
+[HTCondor](https://htcondor.org) pool for admission control, per-lane
+deadlines, and machine-wide exclusivity:
+
+```bash
+scripts/condor-personal.sh up   # one-time install + start (macOS or Linux)
+```
+
+then opt in per invocation (`LANE_EXECUTOR=condor make validate-pr`) or
+in your validation config. See [HTCondor Validation Lanes](condor_lanes.md).
+
 ## Next steps
 
 Change to the repository you want to automate, run `issue-orchestrator setup`, then follow the [Quickstart Guide](quickstart.md).

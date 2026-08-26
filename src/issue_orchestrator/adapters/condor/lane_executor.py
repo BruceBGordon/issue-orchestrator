@@ -43,13 +43,33 @@ _POLL_INTERVAL_SECONDS = 0.1
 _SCHEDULER_SLACK_SECONDS = 120.0
 
 
+# Where scripts/condor-personal.sh installs the personal pool. Resolving
+# it here means a config-file opt-in works from any process — the
+# orchestrator's validation runner, a bare shell, a hook — without every
+# caller having to source the pool's environment first.
+PERSONAL_POOL_HOME_ENVIRONMENT_VARIABLE = "ISSUE_ORCHESTRATOR_CONDOR_HOME"
+_DEFAULT_PERSONAL_POOL_HOME = Path.home() / ".local/share/issue-orchestrator/condor"
+_TOOL_EXECUTABLES = (
+    ("submit", "condor_submit"),
+    ("remove", "condor_rm"),
+    ("query", "condor_q"),
+)
+
+
 @dataclass(frozen=True, slots=True)
 class CondorTools:
-    """Absolute paths to the scheduler's command-line tools."""
+    """Absolute paths to the scheduler's command-line tools.
+
+    ``pool_config`` is the configuration file the tools must use; it is
+    ``None`` for a system installation whose ambient configuration is
+    already correct, and set when the tools come from the personal-pool
+    install, whose configuration lives beside its binaries.
+    """
 
     submit: Path
     remove: Path
     query: Path
+    pool_config: Path | None = None
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -59,25 +79,65 @@ class CondorTools:
         ):
             if not isinstance(cast(object, value), Path) or not value.is_absolute():
                 raise ValueError(f"CondorTools.{field_name} must be an absolute Path")
+        if self.pool_config is not None and (
+            not isinstance(cast(object, self.pool_config), Path)
+            or not self.pool_config.is_absolute()
+        ):
+            raise ValueError("CondorTools.pool_config must be an absolute Path")
 
     @classmethod
     def resolve(cls) -> CondorTools:
-        """Resolve the tools from PATH, failing loudly when absent."""
+        """Resolve from PATH first, then the personal-pool install.
+
+        Fails loudly when neither exists: the backend is opt-in and a
+        configured-but-missing pool must never degrade silently.
+        """
+        from_path = cls._resolve_from_path()
+        if from_path is not None:
+            return from_path
+        from_personal = cls._resolve_from_personal_install()
+        if from_personal is not None:
+            return from_personal
+        raise LaneExecutorUnavailableError(
+            "no scheduler tools on PATH and no personal pool under "
+            f"{cls._personal_pool_home()}: the condor lane backend is opt-in "
+            "and requires a running HTCondor pool "
+            "(run scripts/condor-personal.sh up, see docs/user/condor_lanes.md)"
+        )
+
+    @classmethod
+    def _resolve_from_path(cls) -> CondorTools | None:
         located: dict[str, Path] = {}
-        for field_name, executable in (
-            ("submit", "condor_submit"),
-            ("remove", "condor_rm"),
-            ("query", "condor_q"),
-        ):
+        for field_name, executable in _TOOL_EXECUTABLES:
             found = shutil.which(executable)
             if found is None:
-                raise LaneExecutorUnavailableError(
-                    f"{executable} is not on PATH: the condor lane backend is "
-                    "opt-in and requires a running HTCondor pool "
-                    "(see scripts/condor-personal.sh)"
-                )
+                return None
             located[field_name] = Path(found).resolve()
         return cls(**located)
+
+    @classmethod
+    def _resolve_from_personal_install(cls) -> CondorTools | None:
+        home = cls._personal_pool_home()
+        for install in sorted(home.glob("condor-*"), reverse=True):
+            binaries = install / "bin"
+            pool_config = install / "etc" / "condor_config"
+            located: dict[str, Path] = {}
+            for field_name, executable in _TOOL_EXECUTABLES:
+                candidate = binaries / executable
+                if not candidate.is_file() or not os.access(candidate, os.X_OK):
+                    located.clear()
+                    break
+                located[field_name] = candidate.resolve()
+            if located and pool_config.is_file():
+                return cls(pool_config=pool_config.resolve(), **located)
+        return None
+
+    @staticmethod
+    def _personal_pool_home() -> Path:
+        override = os.environ.get(PERSONAL_POOL_HOME_ENVIRONMENT_VARIABLE)
+        if override:
+            return Path(override)
+        return _DEFAULT_PERSONAL_POOL_HOME
 
 
 class CondorLaneExecutor:
@@ -189,8 +249,12 @@ class CondorLaneExecutor:
                 f"{completed.stderr.strip() or completed.stdout.strip()}"
             )
 
-    @staticmethod
-    def _run_tool(arguments: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+    def _run_tool(
+        self, arguments: tuple[str, ...]
+    ) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        if self._tools.pool_config is not None:
+            environment["CONDOR_CONFIG"] = str(self._tools.pool_config)
         try:
             return subprocess.run(
                 arguments,
@@ -198,7 +262,7 @@ class CondorLaneExecutor:
                 text=True,
                 check=False,
                 timeout=_TOOL_TIMEOUT_SECONDS,
-                env=os.environ,
+                env=environment,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise LaneExecutorError(
