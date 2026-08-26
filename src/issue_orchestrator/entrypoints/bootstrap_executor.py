@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import time
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from ..control.executor_admission import (
@@ -41,10 +42,8 @@ from ..ports.terminal_session_terminator import TerminalSessionTerminator
 from ..ports.terminal_session_owner import TerminalSessionOwner
 from ..ports.terminal_session_registry import TerminalSessionRegistry
 from ..ports.validation_command_runner import ValidationCommandRunner
-from ..execution.terminal_session_lifecycle import (
-    TerminalSessionWatcherFactory,
-    ThreadTerminalSessionWatcherFactory,
-)
+if TYPE_CHECKING:
+    from ..execution.terminal_session_lifecycle import TerminalSessionWatcherFactory
 
 
 _PROCESS_TERMINATION = ExecutorProcessTerminationPolicy(
@@ -204,6 +203,10 @@ def terminal_session_watcher_policy() -> TerminalSessionWatcherPolicy:
 
 def build_terminal_session_watcher_factory() -> TerminalSessionWatcherFactory:
     """Compose the thread-backed PTY completion-owner factory."""
+    from ..execution.terminal_session_lifecycle import (
+        ThreadTerminalSessionWatcherFactory,
+    )
+
     return ThreadTerminalSessionWatcherFactory(build_retained_thread_factory())
 
 

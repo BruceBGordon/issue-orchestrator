@@ -22,6 +22,7 @@ from issue_orchestrator.control.executor_admission import (
 from issue_orchestrator.domain.executor import (
     ExecutorAggressiveness,
     ExecutorCommand,
+    ExecutorCommandFinalizationError,
     ExecutorCommandLifecycle,
     ExecutorConcurrencyRange,
     ExecutorFairnessGroup,
@@ -36,6 +37,8 @@ from issue_orchestrator.domain.executor import (
 from issue_orchestrator.domain.executor_host import ExecutorHostCpuUtilization
 from issue_orchestrator.domain.executor_monitoring import (
     ExecutorAllRepositories,
+    ExecutorCommandFinalizationFailed,
+    ExecutorRecentEventsQuery,
     ExecutorStatusQuery,
 )
 from issue_orchestrator.execution.host_executor import (
@@ -143,6 +146,31 @@ class _FailingAtomicPathReplacement:
         raise OSError("simulated atomic replacement failure")
 
 
+class _FailingHistoryAtomicPathReplacement:
+    """Port fake rejecting only post-command learning persistence."""
+
+    def __init__(self) -> None:
+        self._delegate = OsAtomicPathReplacement()
+        self.rejected_destinations: list[Path] = []
+
+    def replace(self, source: Path, destination: Path) -> None:
+        if destination.parent.name == "work-history" and destination.suffix == ".json":
+            self.rejected_destinations.append(destination)
+            raise OSError("simulated post-command history failure")
+        self._delegate.replace(source, destination)
+
+
+class _FailingExecutorReporter:
+    """Text port that rejects the first human admission report."""
+
+    def write(self, text: str) -> int:
+        del text
+        raise OSError("simulated executor admission report failure")
+
+    def flush(self) -> None:
+        return None
+
+
 def test_atomic_replace_failure_removes_its_temporary_record(tmp_path: Path) -> None:
     pool_dir = tmp_path / "pool"
     replacement = _FailingAtomicPathReplacement()
@@ -162,6 +190,116 @@ def test_atomic_replace_failure_removes_its_temporary_record(tmp_path: Path) -> 
     [attempt] = replacement.attempts
     assert attempt[1] == pool_dir / "policy.json"
     assert attempt[0].exists() is False
+
+
+def test_post_command_evidence_failure_releases_lease_and_records_terminal_fact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    pool_dir = tmp_path / "pool"
+    marker = tmp_path / "command-completed"
+    replacement = _FailingHistoryAtomicPathReplacement()
+    executor = _executor(
+        pool_dir,
+        ExecutorHistoryRetentionPolicy(3, 2),
+        PosixExecutorHistoryRetentionLock(
+            (pool_dir / "work-history" / "retention.lock").resolve()
+        ),
+        request_nonce="9" * 32,
+        atomic_path_replacement=replacement,
+    )
+    monkeypatch.chdir(REPO_ROOT)
+
+    with pytest.raises(ExecutorCommandFinalizationError) as raised:
+        executor.run(
+            ExecutorRunSpecification(
+                work_key=ExecutorWorkKey("history:post-command-failure"),
+                fairness_group=ExecutorFairnessGroup(
+                    "history:post-command-failure"
+                ),
+                concurrency_range=ExecutorConcurrencyRange(1, 1),
+                exclusive_resources=(),
+            ),
+            ExecutorCommand(
+                (
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                ),
+                ExecutorUnboundedDeadline(),
+                ExecutorCommandLifecycle.DETACHED,
+                ExecutorNoCommandCancellation(),
+            ),
+        )
+
+    assert marker.exists()
+    assert raised.value.command_result.exit_code == 0
+    assert raised.value.command_result.grant.concurrency == 1
+    assert tuple(
+        failure.attempt_name for failure in raised.value.failures
+    ) == ("record successful command history",)
+    assert len(replacement.rejected_destinations) == 1
+    assert tuple((pool_dir / "leases").glob("*.json")) == ()
+    timeline = HostExecutorMonitor(
+        pool_dir,
+        2,
+        _demand_estimator(),
+        ExecutorHistoryRetentionPolicy(3, 2),
+        PosixExecutorHistoryRetentionLock(
+            (pool_dir / "work-history" / "retention.lock").resolve()
+        ),
+        OsAtomicPathReplacement(),
+    ).recent_events(ExecutorRecentEventsQuery(20))
+    [failure] = [
+        event
+        for event in timeline.events
+        if type(event) is ExecutorCommandFinalizationFailed
+    ]
+    assert failure.exit_code == 0
+    assert failure.concurrency == 1
+    assert failure.resources.wall_seconds > 0
+    assert tuple(detail.attempt_name for detail in failure.failures) == (
+        "record successful command history",
+    )
+    standard_error = capsys.readouterr().err
+    assert "[executor] completed work=history:post-command-failure" in standard_error
+    assert "[executor] finalization-failed" in standard_error
+
+
+def test_admission_report_failure_rolls_back_lease_for_same_process_contender(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool_dir = tmp_path / "pool"
+    retention = ExecutorHistoryRetentionPolicy(3, 2)
+    lock_path = (pool_dir / "work-history" / "retention.lock").resolve()
+    executor = _executor(
+        pool_dir,
+        retention,
+        PosixExecutorHistoryRetentionLock(lock_path),
+        request_nonce="7" * 32,
+        atomic_path_replacement=OsAtomicPathReplacement(),
+    )
+    monkeypatch.chdir(REPO_ROOT)
+
+    with monkeypatch.context() as report_fault:
+        report_fault.setattr(sys, "stderr", _FailingExecutorReporter())
+        with pytest.raises(
+            OSError,
+            match="simulated executor admission report failure",
+        ):
+            _run_work(executor, "admission:report-failure")
+
+    assert tuple((pool_dir / "leases").glob("*.json")) == ()
+    recovered = _executor(
+        pool_dir,
+        retention,
+        PosixExecutorHistoryRetentionLock(lock_path),
+        request_nonce="8" * 32,
+        atomic_path_replacement=OsAtomicPathReplacement(),
+    )
+    assert _run_work(recovered, "admission:recovered").exit_code == 0
 
 
 def test_executor_prunes_only_recognizable_atomic_crash_remnants(
@@ -254,9 +392,13 @@ def test_retention_delete_sync_failure_surfaces_and_stops_later_pruning(
 
     monkeypatch.setattr(os, "fsync", fail_second_history_directory_sync)
 
-    with pytest.raises(OSError, match="simulated retention directory sync failure"):
+    with pytest.raises(ExecutorCommandFinalizationError) as raised:
         _run_work(pruning_executor, "retention:new")
 
+    [failure] = raised.value.failures
+    assert failure.attempt_name == "record successful command history"
+    assert type(failure.error) is OSError
+    assert "simulated retention directory sync failure" in str(failure.error)
     assert history_directory_syncs == 2
     assert oldest_first[0].exists() is False
     assert oldest_first[1].exists() is True

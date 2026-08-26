@@ -40,6 +40,7 @@ from issue_orchestrator.domain.executor import (
 from issue_orchestrator.domain.executor_monitoring import (
     ExecutorAllRepositories,
     ExecutorAdmissionDeadlineExceeded,
+    ExecutorCommandFinalizationFailed,
     ExecutorCommandDeadlineExceeded,
     ExecutorCommandLifecycleFailed,
     ExecutorEvent,
@@ -167,6 +168,7 @@ class ProfileExecutorEventType(StrEnum):
     WAITING = "waiting"
     ADMITTED = "admitted"
     COMMAND_LIFECYCLE_FAILED = "command-lifecycle-failed"
+    COMMAND_FINALIZATION_FAILED = "command-finalization-failed"
     ADMISSION_DEADLINE_EXCEEDED = "admission-deadline-exceeded"
     COMMAND_DEADLINE_EXCEEDED = "command-deadline-exceeded"
     COMPLETED = "completed"
@@ -1927,6 +1929,10 @@ def profile_event_type(event: ExecutorEvent) -> ProfileExecutorEventType:
         (
             ExecutorCommandLifecycleFailed,
             ProfileExecutorEventType.COMMAND_LIFECYCLE_FAILED,
+        ),
+        (
+            ExecutorCommandFinalizationFailed,
+            ProfileExecutorEventType.COMMAND_FINALIZATION_FAILED,
         ),
         (
             ExecutorAdmissionDeadlineExceeded,

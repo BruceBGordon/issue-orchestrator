@@ -17,12 +17,21 @@ class ValidationResourceSamplerStartRejected:
 
     error: BaseException
 
+    def __post_init__(self) -> None:
+        _require_error(self.error, "ValidationResourceSamplerStartRejected.error")
+
 
 @dataclass(frozen=True, slots=True)
 class ValidationResourceSamplerStartIndeterminate:
     """A retained sampler target may still acknowledge activation."""
 
     error: BaseException
+
+    def __post_init__(self) -> None:
+        _require_error(
+            self.error,
+            "ValidationResourceSamplerStartIndeterminate.error",
+        )
 
 
 ValidationResourceSamplerStart = (
@@ -69,12 +78,18 @@ class ValidationResourceSamplerShutdownFailed:
 
     error: BaseException
 
+    def __post_init__(self) -> None:
+        _require_error(self.error, "ValidationResourceSamplerShutdownFailed.error")
+
 
 @dataclass(frozen=True, slots=True)
 class ValidationResourceSamplerFailed:
     """Resource collection or synchronous evidence publication failed."""
 
     error: BaseException
+
+    def __post_init__(self) -> None:
+        _require_error(self.error, "ValidationResourceSamplerFailed.error")
 
 
 ValidationResourceSamplerShutdown = (
@@ -95,3 +110,8 @@ def validation_resource_sampler_shutdown_failure(
     if type(shutdown) is ValidationResourceSamplerStopped:
         return None
     raise AssertionError("validation resource sampler shutdown is a closed union")
+
+
+def _require_error(value: object, field_name: str) -> None:
+    if not isinstance(value, BaseException):
+        raise ValueError(f"{field_name} must be a BaseException")

@@ -534,3 +534,56 @@ class ExecutorRunResult:
             raise ValueError(
                 "ExecutorRunResult.grant must be an ExecutorConcurrencyGrant"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorCommandFinalizationFailure:
+    """One named post-containment operation that failed."""
+
+    attempt_name: str
+    error: BaseException
+
+    def __post_init__(self) -> None:
+        if type(self.attempt_name) is not str or not self.attempt_name:
+            raise ValueError(
+                "ExecutorCommandFinalizationFailure.attempt_name must not be empty"
+            )
+        _require_base_exception(
+            self.error,
+            "ExecutorCommandFinalizationFailure.error",
+        )
+
+
+class ExecutorCommandFinalizationError(RuntimeError):
+    """The command terminated, but its required finalization did not."""
+
+    def __init__(
+        self,
+        command_result: ExecutorRunResult,
+        failures: tuple[ExecutorCommandFinalizationFailure, ...],
+    ) -> None:
+        if type(command_result) is not ExecutorRunResult:
+            raise ValueError(
+                "ExecutorCommandFinalizationError.command_result must be an "
+                "ExecutorRunResult"
+            )
+        if not failures or any(
+            type(failure) is not ExecutorCommandFinalizationFailure
+            for failure in failures
+        ):
+            raise ValueError(
+                "ExecutorCommandFinalizationError.failures must contain "
+                "ExecutorCommandFinalizationFailure values"
+            )
+        self.command_result = command_result
+        self.failures = failures
+        attempts = ", ".join(failure.attempt_name for failure in failures)
+        super().__init__(
+            "executor command terminated but finalization failed: "
+            f"exit={command_result.exit_code} attempts={attempts}"
+        )
+
+
+def _require_base_exception(value: object, field_name: str) -> None:
+    if not isinstance(value, BaseException):
+        raise ValueError(f"{field_name} must be a BaseException")

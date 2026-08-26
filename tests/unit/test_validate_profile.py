@@ -20,12 +20,19 @@ from issue_orchestrator.domain.executor import (
     ExecutorAggressiveness,
     ExecutorFairnessGroup,
     ExecutorPolicySource,
+    ExecutorWorkKey,
 )
 from issue_orchestrator.domain.executor_monitoring import (
+    ExecutorCommandFinalizationFailed,
     ExecutorEventPage,
     ExecutorEventMetadata,
     ExecutorFairnessGroupEventsQuery,
+    ExecutorFinalizationFailureDetail,
+    ExecutorMonitoredWork,
     ExecutorPolicyChanged,
+    ExecutorRepositoryReference,
+    ExecutorRequestId,
+    ExecutorResourceUsage,
     ExecutorStatus,
     ExecutorStatusQuery,
 )
@@ -1146,3 +1153,46 @@ def test_aggregate_event_capture_uses_exact_group_and_survives_clock_rollback(
     serialized = json.dumps(asdict(capture))
     assert '"event_type": "policy-changed"' in serialized
     assert '"effective_source": "environment"' in serialized
+
+
+def test_profile_serializes_command_finalization_failure_without_losing_result(
+) -> None:
+    profile = _load_profile_module()
+    event = ExecutorCommandFinalizationFailed(
+        metadata=ExecutorEventMetadata(1_800_000_000.0, 4321),
+        work=ExecutorMonitoredWork(
+            ExecutorRequestId("profile-finalization-failure"),
+            ExecutorRepositoryReference("/repo/.git", "io"),
+            ExecutorWorkKey("io:unit"),
+            ExecutorFairnessGroup("profile:aggregate"),
+        ),
+        concurrency=8,
+        charged_cpu_slots=4,
+        exit_code=0,
+        resources=ExecutorResourceUsage(
+            wall_seconds=85.0,
+            cpu_seconds=240.0,
+            executor_process_lifetime_children_max_rss_bytes=4_000_000_000,
+            input_blocks=12,
+            output_blocks=34,
+        ),
+        failures=(
+            ExecutorFinalizationFailureDetail(
+                "record successful command history",
+                "OSError",
+                "disk unavailable",
+            ),
+        ),
+    )
+
+    record = profile.ProfileExecutorEventRecord(event)
+    serialized = json.dumps(asdict(record), sort_keys=True)
+
+    assert (
+        record.event_type
+        is profile.ProfileExecutorEventType.COMMAND_FINALIZATION_FAILED
+    )
+    assert '"event_type": "command-finalization-failed"' in serialized
+    assert '"exit_code": 0' in serialized
+    assert '"wall_seconds": 85.0' in serialized
+    assert '"attempt_name": "record successful command history"' in serialized

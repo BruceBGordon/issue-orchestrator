@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import signal
 import time
 from dataclasses import dataclass, field
@@ -107,6 +108,27 @@ class _GuardianCommandTerminal:
             ExecutorGuardianInternalFailed,
         ):
             raise ValueError("_GuardianCommandTerminal requires a terminal fact")
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedCommandArguments:
+    arguments: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _RejectedCommandResolution:
+    guardian_exit_code: int
+
+
+_CommandResolution = _ResolvedCommandArguments | _RejectedCommandResolution
+
+
+@dataclass(frozen=True, slots=True)
+class _StartedCommandProcess:
+    process: PosixProcessHandle
+
+
+_CommandActivation = _StartedCommandProcess | _RejectedCommandResolution
 
 
 @dataclass(slots=True)
@@ -301,8 +323,47 @@ class PosixExecutorGuardianChild:
         result_writer: _GuardianResultWriter,
         group_owner: _GuardianGroupOwner,
     ) -> int:
-        arguments = invocation.arguments
-        self._require_arguments(arguments)
+        resolution = self._resolve_command(
+            invocation.arguments,
+            result_writer,
+            group_owner,
+        )
+        if type(resolution) is _RejectedCommandResolution:
+            return resolution.guardian_exit_code
+        if type(resolution) is not _ResolvedCommandArguments:
+            raise AssertionError("command resolution is a closed union")
+        arguments = resolution.arguments
+        activation = self._activate_resolved_command(
+            arguments,
+            result_writer,
+            group_owner,
+        )
+        if type(activation) is _RejectedCommandResolution:
+            return activation.guardian_exit_code
+        if type(activation) is not _StartedCommandProcess:
+            raise AssertionError("command activation is a closed union")
+        process = activation.process
+
+        outcome = self._wait_for_outcome(
+            process,
+            invocation.domain_budget(),
+            group_owner,
+        )
+        try:
+            result_writer.write(outcome.terminal)
+        finally:
+            group_owner.contain(
+                outcome.terminal,
+                self._termination_policy,
+            )
+        raise AssertionError("group containment unexpectedly returned to guardian")
+
+    def _activate_resolved_command(
+        self,
+        arguments: tuple[str, ...],
+        result_writer: _GuardianResultWriter,
+        group_owner: _GuardianGroupOwner,
+    ) -> _CommandActivation:
         try:
             launch = self._process_launcher.launch(
                 PosixProcessLaunchSpec(
@@ -331,7 +392,9 @@ class PosixExecutorGuardianChild:
                 result_writer.write(terminal)
             finally:
                 group_owner.retire_before_opaque_work()
-            return 0 if type(terminal) is ExecutorGuardianCommandStartFailed else 1
+            return _RejectedCommandResolution(
+                0 if type(terminal) is ExecutorGuardianCommandStartFailed else 1
+            )
         if type(launch) is PosixProcessExecRejected:
             terminal = ExecutorGuardianCommandStartFailed(
                 launch.error_type,
@@ -341,7 +404,7 @@ class PosixExecutorGuardianChild:
                 result_writer.write(terminal)
             finally:
                 group_owner.retire_before_opaque_work()
-            return 0
+            return _RejectedCommandResolution(0)
         if type(launch) is PosixProcessLaunchRecovered:
             terminal = ExecutorGuardianInternalFailed(
                 type(launch.activation_error).__name__,
@@ -351,7 +414,7 @@ class PosixExecutorGuardianChild:
                 result_writer.write(terminal)
             finally:
                 group_owner.retire_before_opaque_work()
-            return 1
+            return _RejectedCommandResolution(1)
         if type(launch) is PosixProcessLaunchRecoveryFailed:
             recovery = BaseExceptionGroup(
                 "opaque command activation and recovery failed",
@@ -368,21 +431,7 @@ class PosixExecutorGuardianChild:
             raise AssertionError("guardian containment unexpectedly returned")
         if type(launch) is not PosixProcessLaunchStarted:
             raise AssertionError("opaque command launch is a closed union")
-        process = launch.process
-
-        outcome = self._wait_for_outcome(
-            process,
-            invocation.domain_budget(),
-            group_owner,
-        )
-        try:
-            result_writer.write(outcome.terminal)
-        finally:
-            group_owner.contain(
-                outcome.terminal,
-                self._termination_policy,
-            )
-        raise AssertionError("group containment unexpectedly returned to guardian")
+        return _StartedCommandProcess(launch.process)
 
     @staticmethod
     def _rejected_launch_terminal(
@@ -402,6 +451,53 @@ class PosixExecutorGuardianChild:
             raise ValueError("executor guardian arguments must be a non-empty tuple")
         if any(type(argument) is not str for argument in arguments):
             raise ValueError("executor guardian arguments must contain strings")
+
+    @staticmethod
+    def _resolved_arguments(arguments: tuple[str, ...]) -> tuple[str, ...]:
+        """Resolve standard command names against the exact inherited PATH."""
+        executable = arguments[0]
+        executable_path = Path(executable)
+        if executable_path.is_absolute():
+            resolved_executable = executable_path
+        elif "/" in executable:
+            resolved_executable = (Path.cwd() / executable_path).resolve()
+        else:
+            search_path = os.environ.get("PATH")
+            if search_path is None:
+                raise FileNotFoundError(
+                    f"cannot resolve executor command without PATH: {executable!r}"
+                )
+            match = shutil.which(executable, path=search_path)
+            if match is None:
+                raise FileNotFoundError(
+                    f"executor command is not present on PATH: {executable!r}"
+                )
+            resolved_executable = Path(match).resolve()
+        return (str(resolved_executable), *arguments[1:])
+
+    def _resolve_command(
+        self,
+        requested_arguments: tuple[str, ...],
+        result_writer: _GuardianResultWriter,
+        group_owner: _GuardianGroupOwner,
+    ) -> _CommandResolution:
+        self._require_arguments(requested_arguments)
+        try:
+            return _ResolvedCommandArguments(
+                self._resolved_arguments(requested_arguments)
+            )
+        except OSError as error:
+            terminal = self._rejected_launch_terminal(
+                error,
+                requested_arguments[0],
+            )
+            try:
+                result_writer.write(terminal)
+            finally:
+                group_owner.retire_before_opaque_work()
+            return _RejectedCommandResolution(
+                0 if type(terminal) is ExecutorGuardianCommandStartFailed else 1
+            )
 
     @staticmethod
     def _await_start(start_file_descriptor: int) -> None:

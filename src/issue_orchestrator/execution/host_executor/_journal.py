@@ -30,6 +30,7 @@ from ...domain.executor import (
 from ...domain.executor_host import ExecutorHostCpuUtilization
 from ...domain.executor_monitoring import (
     ExecutorAdmissionDeadlineExceeded,
+    ExecutorCommandFinalizationFailed,
     ExecutorCommandDeadlineExceeded,
     ExecutorCommandLifecycleFailed,
     ExecutorCpuSlotState,
@@ -37,6 +38,7 @@ from ...domain.executor_monitoring import (
     ExecutorEventMetadata,
     ExecutorEventTimeline,
     ExecutorEventPage,
+    ExecutorFinalizationFailureDetail,
     ExecutorFairnessGroupEventsQuery,
     ExecutorHostLoad,
     ExecutorMonitoredWork,
@@ -53,13 +55,19 @@ from ...domain.executor_monitoring import (
 )
 from ._contracts import (
     AdmissionGrantRecord,
+    ExecutedCommandResourceRecord,
     ExecutorStrictRecord,
     HostCpuUtilizationRecord,
     HostLoadRecord,
     QueuedWorkRecord,
     ResourceObservationRecord,
 )
-from ._types import ExecutorWorkIdentity, RecordedExecutorObservation
+from ._types import (
+    ExecutedExecutorCommand,
+    ExecutorWorkIdentity,
+    RecordedExecutorObservation,
+)
+from ...domain.executor import ExecutorCommandFinalizationError
 from ._host_observation import ExecutorHostLoadObservation
 
 
@@ -131,6 +139,25 @@ class CommandLifecycleFailedEventRecord(_EventRecord):
     error_message: str = Field(min_length=1)
 
 
+class FinalizationFailureRecord(ExecutorStrictRecord):
+    attempt_name: str = Field(min_length=1)
+    error_type: str = Field(min_length=1)
+    error_message: str = Field(min_length=1)
+
+
+class CommandFinalizationFailedEventRecord(_EventRecord):
+    event: Literal["command-finalization-failed"] = "command-finalization-failed"
+    request_id: str = Field(min_length=1)
+    repository_key: str = Field(min_length=1)
+    repository_label: str = Field(min_length=1)
+    work_key: str = Field(min_length=1)
+    fairness_group: str = Field(min_length=1)
+    grant: AdmissionGrantRecord
+    exit_code: int
+    resources: ExecutedCommandResourceRecord
+    failures: tuple[FinalizationFailureRecord, ...] = Field(min_length=1)
+
+
 class AdmissionDeadlineExceededEventRecord(_EventRecord):
     event: Literal["admission-deadline-exceeded"] = "admission-deadline-exceeded"
     request_id: str = Field(min_length=1)
@@ -186,6 +213,7 @@ StoredExecutorEvent = (
     | WaitingEventRecord
     | AdmittedEventRecord
     | CommandLifecycleFailedEventRecord
+    | CommandFinalizationFailedEventRecord
     | AdmissionDeadlineExceededEventRecord
     | CommandDeadlineExceededEventRecord
     | CompletedEventRecord
@@ -332,6 +360,36 @@ class ExecutorEventStore:
                 grant=AdmissionGrantRecord.from_domain(grant),
                 error_type=type(error).__name__,
                 error_message=_exception_message(error),
+            )
+        )
+
+    def command_finalization_failed(
+        self,
+        identity: ExecutorWorkIdentity,
+        work: QueuedExecutorWork,
+        result: ExecutedExecutorCommand,
+        error: ExecutorCommandFinalizationError,
+    ) -> None:
+        self.append(
+            CommandFinalizationFailedEventRecord(
+                request_id=work.request_id.value,
+                repository_key=identity.repository.key,
+                repository_label=identity.repository.label,
+                work_key=identity.work_key.value,
+                fairness_group=work.fairness_group.value,
+                grant=AdmissionGrantRecord.from_domain(result.admission_grant),
+                exit_code=result.exit_code,
+                resources=ExecutedCommandResourceRecord.from_domain(
+                    result.resources
+                ),
+                failures=tuple(
+                    FinalizationFailureRecord(
+                        attempt_name=failure.attempt_name,
+                        error_type=type(failure.error).__name__,
+                        error_message=_exception_message(failure.error),
+                    )
+                    for failure in error.failures
+                ),
             )
         )
 
@@ -638,6 +696,37 @@ def _to_domain_event(record: StoredExecutorEvent) -> ExecutorEvent:
             concurrency=record.grant.concurrency,
             error_type=record.error_type,
             error_message=record.error_message,
+        )
+    if isinstance(record, CommandFinalizationFailedEventRecord):
+        return ExecutorCommandFinalizationFailed(
+            metadata=_event_metadata(record),
+            work=_monitored_work(
+                request_id=record.request_id,
+                repository_key=record.repository_key,
+                repository_label=record.repository_label,
+                work_key=record.work_key,
+                fairness_group=record.fairness_group,
+            ),
+            concurrency=record.grant.concurrency,
+            charged_cpu_slots=record.grant.capacity_units,
+            exit_code=record.exit_code,
+            resources=ExecutorResourceUsage(
+                wall_seconds=record.resources.wall_seconds,
+                cpu_seconds=record.resources.cpu_seconds,
+                executor_process_lifetime_children_max_rss_bytes=(
+                    record.resources.max_rss_bytes
+                ),
+                input_blocks=record.resources.input_blocks,
+                output_blocks=record.resources.output_blocks,
+            ),
+            failures=tuple(
+                ExecutorFinalizationFailureDetail(
+                    attempt_name=failure.attempt_name,
+                    error_type=failure.error_type,
+                    error_message=failure.error_message,
+                )
+                for failure in record.failures
+            ),
         )
     if isinstance(record, AdmissionDeadlineExceededEventRecord):
         return ExecutorAdmissionDeadlineExceeded(

@@ -21,6 +21,7 @@ from ..domain.executor import (
 from ..domain.executor_monitoring import (
     ExecutorAllRepositories,
     ExecutorAdmissionDeadlineExceeded,
+    ExecutorCommandFinalizationFailed,
     ExecutorCommandDeadlineExceeded,
     ExecutorCommandLifecycleFailed,
     ExecutorEvent,
@@ -260,6 +261,20 @@ def _format_executor_event(event: ExecutorEvent) -> str:
         return (
             f"{prefix} command-lifecycle-failed concurrency={event.concurrency} "
             f"error={event.error_type}: {event.error_message}"
+        )
+    if isinstance(event, ExecutorCommandFinalizationFailed):
+        failures = "; ".join(
+            f"{failure.attempt_name}={failure.error_type}: "
+            f"{failure.error_message}"
+            for failure in event.failures
+        )
+        return (
+            f"{prefix} command-finalization-failed exit={event.exit_code} "
+            f"concurrency={event.concurrency} "
+            f"charged_cpu_slots={event.charged_cpu_slots} "
+            f"wall={event.resources.wall_seconds:.3f}s "
+            f"child_cpu={event.resources.cpu_seconds:.3f}s "
+            f"failures={failures}"
         )
     if isinstance(event, ExecutorAdmissionDeadlineExceeded):
         return (

@@ -376,6 +376,64 @@ class ExecutorCommandLifecycleFailed:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutorFinalizationFailureDetail:
+    """Serializable identity of one failed finalization attempt."""
+
+    attempt_name: str
+    error_type: str
+    error_message: str
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("attempt_name", self.attempt_name),
+            ("error_type", self.error_type),
+            ("error_message", self.error_message),
+        ):
+            if type(value) is not str or not value:
+                raise ValueError(
+                    f"ExecutorFinalizationFailureDetail.{field_name} must not "
+                    "be empty"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorCommandFinalizationFailed:
+    """The command terminated exactly, but post-containment evidence failed."""
+
+    metadata: ExecutorEventMetadata
+    work: ExecutorMonitoredWork
+    concurrency: int
+    charged_cpu_slots: int
+    exit_code: int
+    resources: ExecutorResourceUsage
+    failures: tuple[ExecutorFinalizationFailureDetail, ...]
+
+    def __post_init__(self) -> None:
+        for field_name, value, expected_type in (
+            ("metadata", self.metadata, ExecutorEventMetadata),
+            ("work", self.work, ExecutorMonitoredWork),
+            ("resources", self.resources, ExecutorResourceUsage),
+        ):
+            _require_exact_type(type(self).__name__, field_name, value, expected_type)
+        _require_positive_integer(type(self).__name__, "concurrency", self.concurrency)
+        _require_positive_integer(
+            type(self).__name__, "charged_cpu_slots", self.charged_cpu_slots
+        )
+        if type(self.exit_code) is not int:
+            raise ValueError(
+                "ExecutorCommandFinalizationFailed.exit_code must be an integer"
+            )
+        if not self.failures or any(
+            type(failure) is not ExecutorFinalizationFailureDetail
+            for failure in self.failures
+        ):
+            raise ValueError(
+                "ExecutorCommandFinalizationFailed.failures must contain "
+                "ExecutorFinalizationFailureDetail values"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutorAdmissionDeadlineExceeded:
     """A queued request reached its absolute bound before admission."""
 
@@ -531,6 +589,7 @@ ExecutorEvent = (
     | ExecutorWorkWaiting
     | ExecutorWorkAdmitted
     | ExecutorCommandLifecycleFailed
+    | ExecutorCommandFinalizationFailed
     | ExecutorAdmissionDeadlineExceeded
     | ExecutorCommandDeadlineExceeded
     | ExecutorWorkCompleted
@@ -562,6 +621,7 @@ class ExecutorEventTimeline:
             ExecutorWorkWaiting,
             ExecutorWorkAdmitted,
             ExecutorCommandLifecycleFailed,
+            ExecutorCommandFinalizationFailed,
             ExecutorAdmissionDeadlineExceeded,
             ExecutorCommandDeadlineExceeded,
             ExecutorWorkCompleted,

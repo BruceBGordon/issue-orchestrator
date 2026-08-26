@@ -8,8 +8,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from issue_orchestrator.domain.validation_resource_sampling import (
     ValidationResourceSamplerFailed,
+    ValidationResourceSamplerStartIndeterminate,
+    ValidationResourceSamplerStartRejected,
     ValidationResourceSamplerShutdownFailed,
     ValidationResourceSamplerStopped,
     ValidationResourceSamplerStarted,
@@ -48,6 +52,27 @@ def _sample() -> ValidationResourceSample:
         swap=None,
         disk=None,
     )
+
+
+@pytest.mark.parametrize(
+    "fact_type",
+    (
+        ValidationResourceSamplerStartRejected,
+        ValidationResourceSamplerStartIndeterminate,
+        ValidationResourceSamplerShutdownFailed,
+        ValidationResourceSamplerFailed,
+    ),
+)
+def test_sampler_failure_facts_require_real_exceptions(
+    fact_type: type[
+        ValidationResourceSamplerStartRejected
+        | ValidationResourceSamplerStartIndeterminate
+        | ValidationResourceSamplerShutdownFailed
+        | ValidationResourceSamplerFailed
+    ],
+) -> None:
+    with pytest.raises(ValueError, match="error must be a BaseException"):
+        fact_type("not an exception")  # type: ignore[arg-type]
 
 
 @dataclass(slots=True)

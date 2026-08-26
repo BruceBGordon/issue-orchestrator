@@ -22,7 +22,6 @@ from ...domain.executor import (
     ExecutorBoundedDeadline,
     ExecutorCommand,
     ExecutorCommandBudget,
-    ExecutorConcurrencyGrant,
     ExecutorDeadlineExceededError,
     ExecutorDeadlinePhase,
     ExecutorDeadlineReason,
@@ -66,7 +65,10 @@ from ._state import (
 from ._types import (
     ExecutedExecutorCommand,
     ExecutorWorkIdentity,
-    RecordedExecutorObservation,
+)
+from ._completion import (
+    ExecutorCommandCompletion,
+    build_executor_command_finalizer,
 )
 from .host_policy import ExecutorPolicyStore
 from .request_identity import ExecutorRequestIdentityFactory
@@ -191,6 +193,12 @@ class HostExecutor(Executor):
         )
         self._policy_store = ExecutorPolicyStore(pool_dir, pool_records)
         self._events = ExecutorEventStore(pool_dir)
+        self._command_finalizer = build_executor_command_finalizer(
+            self._history,
+            self._events,
+            demand_estimator,
+            host_cpu_slots,
+        )
         self._repository_resolver = ExecutorRepositoryResolver()
 
     def policy(self) -> ExecutorPolicy:
@@ -296,30 +304,14 @@ class HostExecutor(Executor):
             command,
             submitted_at_monotonic,
         )
-        recorded = RecordedExecutorObservation(
-            resources=result.resources,
-            exit_code=result.exit_code,
-            recorded_at_unix=time.time(),
-        )
-        if recorded.exit_code == 0:
-            self._history.record_successful(identity, recorded)
-        updated_resources = self._history.successful_resources(identity)
-        updated_demand = self._demand_estimator.estimate(updated_resources)
-        self._events.completed(
-            identity=identity,
-            work=work,
-            grant=result.admission_grant,
-            aggressiveness_percent=effective_policy.aggressiveness.percent,
-            observation=recorded,
-            previous_cores_per_concurrency=(previous_demand.cores_per_concurrency),
-            updated_cores_per_concurrency=updated_demand.cores_per_concurrency,
-            successful_observation_count=len(updated_resources),
-            host_load=observe_host_load(),
-        )
-        self._report_completion(identity, result)
-        return ExecutorRunResult(
-            result.exit_code,
-            ExecutorConcurrencyGrant(result.admission_grant.concurrency),
+        return self._command_finalizer.finalize(
+            ExecutorCommandCompletion(
+                identity=identity,
+                work=work,
+                command=result,
+                previous_demand=previous_demand,
+                aggressiveness_percent=effective_policy.aggressiveness.percent,
+            )
         )
 
     def _acquire(
@@ -361,6 +353,12 @@ class HostExecutor(Executor):
                         host_load=host_load,
                         host_cpu_utilization=host_cpu_utilization,
                     )
+                    self._report_admission(
+                        "acquired",
+                        owned_request.work,
+                        outcome.lease,
+                        f" wait={waited:.3f}s",
+                    )
                 except BaseException as admission_publication_error:
                     raise_primary_with_cleanup(
                         "executor admission publication and lease cleanup failures",
@@ -374,12 +372,6 @@ class HostExecutor(Executor):
                             )
                         ).run(),
                     )
-                self._report_admission(
-                    "acquired",
-                    owned_request.work,
-                    outcome.lease,
-                    f" wait={waited:.3f}s",
-                )
                 return outcome.lease
             decision = outcome.decision
             if decision.reason != previous_wait_reason:
@@ -416,6 +408,40 @@ class HostExecutor(Executor):
         command: ExecutorCommand,
         submitted_at_monotonic: float,
     ) -> ExecutedExecutorCommand:
+        """Own the admitted lease across every command preparation outcome."""
+        try:
+            result = self._run_command_with_local_lease(
+                identity,
+                work,
+                lease,
+                command,
+                submitted_at_monotonic,
+            )
+        except BaseException as command_error:
+            raise_primary_with_cleanup(
+                "executor command and lease cleanup failures",
+                command_error,
+                IndependentCleanupPlan(
+                    (CleanupAction("release executor command lease", lease.release),)
+                ).run(),
+            )
+        raise_cleanup_failures(
+            "executor command lease cleanup failures",
+            IndependentCleanupPlan(
+                (CleanupAction("release executor command lease", lease.release),)
+            ).run(),
+        )
+        return result
+
+    def _run_command_with_local_lease(
+        self,
+        identity: ExecutorWorkIdentity,
+        work: QueuedExecutorWork,
+        lease: HostExecutorLease,
+        command: ExecutorCommand,
+        submitted_at_monotonic: float,
+    ) -> ExecutedExecutorCommand:
+        """Execute while the caller retains authoritative lease ownership."""
         child_env = os.environ.copy()
         granted_concurrency = str(lease.grant.concurrency)
         child_env[EXECUTOR_CONCURRENCY_ENV] = granted_concurrency
@@ -496,7 +522,6 @@ class HostExecutor(Executor):
                         "observe executor command completion resources",
                         observe_completion_resources,
                     ),
-                    CleanupAction("release executor command lease", lease.release),
                 )
             ).run()
             if primary_error is not None:
@@ -655,25 +680,6 @@ class HostExecutor(Executor):
             f"{self._host_cpu_slots} concurrency={lease.grant.concurrency} "
             f"work={work.work_key.value} group={work.fairness_group.value}"
             f"{exclusive}{suffix}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    def _report_completion(
-        self,
-        identity: ExecutorWorkIdentity,
-        result: ExecutedExecutorCommand,
-    ) -> None:
-        print(
-            f"[executor] completed work={identity.work_key.value} "
-            f"cpu_slots={result.admission_grant.cpu_slots}/"
-            f"{self._host_cpu_slots} "
-            f"concurrency={result.admission_grant.concurrency} "
-            f"exit={result.exit_code} "
-            f"wall={result.resources.wall_seconds:.3f}s "
-            f"child_cpu={result.resources.cpu_seconds:.3f}s "
-            "executor_process_lifetime_children_max_rss="
-            f"{result.resources.executor_process_lifetime_children_max_rss_bytes}",
             file=sys.stderr,
             flush=True,
         )
