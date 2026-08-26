@@ -12,7 +12,7 @@ Storage location: .issue-orchestrator/validation/<suite>/<HEAD_SHA>.json
 import json
 import logging
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -176,8 +176,6 @@ class ValidationRunner:
         )
         evidence = execution.evidence(execution_deadline)
         exit_code = evidence.exit_code
-        stdout = evidence.stdout
-        stderr = evidence.stderr
         timed_out = evidence.timed_out
         if timed_out:
             logger.warning(

@@ -478,7 +478,6 @@ class PosixExecutorGuardianChild:
                 )
             raise AssertionError("guardian containment unexpectedly returned")
         if type(launch) is PosixProcessLaunchRecoveryFailed:
-            terminal: ExecutorGuardianActivationTimedOut | ExecutorGuardianInternalFailed
             if type(budget) is ExecutorGuardianBoundedBudget and isinstance(
                 launch.activation_error,
                 PosixProcessActivationDeadlineExceededError,

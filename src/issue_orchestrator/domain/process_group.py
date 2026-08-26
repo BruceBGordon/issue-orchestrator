@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from dataclasses import dataclass
 import math
 
@@ -198,7 +200,7 @@ class ProcessGroupCourtesyFailed:
     error: BaseException
 
     def __post_init__(self) -> None:
-        if not isinstance(self.error, BaseException):
+        if not isinstance(cast(object, self.error), BaseException):
             raise ValueError("ProcessGroupCourtesyFailed.error must be an exception")
 
 

@@ -15,7 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import BinaryIO, Generator, NoReturn
 
-from .independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupFailed,
     CleanupFailure,

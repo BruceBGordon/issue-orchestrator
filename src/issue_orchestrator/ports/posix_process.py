@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import cast, Protocol, runtime_checkable
 
 from ..domain.posix_process import PosixProcessLaunchSpec
 
@@ -55,7 +55,7 @@ class PosixProcessLaunchStarted:
     process: PosixProcessHandle
 
     def __post_init__(self) -> None:
-        if not isinstance(self.process, PosixProcessHandle):
+        if not isinstance(cast(object, self.process), PosixProcessHandle):
             raise ValueError("PosixProcessLaunchStarted.process must be typed")
 
 
@@ -66,7 +66,7 @@ class PosixProcessLaunchRejected:
     error: BaseException
 
     def __post_init__(self) -> None:
-        if not isinstance(self.error, BaseException):
+        if not isinstance(cast(object, self.error), BaseException):
             raise ValueError("PosixProcessLaunchRejected.error must be an exception")
 
 
@@ -83,7 +83,7 @@ class PosixProcessLaunchRecovered:
             raise ValueError("PosixProcessLaunchRecovered.process_id must be above 1")
         if type(self.exit_code) is not int:
             raise ValueError("PosixProcessLaunchRecovered.exit_code must be an int")
-        if not isinstance(self.activation_error, BaseException):
+        if not isinstance(cast(object, self.activation_error), BaseException):
             raise ValueError(
                 "PosixProcessLaunchRecovered.activation_error must be an exception"
             )
@@ -128,11 +128,11 @@ class PosixProcessLaunchRecoveryFailed:
             raise ValueError(
                 "PosixProcessLaunchRecoveryFailed.process_id must be above 1"
             )
-        if not isinstance(self.activation_error, BaseException):
+        if not isinstance(cast(object, self.activation_error), BaseException):
             raise ValueError(
                 "PosixProcessLaunchRecoveryFailed.activation_error must be an exception"
             )
-        if not isinstance(self.recovery_error, BaseException):
+        if not isinstance(cast(object, self.recovery_error), BaseException):
             raise ValueError(
                 "PosixProcessLaunchRecoveryFailed.recovery_error must be an exception"
             )

@@ -55,7 +55,7 @@ from ..ports.posix_spawn_primitive import (
     PosixSpawnPrimitiveStarted,
 )
 from ..ports.process_group_supervisor import ProcessGroupSupervisor
-from .independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupFailed,
     CleanupOutcome,

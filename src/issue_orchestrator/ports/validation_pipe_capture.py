@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import cast, Protocol, runtime_checkable
 
 from ..domain.contained_command import ContainedCommandOutputPolicy
 from ..domain.validation_execution import (
@@ -28,7 +28,7 @@ class ValidationPipeCaptureResult:
             raise ValueError(
                 "ValidationPipeCaptureResult.output must be ValidationCommandOutput"
             )
-        if self.failure is not None and not isinstance(self.failure, BaseException):
+        if self.failure is not None and not isinstance(cast(object, self.failure), BaseException):
             raise ValueError(
                 "ValidationPipeCaptureResult.failure must be None or BaseException"
             )

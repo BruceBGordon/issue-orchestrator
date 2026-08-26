@@ -20,7 +20,7 @@ from ..ports.posix_pipe import (
     PosixPipeReader,
     PosixPipeWriter,
 )
-from .independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupFailed,
     CleanupSucceeded,

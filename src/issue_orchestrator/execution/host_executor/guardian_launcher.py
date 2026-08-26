@@ -81,7 +81,7 @@ from ...ports.posix_process import (
     PosixProcessLaunchStarted,
 )
 from ..process_group_supervisor import NeverInterruptProcessGroup
-from ..independent_cleanup import (
+from ...domain.independent_cleanup import (
     CleanupAction,
     CleanupFailed,
     CleanupFailure,

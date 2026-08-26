@@ -86,7 +86,7 @@ from ._completion import (
 from .host_policy import ExecutorPolicyStore
 from .request_identity import ExecutorRequestIdentityFactory
 from ..atomic_record_store import AtomicRecordStore
-from ..independent_cleanup import (
+from ...domain.independent_cleanup import (
     CleanupAction,
     CleanupFailed,
     CleanupOutcome,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from dataclasses import dataclass
 
 
@@ -37,7 +39,7 @@ class PosixPipeCloseFailed:
     error: BaseException
 
     def __post_init__(self) -> None:
-        if not isinstance(self.error, BaseException):
+        if not isinstance(cast(object, self.error), BaseException):
             raise ValueError("PosixPipeCloseFailed.error must be an exception")
 
 

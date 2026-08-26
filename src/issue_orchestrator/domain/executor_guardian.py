@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import math
 from dataclasses import dataclass
 
@@ -307,7 +309,7 @@ class ExecutorGuardianPostContainmentFailure:
             raise ValueError(
                 "ExecutorGuardianPostContainmentFailure.attempt_name must not be empty"
             )
-        if not isinstance(self.error, BaseException):
+        if not isinstance(cast(object, self.error), BaseException):
             raise ValueError(
                 "ExecutorGuardianPostContainmentFailure.error must be a BaseException"
             )

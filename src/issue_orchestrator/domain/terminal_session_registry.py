@@ -69,21 +69,31 @@ class TerminalSessionRecord:
     is_review: bool
 
     def __post_init__(self) -> None:
+        self._require_identity()
+        self._require_process_and_paths()
+
+    def _require_identity(self) -> None:
         if type(self.session_name) is not str or not self.session_name:
             raise ValueError("TerminalSessionRecord.session_name must not be empty")
         if type(self.issue_number) is not int or self.issue_number < 0:
             raise ValueError(
                 "TerminalSessionRecord.issue_number must be non-negative"
             )
+        if self.registered_at.tzinfo is None:
+            raise ValueError(
+                "TerminalSessionRecord.registered_at must be timezone-aware"
+            )
+        if type(self.tab_name) is not str or not self.tab_name:
+            raise ValueError("TerminalSessionRecord.tab_name must not be empty")
+        if type(self.is_review) is not bool:
+            raise ValueError("TerminalSessionRecord.is_review must be bool")
+
+    def _require_process_and_paths(self) -> None:
         if not self.worktree_path.is_absolute():
             raise ValueError("TerminalSessionRecord.worktree_path must be absolute")
         if type(self.process) is not TerminalSessionProcess:
             raise ValueError(
                 "TerminalSessionRecord.process must be TerminalSessionProcess"
-            )
-        if self.registered_at.tzinfo is None:
-            raise ValueError(
-                "TerminalSessionRecord.registered_at must be timezone-aware"
             )
         if not self.recording_path.is_absolute():
             raise ValueError("TerminalSessionRecord.recording_path must be absolute")
@@ -95,10 +105,6 @@ class TerminalSessionRecord:
             raise ValueError(
                 "TerminalSessionRecord.recording_path must belong to run_dir"
             )
-        if type(self.tab_name) is not str or not self.tab_name:
-            raise ValueError("TerminalSessionRecord.tab_name must not be empty")
-        if type(self.is_review) is not bool:
-            raise ValueError("TerminalSessionRecord.is_review must be bool")
 
     @property
     def pid(self) -> int:

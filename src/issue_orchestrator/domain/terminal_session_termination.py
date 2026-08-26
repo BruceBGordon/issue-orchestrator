@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import math
 from dataclasses import dataclass
 from enum import StrEnum
@@ -41,14 +43,14 @@ class TerminalSessionOwnerCancellation:
     record_path: Path
 
     def __post_init__(self) -> None:
-        if not isinstance(self.record_path, Path) or not self.record_path.is_absolute():
+        if not isinstance(cast(object, self.record_path), Path) or not self.record_path.is_absolute():
             raise ValueError(
                 "TerminalSessionOwnerCancellation.record_path must be absolute"
             )
 
     @classmethod
     def for_run_dir(cls, run_dir: Path) -> TerminalSessionOwnerCancellation:
-        if not isinstance(run_dir, Path) or not run_dir.is_absolute():
+        if not isinstance(cast(object, run_dir), Path) or not run_dir.is_absolute():
             raise ValueError(
                 "TerminalSessionOwnerCancellation.run_dir must be absolute"
             )

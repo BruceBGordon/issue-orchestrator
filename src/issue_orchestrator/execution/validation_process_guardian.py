@@ -52,7 +52,7 @@ from ..ports.validation_process_guardian import (
     ValidationProcessGuardianLaunch,
     ValidationProcessGuardianStarted,
 )
-from .independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupFailed,
     CleanupSucceeded,

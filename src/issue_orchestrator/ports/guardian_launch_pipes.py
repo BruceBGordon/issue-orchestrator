@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import cast, Protocol, runtime_checkable
 
 from ..domain.posix_process import PosixDescriptorMapping
 from .posix_pipe import PosixPipeReader, PosixPipeWriter
@@ -41,15 +41,15 @@ class GuardianParentPipeEndpoints:
     parent_lifetime_writer: PosixPipeWriter
 
     def __post_init__(self) -> None:
-        if not isinstance(self.result_reader, PosixPipeReader):
+        if not isinstance(cast(object, self.result_reader), PosixPipeReader):
             raise ValueError("guardian result reader must implement PosixPipeReader")
-        if not isinstance(self.start_writer, PosixPipeWriter):
+        if not isinstance(cast(object, self.start_writer), PosixPipeWriter):
             raise ValueError("guardian start writer must implement PosixPipeWriter")
-        if not isinstance(self.owner_ready_reader, PosixPipeReader):
+        if not isinstance(cast(object, self.owner_ready_reader), PosixPipeReader):
             raise ValueError(
                 "guardian owner-ready reader must implement PosixPipeReader"
             )
-        if not isinstance(self.parent_lifetime_writer, PosixPipeWriter):
+        if not isinstance(cast(object, self.parent_lifetime_writer), PosixPipeWriter):
             raise ValueError(
                 "guardian parent-lifetime writer must implement PosixPipeWriter"
             )
@@ -67,7 +67,7 @@ class GuardianLaunchPipesCloseFailed:
     error: BaseException
 
     def __post_init__(self) -> None:
-        if not isinstance(self.error, BaseException):
+        if not isinstance(cast(object, self.error), BaseException):
             raise ValueError(
                 "GuardianLaunchPipesCloseFailed.error must be an exception"
             )

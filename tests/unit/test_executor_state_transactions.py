@@ -9,7 +9,7 @@ from typing import IO, Any, BinaryIO, cast
 
 import pytest
 from pydantic import BaseModel
-import issue_orchestrator.execution.posix_file_lock as posix_file_lock
+import issue_orchestrator.infra.posix_file_lock as posix_file_lock
 
 from issue_orchestrator.control.executor_admission import (
     ExecutorAdmissionGrant,

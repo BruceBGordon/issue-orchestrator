@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import cast, Protocol, runtime_checkable
 
 from ..domain.posix_process import (
     PosixDescriptorMapping,
@@ -61,7 +61,7 @@ class PosixSpawnPrimitiveRejected:
     error: BaseException
 
     def __post_init__(self) -> None:
-        if not isinstance(self.error, BaseException):
+        if not isinstance(cast(object, self.error), BaseException):
             raise ValueError("PosixSpawnPrimitiveRejected.error must be an exception")
 
 
@@ -77,7 +77,7 @@ class PosixSpawnPrimitiveIndeterminate:
             raise ValueError(
                 "PosixSpawnPrimitiveIndeterminate.process_id must be above 1"
             )
-        if not isinstance(self.error, BaseException):
+        if not isinstance(cast(object, self.error), BaseException):
             raise ValueError(
                 "PosixSpawnPrimitiveIndeterminate.error must be an exception"
             )

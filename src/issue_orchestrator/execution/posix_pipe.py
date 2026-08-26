@@ -11,7 +11,7 @@ from ..domain.posix_pipe import (
     PosixPipeCloseFailed,
 )
 from ..ports.posix_pipe import PosixPipe, PosixPipeReader, PosixPipeWriter
-from .independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupFailed,
     CleanupSucceeded,

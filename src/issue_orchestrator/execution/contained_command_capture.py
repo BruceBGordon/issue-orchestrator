@@ -72,7 +72,7 @@ from ..ports.posix_process import (
     PosixProcessLaunchRejected,
     PosixProcessLaunchStarted,
 )
-from .independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupFailed,
     CleanupSucceeded,

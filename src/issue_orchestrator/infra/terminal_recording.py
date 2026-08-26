@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Protocol, Sequence, TextIO, cast, runtime_checkable
 
-from ..execution.independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     IndependentCleanupPlan,
     raise_cleanup_failures,

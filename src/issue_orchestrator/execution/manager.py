@@ -70,6 +70,47 @@ def _load_plugin_class(
     return plugin_class(**dict(constructor_kwargs or {}))
 
 
+def _require_terminal_session_collaborators(
+    terminal_session_terminator: TerminalSessionTerminator,
+    terminal_session_owner: TerminalSessionOwner,
+    terminal_session_registry: TerminalSessionRegistry,
+    process_group_supervisor: ProcessGroupSupervisor,
+    watcher_policy: TerminalSessionWatcherPolicy,
+    watcher_factory: TerminalSessionWatcherFactory,
+) -> None:
+    """Reject untyped composition before any plugin owns a session."""
+    if not isinstance(terminal_session_terminator, TerminalSessionTerminator):
+        raise ValueError(
+            "create_plugin_manager.terminal_session_terminator must be a "
+            "TerminalSessionTerminator"
+        )
+    if not isinstance(terminal_session_owner, TerminalSessionOwner):
+        raise ValueError(
+            "create_plugin_manager.terminal_session_owner must implement "
+            "TerminalSessionOwner"
+        )
+    if not isinstance(terminal_session_registry, TerminalSessionRegistry):
+        raise ValueError(
+            "create_plugin_manager.terminal_session_registry must implement "
+            "TerminalSessionRegistry"
+        )
+    if not isinstance(process_group_supervisor, ProcessGroupSupervisor):
+        raise ValueError(
+            "create_plugin_manager.process_group_supervisor must implement "
+            "ProcessGroupSupervisor"
+        )
+    if type(watcher_policy) is not TerminalSessionWatcherPolicy:
+        raise ValueError(
+            "create_plugin_manager.watcher_policy must be "
+            "TerminalSessionWatcherPolicy"
+        )
+    if not isinstance(watcher_factory, TerminalSessionWatcherFactory):
+        raise ValueError(
+            "create_plugin_manager.watcher_factory must implement "
+            "TerminalSessionWatcherFactory"
+        )
+
+
 def create_plugin_manager(
     terminal_session_terminator: TerminalSessionTerminator,
     terminal_session_owner: TerminalSessionOwner,
@@ -103,36 +144,14 @@ def create_plugin_manager(
         Configured PluginManager with hooks ready to call.
     """
     pm = pluggy.PluginManager(PROJECT_NAME)
-    if not isinstance(terminal_session_terminator, TerminalSessionTerminator):
-        raise ValueError(
-            "create_plugin_manager.terminal_session_terminator must be a "
-            "TerminalSessionTerminator"
-        )
-    if not isinstance(terminal_session_owner, TerminalSessionOwner):
-        raise ValueError(
-            "create_plugin_manager.terminal_session_owner must implement "
-            "TerminalSessionOwner"
-        )
-    if not isinstance(terminal_session_registry, TerminalSessionRegistry):
-        raise ValueError(
-            "create_plugin_manager.terminal_session_registry must implement "
-            "TerminalSessionRegistry"
-        )
-    if not isinstance(process_group_supervisor, ProcessGroupSupervisor):
-        raise ValueError(
-            "create_plugin_manager.process_group_supervisor must implement "
-            "ProcessGroupSupervisor"
-        )
-    if type(watcher_policy) is not TerminalSessionWatcherPolicy:
-        raise ValueError(
-            "create_plugin_manager.watcher_policy must be "
-            "TerminalSessionWatcherPolicy"
-        )
-    if not isinstance(watcher_factory, TerminalSessionWatcherFactory):
-        raise ValueError(
-            "create_plugin_manager.watcher_factory must implement "
-            "TerminalSessionWatcherFactory"
-        )
+    _require_terminal_session_collaborators(
+        terminal_session_terminator,
+        terminal_session_owner,
+        terminal_session_registry,
+        process_group_supervisor,
+        watcher_policy,
+        watcher_factory,
+    )
 
     # Register hook specifications
     pm.add_hookspecs(TerminalSpec)

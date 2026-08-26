@@ -321,7 +321,7 @@ class ExecutorBoundedDeadline:
         Queueing does not reduce the active allowance.  The independent absolute
         bound still wins when less time remains, preventing indefinite queueing.
         """
-        elapsed = self._elapsed_since_submission(
+        self._elapsed_since_submission(
             submitted_at_monotonic=submitted_at_monotonic,
             observed_at_monotonic=admitted_at_monotonic,
         )

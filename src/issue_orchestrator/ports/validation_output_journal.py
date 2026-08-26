@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import cast, Protocol, runtime_checkable
 
 from ..domain.validation_execution import (
     ValidationCommandOutput,
@@ -25,7 +25,7 @@ class ValidationOutputJournalResult:
     def __post_init__(self) -> None:
         if type(self.output) is not ValidationCommandOutput:
             raise ValueError("validation journal output must be typed")
-        if self.failure is not None and not isinstance(self.failure, BaseException):
+        if self.failure is not None and not isinstance(cast(object, self.failure), BaseException):
             raise ValueError(
                 "validation journal failure must be absent or an exception"
             )

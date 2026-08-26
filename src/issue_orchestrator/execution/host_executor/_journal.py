@@ -73,14 +73,14 @@ from ._types import (
     RecordedExecutorObservation,
 )
 from ...domain.executor import ExecutorCommandFinalizationError
-from ..independent_cleanup import (
+from ...domain.independent_cleanup import (
     CleanupAction,
     CleanupOutcome,
     IndependentCleanupPlan,
     raise_cleanup_failures,
     raise_primary_with_cleanup,
 )
-from ..posix_file_lock import (
+from ...infra.posix_file_lock import (
     PosixFileLockAcquisition,
     PosixFileLockFilePresence,
     PosixFileLockMode,

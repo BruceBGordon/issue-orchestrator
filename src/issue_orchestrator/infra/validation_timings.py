@@ -38,14 +38,14 @@ from ..domain.validation_timing import (
 )
 from ..domain.contained_command import ContainedCommandResult
 from ..domain.validation_execution import ValidationCommandOutputCapture
-from ..execution.independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupOutcome,
     IndependentCleanupPlan,
     raise_cleanup_failures,
     raise_primary_with_cleanup,
 )
-from ..execution.posix_file_lock import (
+from .posix_file_lock import (
     PosixFileLockAcquisition,
     PosixFileLockFilePresence,
     PosixFileLockMode,

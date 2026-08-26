@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import cast, Protocol, runtime_checkable
 
 from ..domain.posix_process import (
     PosixDescriptorMapping,
@@ -38,9 +38,9 @@ class ValidationProcessGuardianStarted:
     parent_lifetime: ValidationProcessParentLifetime
 
     def __post_init__(self) -> None:
-        if not isinstance(self.process, PosixProcessHandle):
+        if not isinstance(cast(object, self.process), PosixProcessHandle):
             raise ValueError("guarded validation process must implement its port")
-        if not isinstance(self.parent_lifetime, ValidationProcessParentLifetime):
+        if not isinstance(cast(object, self.parent_lifetime), ValidationProcessParentLifetime):
             raise ValueError("guarded validation parent lifetime must implement its port")
 
 

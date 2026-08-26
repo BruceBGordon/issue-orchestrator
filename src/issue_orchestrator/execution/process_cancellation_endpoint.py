@@ -22,7 +22,7 @@ from ..ports.atomic_record_store import (
     AtomicRecordPersistence,
     AtomicRecordStoreFactory,
 )
-from .independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupFailed,
     CleanupFailure,

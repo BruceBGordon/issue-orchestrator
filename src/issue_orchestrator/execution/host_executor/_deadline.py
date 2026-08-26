@@ -15,7 +15,7 @@ from ...domain.executor import (
     ExecutorDeadlinePhase,
     ExecutorDeadlineReason,
 )
-from ..independent_cleanup import (
+from ...domain.independent_cleanup import (
     CleanupAction,
     IndependentCleanupPlan,
     raise_primary_with_cleanup,

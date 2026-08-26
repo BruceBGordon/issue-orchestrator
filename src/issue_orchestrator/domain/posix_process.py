@@ -71,7 +71,7 @@ class PosixProcessEnvironment:
     @classmethod
     def from_mapping(cls, values: Mapping[str, str]) -> PosixProcessEnvironment:
         """Copy a string mapping into stable, sorted typed entries."""
-        if not isinstance(values, Mapping):
+        if not isinstance(cast(object, values), Mapping):
             raise ValueError("PosixProcessEnvironment requires a mapping")
         return cls(
             tuple(
@@ -150,7 +150,7 @@ class PosixProcessActivationDeadlinePresent:
 
     def __post_init__(self) -> None:
         if type(self.recovery_failures) is not tuple or any(
-            not isinstance(failure, BaseException) for failure in self.recovery_failures
+            not isinstance(cast(object, failure), BaseException) for failure in self.recovery_failures
         ):
             raise ValueError(
                 "PosixProcessActivationDeadlinePresent.recovery_failures "
@@ -269,7 +269,7 @@ class PosixProcessLaunchSpec:
     def __post_init__(self) -> None:
         if type(self.program) is not PosixProcessProgram:
             raise ValueError("PosixProcessLaunchSpec.program must be typed")
-        if not isinstance(self.working_directory, Path) or not (
+        if not isinstance(cast(object, self.working_directory), Path) or not (
             self.working_directory.is_absolute()
         ):
             raise ValueError(

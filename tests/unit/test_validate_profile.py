@@ -40,7 +40,7 @@ from issue_orchestrator.domain.executor_monitoring import (
     ExecutorStatus,
     ExecutorStatusQuery,
 )
-from issue_orchestrator.execution.posix_file_lock import (
+from issue_orchestrator.infra.posix_file_lock import (
     PosixFileLockAcquired,
     PosixFileLockContended,
 )

@@ -38,7 +38,7 @@ from issue_orchestrator.execution.agent_runner_types import (
     RetryPolicy,
     _format_command_for_log,
 )
-from issue_orchestrator.execution.independent_cleanup import (
+from issue_orchestrator.domain.independent_cleanup import (
     CleanupAction,
     IndependentCleanupPlan,
     raise_cleanup_failures,

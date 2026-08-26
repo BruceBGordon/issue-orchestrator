@@ -44,7 +44,7 @@ from .process_cancellation_endpoint import (
     ProcessCancellationOwnerControls,
     ProcessCancellationRequest,
 )
-from .independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupOutcome,
     IndependentCleanupPlan,

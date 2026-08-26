@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,7 +95,7 @@ class ValidationHostProbeRequest:
                 "ValidationHostProbeRequest.arguments must be a non-empty argv tuple"
             )
         if (
-            not isinstance(self.working_directory, Path)
+            not isinstance(cast(object, self.working_directory), Path)
             or not self.working_directory.is_absolute()
         ):
             raise ValueError(

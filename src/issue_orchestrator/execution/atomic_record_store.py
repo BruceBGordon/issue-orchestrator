@@ -12,13 +12,13 @@ from pydantic import BaseModel
 
 from ..ports.atomic_path_replacement import AtomicPathReplacement
 from ..ports.atomic_record_store import AtomicRecordPersistence
-from .independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     IndependentCleanupPlan,
     raise_cleanup_failures,
     raise_primary_with_cleanup,
 )
-from .posix_file_lock import (
+from ..infra.posix_file_lock import (
     PosixFileLockAcquisition,
     PosixFileLockFilePresence,
     PosixFileLockMode,

@@ -73,7 +73,7 @@ from ..ports.validation_output_journal import (
     ValidationOutputJournalFactory,
     ValidationOutputStream,
 )
-from .independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupFailed,
     CleanupSucceeded,

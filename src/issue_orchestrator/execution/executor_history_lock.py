@@ -7,7 +7,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
-from .posix_file_lock import (
+from ..infra.posix_file_lock import (
     PosixFileLockAcquisition,
     PosixFileLockFilePresence,
     PosixFileLockMode,

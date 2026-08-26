@@ -9,7 +9,7 @@ from typing import IO, Any, BinaryIO, cast
 
 import pytest
 
-from issue_orchestrator.execution.posix_file_lock import (
+from issue_orchestrator.infra.posix_file_lock import (
     PosixFileLockAcquisition,
     PosixFileLockContended,
     PosixFileLockFilePresence,
@@ -18,7 +18,7 @@ from issue_orchestrator.execution.posix_file_lock import (
     PosixFileLockOwnershipRetainedError,
     PosixFileLockSpecification,
 )
-import issue_orchestrator.execution.posix_file_lock as posix_file_lock
+import issue_orchestrator.infra.posix_file_lock as posix_file_lock
 
 
 class _CloseFailingHandle:
@@ -211,7 +211,7 @@ def test_new_raw_flock_clients_are_rejected_by_the_owner_guardrail() -> None:
     source_root = Path(__file__).parents[2] / "src" / "issue_orchestrator"
     grandfathered = {
         Path("execution/host_executor/_state.py"),
-        Path("execution/posix_file_lock.py"),
+        Path("infra/posix_file_lock.py"),
         Path("execution/process_cancellation_endpoint.py"),
         Path("infra/hooks/codex_session.py"),
         Path("infra/repo_lock.py"),

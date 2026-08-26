@@ -18,7 +18,7 @@ from ..domain.terminal_session_owner import TerminalSessionOwnerPolicy
 from ..domain.terminal_session_termination import TerminalSessionOwnerCancellation
 from ..ports.atomic_record_store import AtomicRecordStoreFactory
 from ..ports.posix_process import PosixProcessLauncher
-from .independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     IndependentCleanupPlan,
     raise_primary_with_cleanup,

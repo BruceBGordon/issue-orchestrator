@@ -30,7 +30,7 @@ from issue_orchestrator.domain.executor_monitoring import (
     ExecutorRequestId,
 )
 from issue_orchestrator.execution.host_executor._journal import ExecutorEventStore
-import issue_orchestrator.execution.posix_file_lock as posix_file_lock
+import issue_orchestrator.infra.posix_file_lock as posix_file_lock
 from issue_orchestrator.execution.host_executor._types import (
     ExecutorRepositoryIdentity,
     ExecutorWorkIdentity,

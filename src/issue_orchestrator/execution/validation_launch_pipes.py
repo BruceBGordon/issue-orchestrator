@@ -20,7 +20,7 @@ from ..ports.validation_launch_pipes import (
     ValidationLaunchPipesCloseFailed,
     ValidationLaunchReaders,
 )
-from .independent_cleanup import (
+from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupFailed,
     CleanupSucceeded,

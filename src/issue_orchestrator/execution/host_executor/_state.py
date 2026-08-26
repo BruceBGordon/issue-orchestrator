@@ -33,14 +33,14 @@ from ._contracts import (
     QueuedWorkRecord,
 )
 from ..atomic_record_store import AtomicRecordStore
-from ..independent_cleanup import (
+from ...domain.independent_cleanup import (
     CleanupAction,
     CleanupOutcome,
     IndependentCleanupPlan,
     raise_cleanup_failures,
     raise_primary_with_cleanup,
 )
-from ..posix_file_lock import (
+from ...infra.posix_file_lock import (
     PosixFileLockAcquired,
     PosixFileLockAcquisition,
     PosixFileLockContended,

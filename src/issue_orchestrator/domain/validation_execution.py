@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -111,7 +113,7 @@ class ValidationCommandOutputCapture:
             ("stdout_path", self.stdout_path),
             ("stderr_path", self.stderr_path),
         ):
-            if not isinstance(path, Path) or not path.is_absolute():
+            if not isinstance(cast(object, path), Path) or not path.is_absolute():
                 raise ValueError(
                     f"ValidationCommandOutputCapture.{field_name} must be "
                     "an absolute Path"
@@ -189,7 +191,7 @@ class ValidationCommandNotStarted:
     error: BaseException
 
     def __post_init__(self) -> None:
-        if not isinstance(self.error, BaseException):
+        if not isinstance(cast(object, self.error), BaseException):
             raise ValueError(
                 "ValidationCommandNotStarted.error must be a BaseException"
             )
@@ -365,7 +367,7 @@ class ValidationCommandCleanupFailed:
     error: BaseException
 
     def __post_init__(self) -> None:
-        if not isinstance(self.error, BaseException):
+        if not isinstance(cast(object, self.error), BaseException):
             raise ValueError(
                 "ValidationCommandCleanupFailed.error must be an exception"
             )
@@ -383,7 +385,7 @@ class ValidationCommandTimedOutCleanupFailed:
             raise ValueError(
                 "ValidationCommandTimedOutCleanupFailed.phase must be typed"
             )
-        if not isinstance(self.error, BaseException):
+        if not isinstance(cast(object, self.error), BaseException):
             raise ValueError(
                 "ValidationCommandTimedOutCleanupFailed.error must be an exception"
             )
@@ -435,7 +437,7 @@ def validation_cleanup_with_failure(
     message: str,
 ) -> ValidationCommandCleanup:
     """Add cleanup failure evidence without discarding a typed timeout fact."""
-    if not isinstance(error, BaseException):
+    if not isinstance(cast(object, error), BaseException):
         raise ValueError("validation cleanup failure must be an exception")
     if type(message) is not str or not message:
         raise ValueError("validation cleanup failure message must not be empty")

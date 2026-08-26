@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Protocol, runtime_checkable
+from typing import cast, Mapping, Protocol, runtime_checkable
 
 from ..domain.posix_process import (
     PosixDescriptorMapping,
@@ -26,7 +26,7 @@ class ValidationLaunchReaders:
             ("stderr", self.stderr),
             ("executor_handshake", self.executor_handshake),
         ):
-            if not isinstance(reader, PosixPipeReader):
+            if not isinstance(cast(object, reader), PosixPipeReader):
                 raise ValueError(
                     f"ValidationLaunchReaders.{field_name} must implement "
                     "PosixPipeReader"
@@ -45,7 +45,7 @@ class ValidationLaunchPipesCloseFailed:
     error: BaseException
 
     def __post_init__(self) -> None:
-        if not isinstance(self.error, BaseException):
+        if not isinstance(cast(object, self.error), BaseException):
             raise ValueError(
                 "ValidationLaunchPipesCloseFailed.error must be an exception"
             )

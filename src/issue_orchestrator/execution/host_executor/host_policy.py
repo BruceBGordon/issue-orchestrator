@@ -17,7 +17,7 @@ from ...domain.executor import (
 )
 from ._contracts import PersistedPolicyRecord
 from ..atomic_record_store import AtomicRecordStore
-from ..posix_file_lock import (
+from ...infra.posix_file_lock import (
     PosixFileLockAcquisition,
     PosixFileLockFilePresence,
     PosixFileLockMode,
