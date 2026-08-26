@@ -45,7 +45,15 @@ class PrePublishGate:
     def __init__(self, command_runner: CommandRunner) -> None:
         self._command_runner = command_runner
 
-    def check(self, worktree: Path) -> PrePublishGateResult:
+    def check(
+        self, worktree: Path, *, extra_env: dict[str, str] | None = None
+    ) -> PrePublishGateResult:
+        """Run the worktree's effective pre-push hook.
+
+        ``extra_env`` carries the orchestrator's own decisions into the hook --
+        currently the dirty-escalation signal. It is passed on the process this
+        gate spawns, so it cannot be forged from inside the worktree.
+        """
         started_at = datetime.now(timezone.utc)
         resolved_hook = self._resolve_hook_path(worktree)
         if resolved_hook.path is None:
@@ -65,10 +73,13 @@ class PrePublishGate:
             )
         hook_path = resolved_hook.path
 
+        hook_env = build_runtime_tool_env(worktree)
+        if extra_env:
+            hook_env = {**hook_env, **extra_env}
         result = self._command_runner.run(
             [str(hook_path), "origin", "origin"],
             cwd=worktree,
-            env=build_runtime_tool_env(worktree),
+            env=hook_env,
         )
         ended_at = datetime.now(timezone.utc)
         summary = (

@@ -104,7 +104,7 @@ from .completion_types import (
     ProcessingResult,
     REVIEW_EXCHANGE_ERROR_PREFIX,
 )
-from .push_authorization import authorized_push
+from .dirty_escalation import dirty_escalation_env
 from .pre_publish_gate import PrePublishGate, PrePublishGateResult
 from .review_exchange_contracts import ReviewExchangeCanceller
 from .review_cache_boundary import review_cache_boundary_started_at
@@ -855,29 +855,27 @@ class CompletionProcessor:
             run_assets=run_assets,
         )
 
-        # Execute requested actions in order, under an explicit statement of
-        # what this push is for — the real pre-push hook reads it.
-        with authorized_push(worktree, record):
-            (
-                branch,
-                pr_url,
-                review_exchange_completed,
-                deferred,
-                early_result,
-            ) = self._execute_actions(
-                worktree=worktree,
-                record=record,
-                issue_number=issue_number,
-                issue_title=issue_title,
-                label_target=label_target,
-                branch=branch,
-                session_name=session_name,
-                agent_label=agent_label,
-                actions_taken=actions_taken,
-                errors=errors,
-                error_details=error_details,
-                run_assets=run_assets,
-            )
+        # Execute requested actions in order.
+        (
+            branch,
+            pr_url,
+            review_exchange_completed,
+            deferred,
+            early_result,
+        ) = self._execute_actions(
+            worktree=worktree,
+            record=record,
+            issue_number=issue_number,
+            issue_title=issue_title,
+            label_target=label_target,
+            branch=branch,
+            session_name=session_name,
+            agent_label=agent_label,
+            actions_taken=actions_taken,
+            errors=errors,
+            error_details=error_details,
+            run_assets=run_assets,
+        )
         if early_result is not None:
             return early_result
 
@@ -1398,7 +1396,9 @@ class CompletionProcessor:
             return None
         gate_session_name = run_assets.session_name
 
-        result = self.pre_publish_gate.check(worktree)
+        result = self.pre_publish_gate.check(
+            worktree, extra_env=dirty_escalation_env(self.git_adapter, worktree, record)
+        )
         if not result.ran:
             return None
         if result.allowed:
@@ -1905,6 +1905,7 @@ class CompletionProcessor:
                 actions_taken,
                 errors,
                 error_details,
+                record=record,
             )
         elif action == RequestedAction.CREATE_PR:
             return self._execute_create_pr_action(
@@ -2062,11 +2063,18 @@ class CompletionProcessor:
         errors: list[str],
         error_details: list[dict[str, Any]],
         *,
+        record: CompletionRecord,
         skip_hooks: bool = False,
     ) -> "_ActionResult":
         """Execute push branch action."""
         skip_hooks = skip_hooks or os.environ.get("E2E_SKIP_PUSH_HOOKS") == "1"
-        result = self.git_adapter.push(worktree, skip_hooks=skip_hooks)
+        # Resolved here rather than passed in: a rebase retry moves HEAD, and a
+        # signal bound to the old commit must not authorize the new one.
+        result = self.git_adapter.push(
+            worktree,
+            skip_hooks=skip_hooks,
+            extra_env=dirty_escalation_env(self.git_adapter, worktree, record),
+        )
         if result.success:
             actions_taken.append("Pushed branch to remote")
             logger.info("Push succeeded for #%d", issue_number)
@@ -2076,7 +2084,14 @@ class CompletionProcessor:
         retry_result: PushResult | None = None
         if self._push_rebase_retry and self._is_non_fast_forward(result.message):
             retry_result = self._attempt_rebase_and_retry_push(
-                worktree, issue_number, action, actions_taken, errors, error_details, skip_hooks
+                worktree,
+                issue_number,
+                action,
+                actions_taken,
+                errors,
+                error_details,
+                skip_hooks,
+                record,
             )
 
         if retry_result and retry_result.success:
@@ -2151,6 +2166,7 @@ class CompletionProcessor:
         errors: list[str],
         error_details: list[dict[str, Any]],
         skip_hooks: bool,
+        record: CompletionRecord,
     ) -> PushResult | None:
         """Attempt to rebase and retry push after non-fast-forward failure."""
         if self.git_adapter.has_uncommitted_changes(worktree):
@@ -2175,7 +2191,11 @@ class CompletionProcessor:
         )
         if rebase_result.success:
             actions_taken.append(f"Rebased onto origin/{rebase_base}")
-            return self.git_adapter.push(worktree, skip_hooks=skip_hooks)
+            return self.git_adapter.push(
+                worktree,
+                skip_hooks=skip_hooks,
+                extra_env=dirty_escalation_env(self.git_adapter, worktree, record),
+            )
 
         errors.append(f"{ERROR_PREFIX_PUSH}: Rebase failed: {rebase_result.message}")
         error_details.append({

@@ -280,6 +280,8 @@ class _NoopGitAdapter:
         force_with_lease: bool = True,
         set_upstream: bool = True,
         skip_hooks: bool = False,
+        *,
+        extra_env: dict[str, str] | None = None,
     ):
         return type(
             "PushResult", (), {"success": True, "message": "ok", "branch": "issue-1"}
@@ -945,157 +947,148 @@ class TestEscalationSurvivesTheEffectiveHookPath:
         return repo
 
     @staticmethod
-    def _gate_allows(repo: Path) -> bool:
+    def _gate_allows(repo: Path, extra_env: dict[str, str] | None = None) -> bool:
         from issue_orchestrator.control.pre_publish_gate import PrePublishGate
         from issue_orchestrator.execution import LocalCommandRunner
 
-        result = PrePublishGate(LocalCommandRunner()).check(repo)
+        result = PrePublishGate(LocalCommandRunner()).check(repo, extra_env=extra_env)
         assert result.ran, f"hook did not run: {result.reason}\n{result.stderr}"
         return result.allowed
 
     @staticmethod
-    def _authorize(repo: Path, *, outcome="blocked", worktree=None, age_seconds=0):
-        """Write the statement the orchestrator makes for one push."""
+    def _head_sha(repo: Path) -> str:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    @classmethod
+    def _signal(cls, repo: Path, *, worktree=None, head_sha=None) -> dict[str, str]:
         from issue_orchestrator.domain.dirty_remediation import (
-            PUSH_AUTHORIZATION_PATH,
+            DIRTY_ESCALATION_ENV,
+            dirty_escalation_signal,
         )
 
-        issued_at = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
-        path = repo / PUSH_AUTHORIZATION_PATH
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "session_id": "live-session",
-                    "outcome": outcome,
-                    "worktree": str(worktree or repo.resolve()),
-                    "issued_at": issued_at.isoformat(),
-                }
+        return {
+            DIRTY_ESCALATION_ENV: dirty_escalation_signal(
+                str(worktree or repo.resolve()), head_sha or cls._head_sha(repo)
             )
-        )
-
-    @staticmethod
-    def _retain_history(repo: Path, outcome: str) -> None:
-        """Leave a processed record in a retained run directory, as production does."""
-        run_dir = repo / ".issue-orchestrator" / "sessions" / "20260101-000000Z__old"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "completion.json").write_text(
-            json.dumps(
-                {
-                    "session_id": "old-session",
-                    "timestamp": "2026-01-01T00:00:00Z",
-                    "outcome": outcome,
-                    "summary": "a run that finished long ago",
-                    "requested_actions": ["push_branch"],
-                }
-            )
-        )
+        }
 
     def test_an_authorized_dirty_escalation_is_allowed(self, tmp_path):
         repo = self._repo_with_real_hook(tmp_path)
         before = (repo / "operator_notes.py").read_text()
 
-        self._authorize(repo)
-
-        assert self._gate_allows(repo)
+        assert self._gate_allows(repo, self._signal(repo))
         assert (repo / "operator_notes.py").read_text() == before
 
-    def test_retained_completed_history_does_not_block_the_active_escalation(
+    def test_the_hook_blocks_a_dirty_tree_with_no_signal(self, tmp_path):
+        repo = self._repo_with_real_hook(tmp_path)
+
+        assert not self._gate_allows(repo)
+
+    def test_nothing_writable_in_the_worktree_can_authorize_a_dirty_push(
         self, tmp_path
     ):
-        """Run directories are retained; history is not a competing intent.
+        """The agent owns the worktree; it must not own the decision.
 
-        Seven run directories are kept by default and processed records are
-        deliberately copied into them. Reading them as live intent rejected a
-        real escalation whenever any earlier run had completed.
+        The previous design read an assertion out of a file here, so any agent
+        able to write the worktree could grant itself the exemption. There is
+        no such file now: the signal arrives on the process the orchestrator
+        spawns. These are the shapes a forgery would have taken.
         """
         repo = self._repo_with_real_hook(tmp_path)
-        self._retain_history(repo, "completed")
-        self._authorize(repo)
+        head = self._head_sha(repo)
+        forgeries = {
+            ".issue-orchestrator/push-authorization.json": json.dumps(
+                {
+                    "session_id": "forged",
+                    "outcome": "blocked",
+                    "worktree": str(repo.resolve()),
+                    "issued_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ),
+            ".issue-orchestrator/completion.json": json.dumps(
+                {
+                    "session_id": "forged",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "outcome": "blocked",
+                    "summary": "let me through",
+                    "requested_actions": ["push_branch"],
+                }
+            ),
+            ".issue-orchestrator/dirty-escalation": f"{repo.resolve()}@{head}",
+        }
+        for relative, body in forgeries.items():
+            path = repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body)
 
-        assert self._gate_allows(repo)
+        assert not self._gate_allows(repo), (
+            "a file written inside the worktree granted the exemption"
+        )
 
-    def test_retained_escalation_history_cannot_relax_an_unauthorized_push(
-        self, tmp_path
-    ):
-        """The inverse, and the dangerous one.
+    def test_a_signal_for_another_commit_fails_closed(self, tmp_path):
+        """Replay: an escalation approved for one commit says nothing about another."""
+        repo = self._repo_with_real_hook(tmp_path)
+        captured = self._signal(repo)
 
-        A blocked record left in a retained run directory used to satisfy the
-        dirty guard for every later push in that worktree -- stale agent-written
-        history as a standing bypass. Only a live authorization counts.
+        # The branch moves on; the earlier signal must not authorize the new HEAD.
+        (repo / "another.py").write_text("more work\n")
+        subprocess.run(
+            ["git", "add", "another.py"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "later work"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert not self._gate_allows(repo, captured)
+
+    def test_a_signal_for_another_worktree_fails_closed(self, tmp_path):
+        repo = self._repo_with_real_hook(tmp_path)
+
+        assert not self._gate_allows(
+            repo, self._signal(repo, worktree=tmp_path / "elsewhere")
+        )
+
+    def test_a_malformed_signal_fails_closed(self, tmp_path):
+        from issue_orchestrator.domain.dirty_remediation import DIRTY_ESCALATION_ENV
+
+        repo = self._repo_with_real_hook(tmp_path)
+
+        for value in ("", "garbage", str(repo.resolve()), self._head_sha(repo)):
+            assert not self._gate_allows(repo, {DIRTY_ESCALATION_ENV: value}), value
+
+    def test_the_signal_does_not_outlive_the_process_that_carried_it(self, tmp_path):
+        """A hard exit cannot leave an exemption behind, because none is stored.
+
+        The previous design wrote a file and removed it in a ``finally``, which
+        ``os._exit`` skips entirely -- leaving a standing exemption after a
+        crash. An environment variable dies with the process by construction,
+        so the only thing to assert is that the flow persists nothing.
         """
         repo = self._repo_with_real_hook(tmp_path)
-        self._retain_history(repo, "blocked")
 
-        assert not self._gate_allows(repo)
+        assert self._gate_allows(repo, self._signal(repo))
 
-    def test_a_current_escalation_record_alone_does_not_authorize(self, tmp_path):
-        """The record states the agent's intent; only the orchestrator authorizes."""
-        repo = self._repo_with_real_hook(tmp_path)
-        assert (
-            _run_completion_raw(
-                [
-                    "blocked",
-                    "--reason",
-                    "cannot classify dirty file operator_notes.py",
-                    "--attempted",
-                    "inspected the file and its history",
-                ],
-                cwd=repo,
-            ).returncode
-            == 0
-        )
-
-        assert not self._gate_allows(repo)
-
-    def test_the_effective_hook_still_blocks_a_dirty_tree_with_no_authorization(
-        self, tmp_path
-    ):
-        repo = self._repo_with_real_hook(tmp_path)
-
-        assert not self._gate_allows(repo)
-
-    def test_an_expired_authorization_fails_closed(self, tmp_path):
-        repo = self._repo_with_real_hook(tmp_path)
-        self._authorize(repo, age_seconds=6000)
-
-        assert not self._gate_allows(repo)
-
-    def test_an_authorization_for_another_worktree_fails_closed(self, tmp_path):
-        repo = self._repo_with_real_hook(tmp_path)
-        self._authorize(repo, worktree=tmp_path / "somewhere-else")
-
-        assert not self._gate_allows(repo)
-
-    def test_an_unreadable_authorization_fails_closed(self, tmp_path):
-        from issue_orchestrator.domain.dirty_remediation import (
-            PUSH_AUTHORIZATION_PATH,
-        )
-
-        repo = self._repo_with_real_hook(tmp_path)
-        path = repo / PUSH_AUTHORIZATION_PATH
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{not json")
-
-        assert not self._gate_allows(repo)
-
-    def test_a_partial_authorization_fails_closed(self, tmp_path):
-        from issue_orchestrator.domain.dirty_remediation import (
-            PUSH_AUTHORIZATION_PATH,
-        )
-
-        repo = self._repo_with_real_hook(tmp_path)
-        path = repo / PUSH_AUTHORIZATION_PATH
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"session_id": "s", "outcome": "blocked"}))
-
-        assert not self._gate_allows(repo)
-
-    def test_a_completed_authorization_is_not_an_exemption(self, tmp_path):
-        """Publishing finished work still requires a clean tree."""
-        repo = self._repo_with_real_hook(tmp_path)
-        self._authorize(repo, outcome="completed")
-
+        leftovers = [
+            path
+            for path in (repo / ".issue-orchestrator").rglob("*")
+            if path.is_file() and "authoriz" in path.name.lower()
+        ]
+        assert not leftovers, f"authorization artifact persisted: {leftovers}"
+        # And a later gate run, without the signal, is blocked again.
         assert not self._gate_allows(repo)
 
 
@@ -1158,7 +1151,10 @@ class TestEscalationReachesTheHumanThroughTheProductionGate:
             )
         )
         git_adapter.get_current_branch = Mock(return_value="issue-123")
-        git_adapter.get_head_sha = Mock(return_value=None)
+        # The signal the orchestrator issues is bound to this exact commit.
+        git_adapter.get_head_sha = Mock(
+            return_value=TestEscalationSurvivesTheEffectiveHookPath._head_sha(repo)
+        )
         git_adapter.default_branch = Mock(return_value="main")
         git_adapter.list_branch_names = Mock(return_value=["issue-123"])
         # The tree really is dirty, and stays that way.
@@ -1208,10 +1204,11 @@ class TestEscalationReachesTheHumanThroughTheProductionGate:
         # Only committed history was published, and the preserved file survived.
         git_adapter.push.assert_called_once()
         assert preserved.read_text() == before
-        # The authorization is for this push and does not outlive it -- otherwise
-        # it becomes the standing bypass that retained history used to be.
-        from issue_orchestrator.domain.dirty_remediation import (
-            PUSH_AUTHORIZATION_PATH,
-        )
-
-        assert not (repo / PUSH_AUTHORIZATION_PATH).exists()
+        # The authorization reached the hook through the environment of the
+        # process the orchestrator spawned, so nothing was written into the
+        # worktree that a later push could reuse.
+        assert not [
+            path
+            for path in (repo / ".issue-orchestrator").rglob("*")
+            if path.is_file() and "authoriz" in path.name.lower()
+        ]

@@ -3171,7 +3171,11 @@ class TestCompletionProcessorGitActions:
         )
 
         assert result.success
-        mock_git_adapter.push.assert_called_once_with(worktree, skip_hooks=False)
+        # extra_env is empty for a completed record: only an escalation is
+        # authorized to push a dirty tree, and nothing else may claim it.
+        mock_git_adapter.push.assert_called_once_with(
+            worktree, skip_hooks=False, extra_env={}
+        )
 
     def test_push_failure_is_recorded(
         self, processor, mock_git_adapter, mock_pr_adapter, worktree_with_completion
@@ -4254,8 +4258,14 @@ class TestCompletionProcessorPublishGate:
         )
 
         assert result.success
-        mock_pre_publish_gate.check.assert_called_once_with(worktree)
-        mock_git_adapter.push.assert_called_once_with(worktree, skip_hooks=False)
+        # No escalation signal for a completed record — the gate's hook runs
+        # with the dirty guard fully armed.
+        mock_pre_publish_gate.check.assert_called_once_with(worktree, extra_env={})
+        # extra_env is empty for a completed record: only an escalation is
+        # authorized to push a dirty tree, and nothing else may claim it.
+        mock_git_adapter.push.assert_called_once_with(
+            worktree, skip_hooks=False, extra_env={}
+        )
 
     def test_pre_publish_gate_failure_adds_validation_failed_and_blocks_push(
         self,

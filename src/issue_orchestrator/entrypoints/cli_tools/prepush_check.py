@@ -12,8 +12,8 @@ Exit codes:
     2 = validation error
 """
 
-import json
 import logging
+import os
 import shutil
 import sys
 import time
@@ -23,10 +23,10 @@ from pathlib import Path
 from typing import Optional
 
 from ...domain.dirty_remediation import (
-    PUSH_AUTHORIZATION_PATH,
+    DIRTY_ESCALATION_ENV,
     DirtyTreeDisposition,
-    PushAuthorization,
     guard_hint_lines,
+    signal_authorizes_dirty_push,
 )
 from ...control.validation import PublishGate
 from ...execution import GitWorkingCopy, LocalCommandRunner
@@ -105,37 +105,26 @@ def _filter_guard_excluded_files(files: list[str], worktree: Path) -> list[str]:
 
 
 def _declared_dirty_disposition(worktree: Path) -> "DirtyTreeDisposition":
-    """Whether the orchestrator authorized a dirty push of this worktree.
+    """Whether the orchestrator authorized a dirty push of this worktree, now.
 
-    The hook reads one fixed path that the orchestrator writes for the push it
-    is making, and nothing else. It deliberately does not look at completion
-    records: run directories are retained and processed records are copied into
-    them, so those answer a question about history rather than about this push.
-    Globbing them got it wrong in both directions -- retained ``completed``
-    history blocked a live escalation, and a retained ``blocked`` record
-    relaxed the guard for unrelated pushes indefinitely.
+    The signal arrives in the environment of the process the orchestrator
+    spawned -- the pre-publish gate's hook run, or the push itself. It is not a
+    file, and that is the point: a file in the worktree is writable by the
+    agent, so it is an assertion anyone can make rather than a decision only
+    the orchestrator can take, and it survives a hard process exit, which turns
+    a crash into a standing exemption. An environment variable can be neither.
 
-    Fail closed on everything: no authorization, an unreadable or partial one,
-    one issued for a different worktree, one too old to be about this push, or
-    one naming an outcome that was never entitled to the exemption.
+    The value names a worktree and a commit, and both must match here, so a
+    value observed in one context cannot authorize a push of a different tree
+    or a different HEAD. Everything else fails closed: no signal, an
+    unresolvable HEAD, or any mismatch.
     """
-    path = worktree / PUSH_AUTHORIZATION_PATH
-    try:
-        authorization = PushAuthorization.from_dict(json.loads(path.read_text()))
-    except (OSError, ValueError):
-        return DirtyTreeDisposition.REJECT
-    if authorization is None:
-        return DirtyTreeDisposition.REJECT
-
-    try:
-        issued_at = datetime.fromisoformat(authorization.issued_at)
-    except ValueError:
-        return DirtyTreeDisposition.REJECT
-    if issued_at.tzinfo is None:
-        issued_at = issued_at.replace(tzinfo=timezone.utc)
-    age_seconds = (datetime.now(timezone.utc) - issued_at).total_seconds()
-
-    if authorization.authorizes_dirty_push(str(worktree.resolve()), age_seconds):
+    head_sha = GitWorkingCopy().get_head_sha(worktree)
+    if signal_authorizes_dirty_push(
+        os.environ.get(DIRTY_ESCALATION_ENV),
+        str(worktree.resolve()),
+        head_sha,
+    ):
         return DirtyTreeDisposition.PRESERVE_AND_ESCALATE
     return DirtyTreeDisposition.REJECT
 

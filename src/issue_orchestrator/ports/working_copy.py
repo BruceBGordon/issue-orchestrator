@@ -269,6 +269,8 @@ class WorkingCopy(Protocol):
         worktree: Path,
         remote: str = "origin",
         set_upstream: bool = True,
+        *,
+        extra_env: dict[str, str] | None = None,
     ) -> PushResult:
         """Push current branch to remote with --force-with-lease.
 

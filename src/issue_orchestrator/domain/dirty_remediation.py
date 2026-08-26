@@ -217,64 +217,37 @@ def dirty_tree_disposition(status: str) -> DirtyTreeDisposition:
     return DirtyTreeDisposition.REJECT
 
 
-#: Where the orchestrator states, for exactly one push, that it has read an
-#: escalation record and accepted its dirty tree. One fixed path, written by
-#: the orchestrator and removed when the push is done.
+#: How the orchestrator tells the pre-push hook that this particular dirty push
+#: is the escalation it already decided to allow.
 #:
-#: The hook cannot be left to infer the active intent from stored artifacts.
-#: Run directories are retained (seven by default) and processed records are
-#: deliberately copied into them, so "is there a blocked record here?" answers
-#: a question about history, not about this push. Asking it both ways round is
-#: wrong: retained ``completed`` history blocked a live escalation, and a
-#: retained ``blocked`` record relaxed the guard for unrelated pushes long
-#: afterwards.
-PUSH_AUTHORIZATION_PATH = ".issue-orchestrator/push-authorization.json"
-
-#: An authorization is for the push being made now. The gate and the push that
-#: follows it take seconds; this bound only has to be short enough that a file
-#: left behind by a crash cannot authorize a later, unrelated push.
-PUSH_AUTHORIZATION_TTL_SECONDS = 600
+#: This is an environment variable on the processes the orchestrator itself
+#: spawns -- the pre-publish gate's hook run and the push -- and deliberately
+#: not a file in the worktree. A worktree file is writable by the agent, so it
+#: is an assertion anyone can make rather than a decision only the orchestrator
+#: can take; it also outlives a hard process exit, which turns a crash into a
+#: standing exemption. An environment variable can be neither forged by writing
+#: to the worktree nor left behind by a process that died.
+DIRTY_ESCALATION_ENV = "ISSUE_ORCHESTRATOR_DIRTY_ESCALATION"
 
 
-@dataclass(frozen=True)
-class PushAuthorization:
-    """The orchestrator's statement that one specific dirty push is intended."""
+def dirty_escalation_signal(worktree: str, head_sha: str) -> str:
+    """The value that authorizes a dirty push of ``worktree`` at ``head_sha``.
 
-    session_id: str
-    outcome: str
-    worktree: str
-    issued_at: str
+    Binding both means a value observed in one context cannot be reused for a
+    different worktree or a different commit: the push publishes exactly this
+    HEAD, so an escalation approved for one commit says nothing about another.
+    """
+    return f"{worktree}@{head_sha}"
 
-    def to_dict(self) -> dict[str, str]:
-        return {
-            "session_id": self.session_id,
-            "outcome": self.outcome,
-            "worktree": self.worktree,
-            "issued_at": self.issued_at,
-        }
 
-    @classmethod
-    def from_dict(cls, data: object) -> "PushAuthorization | None":
-        """Parse, or return ``None`` for anything that is not a full statement."""
-        if not isinstance(data, dict):
-            return None
-        fields = ("session_id", "outcome", "worktree", "issued_at")
-        values = [data.get(name) for name in fields]
-        if not all(isinstance(value, str) and value for value in values):
-            return None
-        return cls(*values)  # type: ignore[arg-type]
+def signal_authorizes_dirty_push(
+    value: str | None, worktree: str, head_sha: str | None
+) -> bool:
+    """Whether ``value`` authorizes a dirty push of this worktree at this HEAD.
 
-    def authorizes_dirty_push(self, worktree: str, age_seconds: float) -> bool:
-        """Whether this authorizes a dirty push of ``worktree`` right now.
-
-        Every clause is a way to say no: a different worktree, an outcome that
-        was never entitled to the exemption, or an authorization old enough to
-        be a leftover rather than a statement about this push.
-        """
-        if self.worktree != worktree:
-            return False
-        if age_seconds < 0 or age_seconds > PUSH_AUTHORIZATION_TTL_SECONDS:
-            return False
-        return dirty_tree_disposition(self.outcome) is (
-            DirtyTreeDisposition.PRESERVE_AND_ESCALATE
-        )
+    Fail closed on everything: no signal, an unresolvable HEAD, or a signal
+    naming any other worktree or commit.
+    """
+    if not value or not head_sha:
+        return False
+    return value == dirty_escalation_signal(worktree, head_sha)
