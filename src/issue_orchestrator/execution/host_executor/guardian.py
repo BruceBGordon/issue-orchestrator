@@ -32,6 +32,7 @@ from ...domain.executor_guardian import (
     ExecutorGuardianTerminationPolicy,
     ExecutorGuardianUnboundedBudget,
 )
+from ...domain.process_group_sentinel import ProcessGroupSentinelParentLifetime
 from ...ports.posix_process import (
     PosixProcessExecRejected,
     PosixProcessHandle,
@@ -264,15 +265,21 @@ class PosixExecutorGuardianChild:
             )
         else:
             raise AssertionError("guardian cancellation is a closed union")
-        controller = ProcessGroupSentinelController.start(
+        controller = ProcessGroupSentinelController.start_with_parent_lifetime(
             invocation.process_group_sentinel_program(),
             sentinel_cancellation,
             invocation.process_group_sentinel_policy(),
             invocation.lease_file_descriptors,
+            ProcessGroupSentinelParentLifetime(
+                invocation.parent_lifetime_read_file_descriptor
+            ),
             self._process_launcher,
         )
         cleanup_errors: list[BaseException] = []
-        for descriptor in cancellation_descriptors:
+        for descriptor in (
+            *cancellation_descriptors,
+            invocation.parent_lifetime_read_file_descriptor,
+        ):
             try:
                 os.close(descriptor)
             except BaseException as error:

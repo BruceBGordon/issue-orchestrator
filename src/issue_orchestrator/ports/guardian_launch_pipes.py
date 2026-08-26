@@ -16,9 +16,15 @@ class GuardianChildPipeDescriptors:
     result_writer: int
     start_reader: int
     owner_ready_writer: int
+    parent_lifetime_reader: int
 
     def __post_init__(self) -> None:
-        values = (self.result_writer, self.start_reader, self.owner_ready_writer)
+        values = (
+            self.result_writer,
+            self.start_reader,
+            self.owner_ready_writer,
+            self.parent_lifetime_reader,
+        )
         if any(type(value) is not int or value < 0 for value in values):
             raise ValueError("guardian child pipe descriptors must be non-negative")
         if len(values) != len(set(values)):
@@ -32,6 +38,7 @@ class GuardianParentPipeEndpoints:
     result_reader: PosixPipeReader
     start_writer: PosixPipeWriter
     owner_ready_reader: PosixPipeReader
+    parent_lifetime_writer: PosixPipeWriter
 
     def __post_init__(self) -> None:
         if not isinstance(self.result_reader, PosixPipeReader):
@@ -41,6 +48,10 @@ class GuardianParentPipeEndpoints:
         if not isinstance(self.owner_ready_reader, PosixPipeReader):
             raise ValueError(
                 "guardian owner-ready reader must implement PosixPipeReader"
+            )
+        if not isinstance(self.parent_lifetime_writer, PosixPipeWriter):
+            raise ValueError(
+                "guardian parent-lifetime writer must implement PosixPipeWriter"
             )
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 import math
@@ -19,6 +19,17 @@ from .process_group import (
 
 
 _OUTER_CONTAINMENT_MARGIN_SECONDS = 30
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationGuardianClock:
+    """Injected monotonic clock for one absolute guardian activation budget."""
+
+    monotonic_now: Callable[[], float]
+
+    def __post_init__(self) -> None:
+        if not callable(self.monotonic_now):
+            raise ValueError("ValidationGuardianClock.monotonic_now must be callable")
 
 
 @dataclass(frozen=True, slots=True)

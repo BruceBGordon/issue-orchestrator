@@ -60,14 +60,19 @@ def _raise_with_cleanup(
 
 
 class OwnedGuardianLaunchPipes:
-    """Own three pipes and all parent endpoints until terminal cleanup."""
+    """Own activation and lifetime pipes through terminal cleanup."""
 
     def __init__(
-        self, result: PosixPipe, start: PosixPipe, owner_ready: PosixPipe
+        self,
+        result: PosixPipe,
+        start: PosixPipe,
+        owner_ready: PosixPipe,
+        parent_lifetime: PosixPipe,
     ) -> None:
         self._result = result
         self._start = start
         self._owner_ready = owner_ready
+        self._parent_lifetime = parent_lifetime
         self._parent_readers: list[PosixPipeReader] = []
         self._parent_writers: list[PosixPipeWriter] = []
         self._closed = False
@@ -79,6 +84,7 @@ class OwnedGuardianLaunchPipes:
             result_writer=self._result.write_descriptor,
             start_reader=self._start.read_descriptor,
             owner_ready_writer=self._owner_ready.write_descriptor,
+            parent_lifetime_reader=self._parent_lifetime.read_descriptor,
         )
 
     def descriptor_mappings(
@@ -92,6 +98,7 @@ class OwnedGuardianLaunchPipes:
             child.result_writer,
             child.start_reader,
             child.owner_ready_writer,
+            child.parent_lifetime_reader,
         )
         if len(all_descriptors) != len(set(all_descriptors)):
             raise ValueError("guardian inherited descriptors must be unique")
@@ -111,6 +118,10 @@ class OwnedGuardianLaunchPipes:
             self._parent_writers.append(start_writer)
             owner_ready_reader = self._owner_ready.transfer_reader_after_launch()
             self._parent_readers.append(owner_ready_reader)
+            parent_lifetime_writer = (
+                self._parent_lifetime.transfer_writer_after_launch()
+            )
+            self._parent_writers.append(parent_lifetime_writer)
         except BaseException as transfer_error:
             _raise_with_cleanup(
                 "guardian parent endpoint transfer and cleanup both failed",
@@ -121,6 +132,7 @@ class OwnedGuardianLaunchPipes:
             result_reader,
             start_writer,
             owner_ready_reader,
+            parent_lifetime_writer,
         )
 
     def close(
@@ -159,6 +171,7 @@ class OwnedGuardianLaunchPipes:
                     ("result", self._result),
                     ("start", self._start),
                     ("owner-ready", self._owner_ready),
+                    ("parent-lifetime", self._parent_lifetime),
                 )
             )
         )
@@ -185,7 +198,7 @@ class PosixGuardianLaunchPipesFactory:
     def create(self) -> GuardianLaunchPipes:
         acquired: list[PosixPipe] = []
         try:
-            for _role in ("result", "start", "owner-ready"):
+            for _role in ("result", "start", "owner-ready", "parent-lifetime"):
                 acquired.append(self._pipe_factory.open())
         except BaseException as acquisition_error:
             cleanup = _cleanup_error(
@@ -202,5 +215,10 @@ class PosixGuardianLaunchPipesFactory:
                 acquisition_error,
                 cleanup,
             )
-        result, start, owner_ready = acquired
-        return OwnedGuardianLaunchPipes(result, start, owner_ready)
+        result, start, owner_ready, parent_lifetime = acquired
+        return OwnedGuardianLaunchPipes(
+            result,
+            start,
+            owner_ready,
+            parent_lifetime,
+        )

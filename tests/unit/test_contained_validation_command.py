@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import os
-import shlex
+import signal
 import sys
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from shlex import join as shell_join
+from shlex import quote as shell_quote
 
 import pytest
 
@@ -22,6 +25,10 @@ from issue_orchestrator.domain.process_group import (
     ProcessGroupTermination,
     ProcessGroupWait,
 )
+from issue_orchestrator.domain.process_group_sentinel import (
+    ProcessGroupSentinelPolicy,
+    ProcessGroupSentinelProgram,
+)
 from issue_orchestrator.domain.validation_execution import (
     ContainedValidationCommand,
     ValidationCommandDeadlineExceeded,
@@ -33,6 +40,7 @@ from issue_orchestrator.domain.validation_execution import (
     ValidationCommandTimedOut,
     ValidationCommandTimeoutPhase,
     ValidationExecutionDeadline,
+    ValidationGuardianClock,
 )
 from issue_orchestrator.execution.contained_validation_command import (
     PosixContainedValidationCommandRunner,
@@ -48,7 +56,10 @@ from issue_orchestrator.domain.posix_process import (
     PosixDescriptorMapping,
     PosixProcessActivationPolicy,
     PosixProcessEnvironment,
+    PosixProcessGroupMode,
+    PosixProcessLaunchSpec,
     PosixProcessProgram,
+    PosixProcessWithoutTerminal,
 )
 from issue_orchestrator.execution.posix_pipe import OsPosixPipeFactory
 from issue_orchestrator.execution.posix_process import (
@@ -61,12 +72,17 @@ from issue_orchestrator.execution.validation_launch_pipes import (
 from issue_orchestrator.execution.validation_pipe_resources import (
     default_validation_pipe_selector,
 )
+from issue_orchestrator.execution.validation_process_guardian import (
+    SentinelValidationProcessGuardian,
+    ValidationProcessGuardianProgram,
+)
 from issue_orchestrator.ports.process_group_supervisor import (
     ProcessGroupInterruption,
     ProcessGroupSupervisor,
 )
 from issue_orchestrator.ports.posix_pipe import PosixPipeReader
 from issue_orchestrator.ports.posix_process import PosixProcessLauncher
+from issue_orchestrator.ports.posix_process import PosixProcessLaunchStarted
 from issue_orchestrator.ports.validation_pipe_capture import (
     ValidationPipeCapture,
     ValidationPipeCaptureFactory,
@@ -82,11 +98,24 @@ from issue_orchestrator.ports.validation_launch_pipes import (
 from issue_orchestrator.infra.validation_executor_handshake import (
     VALIDATION_EXECUTOR_HANDSHAKE_ENVIRONMENT,
 )
+from issue_orchestrator.infra.executor_deadline_environment import (
+    EXECUTOR_DEADLINE_ENVIRONMENT,
+)
+from issue_orchestrator.execution.host_executor.host_policy import (
+    EXECUTOR_POOL_DIR_ENV,
+)
+from issue_orchestrator.entrypoints.bootstrap import build_posix_process_launcher
 from tests.process_tree_fixture import (
     CooperativeTermResistantProcessTreeProgram,
+    ParentCrashProcessTreeProgram,
     ProcessTreeMember,
 )
-from tests.process_completion_fixture import build_test_process_group_observer
+from tests.process_completion_fixture import (
+    NoDescendantProcessContainment,
+    PROCESS_COMPLETION_WATCHDOG,
+    TextProcessInvocation,
+    build_test_process_group_observer,
+)
 from tests.posix_process_fixture import ReapEvidenceFailingProcessLauncher
 
 
@@ -119,8 +148,9 @@ def _runner_with_launch_pipes(
     capture_factory: ValidationPipeCaptureFactory,
     launch_pipes_factory: ValidationLaunchPipesFactory,
 ) -> PosixContainedValidationCommandRunner:
+    process_launcher = _validation_process_launcher(supervisor)
     return PosixContainedValidationCommandRunner(
-        _validation_process_launcher(supervisor),
+        _validation_process_guardian(process_launcher, supervisor),
         supervisor,
         ContainedCommandOutputPolicy(
             poll_interval_seconds=0.01,
@@ -158,11 +188,38 @@ def _runner_with_process_launcher(
     supervisor: ProcessGroupSupervisor,
 ) -> PosixContainedValidationCommandRunner:
     return PosixContainedValidationCommandRunner(
-        process_launcher,
+        _validation_process_guardian(process_launcher, supervisor),
         supervisor,
         ContainedCommandOutputPolicy(0.01, 1.0, 1_048_576),
         PosixValidationPipeCaptureFactory(default_validation_pipe_selector),
         PosixValidationLaunchPipesFactory(OsPosixPipeFactory()),
+    )
+
+
+def _validation_process_guardian(
+    process_launcher: PosixProcessLauncher,
+    supervisor: ProcessGroupSupervisor,
+) -> SentinelValidationProcessGuardian:
+    return SentinelValidationProcessGuardian(
+        ValidationProcessGuardianProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.execution.validation_process_guardian",
+            )
+        ),
+        ProcessGroupSentinelProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.execution.process_group_sentinel",
+            )
+        ),
+        ProcessGroupSentinelPolicy(0.05, 2.0),
+        process_launcher,
+        supervisor,
+        OsPosixPipeFactory(),
+        ValidationGuardianClock(time.monotonic),
     )
 
 
@@ -314,7 +371,7 @@ def test_timeout_contains_term_resistant_descendant_before_return(
         300,
         ("validation-ready",),
     ).python_source()
-    command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(program)}"
+    command = f"exec {shell_quote(sys.executable)} -c {shell_quote(program)}"
 
     result = _runner().run(
         ContainedValidationCommand(
@@ -348,7 +405,7 @@ def test_nested_executor_handshake_yields_to_outer_deadline(tmp_path: Path) -> N
         "time.sleep(1.25); "
         "print('nested-executor-completed',flush=True)"
     )
-    command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(program)}"
+    command = f"exec {shell_quote(sys.executable)} -c {shell_quote(program)}"
 
     result = _runner().run(
         ContainedValidationCommand(
@@ -382,7 +439,7 @@ def test_nested_executor_outer_deadline_starts_at_handshake(tmp_path: Path) -> N
         "time.sleep(1.75); "
         "print('delayed-nested-executor-completed',flush=True)"
     )
-    command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(program)}"
+    command = f"exec {shell_quote(sys.executable)} -c {shell_quote(program)}"
 
     result = _runner().run(
         ContainedValidationCommand(
@@ -456,7 +513,7 @@ def test_nested_executor_remains_bounded_by_outer_deadline(tmp_path: Path) -> No
         "handshake.acknowledge_if_requested(os.environ); "
         "time.sleep(10)"
     )
-    command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(program)}"
+    command = f"exec {shell_quote(sys.executable)} -c {shell_quote(program)}"
 
     result = _runner().run(
         ContainedValidationCommand(
@@ -484,7 +541,7 @@ def test_natural_completion_returns_typed_capture_finalization_failure(
         _FailingCaptureFactory(RuntimeError("injected finalization failure"))
     ).run(
         ContainedValidationCommand(
-            command=f"exec {shlex.quote(sys.executable)} -c pass",
+            command=f"exec {shell_quote(sys.executable)} -c pass",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
@@ -509,7 +566,7 @@ def test_supervision_recovery_aggregates_typed_capture_finalization_failure(
         _FailingCaptureFactory(RuntimeError("injected finalization failure")),
     ).run(
         ContainedValidationCommand(
-            command=f"exec {shlex.quote(sys.executable)} -c 'import time; time.sleep(300)'",
+            command=f"exec {shell_quote(sys.executable)} -c 'import time; time.sleep(300)'",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
@@ -532,7 +589,7 @@ def test_capture_setup_failure_contains_and_reaps_started_child(
 ) -> None:
     result = _runner_with_capture(_SetupFailingCaptureFactory()).run(
         ContainedValidationCommand(
-            command=f"exec {shlex.quote(sys.executable)} -c 'import time; time.sleep(300)'",
+            command=f"exec {shell_quote(sys.executable)} -c 'import time; time.sleep(300)'",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
@@ -559,7 +616,7 @@ def test_post_spawn_reader_transfer_failure_contains_and_reaps_started_child(
         _TransferFailingValidationLaunchPipesFactory(transfer_failure),
     ).run(
         ContainedValidationCommand(
-            command=f"exec {shlex.quote(sys.executable)} -c 'import time; time.sleep(300)'",
+            command=f"exec {shell_quote(sys.executable)} -c 'import time; time.sleep(300)'",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
@@ -587,7 +644,7 @@ def test_non_finite_executor_acknowledgement_fails_and_contains_child(
     )
     result = _runner().run(
         ContainedValidationCommand(
-            command=f"exec {shlex.quote(sys.executable)} -c {shlex.quote(program)}",
+            command=f"exec {shell_quote(sys.executable)} -c {shell_quote(program)}",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
@@ -618,7 +675,7 @@ def test_partial_executor_handshake_is_rejected_after_fast_child_exit(
 
     result = _runner().run(
         ContainedValidationCommand(
-            command=f"exec {shlex.quote(sys.executable)} -c {shlex.quote(program)}",
+            command=f"exec {shell_quote(sys.executable)} -c {shell_quote(program)}",
             working_directory=tmp_path.resolve(),
             environment=os.environ,
             deadline=ValidationExecutionDeadline.for_active_timeout(5),
@@ -663,3 +720,134 @@ def test_reap_evidence_failure_does_not_skip_validation_output_finalization(
     assert result.cleanup.error is evidence_failure
     assert result.output.stdout == "retained-validation-output\n"
     ProcessTreeMember(result.child.process_id).assert_contained()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX crash containment")
+@pytest.mark.timeout(45)
+def test_outer_crash_contains_nested_executor_and_releases_exclusive_slot(
+    tmp_path: Path,
+) -> None:
+    """A hard-killed validation parent cannot strand detached executor work."""
+    repo_root = Path(__file__).resolve().parents[2]
+    pool_dir = (tmp_path / "executor-pool").resolve()
+    leader_pid_path = (tmp_path / "nested-leader.pid").resolve()
+    descendant_pid_path = (tmp_path / "nested-descendant.pid").resolve()
+    process_source = ParentCrashProcessTreeProgram(
+        leader_pid_path,
+        descendant_pid_path,
+        300,
+    ).python_source()
+    base_environment = dict(os.environ)
+    base_environment[EXECUTOR_POOL_DIR_ENV] = str(pool_dir)
+    bounded_environment = EXECUTOR_DEADLINE_ENVIRONMENT.encode(
+        base_environment,
+        ExecutorBoundedDeadline(10.0, 20.0),
+    )
+    executor_command = shell_join(
+        (
+            sys.executable,
+            "-m",
+            "issue_orchestrator.entrypoints.cli",
+            "executor-run",
+            "--work-key",
+            "pressure:validation-crash",
+            "--group",
+            "pressure-validation-crash",
+            "--min-concurrency",
+            "1",
+            "--max-concurrency",
+            "1",
+            "--exclusive",
+            "validation-crash-proof",
+            "--",
+            sys.executable,
+            "-c",
+            process_source,
+        )
+    )
+    outer_source = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "from issue_orchestrator.domain.validation_execution import "
+        "ContainedValidationCommand, ValidationExecutionDeadline\n"
+        "from issue_orchestrator.entrypoints.bootstrap import "
+        "build_validation_command_runner\n"
+        "result = build_validation_command_runner().run(\n"
+        "    ContainedValidationCommand(\n"
+        f"        command={executor_command!r},\n"
+        f"        working_directory=Path({str(repo_root)!r}),\n"
+        "        environment=os.environ,\n"
+        "        deadline=ValidationExecutionDeadline.for_active_timeout(30),\n"
+        "    )\n"
+        ")\n"
+        "raise SystemExit(result.exit_code)\n"
+    )
+    launch = build_posix_process_launcher().launch(
+        PosixProcessLaunchSpec(
+            PosixProcessProgram((sys.executable, "-c", outer_source)),
+            repo_root,
+            PosixProcessEnvironment.from_mapping(bounded_environment),
+            PosixProcessGroupMode.NEW_SESSION,
+            (),
+            PosixProcessWithoutTerminal(),
+        )
+    )
+    assert type(launch) is PosixProcessLaunchStarted
+    PROCESS_COMPLETION_WATCHDOG.wait_for_path(
+        leader_pid_path,
+        operation="nested executor leader readiness",
+    )
+    PROCESS_COMPLETION_WATCHDOG.wait_for_path(
+        descendant_pid_path,
+        operation="nested executor descendant readiness",
+    )
+    nested_leader = ProcessTreeMember(
+        int(leader_pid_path.read_text(encoding="utf-8"))
+    )
+    nested_descendant = ProcessTreeMember(
+        int(descendant_pid_path.read_text(encoding="utf-8"))
+    )
+
+    launch.process.kill()
+    assert PROCESS_COMPLETION_WATCHDOG.wait_posix_process(
+        launch.process,
+        operation="hard-killed outer validation parent",
+    ) == -signal.SIGKILL
+    nested_leader.assert_contained()
+    nested_descendant.assert_contained()
+
+    contender_environment = EXECUTOR_DEADLINE_ENVIRONMENT.encode(
+        base_environment,
+        ExecutorBoundedDeadline(2.0, 4.0),
+    )
+    contender = PROCESS_COMPLETION_WATCHDOG.run_text(
+        TextProcessInvocation(
+            operation="post-crash exclusive contender",
+            arguments=(
+                sys.executable,
+                "-m",
+                "issue_orchestrator.entrypoints.cli",
+                "executor-run",
+                "--work-key",
+                "pressure:post-crash",
+                "--group",
+                "pressure-post-crash",
+                "--min-concurrency",
+                "1",
+                "--max-concurrency",
+                "1",
+                "--exclusive",
+                "validation-crash-proof",
+                "--",
+                sys.executable,
+                "-c",
+                "print('post-crash-admitted')",
+            ),
+            working_directory=repo_root,
+            environment=contender_environment,
+            timeout_containment=NoDescendantProcessContainment(),
+        )
+    )
+
+    assert contender.returncode == 0, contender.stderr
+    assert "post-crash-admitted" in contender.stdout

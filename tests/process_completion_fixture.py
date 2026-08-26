@@ -13,7 +13,7 @@ from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TextIO, TypeVar
+from typing import IO, Any, TypeVar
 
 from issue_orchestrator.domain.executor import ExecutorInteractiveSessionCancellation
 from issue_orchestrator.adapters.ps_process_group_observer import (
@@ -29,6 +29,7 @@ from issue_orchestrator.execution.executor_guardian_cancellation import (
 from issue_orchestrator.execution.atomic_record_store import (
     OsAtomicRecordStoreFactory,
 )
+from issue_orchestrator.ports.posix_process import PosixProcessHandle
 from tests.process_tree_fixture import (
     PROCESS_CONTAINMENT_WATCHDOG_SECONDS,
     ProcessTreeMember,
@@ -249,8 +250,9 @@ class ProcessCompletionWatchdog:
                     ),
                     ProcessCleanupStep(
                         operation="reap outer process",
-                        action=lambda: process.wait(
-                            timeout=PROCESS_CONTAINMENT_WATCHDOG_SECONDS
+                        action=lambda: _wait_subprocess(
+                            process,
+                            PROCESS_CONTAINMENT_WATCHDOG_SECONDS,
                         ),
                     ),
                     ProcessCleanupStep(
@@ -298,6 +300,46 @@ class ProcessCompletionWatchdog:
                 f"{self.timeout_seconds:.0f}-second deadlock watchdog; "
                 f"pid={process.pid} returncode={process.poll()!r}"
             ) from error
+
+    def wait_posix_process(
+        self,
+        process: PosixProcessHandle,
+        *,
+        operation: str,
+    ) -> int:
+        """Reap one typed retained child under the shared deadlock owner."""
+        if not isinstance(process, PosixProcessHandle):
+            raise ValueError(
+                "ProcessCompletionWatchdog.wait_posix_process requires "
+                "PosixProcessHandle"
+            )
+        _require_operation(operation)
+        try:
+            return process.wait(self.timeout_seconds)
+        except TimeoutError as error:
+            completion_error = ProcessCompletionTimeout(
+                f"{operation} did not complete within the "
+                f"{self.timeout_seconds:.0f}-second deadlock watchdog; "
+                f"pid={process.process_id} returncode={process.return_code!r}"
+            )
+            completion_error.__cause__ = error
+            ProcessCleanupPlan(
+                operation=f"contain timed-out {operation}",
+                steps=(
+                    ProcessCleanupStep(
+                        operation="kill exact retained child",
+                        action=process.kill,
+                    ),
+                    ProcessCleanupStep(
+                        operation="reap exact retained child",
+                        action=lambda: _wait_posix_process(
+                            process,
+                            PROCESS_CONTAINMENT_WATCHDOG_SECONDS
+                        ),
+                    ),
+                ),
+            ).execute(preceding_error=completion_error)
+            raise AssertionError("timeout cleanup must raise")
 
     def wait_for_event(self, event: threading.Event, *, operation: str) -> None:
         """Require an explicit thread handoff under this deadlock watchdog."""
@@ -434,7 +476,21 @@ def _kill_process_group(process_group_id: int) -> None:
         return
 
 
-def _close_process_stream(stream: TextIO | None) -> None:
+def _wait_subprocess(
+    process: subprocess.Popen[_Output],
+    timeout_seconds: float,
+) -> None:
+    process.wait(timeout=timeout_seconds)
+
+
+def _wait_posix_process(
+    process: PosixProcessHandle,
+    timeout_seconds: float,
+) -> None:
+    process.wait(timeout_seconds)
+
+
+def _close_process_stream(stream: IO[Any] | None) -> None:
     if stream is not None:
         stream.close()
 

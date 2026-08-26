@@ -50,3 +50,20 @@ class ProcessGroupSentinelProgram:
             raise ValueError(
                 "ProcessGroupSentinelProgram executable must be absolute"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessGroupSentinelParentLifetime:
+    """Read endpoint whose closure means the owning parent has disappeared."""
+
+    read_file_descriptor: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.read_file_descriptor) is not int
+            or self.read_file_descriptor < 0
+        ):
+            raise ValueError(
+                "ProcessGroupSentinelParentLifetime.read_file_descriptor must "
+                "be non-negative"
+            )

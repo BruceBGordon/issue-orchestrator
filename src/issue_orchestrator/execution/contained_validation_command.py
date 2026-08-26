@@ -43,11 +43,9 @@ from ..ports.posix_pipe import PosixPipeReader
 from ..ports.posix_process import (
     PosixProcessExecRejected,
     PosixProcessHandle,
-    PosixProcessLauncher,
     PosixProcessLaunchRecovered,
     PosixProcessLaunchRecoveryFailed,
     PosixProcessLaunchRejected,
-    PosixProcessLaunchStarted,
 )
 from ..ports.process_group_supervisor import (
     ProcessGroupInterruption,
@@ -64,6 +62,11 @@ from ..ports.validation_launch_pipes import (
     ValidationLaunchPipesCloseFailed,
     ValidationLaunchPipesFactory,
     ValidationLaunchReaders,
+)
+from ..ports.validation_process_guardian import (
+    ValidationProcessGuardian,
+    ValidationProcessGuardianStarted,
+    ValidationProcessParentLifetime,
 )
 from .validation_pipe_resources import (
     ValidationPipeResourceOwner,
@@ -103,12 +106,17 @@ def _combined_error(
 @dataclass(frozen=True, slots=True)
 class _StartedValidationCommand:
     process: PosixProcessHandle
+    parent_lifetime: ValidationProcessParentLifetime
     readers: ValidationLaunchReaders
     started_at_monotonic: float
 
     def __post_init__(self) -> None:
         if not isinstance(self.process, PosixProcessHandle):
             raise ValueError("started validation process must implement its port")
+        if not isinstance(self.parent_lifetime, ValidationProcessParentLifetime):
+            raise ValueError(
+                "started validation parent lifetime must implement its port"
+            )
         if type(self.readers) is not ValidationLaunchReaders:
             raise ValueError("started validation readers must be typed")
         if (
@@ -157,6 +165,25 @@ class _ValidationReapEvidenceFailed:
 
 _ValidationReapEvidence = (
     _ValidationReapEvidenceRecorded | _ValidationReapEvidenceFailed
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationParentLifetimeClosed:
+    """The post-containment parent lifetime was released."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationParentLifetimeCloseFailed:
+    error: BaseException
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.error, BaseException):
+            raise ValueError("validation parent lifetime failure must be typed")
+
+
+_ValidationParentLifetimeClose = (
+    _ValidationParentLifetimeClosed | _ValidationParentLifetimeCloseFailed
 )
 
 
@@ -401,18 +428,18 @@ class PosixContainedValidationCommandRunner:
 
     def __init__(
         self,
-        process_launcher: PosixProcessLauncher,
+        process_guardian: ValidationProcessGuardian,
         process_group_supervisor: ProcessGroupSupervisor,
         output_policy: ContainedCommandOutputPolicy,
         capture_factory: ValidationPipeCaptureFactory,
         launch_pipes_factory: ValidationLaunchPipesFactory,
     ) -> None:
-        if not isinstance(process_launcher, PosixProcessLauncher):
+        if not isinstance(process_guardian, ValidationProcessGuardian):
             raise ValueError(
-                "PosixContainedValidationCommandRunner.process_launcher must "
-                "implement PosixProcessLauncher"
+                "PosixContainedValidationCommandRunner.process_guardian must "
+                "implement ValidationProcessGuardian"
             )
-        self._process_launcher = process_launcher
+        self._process_guardian = process_guardian
         if not isinstance(process_group_supervisor, ProcessGroupSupervisor):
             raise ValueError(
                 "PosixContainedValidationCommandRunner.process_group_supervisor "
@@ -451,21 +478,16 @@ class PosixContainedValidationCommandRunner:
         return self._run_started(activation, command.deadline)
 
     def _activate(self, command: ContainedValidationCommand) -> _ValidationActivation:
-        started_at_monotonic = time.monotonic()
         try:
             pipes = self._launch_pipes_factory.create()
         except BaseException as acquisition_error:
             return _ValidationActivationClosed(self._not_started(acquisition_error))
         try:
-            launch = self._process_launcher.launch(
-                PosixProcessLaunchSpec(
-                    program=PosixProcessProgram(("/bin/sh", "-c", command.command)),
-                    working_directory=command.working_directory,
-                    environment=pipes.child_environment(command.environment),
-                    group_mode=PosixProcessGroupMode.NEW_SESSION,
-                    descriptor_mappings=pipes.descriptor_mappings,
-                    terminal=PosixProcessWithoutTerminal(),
-                )
+            launch = self._process_guardian.launch(
+                PosixProcessProgram(("/bin/sh", "-c", command.command)),
+                command.working_directory,
+                pipes.child_environment(command.environment),
+                pipes.descriptor_mappings,
             )
         except BaseException as prelaunch_error:
             return _ValidationActivationClosed(
@@ -532,14 +554,15 @@ class PosixContainedValidationCommandRunner:
                     output=ValidationCommandOutput("", ""),
                 )
             )
-        if type(launch) is not PosixProcessLaunchStarted:
-            raise AssertionError("POSIX process launch is a closed union")
+        if type(launch) is not ValidationProcessGuardianStarted:
+            raise AssertionError("validation guardian launch is a closed union")
         try:
             readers = pipes.transfer_readers_after_launch()
         except BaseException as transfer_error:
             return _ValidationActivationClosed(
                 self._abort_without_capture(
                     launch.process,
+                    launch.parent_lifetime,
                     _combined_error(
                         "validation reader transfer and pipe cleanup both failed",
                         transfer_error,
@@ -549,8 +572,9 @@ class PosixContainedValidationCommandRunner:
             )
         return _StartedValidationCommand(
             launch.process,
+            launch.parent_lifetime,
             readers,
-            started_at_monotonic,
+            time.monotonic(),
         )
 
     @staticmethod
@@ -577,7 +601,11 @@ class PosixContainedValidationCommandRunner:
                 started.started_at_monotonic,
             )
         except BaseException as capture_setup_error:
-            return self._abort_without_capture(process, capture_setup_error)
+            return self._abort_without_capture(
+                process,
+                started.parent_lifetime,
+                capture_setup_error,
+            )
         leader = OwnedProcessGroupLeader(process.process_id)
         try:
             supervision = self._supervisor.supervise(
@@ -588,10 +616,12 @@ class PosixContainedValidationCommandRunner:
         except BaseException as supervision_error:
             return self._recover_after_supervision_failure(
                 process,
+                started.parent_lifetime,
                 leader,
                 capture,
                 supervision_error,
             )
+        parent_lifetime = self._close_parent_lifetime(started.parent_lifetime)
         finalization = self._finalize_capture(capture)
         reap_evidence = self._record_reap_evidence(
             process,
@@ -630,24 +660,45 @@ class PosixContainedValidationCommandRunner:
             )
         elif type(reap_evidence) is not _ValidationReapEvidenceRecorded:
             raise AssertionError("validation reap evidence is a closed union")
+        if type(parent_lifetime) is _ValidationParentLifetimeCloseFailed:
+            cleanup = validation_cleanup_with_failure(
+                cleanup,
+                parent_lifetime.error,
+                "validation execution and parent lifetime cleanup both failed",
+            )
+        elif type(parent_lifetime) is not _ValidationParentLifetimeClosed:
+            raise AssertionError("validation parent lifetime close is a closed union")
         return ValidationCommandExecution(child, cleanup, output)
 
     def _abort_without_capture(
         self,
         process: PosixProcessHandle,
+        parent_lifetime: ValidationProcessParentLifetime,
         original_error: BaseException,
     ) -> ValidationCommandExecution:
         leader = OwnedProcessGroupLeader(process.process_id)
+        lifetime_close = self._close_parent_lifetime(parent_lifetime)
         try:
             termination = self._supervisor.abort(leader)
         except BaseException as cleanup_error:
+            containment_error = cleanup_error
+            if type(lifetime_close) is _ValidationParentLifetimeCloseFailed:
+                containment_error = _combined_error(
+                    "validation containment and parent lifetime cleanup both failed",
+                    cleanup_error,
+                    lifetime_close.error,
+                )
+            elif type(lifetime_close) is not _ValidationParentLifetimeClosed:
+                raise AssertionError(
+                    "validation parent lifetime close is a closed union"
+                )
             return ValidationCommandExecution(
                 child=ValidationCommandExitUnknown(process.process_id),
                 cleanup=ValidationCommandCleanupFailed(
                     _combined_error(
                         "validation setup and cleanup both failed",
                         original_error,
-                        cleanup_error,
+                        containment_error,
                     )
                 ),
                 output=ValidationCommandOutput("", ""),
@@ -656,6 +707,14 @@ class PosixContainedValidationCommandRunner:
             original_error
         )
         cleanup = self._add_termination_failures(cleanup, termination)
+        if type(lifetime_close) is _ValidationParentLifetimeCloseFailed:
+            cleanup = validation_cleanup_with_failure(
+                cleanup,
+                lifetime_close.error,
+                "validation setup and parent lifetime cleanup both failed",
+            )
+        elif type(lifetime_close) is not _ValidationParentLifetimeClosed:
+            raise AssertionError("validation parent lifetime close is a closed union")
         reap_evidence = self._record_reap_evidence(process, termination)
         if type(reap_evidence) is _ValidationReapEvidenceFailed:
             cleanup = validation_cleanup_with_failure(
@@ -677,26 +736,39 @@ class PosixContainedValidationCommandRunner:
     def _recover_after_supervision_failure(
         self,
         process: PosixProcessHandle,
+        parent_lifetime: ValidationProcessParentLifetime,
         leader: OwnedProcessGroupLeader,
         capture: ValidationPipeCapture,
         supervision_error: BaseException,
     ) -> ValidationCommandExecution:
+        lifetime_close = self._close_parent_lifetime(parent_lifetime)
         try:
             termination = self._supervisor.abort(leader)
         except BaseException as cleanup_error:
             finalization = self._finalize_capture(capture)
             capture_error, output = self._capture_failure_and_output(finalization)
+            recovery_error = _combined_error(
+                "validation containment and output finalization both failed",
+                cleanup_error,
+                capture_error,
+            )
+            if type(lifetime_close) is _ValidationParentLifetimeCloseFailed:
+                recovery_error = _combined_error(
+                    "validation containment and parent lifetime cleanup both failed",
+                    recovery_error,
+                    lifetime_close.error,
+                )
+            elif type(lifetime_close) is not _ValidationParentLifetimeClosed:
+                raise AssertionError(
+                    "validation parent lifetime close is a closed union"
+                )
             return ValidationCommandExecution(
                 child=ValidationCommandExitUnknown(process.process_id),
                 cleanup=ValidationCommandCleanupFailed(
                     _combined_error(
                         "validation supervision and containment both failed",
                         supervision_error,
-                        _combined_error(
-                            "validation containment and output finalization both failed",
-                            cleanup_error,
-                            capture_error,
-                        ),
+                        recovery_error,
                     )
                 ),
                 output=output,
@@ -711,6 +783,14 @@ class PosixContainedValidationCommandRunner:
             )
         )
         cleanup = self._add_termination_failures(cleanup, termination)
+        if type(lifetime_close) is _ValidationParentLifetimeCloseFailed:
+            cleanup = validation_cleanup_with_failure(
+                cleanup,
+                lifetime_close.error,
+                "validation recovery and parent lifetime cleanup both failed",
+            )
+        elif type(lifetime_close) is not _ValidationParentLifetimeClosed:
+            raise AssertionError("validation parent lifetime close is a closed union")
         reap_evidence = self._record_reap_evidence(process, termination)
         if type(reap_evidence) is _ValidationReapEvidenceFailed:
             cleanup = validation_cleanup_with_failure(
@@ -758,6 +838,16 @@ class PosixContainedValidationCommandRunner:
         except BaseException as error:
             return _ValidationReapEvidenceFailed(error)
         return _ValidationReapEvidenceRecorded()
+
+    @staticmethod
+    def _close_parent_lifetime(
+        parent_lifetime: ValidationProcessParentLifetime,
+    ) -> _ValidationParentLifetimeClose:
+        try:
+            parent_lifetime.close()
+        except BaseException as error:
+            return _ValidationParentLifetimeCloseFailed(error)
+        return _ValidationParentLifetimeClosed()
 
     @staticmethod
     def _add_termination_failures(

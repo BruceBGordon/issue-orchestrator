@@ -232,6 +232,36 @@ class CooperativeTermResistantProcessTreeProgram:
 
 
 @dataclass(frozen=True, slots=True)
+class ParentCrashProcessTreeProgram:
+    """TERM-resistant tree that publishes both leader and descendant identity."""
+
+    leader_pid_path: Path
+    descendant_pid_path: Path
+    descendant_lifetime_seconds: int
+
+    def __post_init__(self) -> None:
+        _require_absolute_pid_path(self.leader_pid_path)
+        _require_absolute_pid_path(self.descendant_pid_path)
+        if self.leader_pid_path == self.descendant_pid_path:
+            raise ValueError("leader and descendant identity paths must be distinct")
+        TermResistantChildProgram(self.descendant_lifetime_seconds)
+
+    def python_source(self) -> str:
+        """Return a fully ready tree whose leader exits cooperatively on TERM."""
+        return (
+            "import os\n"
+            f"{_ready_descendant_source(self.descendant_lifetime_seconds)}"
+            "signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0))\n"
+            f"{_publish_descendant_source(self.descendant_pid_path)}"
+            f"pathlib.Path({str(self.leader_pid_path)!r}).write_text(\n"
+            "    str(os.getpid()), encoding='utf-8'\n"
+            ")\n"
+            "signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})\n"
+            "signal.pause()\n"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ExitingTermResistantProcessTreeProgram:
     """Leader that exits only after its resistant descendant is ready."""
 

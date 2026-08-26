@@ -349,6 +349,9 @@ class PosixExecutorCommandGuardian:
                 result_file_descriptor=child_descriptors.result_writer,
                 start_file_descriptor=child_descriptors.start_reader,
                 owner_ready_file_descriptor=child_descriptors.owner_ready_writer,
+                parent_lifetime_read_file_descriptor=(
+                    child_descriptors.parent_lifetime_reader
+                ),
                 lifecycle=request.lifecycle,
                 budget=request.budget,
                 cancellation=self._guardian_cancellation_record(cancellation_controls),
@@ -745,10 +748,23 @@ class PosixExecutorCommandGuardian:
         result_read_fd: int,
     ) -> ExecutorGuardianTerminal:
         """Interpret one fully contained guardian supervision outcome."""
-        guardian.record_external_reap(supervision.termination.leader_exit_code)
+        evidence_failures: list[BaseException] = []
+        try:
+            guardian.record_external_reap(
+                supervision.termination.leader_exit_code
+            )
+        except BaseException as error:
+            evidence_failures.append(error)
         courtesy_failure = supervision.termination.courtesy_failure()
         if courtesy_failure is not None:
-            raise courtesy_failure.error
+            evidence_failures.append(courtesy_failure.error)
+        if evidence_failures:
+            if len(evidence_failures) == 1:
+                raise evidence_failures[0]
+            raise BaseExceptionGroup(
+                "guardian post-containment evidence failed",
+                evidence_failures,
+            )
         if type(supervision) is ProcessGroupInterrupted:
             return ExecutorGuardianCommandCompleted(-signal.SIGTERM)
         if type(supervision) is not ProcessGroupCompleted:

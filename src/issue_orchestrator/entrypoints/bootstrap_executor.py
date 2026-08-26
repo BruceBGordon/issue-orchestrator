@@ -324,6 +324,15 @@ def build_validation_command_runner() -> ValidationCommandRunner:
         PosixContainedValidationCommandRunner,
         PosixValidationPipeCaptureFactory,
     )
+    from ..execution.validation_process_guardian import (
+        SentinelValidationProcessGuardian,
+        ValidationProcessGuardianProgram,
+    )
+    from ..domain.validation_execution import ValidationGuardianClock
+    from ..domain.process_group_sentinel import (
+        ProcessGroupSentinelPolicy,
+        ProcessGroupSentinelProgram,
+    )
     from ..execution.validation_pipe_resources import (
         default_validation_pipe_selector,
     )
@@ -332,16 +341,47 @@ def build_validation_command_runner() -> ValidationCommandRunner:
         PosixValidationLaunchPipesFactory,
     )
 
+    process_launcher = build_posix_process_launcher()
+    process_group_supervisor = build_process_group_supervisor()
+    pipe_factory = OsPosixPipeFactory()
+    process_guardian = SentinelValidationProcessGuardian(
+        ValidationProcessGuardianProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.execution.validation_process_guardian",
+            )
+        ),
+        ProcessGroupSentinelProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.execution.process_group_sentinel",
+            )
+        ),
+        ProcessGroupSentinelPolicy(
+            graceful_shutdown_seconds=(
+                _PROCESS_TERMINATION.graceful_shutdown_seconds
+            ),
+            startup_timeout_seconds=(
+                _POSIX_PROCESS_ACTIVATION_TIMEOUT_SECONDS
+            ),
+        ),
+        process_launcher,
+        process_group_supervisor,
+        pipe_factory,
+        ValidationGuardianClock(time.monotonic),
+    )
     return PosixContainedValidationCommandRunner(
-        build_posix_process_launcher(),
-        build_process_group_supervisor(),
+        process_guardian,
+        process_group_supervisor,
         ContainedCommandOutputPolicy(
             poll_interval_seconds=0.05,
             shutdown_timeout_seconds=2.0,
             final_drain_byte_limit=4_194_304,
         ),
         PosixValidationPipeCaptureFactory(default_validation_pipe_selector),
-        PosixValidationLaunchPipesFactory(OsPosixPipeFactory()),
+        PosixValidationLaunchPipesFactory(pipe_factory),
     )
 
 

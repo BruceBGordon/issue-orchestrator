@@ -16,6 +16,7 @@ from typing import Annotated, Literal
 from pydantic import Field, ValidationError
 
 from ..domain.process_group_sentinel import (
+    ProcessGroupSentinelParentLifetime,
     ProcessGroupSentinelPolicy,
     ProcessGroupSentinelProgram,
 )
@@ -56,6 +57,7 @@ _CONTAIN = b"K"
 _RETIRE = b"X"
 _CANCELLATION_MARKER = "cancellation"
 _CONTROLLER_MARKER = "controller"
+_PARENT_LIFETIME_MARKER = "parent-lifetime"
 
 
 class ProcessGroupSentinelError(RuntimeError):
@@ -88,6 +90,21 @@ _SentinelCancellationRecord = Annotated[
 ]
 
 
+class _SentinelWithoutParentLifetimeRecord(StrictWireRecord):
+    kind: Literal["without-parent-lifetime"] = "without-parent-lifetime"
+
+
+class _SentinelParentLifetimeRecord(StrictWireRecord):
+    kind: Literal["parent-lifetime"] = "parent-lifetime"
+    read_file_descriptor: int = Field(ge=0)
+
+
+_SentinelParentLifetimeRecordUnion = Annotated[
+    _SentinelWithoutParentLifetimeRecord | _SentinelParentLifetimeRecord,
+    Field(discriminator="kind"),
+]
+
+
 class _ProcessGroupSentinelInvocation(StrictWireRecord):
     schema_version: Literal[1] = 1
     cancellation: _SentinelCancellationRecord
@@ -95,6 +112,7 @@ class _ProcessGroupSentinelInvocation(StrictWireRecord):
     ready_file_descriptor: int = Field(ge=0)
     process_group_id: int = Field(gt=1)
     graceful_shutdown_seconds: float = Field(gt=0)
+    parent_lifetime: _SentinelParentLifetimeRecordUnion
 
 
 class _SentinelLaunchResources:
@@ -230,6 +248,49 @@ class ProcessGroupSentinelController:
         process_launcher: PosixProcessLauncher,
     ) -> ProcessGroupSentinelController:
         """Start a sentinel in the caller's current process group and await it."""
+        return cls._start(
+            program,
+            cancellation,
+            policy,
+            lifetime_file_descriptors,
+            _SentinelWithoutParentLifetimeRecord(),
+            process_launcher,
+        )
+
+    @classmethod
+    def start_with_parent_lifetime(
+        cls,
+        program: ProcessGroupSentinelProgram,
+        cancellation: ProcessGroupSentinelCancellation,
+        policy: ProcessGroupSentinelPolicy,
+        lifetime_file_descriptors: tuple[int, ...],
+        parent_lifetime: ProcessGroupSentinelParentLifetime,
+        process_launcher: PosixProcessLauncher,
+    ) -> ProcessGroupSentinelController:
+        """Start a sentinel that also contains on exact parent-lifetime EOF."""
+        if type(parent_lifetime) is not ProcessGroupSentinelParentLifetime:
+            raise ValueError("sentinel parent_lifetime must be typed")
+        return cls._start(
+            program,
+            cancellation,
+            policy,
+            lifetime_file_descriptors,
+            _SentinelParentLifetimeRecord(
+                read_file_descriptor=parent_lifetime.read_file_descriptor
+            ),
+            process_launcher,
+        )
+
+    @classmethod
+    def _start(
+        cls,
+        program: ProcessGroupSentinelProgram,
+        cancellation: ProcessGroupSentinelCancellation,
+        policy: ProcessGroupSentinelPolicy,
+        lifetime_file_descriptors: tuple[int, ...],
+        parent_lifetime: _SentinelParentLifetimeRecordUnion,
+        process_launcher: PosixProcessLauncher,
+    ) -> ProcessGroupSentinelController:
         cls._validate_start_contract(
             program,
             cancellation,
@@ -240,9 +301,13 @@ class ProcessGroupSentinelController:
         cancellation_record, cancellation_descriptors = (
             cls._cancellation_record(cancellation)
         )
+        parent_lifetime_descriptors = cls._parent_lifetime_descriptors(
+            parent_lifetime
+        )
         inherited_descriptors = (
             *cancellation_descriptors,
             *lifetime_file_descriptors,
+            *parent_lifetime_descriptors,
         )
         if len(set(inherited_descriptors)) != len(inherited_descriptors):
             raise ValueError("sentinel inherited descriptors must be unique")
@@ -256,6 +321,7 @@ class ProcessGroupSentinelController:
                 ready_file_descriptor=resources.readiness_writer_descriptor,
                 process_group_id=os.getpgrp(),
                 graceful_shutdown_seconds=policy.graceful_shutdown_seconds,
+                parent_lifetime=parent_lifetime,
             )
             activation = cls._activate(
                 program,
@@ -291,6 +357,16 @@ class ProcessGroupSentinelController:
                     policy.startup_timeout_seconds,
                 ),
             )
+
+    @staticmethod
+    def _parent_lifetime_descriptors(
+        parent_lifetime: _SentinelParentLifetimeRecordUnion,
+    ) -> tuple[int, ...]:
+        if type(parent_lifetime) is _SentinelWithoutParentLifetimeRecord:
+            return ()
+        if type(parent_lifetime) is _SentinelParentLifetimeRecord:
+            return (parent_lifetime.read_file_descriptor,)
+        raise AssertionError("sentinel parent lifetime is a closed union")
 
     @staticmethod
     def _validate_start_contract(
@@ -747,6 +823,18 @@ class _ProcessGroupSentinelChild:
         finally:
             controller.close()
             owner.close()
+            self._close_parent_lifetime(invocation.parent_lifetime)
+
+    @staticmethod
+    def _close_parent_lifetime(
+        parent_lifetime: _SentinelParentLifetimeRecordUnion,
+    ) -> None:
+        if type(parent_lifetime) is _SentinelWithoutParentLifetimeRecord:
+            return
+        if type(parent_lifetime) is _SentinelParentLifetimeRecord:
+            os.close(parent_lifetime.read_file_descriptor)
+            return
+        raise AssertionError("sentinel parent lifetime is a closed union")
 
     @staticmethod
     def _publish_ready(ready_file_descriptor: int) -> None:
@@ -768,6 +856,7 @@ class _ProcessGroupSentinelChild:
         with selectors.DefaultSelector() as selector:
             selector.register(controller, selectors.EVENT_READ, _CONTROLLER_MARKER)
             owner.register(selector, _CANCELLATION_MARKER)
+            cls._register_parent_lifetime(selector, invocation.parent_lifetime)
             while True:
                 for key, _events in selector.select():
                     if key.data == _CANCELLATION_MARKER:
@@ -778,16 +867,42 @@ class _ProcessGroupSentinelChild:
                         )
                         if request is not None:
                             cls._contain_group(invocation, request)
-                    elif key.data == _CONTROLLER_MARKER:
-                        command = controller.recv(2)
-                        if command == _RETIRE:
-                            return 0
-                        if command in (b"", _CONTAIN):
-                            cls._contain_group(invocation, None)
-                        cls._contain_group(invocation, None)
-                    else:
-                        raise AssertionError("sentinel selector marker is closed")
+                        continue
+                    if cls._handle_control_event(key.data, invocation, controller):
+                        return 0
         raise AssertionError("sentinel event loop unexpectedly returned")
+
+    @staticmethod
+    def _register_parent_lifetime(
+        selector: selectors.BaseSelector,
+        parent_lifetime: _SentinelParentLifetimeRecordUnion,
+    ) -> None:
+        if type(parent_lifetime) is _SentinelWithoutParentLifetimeRecord:
+            return
+        if type(parent_lifetime) is not _SentinelParentLifetimeRecord:
+            raise AssertionError("sentinel parent lifetime is a closed union")
+        selector.register(
+            parent_lifetime.read_file_descriptor,
+            selectors.EVENT_READ,
+            _PARENT_LIFETIME_MARKER,
+        )
+
+    @classmethod
+    def _handle_control_event(
+        cls,
+        marker: object,
+        invocation: _ProcessGroupSentinelInvocation,
+        controller: socket.socket,
+    ) -> bool:
+        if marker == _PARENT_LIFETIME_MARKER:
+            cls._contain_group(invocation, None)
+        if marker != _CONTROLLER_MARKER:
+            raise AssertionError("sentinel selector marker is closed")
+        command = controller.recv(2)
+        if command == _RETIRE:
+            return True
+        cls._contain_group(invocation, None)
+        raise AssertionError("sentinel containment unexpectedly returned")
 
     @staticmethod
     def _contain_group(
