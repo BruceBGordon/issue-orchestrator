@@ -39,6 +39,9 @@ from issue_orchestrator.entrypoints.bootstrap import (
     build_terminal_session_terminator,
 )
 from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_terminal_session_owner,
+    build_terminal_session_registry,
+    build_terminal_session_watcher_factory,
     terminal_session_watcher_policy,
 )
 from issue_orchestrator.execution.worktree_adapter import GitWorktreeManager
@@ -59,6 +62,19 @@ from .scenario_dsl import script
 # ---------------------------------------------------------------------------
 # Helpers & Fixtures
 # ---------------------------------------------------------------------------
+
+
+
+def _subprocess_plugin(registry_root: Path) -> SubprocessPlugin:
+    """Compose the production plugin with a test-owned registry root."""
+    return SubprocessPlugin(
+        build_terminal_session_terminator(),
+        build_terminal_session_owner(),
+        build_terminal_session_registry(registry_root.resolve()),
+        build_process_group_supervisor(),
+        terminal_session_watcher_policy(),
+        build_terminal_session_watcher_factory(),
+    )
 
 
 def _init_foreign_repo(tmp_path: Path) -> Path:
@@ -394,18 +410,14 @@ def test_foreign_repo_default_setup_commands_empty() -> None:
 
 
 @pytest.mark.integration
-def test_foreign_repo_scripts_dir_from_package() -> None:
+def test_foreign_repo_scripts_dir_from_package(tmp_path: Path) -> None:
     """terminal_subprocess uses package-relative scripts dir, not repo_root.
 
     Instead of mirroring the implementation's path arithmetic, we verify the
     scripts directory referenced in the command actually exists and contains
     the expected wrapper scripts.
     """
-    plugin = SubprocessPlugin(
-        build_terminal_session_terminator(),
-        build_process_group_supervisor(),
-        terminal_session_watcher_policy(),
-    )
+    plugin = _subprocess_plugin(tmp_path)
     cmd = plugin._build_process_command("echo test", Path("/tmp/fake-worktree"))  # noqa: SLF001
 
     # Extract the PATH value from the generated command
@@ -509,11 +521,7 @@ def test_foreign_repo_real_path_chain_finds_coding_done(make_worktree) -> None:
     assert not (wt / "src" / "issue_orchestrator" / "domain").exists()
     assert not (wt / ".venv").exists()
 
-    plugin = SubprocessPlugin(
-        build_terminal_session_terminator(),
-        build_process_group_supervisor(),
-        terminal_session_watcher_policy(),
-    )
+    plugin = _subprocess_plugin(wt)
     exports = _build_session_exports(_coder_session_contract(77, wt))
     full_cmd = plugin._build_process_command(  # noqa: SLF001
         f"{exports} && which coding-done", wt
@@ -538,11 +546,7 @@ def test_foreign_repo_real_path_chain_coding_done_executes(make_worktree) -> Non
     handle = make_worktree(78, "coding-done-exec-test")
     wt = handle.path
 
-    plugin = SubprocessPlugin(
-        build_terminal_session_terminator(),
-        build_process_group_supervisor(),
-        terminal_session_watcher_policy(),
-    )
+    plugin = _subprocess_plugin(wt)
     exports = _build_session_exports(_coder_session_contract(78, wt))
     full_cmd = plugin._build_process_command(  # noqa: SLF001
         f"{exports} && coding-done --help", wt
@@ -571,11 +575,7 @@ def test_foreign_repo_real_path_chain_validation_runs(make_worktree) -> None:
     val_script.write_text("#!/bin/bash\necho VALIDATION_OK\nexit 0\n")
     val_script.chmod(0o755)
 
-    plugin = SubprocessPlugin(
-        build_terminal_session_terminator(),
-        build_process_group_supervisor(),
-        terminal_session_watcher_policy(),
-    )
+    plugin = _subprocess_plugin(wt)
     exports = _build_session_exports(_coder_session_contract(79, wt))
     full_cmd = plugin._build_process_command(  # noqa: SLF001
         f"{exports} && ./validate.sh", wt
@@ -620,11 +620,7 @@ def test_foreign_repo_coding_done_writes_completion(make_worktree) -> None:
         " --problems 'None'"
     )
 
-    plugin = SubprocessPlugin(
-        build_terminal_session_terminator(),
-        build_process_group_supervisor(),
-        terminal_session_watcher_policy(),
-    )
+    plugin = _subprocess_plugin(wt)
     full_cmd = plugin._build_process_command(  # noqa: SLF001
         f"{exports} && {agent_cmd}", wt
     )
@@ -690,11 +686,7 @@ def test_foreign_repo_real_pty_agent_invocation(
     # Use monkeypatch for clean env manipulation (auto-restores on teardown)
     monkeypatch.setenv("ISSUE_ORCHESTRATOR_REPO_ROOT", str(handle.repo))
 
-    plugin = SubprocessPlugin(
-        build_terminal_session_terminator(),
-        build_process_group_supervisor(),
-        terminal_session_watcher_policy(),
-    )
+    plugin = _subprocess_plugin(wt)
     session_name = session_contract.session_name
 
     created = plugin.create_session(
@@ -779,11 +771,7 @@ def test_foreign_repo_claude_code_agent_done(make_worktree) -> None:
     )
 
     escaped_prompt = prompt.replace('"', '\\"')
-    plugin = SubprocessPlugin(
-        build_terminal_session_terminator(),
-        build_process_group_supervisor(),
-        terminal_session_watcher_policy(),
-    )
+    plugin = _subprocess_plugin(wt)
     inner_cmd = (
         f'{exports} && claude -p --model haiku --permission-mode bypassPermissions '
         f'"{escaped_prompt}"'
@@ -844,11 +832,7 @@ def test_foreign_repo_codex_agent_done(make_worktree) -> None:
     )
 
     escaped_prompt = prompt.replace('"', '\\"')
-    plugin = SubprocessPlugin(
-        build_terminal_session_terminator(),
-        build_process_group_supervisor(),
-        terminal_session_watcher_policy(),
-    )
+    plugin = _subprocess_plugin(wt)
     inner_cmd = (
         f'{exports} && codex exec '
         f'--dangerously-bypass-approvals-and-sandbox '

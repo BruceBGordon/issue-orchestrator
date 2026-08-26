@@ -983,8 +983,9 @@ def _send_request_and_await_acknowledgement(
     selector.register(connection, selectors.EVENT_WRITE)
     _send_cancellation_request(connection, selector, endpoint, deadline)
     selector.modify(connection, selectors.EVENT_READ)
-    _await_containment_acknowledgement(connection, selector, endpoint, deadline)
-    return True
+    return _await_containment_acknowledgement(
+        connection, selector, endpoint, deadline
+    )
 
 
 def _send_cancellation_request(
@@ -1011,18 +1012,17 @@ def _await_containment_acknowledgement(
     selector: selectors.BaseSelector,
     endpoint: Path,
     deadline: float,
-) -> None:
+) -> bool:
     acknowledged = False
     while True:
         _select_before_deadline(selector, deadline, endpoint, "response")
         payload = connection.recv(2)
         if not payload:
-            if not acknowledged:
-                raise ProcessCancellationEndpointError(
-                    "cancellation owner closed without containment "
-                    f"acknowledgement: {endpoint}"
-                )
-            return
+            # An owner completing naturally can accept the connection and exit
+            # before processing the request.  The owner lock, not this socket,
+            # proves containment: report the request undelivered so the caller
+            # keeps polling for lock release under its absolute deadline.
+            return acknowledged
         if acknowledged or payload != containment_acknowledgement_byte():
             raise ProcessCancellationEndpointError(
                 f"cancellation owner returned an invalid response: {endpoint}"
