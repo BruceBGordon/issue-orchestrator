@@ -50,6 +50,9 @@ class ProviderCircuitState:
     updated_at: datetime
     # Deadline for the escalating transient ladder (429/5xx/transport).
     transient_open_until: datetime | None = None
+    # Observation watermark for transient state. Success may arrive out of
+    # attempt order and can retire only an outage older than itself.
+    transient_observed_at: datetime | None = None
     # Deadline for the human-fixable credential outage. Its own (long) window,
     # cleared the moment the probe confirms re-authentication.
     auth_open_until: datetime | None = None
@@ -70,6 +73,10 @@ class ProviderCircuitState:
     # Clearing the auth window must therefore not release a quota outage.
     quota_open_until: datetime | None = None
     consecutive_quota_failures: int = 0
+    # Observation watermark for the quota dimension. Completion effects can be
+    # applied out of attempt order, so recovery evidence must be newer than the
+    # exhaustion fact it retires.
+    quota_observed_at: datetime | None = None
 
     @property
     def open_until(self) -> datetime | None:

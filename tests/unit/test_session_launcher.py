@@ -39,6 +39,8 @@ from issue_orchestrator.control.session_completion import (
 from issue_orchestrator.control.completion_dispatcher import CompletedDecision
 from issue_orchestrator.control.completion_handler import CleanupDecision
 from issue_orchestrator.control.session_decision import (
+    ProviderQuotaFailureDecision,
+    ProviderSuccessDecision,
     ProviderTransientFailureDecision,
     SessionDecision,
 )
@@ -5758,6 +5760,7 @@ class TestProcessActiveSessions:
 
     def test_completed_decision_batch_applies_siblings_before_raising(self):
         """One failed completed decision must not discard the rest of the drain batch."""
+        observed_at = datetime.fromisoformat("2026-08-26T00:20:00+00:00")
         first = CompletedDecision(
             session=MagicMock(terminal_id="issue-1"),
             decision=None,
@@ -5767,7 +5770,10 @@ class TestProcessActiveSessions:
             session=MagicMock(terminal_id="issue-2"),
             decision=SessionDecision(
                 status=SessionStatus.RUNNING,
-                provider_success="codex",
+                provider_success=ProviderSuccessDecision(
+                    provider="codex",
+                    observed_at=observed_at,
+                ),
             ),
             error=None,
         )
@@ -5788,16 +5794,36 @@ class TestProcessActiveSessions:
             _apply_completed_decisions([first, second], apply)
 
         assert applied == ["issue-1", "issue-2"]
-        provider_resilience.record_success.assert_called_once_with("codex")
+        provider_resilience.record_success.assert_called_once_with(
+            "codex",
+            observed_at=observed_at,
+        )
 
     def test_provider_resilience_effects_are_recorded_on_apply_thread(self):
         """Provider-circuit mutations happen when the drained decision is applied."""
         provider_resilience = MagicMock()
+        observed_at = datetime.fromisoformat("2026-08-26T00:20:00+00:00")
+        quota_at = datetime.fromisoformat("2026-08-26T00:21:00+00:00")
+        transient_at = datetime.fromisoformat("2026-08-26T00:22:00+00:00")
 
         record_provider_resilience_effects(
             SessionDecision(
                 status=SessionStatus.RUNNING,
-                provider_success="codex",
+                provider_success=ProviderSuccessDecision(
+                    provider="codex",
+                    observed_at=observed_at,
+                ),
+            ),
+            provider_resilience,
+        )
+        record_provider_resilience_effects(
+            SessionDecision(
+                status=SessionStatus.BLOCKED,
+                provider_quota_failure=ProviderQuotaFailureDecision(
+                    provider="codex",
+                    error_summary="usage_limit_exceeded",
+                    observed_at=quota_at,
+                ),
             ),
             provider_resilience,
         )
@@ -5808,16 +5834,26 @@ class TestProcessActiveSessions:
                     provider="claude-code",
                     error_summary="provider overloaded",
                     attempts=3,
+                    observed_at=transient_at,
                 ),
             ),
             provider_resilience,
         )
 
-        provider_resilience.record_success.assert_called_once_with("codex")
+        provider_resilience.record_success.assert_called_once_with(
+            "codex",
+            observed_at=observed_at,
+        )
         provider_resilience.record_transient_failure.assert_called_once_with(
             "claude-code",
             error_summary="provider overloaded",
             attempts=3,
+            now=transient_at,
+        )
+        provider_resilience.record_quota_failure.assert_called_once_with(
+            "codex",
+            error_summary="usage_limit_exceeded",
+            now=quota_at,
         )
 
     def test_skips_running_sessions(self, sample_agent_config, tmp_path):

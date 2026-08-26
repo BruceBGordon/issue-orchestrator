@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -16,12 +17,26 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class ProviderSuccessDecision:
+    """Provider-circuit recovery evidence to apply on the tick thread.
+
+    Completion effects can drain in a different order from provider attempts,
+    so the observation time is part of the fact rather than application
+    metadata. The circuit owner uses it to reject stale recovery evidence.
+    """
+
+    provider: str
+    observed_at: datetime
+
+
+@dataclass(frozen=True)
 class ProviderTransientFailureDecision:
     """Provider-circuit failure effect to apply on the tick thread."""
 
     provider: str | None
     error_summary: str | None
     attempts: int | None
+    observed_at: datetime
 
 
 @dataclass(frozen=True)
@@ -60,6 +75,7 @@ class ProviderQuotaFailureDecision:
 
     provider: str
     error_summary: str
+    observed_at: datetime
 
 
 @dataclass(frozen=True)
@@ -139,9 +155,36 @@ class ProviderAuthOutcome:
         )
 
 
-def provider_success_from_status(status: "ProviderStatus | None") -> str | None:
+def _provider_observed_at(status: "ProviderStatus") -> datetime:
+    """Parse the provider attempt timestamp as an aware datetime or fail loudly."""
+    try:
+        observed_at = datetime.fromisoformat(
+            status.last_attempt_at.replace("Z", "+00:00")
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "ProviderStatus.last_attempt_at must be a valid ISO timestamp; "
+            f"got {status.last_attempt_at!r}"
+        ) from exc
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError(
+            "ProviderStatus.last_attempt_at must include a timezone; "
+            f"got {status.last_attempt_at!r}"
+        )
+    return observed_at
+
+
+def provider_success_from_status(
+    status: "ProviderStatus | None",
+) -> ProviderSuccessDecision | None:
     if status and status.succeeded:
-        return status.provider
+        provider = status.provider
+        if provider is None:
+            return None
+        return ProviderSuccessDecision(
+            provider=provider,
+            observed_at=_provider_observed_at(status),
+        )
     return None
 
 
@@ -152,6 +195,7 @@ def provider_failure_from_status(
         provider=status.provider,
         error_summary=status.last_error_summary,
         attempts=status.attempts,
+        observed_at=_provider_observed_at(status),
     )
 
 
@@ -176,6 +220,7 @@ def provider_quota_failure_from_status(
     return ProviderQuotaFailureDecision(
         provider=status.provider,
         error_summary=status.last_error_summary or "Provider quota exhausted",
+        observed_at=_provider_observed_at(status),
     )
 
 
@@ -195,7 +240,7 @@ class SessionDecision:
     blocked_reason: str | None = None
     completion_detail: dict[str, Any] | None = None
     diagnostic_path: str | None = None
-    provider_success: str | None = None
+    provider_success: ProviderSuccessDecision | None = None
     provider_transient_failure: ProviderTransientFailureDecision | None = None
     provider_auth_failure: ProviderAuthFailureDecision | None = None
     provider_quota_failure: ProviderQuotaFailureDecision | None = None

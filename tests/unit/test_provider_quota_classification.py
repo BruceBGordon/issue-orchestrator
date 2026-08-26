@@ -291,9 +291,19 @@ class TestQuotaCircuit:
         """A completed call proves the account has usable allowance again."""
         events = RecordingEvents()
         manager = _manager(events)
-        manager.record_quota_failure("codex", error_summary="out of credits")
+        quota_at = datetime(2026, 8, 26, 0, 10, tzinfo=timezone.utc)
+        success_at = quota_at + timedelta(seconds=1)
+        manager.record_quota_failure(
+            "codex",
+            error_summary="out of credits",
+            now=quota_at,
+        )
 
-        updated = manager.record_success("codex")
+        updated = manager.record_success(
+            "codex",
+            observed_at=success_at,
+            now=success_at,
+        )
 
         assert updated is None
         assert manager.store.get("codex") is None
@@ -303,15 +313,25 @@ class TestQuotaCircuit:
         """Success is quota evidence, but only a READY probe can clear auth."""
         events = RecordingEvents()
         manager = _manager(events)
-        manager.record_quota_failure("codex", error_summary="out of credits")
+        quota_at = datetime(2026, 8, 26, 0, 10, tzinfo=timezone.utc)
+        manager.record_quota_failure(
+            "codex",
+            error_summary="out of credits",
+            now=quota_at,
+        )
         for sample_id in ("s1", "s2", "s3"):
             manager.record_auth_failure(
                 "codex",
                 error_summary="not logged in",
                 sample_id=sample_id,
+                now=quota_at,
             )
 
-        manager.record_success("codex")
+        manager.record_success(
+            "codex",
+            observed_at=quota_at + timedelta(seconds=1),
+            now=quota_at + timedelta(seconds=1),
+        )
 
         state = manager.store.get("codex")
         assert state is not None
@@ -321,6 +341,55 @@ class TestQuotaCircuit:
         assert state.quota_open_until is None
         assert state.consecutive_quota_failures == 0
         assert events.names().count("provider.outage_exited") == 0
+
+    def test_an_older_success_cannot_retire_a_newer_quota_outage(self) -> None:
+        """Thread-finish order must not let stale recovery erase newer evidence."""
+        events = RecordingEvents()
+        manager = _manager(events)
+        older_success_at = datetime(2026, 8, 26, 0, 10, tzinfo=timezone.utc)
+        quota_at = older_success_at + timedelta(seconds=1)
+        applied_at = quota_at + timedelta(minutes=2)
+        manager.record_quota_failure(
+            "codex",
+            error_summary="out of credits",
+            now=quota_at,
+        )
+
+        updated = manager.record_success(
+            "codex",
+            observed_at=older_success_at,
+            now=applied_at,
+        )
+
+        assert updated is not None
+        assert updated.quota_observed_at == quota_at
+        assert updated.quota_open_until is not None
+        assert updated.consecutive_quota_failures == 1
+        assert manager.is_open("codex", applied_at)
+        assert events.names().count("provider.outage_exited") == 0
+
+    def test_a_newer_success_retires_an_older_quota_outage(self) -> None:
+        """Chronologically newer recovery clears quota despite delayed apply."""
+        events = RecordingEvents()
+        manager = _manager(events)
+        quota_at = datetime(2026, 8, 26, 0, 10, tzinfo=timezone.utc)
+        newer_success_at = quota_at + timedelta(seconds=1)
+        applied_at = newer_success_at + timedelta(minutes=2)
+        manager.record_quota_failure(
+            "codex",
+            error_summary="out of credits",
+            now=quota_at,
+        )
+
+        updated = manager.record_success(
+            "codex",
+            observed_at=newer_success_at,
+            now=applied_at,
+        )
+
+        assert updated is None
+        assert manager.store.get("codex") is None
+        assert events.names().count("provider.outage_exited") == 1
 
     def test_clearing_auth_leaves_the_quota_outage_standing(self) -> None:
         """A READY credential probe is evidence about credentials alone.
@@ -384,6 +453,7 @@ class TestQuotaPersistence:
                 updated_at=deadline,
                 quota_open_until=deadline,
                 consecutive_quota_failures=2,
+                quota_observed_at=deadline - timedelta(hours=1),
             )
         )
 
@@ -391,6 +461,7 @@ class TestQuotaPersistence:
         assert loaded is not None
         assert loaded.quota_open_until == deadline
         assert loaded.consecutive_quota_failures == 2
+        assert loaded.quota_observed_at == deadline - timedelta(hours=1)
 
     def test_a_database_written_before_quota_existed_is_migrated(
         self, tmp_path
@@ -424,3 +495,42 @@ class TestQuotaPersistence:
         assert loaded.consecutive_outages == 2
         assert loaded.quota_open_until is None
         assert loaded.consecutive_quota_failures == 0
+        assert loaded.quota_observed_at is None
+
+    def test_an_active_quota_row_gains_a_conservative_observation_watermark(
+        self, tmp_path
+    ) -> None:
+        """The pre-watermark schema remains protected after an upgrade."""
+        db_path = tmp_path / "pre-watermark.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE provider_circuit (
+                provider TEXT PRIMARY KEY,
+                transient_open_until TEXT,
+                consecutive_outages INTEGER NOT NULL,
+                last_error_summary TEXT,
+                updated_at TEXT NOT NULL,
+                consecutive_auth_failures INTEGER NOT NULL DEFAULT 0,
+                auth_open_until TEXT,
+                last_auth_sample_id TEXT NOT NULL DEFAULT '',
+                quota_open_until TEXT,
+                consecutive_quota_failures INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO provider_circuit VALUES (
+                'codex', NULL, 0, 'out of credits',
+                '2026-08-26T00:10:00+00:00', 0, NULL, '',
+                '2026-08-26T06:10:00+00:00', 1
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        store = SQLiteProviderCircuitStore(db_path)
+
+        loaded = store.get("codex")
+        assert loaded is not None
+        assert loaded.quota_observed_at == datetime(
+            2026, 8, 26, 0, 10, tzinfo=timezone.utc
+        )

@@ -16,6 +16,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS provider_circuit (
     provider TEXT PRIMARY KEY,
     transient_open_until TEXT,
+    transient_observed_at TEXT,
     consecutive_outages INTEGER NOT NULL,
     last_error_summary TEXT,
     updated_at TEXT NOT NULL,
@@ -23,21 +24,26 @@ CREATE TABLE IF NOT EXISTS provider_circuit (
     auth_open_until TEXT,
     last_auth_sample_id TEXT NOT NULL DEFAULT '',
     quota_open_until TEXT,
-    consecutive_quota_failures INTEGER NOT NULL DEFAULT 0
+    consecutive_quota_failures INTEGER NOT NULL DEFAULT 0,
+    quota_observed_at TEXT
 );
 """
 
 _SELECT_ONE = """
-SELECT provider, transient_open_until, consecutive_outages, last_error_summary,
+SELECT provider, transient_open_until, transient_observed_at,
+       consecutive_outages, last_error_summary,
        updated_at, consecutive_auth_failures, auth_open_until,
-       last_auth_sample_id, quota_open_until, consecutive_quota_failures
+       last_auth_sample_id, quota_open_until, consecutive_quota_failures,
+       quota_observed_at
 FROM provider_circuit WHERE provider = ?
 """
 
 _SELECT_ALL = """
-SELECT provider, transient_open_until, consecutive_outages, last_error_summary,
+SELECT provider, transient_open_until, transient_observed_at,
+       consecutive_outages, last_error_summary,
        updated_at, consecutive_auth_failures, auth_open_until,
-       last_auth_sample_id, quota_open_until, consecutive_quota_failures
+       last_auth_sample_id, quota_open_until, consecutive_quota_failures,
+       quota_observed_at
 FROM provider_circuit
 """
 
@@ -49,6 +55,48 @@ def _parse_dt(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _migration_statements(columns: set[str]) -> list[str]:
+    """Plan additive/rename migrations for the schema currently on disk."""
+    migrations = []
+    if "transient_open_until" not in columns and "open_until" in columns:
+        migrations.append(
+            "ALTER TABLE provider_circuit "
+            "RENAME COLUMN open_until TO transient_open_until"
+        )
+    if "transient_observed_at" not in columns:
+        migrations.append(
+            "ALTER TABLE provider_circuit ADD COLUMN transient_observed_at TEXT"
+        )
+    if "consecutive_auth_failures" not in columns:
+        migrations.append(
+            "ALTER TABLE provider_circuit "
+            "ADD COLUMN consecutive_auth_failures INTEGER NOT NULL DEFAULT 0"
+        )
+    if "auth_open_until" not in columns:
+        migrations.append(
+            "ALTER TABLE provider_circuit ADD COLUMN auth_open_until TEXT"
+        )
+    if "last_auth_sample_id" not in columns:
+        migrations.append(
+            "ALTER TABLE provider_circuit "
+            "ADD COLUMN last_auth_sample_id TEXT NOT NULL DEFAULT ''"
+        )
+    if "quota_open_until" not in columns:
+        migrations.append(
+            "ALTER TABLE provider_circuit ADD COLUMN quota_open_until TEXT"
+        )
+    if "consecutive_quota_failures" not in columns:
+        migrations.append(
+            "ALTER TABLE provider_circuit "
+            "ADD COLUMN consecutive_quota_failures INTEGER NOT NULL DEFAULT 0"
+        )
+    if "quota_observed_at" not in columns:
+        migrations.append(
+            "ALTER TABLE provider_circuit ADD COLUMN quota_observed_at TEXT"
+        )
+    return migrations
 
 
 class SQLiteProviderCircuitStore:
@@ -79,39 +127,26 @@ class SQLiteProviderCircuitStore:
         columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(provider_circuit)")
         }
-        migrations = []
-        if "transient_open_until" not in columns and "open_until" in columns:
-            migrations.append(
-                "ALTER TABLE provider_circuit "
-                "RENAME COLUMN open_until TO transient_open_until"
-            )
-        if "consecutive_auth_failures" not in columns:
-            migrations.append(
-                "ALTER TABLE provider_circuit "
-                "ADD COLUMN consecutive_auth_failures INTEGER NOT NULL DEFAULT 0"
-            )
-        if "auth_open_until" not in columns:
-            migrations.append(
-                "ALTER TABLE provider_circuit ADD COLUMN auth_open_until TEXT"
-            )
-        if "last_auth_sample_id" not in columns:
-            migrations.append(
-                "ALTER TABLE provider_circuit "
-                "ADD COLUMN last_auth_sample_id TEXT NOT NULL DEFAULT ''"
-            )
-        if "quota_open_until" not in columns:
-            migrations.append(
-                "ALTER TABLE provider_circuit ADD COLUMN quota_open_until TEXT"
-            )
-        if "consecutive_quota_failures" not in columns:
-            migrations.append(
-                "ALTER TABLE provider_circuit "
-                "ADD COLUMN consecutive_quota_failures INTEGER NOT NULL DEFAULT 0"
-            )
+        add_transient_observed_at = "transient_observed_at" not in columns
+        add_quota_observed_at = "quota_observed_at" not in columns
+        migrations = _migration_statements(columns)
         if not migrations:
             return
         for statement in migrations:
             conn.execute(statement)
+        if add_transient_observed_at:
+            conn.execute(
+                "UPDATE provider_circuit SET transient_observed_at = updated_at "
+                "WHERE transient_open_until IS NOT NULL"
+            )
+        if add_quota_observed_at:
+            # Existing active quota rows predate the explicit per-cause
+            # watermark. Their aggregate update time is the safest conservative
+            # substitute: recovery must be newer than it before retiring them.
+            conn.execute(
+                "UPDATE provider_circuit SET quota_observed_at = updated_at "
+                "WHERE quota_open_until IS NOT NULL"
+            )
         conn.commit()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -137,6 +172,7 @@ class SQLiteProviderCircuitStore:
         return ProviderCircuitState(
             provider=row["provider"],
             transient_open_until=_parse_dt(row["transient_open_until"]),
+            transient_observed_at=_parse_dt(row["transient_observed_at"]),
             auth_open_until=_parse_dt(row["auth_open_until"]),
             consecutive_outages=int(row["consecutive_outages"]),
             last_error_summary=row["last_error_summary"],
@@ -145,6 +181,7 @@ class SQLiteProviderCircuitStore:
             last_auth_sample_id=row["last_auth_sample_id"] or "",
             quota_open_until=_parse_dt(row["quota_open_until"]),
             consecutive_quota_failures=int(row["consecutive_quota_failures"] or 0),
+            quota_observed_at=_parse_dt(row["quota_observed_at"]),
         )
 
     def get(self, provider: str) -> ProviderCircuitState | None:
@@ -164,13 +201,15 @@ class SQLiteProviderCircuitStore:
             tx.execute(
                 """
                 INSERT INTO provider_circuit (
-                    provider, transient_open_until, consecutive_outages,
+                    provider, transient_open_until, transient_observed_at,
+                    consecutive_outages,
                     last_error_summary, updated_at, consecutive_auth_failures,
                     auth_open_until, last_auth_sample_id, quota_open_until,
-                    consecutive_quota_failures
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    consecutive_quota_failures, quota_observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider) DO UPDATE SET
                     transient_open_until=excluded.transient_open_until,
+                    transient_observed_at=excluded.transient_observed_at,
                     consecutive_outages=excluded.consecutive_outages,
                     last_error_summary=excluded.last_error_summary,
                     updated_at=excluded.updated_at,
@@ -180,12 +219,16 @@ class SQLiteProviderCircuitStore:
                     quota_open_until=excluded.quota_open_until,
                     consecutive_quota_failures=(
                         excluded.consecutive_quota_failures
-                    )
+                    ),
+                    quota_observed_at=excluded.quota_observed_at
                 """,
                 (
                     state.provider,
                     state.transient_open_until.isoformat()
                     if state.transient_open_until
+                    else None,
+                    state.transient_observed_at.isoformat()
+                    if state.transient_observed_at
                     else None,
                     int(state.consecutive_outages),
                     state.last_error_summary,
@@ -199,6 +242,9 @@ class SQLiteProviderCircuitStore:
                     if state.quota_open_until
                     else None,
                     int(state.consecutive_quota_failures),
+                    state.quota_observed_at.isoformat()
+                    if state.quota_observed_at
+                    else None,
                 ),
             )
 

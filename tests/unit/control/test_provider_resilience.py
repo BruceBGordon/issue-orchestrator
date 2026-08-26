@@ -39,5 +39,10 @@ def test_record_success_resets_state():
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     mgr.record_transient_failure("claude-code", error_summary="503", attempts=1, now=now)
 
-    mgr.record_success("claude-code", now=now + timedelta(seconds=10))
+    success_at = now + timedelta(seconds=10)
+    mgr.record_success(
+        "claude-code",
+        observed_at=success_at,
+        now=success_at,
+    )
     assert mgr.get_state("claude-code") is None

@@ -32,13 +32,18 @@ def record_provider_resilience_effects(
     if provider_resilience is None:
         return
     if decision.provider_success:
-        provider_resilience.record_success(decision.provider_success)
+        success = decision.provider_success
+        provider_resilience.record_success(
+            success.provider,
+            observed_at=success.observed_at,
+        )
     if decision.provider_transient_failure:
         failure = decision.provider_transient_failure
         provider_resilience.record_transient_failure(
             failure.provider,
             error_summary=failure.error_summary,
             attempts=failure.attempts,
+            now=failure.observed_at,
         )
     if decision.provider_auth_failure:
         auth_failure = decision.provider_auth_failure
@@ -55,4 +60,5 @@ def record_provider_resilience_effects(
         provider_resilience.record_quota_failure(
             quota_failure.provider,
             error_summary=quota_failure.error_summary,
+            now=quota_failure.observed_at,
         )

@@ -114,6 +114,7 @@ class ProviderResilienceManager:
         new_state = ProviderCircuitState(
             provider=provider,
             transient_open_until=open_until,
+            transient_observed_at=now,
             # The auth dimension is untouched: a service outage neither proves
             # nor disproves anything about the credentials (#6999 F3).
             auth_open_until=state.auth_open_until if state else None,
@@ -128,6 +129,7 @@ class ProviderResilienceManager:
             consecutive_quota_failures=(
                 state.consecutive_quota_failures if state else 0
             ),
+            quota_observed_at=state.quota_observed_at if state else None,
         )
         self.store.save(new_state)
 
@@ -219,6 +221,7 @@ class ProviderResilienceManager:
         new_state = ProviderCircuitState(
             provider=provider,
             transient_open_until=state.transient_open_until if state else None,
+            transient_observed_at=state.transient_observed_at if state else None,
             auth_open_until=auth_open_until,
             consecutive_outages=state.consecutive_outages if state else 0,
             last_error_summary=error_summary,
@@ -231,6 +234,7 @@ class ProviderResilienceManager:
             consecutive_quota_failures=(
                 state.consecutive_quota_failures if state else 0
             ),
+            quota_observed_at=state.quota_observed_at if state else None,
         )
         self.store.save(new_state)
 
@@ -300,6 +304,7 @@ class ProviderResilienceManager:
         new_state = ProviderCircuitState(
             provider=provider,
             transient_open_until=state.transient_open_until if state else None,
+            transient_observed_at=state.transient_observed_at if state else None,
             auth_open_until=state.auth_open_until if state else None,
             consecutive_outages=state.consecutive_outages if state else 0,
             last_error_summary=error_summary,
@@ -308,6 +313,7 @@ class ProviderResilienceManager:
             last_auth_sample_id=state.last_auth_sample_id if state else "",
             quota_open_until=quota_open_until,
             consecutive_quota_failures=consecutive_quota,
+            quota_observed_at=now,
         )
         self.store.save(new_state)
 
@@ -366,6 +372,7 @@ class ProviderResilienceManager:
         updated = ProviderCircuitState(
             provider=provider,
             transient_open_until=state.transient_open_until,
+            transient_observed_at=state.transient_observed_at,
             auth_open_until=None,
             consecutive_outages=state.consecutive_outages,
             last_error_summary=state.last_error_summary,
@@ -377,6 +384,7 @@ class ProviderResilienceManager:
             # outage keeps its deadline and the provider stays closed on it.
             quota_open_until=state.quota_open_until,
             consecutive_quota_failures=state.consecutive_quota_failures,
+            quota_observed_at=state.quota_observed_at,
         )
         self.store.save(updated)
 
@@ -391,15 +399,23 @@ class ProviderResilienceManager:
         return updated
 
     def record_success(
-        self, provider: str | None, now: datetime | None = None
+        self,
+        provider: str | None,
+        *,
+        observed_at: datetime,
+        now: datetime | None = None,
     ) -> ProviderCircuitState | None:
         """Retire the *transient* and *quota* outages after a call came back clean.
 
         Cause-specific, for the same reason :meth:`clear_auth_failures` is
         (#6999 F3). A completed provider call proves both that the service
         answered and that the account had enough allowance to perform work, so
-        it retires transient and quota state. This also bounds the impact of a
-        false-positive quota classification to the next successful call.
+        it retires transient and quota state that predates the call.
+        Completion effects can be applied out of provider-attempt order, so the
+        observation timestamp is required and chronology is enforced here, in
+        the state owner. An older success cannot erase a newer outage fact.
+        This also bounds a false-positive quota classification to the next
+        chronologically later successful call.
 
         Success does not prove that a concurrently recorded credential outage
         has recovered, and it is not the typed READY readiness probe the auth
@@ -426,32 +442,71 @@ class ProviderResilienceManager:
         """
         if not provider:
             return None
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("provider success observed_at must include a timezone")
         now = now or _now()
         state = self.store.get(provider)
         if state is None:
             return None
 
         was_open = self._is_open_state(state, now)
+        transient_cause_exists = (
+            state.transient_open_until is not None
+            or state.consecutive_outages > 0
+            or state.transient_observed_at is not None
+        )
+        transient_is_newer_than_success = transient_cause_exists and (
+            state.transient_observed_at is None
+            or observed_at <= state.transient_observed_at
+        )
+        quota_cause_exists = (
+            state.quota_open_until is not None
+            or state.consecutive_quota_failures > 0
+            or state.quota_observed_at is not None
+        )
+        quota_is_newer_than_success = quota_cause_exists and (
+            state.quota_observed_at is None
+            or observed_at <= state.quota_observed_at
+        )
         updated: ProviderCircuitState | None = ProviderCircuitState(
             provider=provider,
-            transient_open_until=None,
+            transient_open_until=(
+                state.transient_open_until
+                if transient_is_newer_than_success
+                else None
+            ),
             # Untouched: a service call that succeeded says nothing about the
             # credential, and the auth cause is retired by a READY probe only.
             auth_open_until=state.auth_open_until,
-            consecutive_outages=0,
+            transient_observed_at=(
+                state.transient_observed_at
+                if transient_is_newer_than_success
+                else None
+            ),
+            consecutive_outages=(
+                state.consecutive_outages if transient_is_newer_than_success else 0
+            ),
             last_error_summary=state.last_error_summary,
             updated_at=now,
             consecutive_auth_failures=state.consecutive_auth_failures,
             last_auth_sample_id=state.last_auth_sample_id,
-            # A call that completed is positive evidence that the account has
-            # usable allowance again, so quota can retire before its deadline.
-            quota_open_until=None,
-            consecutive_quota_failures=0,
+            # A completed call is positive allowance evidence only for quota
+            # observations older than itself. Preserve an equal/newer fact: an
+            # out-of-order completion must never re-admit exhausted work.
+            quota_open_until=(
+                state.quota_open_until if quota_is_newer_than_success else None
+            ),
+            consecutive_quota_failures=(
+                state.consecutive_quota_failures if quota_is_newer_than_success else 0
+            ),
+            quota_observed_at=(
+                state.quota_observed_at if quota_is_newer_than_success else None
+            ),
         )
-        auth_cause_remains = (
+        cause_remains = transient_is_newer_than_success or (
             state.auth_open_until is not None or state.consecutive_auth_failures > 0
-        )
-        if auth_cause_remains:
+        ) or quota_is_newer_than_success
+        if cause_remains:
             self.store.save(updated)
         else:
             # Nothing is left to remember, and a healthy circuit has no row.
@@ -484,6 +539,7 @@ class ProviderResilienceManager:
             updated = ProviderCircuitState(
                 provider=state.provider,
                 transient_open_until=None,
+                transient_observed_at=None,
                 auth_open_until=None,
                 consecutive_outages=state.consecutive_outages,
                 last_error_summary=state.last_error_summary,
@@ -496,6 +552,7 @@ class ProviderResilienceManager:
                 # exhaustion starts fresh rather than using a stale count.
                 quota_open_until=None,
                 consecutive_quota_failures=0,
+                quota_observed_at=None,
             )
             self.store.save(updated)
             closed.append(updated)

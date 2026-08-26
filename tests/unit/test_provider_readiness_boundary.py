@@ -2007,7 +2007,12 @@ class TestIndependentOutageCauses:
         auth_deadline = opened.auth_open_until
         assert auth_deadline is not None
 
-        manager.record_success("claude-code", now=start + timedelta(seconds=1))
+        success_at = start + timedelta(seconds=1)
+        manager.record_success(
+            "claude-code",
+            observed_at=success_at,
+            now=success_at,
+        )
 
         state = manager.get_state("claude-code")
         assert state is not None, "the auth outage must survive a service success"
@@ -2031,7 +2036,12 @@ class TestIndependentOutageCauses:
             now=start + timedelta(seconds=1),
         )
 
-        manager.record_success("claude-code", now=start + timedelta(seconds=2))
+        success_at = start + timedelta(seconds=2)
+        manager.record_success(
+            "claude-code",
+            observed_at=success_at,
+            now=success_at,
+        )
 
         state = manager.get_state("claude-code")
         assert state is not None
@@ -2046,6 +2056,32 @@ class TestIndependentOutageCauses:
         manager.clear_auth_failures("claude-code", now=start + timedelta(seconds=4))
         assert not manager.is_open("claude-code", start + timedelta(seconds=5))
         assert events.names().count(EventName.PROVIDER_OUTAGE_EXITED.value) == 1
+
+    def test_an_older_success_cannot_retire_a_newer_transient_outage(self) -> None:
+        """The owner applies attempt chronology, not completion drain order."""
+        events = RecordingEvents()
+        manager = _manager(events)
+        older_success_at = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
+        transient_at = older_success_at + timedelta(seconds=1)
+        applied_at = transient_at + timedelta(seconds=1)
+        manager.record_transient_failure(
+            "claude-code",
+            error_summary="503",
+            now=transient_at,
+        )
+
+        updated = manager.record_success(
+            "claude-code",
+            observed_at=older_success_at,
+            now=applied_at,
+        )
+
+        assert updated is not None
+        assert updated.transient_observed_at == transient_at
+        assert updated.transient_open_until is not None
+        assert updated.consecutive_outages == 1
+        assert manager.is_open("claude-code", applied_at)
+        assert EventName.PROVIDER_OUTAGE_EXITED.value not in events.names()
 
     def test_a_success_between_auth_failures_does_not_reset_the_threshold(
         self,
@@ -2066,7 +2102,12 @@ class TestIndependentOutageCauses:
         )
         assert not manager.is_open("claude-code", start + timedelta(seconds=1))
 
-        manager.record_success("claude-code", now=start + timedelta(seconds=1))
+        success_at = start + timedelta(seconds=1)
+        manager.record_success(
+            "claude-code",
+            observed_at=success_at,
+            now=success_at,
+        )
         manager.record_auth_failure(
             "claude-code",
             error_summary="not logged in",
@@ -2088,7 +2129,12 @@ class TestIndependentOutageCauses:
         start = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
         manager.record_transient_failure("claude-code", error_summary="503", now=start)
 
-        manager.record_success("claude-code", now=start + timedelta(seconds=1))
+        success_at = start + timedelta(seconds=1)
+        manager.record_success(
+            "claude-code",
+            observed_at=success_at,
+            now=success_at,
+        )
 
         assert manager.get_state("claude-code") is None
         assert events.names().count(EventName.PROVIDER_OUTAGE_EXITED.value) == 1
@@ -2162,6 +2208,9 @@ def test_split_deadlines_survive_a_single_open_until_database(tmp_path: Path) ->
     assert state is not None
     assert state.transient_open_until == datetime(
         2026, 8, 4, 23, 0, tzinfo=timezone.utc
+    )
+    assert state.transient_observed_at == datetime(
+        2026, 8, 4, 22, 0, tzinfo=timezone.utc
     )
     assert state.auth_open_until is None
     assert state.open_until == state.transient_open_until
