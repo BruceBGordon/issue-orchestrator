@@ -15,10 +15,7 @@ push itself.
 import logging
 from pathlib import Path
 
-from ..domain.dirty_remediation import (
-    publish_is_best_effort,
-    unpublished_escalation_notice,
-)
+from ..domain.dirty_remediation import publish_is_best_effort
 from ..domain.models import CompletionRecord
 
 logger = logging.getLogger(__name__)
@@ -43,9 +40,21 @@ def route_despite_publish_failure(
         return False
 
     actions_taken.append(f"Branch not pushed ({step}); continued to human routing")
-    notice = unpublished_escalation_notice(str(worktree), branch, reason)
-    record.comment_body = (
-        f"{record.comment_body}\n\n{notice}" if record.comment_body else notice
+    # Deliberately not appended to the agent's comment. Two reasons: the comment
+    # body is validated against GitHub's 64 KiB limit *before* this point, so
+    # appending here can push an accepted body over it and lose the escalation
+    # context entirely; and a "recover the commits before cleanup" note would be
+    # untrue -- escalations get immediate cleanup with remove_worktrees=True, so
+    # there is no interval to recover in.
+    #
+    # Retaining and recovering that work is a real gap, tracked as #7110: it
+    # needs one typed outcome driving cleanup strategy, the cleanup state owner,
+    # the action planner and retry admission together. A comment cannot paper
+    # over it, and this module must not imply otherwise.
+    logger.warning(
+        "Escalation published nothing; local commits on %s in %s are not retained",
+        branch or "the current branch",
+        worktree,
     )
     logger.info(
         "Publish failed for an escalation (%s); routing to a human anyway: %s",

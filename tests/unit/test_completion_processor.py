@@ -424,9 +424,13 @@ class TestStackPublishGateWiring:
         from issue_orchestrator.control.stack_publish_gate import StackPublishDecision
 
         processor.attach_stack_publish_gate(
-            _FakeStackGate(StackPublishDecision(
-                is_stack=True, allowed=True, base_branch="20-base",
-            ))
+            _FakeStackGate(
+                StackPublishDecision(
+                    is_stack=True,
+                    allowed=True,
+                    base_branch="20-base",
+                )
+            )
         )
         worktree = worktree_with_completion(self._publish_record())
 
@@ -446,10 +450,13 @@ class TestStackPublishGateWiring:
         from issue_orchestrator.control.stack_publish_gate import StackPublishDecision
 
         processor.attach_stack_publish_gate(
-            _FakeStackGate(StackPublishDecision(
-                is_stack=True, allowed=False,
-                reason="Stack publish gate blocked: publish: blocked (base_branch_conflict)",
-            ))
+            _FakeStackGate(
+                StackPublishDecision(
+                    is_stack=True,
+                    allowed=False,
+                    reason="Stack publish gate blocked: publish: blocked (base_branch_conflict)",
+                )
+            )
         )
         worktree = worktree_with_completion(self._publish_record())
 
@@ -597,14 +604,22 @@ class TestStackCreatedPRBaseEnforcement:
             StackPublishDecision(is_stack=True, allowed=True, base_branch="20-base")
         )
 
-    def _run(self, processor, mock_pr_adapter, mock_git_adapter, worktree_with_completion):
+    def _run(
+        self, processor, mock_pr_adapter, mock_git_adapter, worktree_with_completion
+    ):
         # Issue-scoped reuse preflight finds nothing, but create_pr is idempotent
         # and returns an existing PR targeting the wrong (default) base.
         mock_pr_adapter.get_prs_for_issue.return_value = []
         mock_git_adapter.get_current_branch.return_value = "123-feature"
         mock_pr_adapter.create_pr.return_value = PRInfo(
-            number=42, title="#123: Test", url="https://github.com/owner/repo/pull/42",
-            branch="123-feature", body="", state="open", labels=[], base_branch="main",
+            number=42,
+            title="#123: Test",
+            url="https://github.com/owner/repo/pull/42",
+            branch="123-feature",
+            body="",
+            state="open",
+            labels=[],
+            base_branch="main",
         )
         worktree = worktree_with_completion(self._publish_record())
         return processor.process(
@@ -619,7 +634,9 @@ class TestStackCreatedPRBaseEnforcement:
     ):
         processor.attach_stack_publish_gate(self._stack_gate())
 
-        result = self._run(processor, mock_pr_adapter, mock_git_adapter, worktree_with_completion)
+        result = self._run(
+            processor, mock_pr_adapter, mock_git_adapter, worktree_with_completion
+        )
 
         assert result.success
         mock_pr_adapter.set_pr_base.assert_called_once_with(42, "20-base")
@@ -630,13 +647,16 @@ class TestStackCreatedPRBaseEnforcement:
         processor.attach_stack_publish_gate(self._stack_gate())
         mock_pr_adapter.set_pr_base.side_effect = RuntimeError("403 forbidden")
 
-        result = self._run(processor, mock_pr_adapter, mock_git_adapter, worktree_with_completion)
+        result = self._run(
+            processor, mock_pr_adapter, mock_git_adapter, worktree_with_completion
+        )
 
         assert not result.success
         assert any("retarget failed" in e for e in result.errors)
         # Review-completion labels must not be applied to the wrong-base PR.
         assert not any(
-            c.args and c.args[0] == 42 for c in mock_pr_adapter.add_comment.call_args_list
+            c.args and c.args[0] == 42
+            for c in mock_pr_adapter.add_comment.call_args_list
         )
 
 
@@ -806,7 +826,9 @@ class TestReviewExchangeModeResolution:
         config.review_exchange_mode = "via-local-loop"
         processor = self._make_processor(config)
 
-        assert processor._resolve_review_exchange_mode("agent:coder") == "via-local-loop"  # noqa: SLF001
+        assert (
+            processor._resolve_review_exchange_mode("agent:coder") == "via-local-loop"
+        )  # noqa: SLF001
 
 
 class TestReviewExchangeExecution:
@@ -2226,7 +2248,9 @@ class TestReviewExchangeExecution:
             lambda *_args, **_kwargs: False,
         )
 
-        assert processor._resolve_review_exchange_mode("agent:coder") == "via-local-loop"  # noqa: SLF001
+        assert (
+            processor._resolve_review_exchange_mode("agent:coder") == "via-local-loop"
+        )  # noqa: SLF001
 
     def test_auto_mode_without_agent_label_returns_none(self, tmp_path):
         config = self._make_config(tmp_path)
@@ -2915,6 +2939,7 @@ class TestTechLeadCompletionEffects:
         from issue_orchestrator.control.tech_lead_approval_gate import (
             TechLeadDecisionApprovalGate,
         )
+
         review_runner = _CapturingReviewExchangeRunner()
         processor = self._make_processor(
             tmp_path,
@@ -2987,6 +3012,7 @@ class TestTechLeadCompletionEffects:
         from issue_orchestrator.control.completion_types import (
             ERROR_PREFIX_TECH_LEAD_DECISION,
         )
+
         processor = self._make_processor(
             tmp_path,
             mock_label_adapter,
@@ -3078,6 +3104,7 @@ class TestTechLeadCompletionEffects:
             TechLeadAssignment,
             TechLeadSessionFlavor,
         )
+
         processor = self._make_processor(
             tmp_path,
             mock_label_adapter,
@@ -3124,6 +3151,7 @@ class TestTechLeadCompletionEffects:
         from issue_orchestrator.control.completion_types import (
             ERROR_PREFIX_TECH_LEAD_DECISION,
         )
+
         processor = self._make_processor(
             tmp_path,
             mock_label_adapter,
@@ -3288,20 +3316,31 @@ class TestCompletionProcessorGitActions:
         branch via the stack work gate, not the default base."""
         from issue_orchestrator.control.stack_publish_gate import StackPublishDecision
 
-        processor.attach_stack_publish_gate(_FakeStackGate(
-            StackPublishDecision.not_stack(),
-            work_decision=StackPublishDecision(
-                is_stack=True, allowed=True, base_branch="20-base"
-            ),
-        ))
+        processor.attach_stack_publish_gate(
+            _FakeStackGate(
+                StackPublishDecision.not_stack(),
+                work_decision=StackPublishDecision(
+                    is_stack=True, allowed=True, base_branch="20-base"
+                ),
+            )
+        )
         mock_git_adapter.push.side_effect = [
-            PushResult(success=False, branch="issue-123", remote="origin", message="non-fast-forward"),
-            PushResult(success=True, branch="issue-123", remote="origin", message="Pushed"),
+            PushResult(
+                success=False,
+                branch="issue-123",
+                remote="origin",
+                message="non-fast-forward",
+            ),
+            PushResult(
+                success=True, branch="issue-123", remote="origin", message="Pushed"
+            ),
         ]
-        worktree = worktree_with_completion(make_record(
-            outcome=CompletionOutcome.COMPLETED,
-            requested_actions=[RequestedAction.PUSH_BRANCH],
-        ))
+        worktree = worktree_with_completion(
+            make_record(
+                outcome=CompletionOutcome.COMPLETED,
+                requested_actions=[RequestedAction.PUSH_BRANCH],
+            )
+        )
 
         result = processor.process(
             worktree,
@@ -3311,7 +3350,9 @@ class TestCompletionProcessorGitActions:
         )
 
         assert result.success
-        mock_git_adapter.rebase_on_branch.assert_called_once_with(worktree, "origin/20-base")
+        mock_git_adapter.rebase_on_branch.assert_called_once_with(
+            worktree, "origin/20-base"
+        )
         assert mock_git_adapter.push.call_count == 2
 
     def test_push_retry_fails_closed_when_stack_gate_blocked(
@@ -3321,21 +3362,32 @@ class TestCompletionProcessorGitActions:
         default-base rebase and no second push onto the wrong shape."""
         from issue_orchestrator.control.stack_publish_gate import StackPublishDecision
 
-        processor.attach_stack_publish_gate(_FakeStackGate(
-            StackPublishDecision.not_stack(),
-            work_decision=StackPublishDecision.blocked(
-                "Stack work gate blocked: work: blocked (ambiguous_stack_base)",
-                retryable=False,
-            ),
-        ))
+        processor.attach_stack_publish_gate(
+            _FakeStackGate(
+                StackPublishDecision.not_stack(),
+                work_decision=StackPublishDecision.blocked(
+                    "Stack work gate blocked: work: blocked (ambiguous_stack_base)",
+                    retryable=False,
+                ),
+            )
+        )
         mock_git_adapter.push.side_effect = [
-            PushResult(success=False, branch="issue-123", remote="origin", message="non-fast-forward"),
-            PushResult(success=True, branch="issue-123", remote="origin", message="Pushed"),
+            PushResult(
+                success=False,
+                branch="issue-123",
+                remote="origin",
+                message="non-fast-forward",
+            ),
+            PushResult(
+                success=True, branch="issue-123", remote="origin", message="Pushed"
+            ),
         ]
-        worktree = worktree_with_completion(make_record(
-            outcome=CompletionOutcome.COMPLETED,
-            requested_actions=[RequestedAction.PUSH_BRANCH],
-        ))
+        worktree = worktree_with_completion(
+            make_record(
+                outcome=CompletionOutcome.COMPLETED,
+                requested_actions=[RequestedAction.PUSH_BRANCH],
+            )
+        )
 
         result = processor.process(
             worktree,
@@ -5463,15 +5515,23 @@ class TestEscalationSurvivesAFailedPublish:
         mock_label_adapter.add_label.assert_any_call(123, label)
         mock_pr_adapter.add_comment.assert_called()
 
-    def test_the_comment_says_where_the_unpushed_commits_are(
+    def test_an_oversized_comment_body_still_reaches_the_human(
         self,
+        tmp_path,
         mock_label_adapter,
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
         worktree_with_completion,
     ):
-        """Cleanup removes worktrees by default; the human needs the path."""
+        """Publish-failure routing must not push a valid comment over the limit.
+
+        `CompletionRecord.from_dict` accepts a comment body up to GitHub's
+        64 KiB. An earlier revision appended a recovery notice *after* that
+        validation, so an accepted body became an oversized post, the bounded
+        adapter rejected it, and the escalation context the human needed was
+        never delivered. Nothing is appended here any more.
+        """
         processor = CompletionProcessor(
             agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
@@ -5483,8 +5543,12 @@ class TestEscalationSurvivesAFailedPublish:
             config=Config(),
         )
         mock_git_adapter.push.return_value = PushResult(
-            success=False, branch="issue-123", remote="origin", message="rejected"
+            success=False,
+            branch="issue-123",
+            remote="origin",
+            message="rejected " + "x" * 4096,
         )
+        at_the_limit = "b" * GITHUB_COMMENT_BODY_LIMIT
         record = make_record(
             outcome=CompletionOutcome.BLOCKED,
             requested_actions=[
@@ -5494,6 +5558,7 @@ class TestEscalationSurvivesAFailedPublish:
             ],
             summary="blocked",
         )
+        record.comment_body = at_the_limit
         worktree = worktree_with_completion(record)
 
         processor.process(
@@ -5503,11 +5568,9 @@ class TestEscalationSurvivesAFailedPublish:
             issue_title="Test",
         )
 
-        posted = " ".join(
-            str(call) for call in mock_pr_adapter.add_comment.call_args_list
-        )
-        assert "issue-123" in posted
-        assert "not pushed" in posted
+        # The body the agent wrote is unchanged, so it is still postable.
+        assert len(record.comment_body.encode("utf-8")) <= GITHUB_COMMENT_BODY_LIMIT
+        mock_label_adapter.add_label.assert_any_call(123, "blocked")
 
     def test_a_failed_publish_still_stops_a_completed_record(
         self,

@@ -233,20 +233,3 @@ def publish_is_best_effort(outcome: str) -> bool:
     the result, so a failed push must stop everything after it.
     """
     return outcome in ESCALATION_STATUSES
-
-
-def unpublished_escalation_notice(
-    worktree: str, branch: str | None, reason: str
-) -> str:
-    """What to tell a human when an escalation's branch never reached the remote.
-
-    Cleanup removes worktrees by default, so an escalation whose commits stayed
-    local is exactly how finished work goes missing. Naming the branch and the
-    path while someone can still act on it is the difference between "not
-    published" and "lost".
-    """
-    return (
-        f"The branch was not pushed ({reason}). Any commits made for this "
-        f"issue are still local, on branch '{branch or 'unknown'}' in "
-        f"{worktree}. Recover them before this worktree is cleaned up."
-    )
