@@ -236,6 +236,7 @@ class TerminalSessionOwnerChild:
         controls = ProcessCancellationOwnerControls(
             invocation.listener_file_descriptor,
             invocation.owner_lock_file_descriptor,
+            Path(invocation.cancellation_record_path),
         )
         activation = ProcessCancellationInheritedEndpointActivator(
             cancellation.record_path,

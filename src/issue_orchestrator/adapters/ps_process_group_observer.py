@@ -63,6 +63,7 @@ class PsProcessObservationPolicy:
 class _ProcessTableEntry:
     process_id: int
     process_group_id: int
+    session_id: int
     state: str
 
 
@@ -119,7 +120,40 @@ class PsProcessGroupObserver:
             raise AssertionError("process identity observation is a closed union")
         if identity.birth_identity != expected_birth_identity:
             return ProcessSessionLeaderStale(identity)
-        return ProcessSessionLeaderPresent(identity, self.observe_group(process_id))
+        # The leader created its session, so its PID is the session id; the
+        # decision must cover every group in that session (interactive
+        # guardians and their descendants live outside the leader's group).
+        return ProcessSessionLeaderPresent(
+            identity, self._observe_session_members(process_id)
+        )
+
+    def observe_session_group_ids(self, session_id: int) -> tuple[int, ...]:
+        """Enumerate live group ids in one session (leader must be alive)."""
+        snapshot = self._snapshot()
+        if isinstance(snapshot, ProcessGroupPermissionDenied):
+            return ()
+        return tuple(
+            sorted(
+                {
+                    entry.process_group_id
+                    for entry in snapshot
+                    if entry.session_id == session_id
+                }
+            )
+        )
+
+    def _observe_session_members(self, session_id: int) -> ProcessGroupObservation:
+        snapshot = self._snapshot()
+        if isinstance(snapshot, ProcessGroupPermissionDenied):
+            return snapshot
+        members = tuple(
+            entry for entry in snapshot if entry.session_id == session_id
+        )
+        if not members:
+            return ProcessGroupAbsent()
+        if all(entry.state.startswith("Z") for entry in members):
+            return ProcessGroupZombiesOnly(len(members))
+        return ProcessGroupExecutable(len(members))
 
     def _snapshot(
         self,
@@ -129,7 +163,7 @@ class PsProcessGroupObserver:
                 (
                     str(self._ps_executable),
                     "-axo",
-                    "pid=,pgid=,stat=",
+                    "pid=,pgid=,sess=,stat=",
                 ),
                 capture_output=True,
                 text=True,
@@ -159,14 +193,15 @@ class PsProcessGroupObserver:
 
 def _parse_process_table_line(line: str) -> _ProcessTableEntry:
     fields = line.strip().split()
-    if len(fields) != 3:
+    if len(fields) != 4:
         raise ProcessGroupObservationError(
             f"malformed ps process-table line: {line!r}"
         )
-    raw_pid, raw_pgid, state = fields
+    raw_pid, raw_pgid, raw_session, state = fields
     try:
         process_id = int(raw_pid)
         process_group_id = int(raw_pgid)
+        session_id = int(raw_session)
     except (TypeError, ValueError) as exc:
         raise ProcessGroupObservationError(
             f"malformed ps process-table line: {line!r}"
@@ -178,6 +213,7 @@ def _parse_process_table_line(line: str) -> _ProcessTableEntry:
     return _ProcessTableEntry(
         process_id=process_id,
         process_group_id=process_group_id,
+        session_id=session_id,
         state=state,
     )
 

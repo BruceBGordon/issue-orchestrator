@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import selectors
 import signal
@@ -44,6 +45,7 @@ from .process_cancellation_endpoint import (
     ProcessCancellationOwnerControls,
     ProcessCancellationRequest,
 )
+from .posix_process import descriptor_path
 from ..domain.independent_cleanup import (
     CleanupAction,
     CleanupOutcome,
@@ -83,6 +85,7 @@ class _SentinelCancellationEndpointRecord(StrictWireRecord):
     kind: Literal["cancellation-endpoint"] = "cancellation-endpoint"
     listener_file_descriptor: int = Field(ge=0)
     owner_lock_file_descriptor: int = Field(ge=0)
+    record_path: str = Field(min_length=1)
 
 
 _SentinelCancellationRecord = Annotated[
@@ -114,6 +117,7 @@ class _ProcessGroupSentinelInvocation(StrictWireRecord):
     process_group_id: int = Field(gt=1)
     graceful_shutdown_seconds: float = Field(gt=0)
     parent_lifetime: _SentinelParentLifetimeRecordUnion
+    lease_file_descriptors: tuple[int, ...] = ()
 
 
 class _SentinelLaunchResources:
@@ -321,6 +325,7 @@ class ProcessGroupSentinelController:
                 process_group_id=os.getpgrp(),
                 graceful_shutdown_seconds=policy.graceful_shutdown_seconds,
                 parent_lifetime=parent_lifetime,
+                lease_file_descriptors=lifetime_file_descriptors,
             )
             activation = cls._activate(
                 program,
@@ -411,6 +416,7 @@ class ProcessGroupSentinelController:
                 _SentinelCancellationEndpointRecord(
                     listener_file_descriptor=cancellation.listener_file_descriptor,
                     owner_lock_file_descriptor=cancellation.owner_lock_file_descriptor,
+                    record_path=str(cancellation.record_path),
                 ),
                 (
                     cancellation.listener_file_descriptor,
@@ -797,6 +803,7 @@ def _cancellation_owner(
             ProcessCancellationOwnerControls(
                 record.listener_file_descriptor,
                 record.owner_lock_file_descriptor,
+                Path(record.record_path),
             )
         )
     raise AssertionError("sentinel cancellation record is a closed union")
@@ -908,6 +915,36 @@ class _ProcessGroupSentinelChild:
         request: ProcessCancellationRequest | None,
     ) -> None:
         errors: list[BaseException] = []
+        # The group dies unconditionally from here; retiring the endpoint
+        # record first lets later stop requests observe this containment as
+        # ABSENT instead of an unproven stale owner.
+        cancellation_record = invocation.cancellation
+        if type(cancellation_record) is _SentinelCancellationEndpointRecord:
+            record_file = Path(cancellation_record.record_path)
+            try:
+                payload = json.loads(record_file.read_text(encoding="utf-8"))
+                endpoint = payload.get("endpoint")
+                if isinstance(endpoint, str) and endpoint:
+                    Path(endpoint).unlink(missing_ok=True)
+            except (OSError, ValueError):
+                pass
+            try:
+                record_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+        # The lease charge also ends with this group; only per-command
+        # records under leases/ are retired, never shared capacity locks.
+        for descriptor in invocation.lease_file_descriptors:
+            try:
+                lease_path = descriptor_path(descriptor)
+            except OSError:
+                continue
+            if lease_path.parent.name != "leases":
+                continue
+            try:
+                lease_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         try:
             try:
                 os.killpg(invocation.process_group_id, signal.SIGTERM)

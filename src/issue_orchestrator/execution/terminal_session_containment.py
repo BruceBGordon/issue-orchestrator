@@ -20,6 +20,7 @@ from ..domain.terminal_session_termination import (
 )
 from .executor_guardian_cancellation import ExecutorSessionGuardianCanceller
 from .process_cancellation_endpoint import (
+    ProcessCancellationOwnerUnresponsiveError,
     ProcessCancellationEndpointOutcome,
     ProcessCancellationEndpointRequester,
 )
@@ -103,9 +104,16 @@ class OwnerMediatedTerminalSessionContainment:
         terminal_cancellation: TerminalSessionOwnerCancellation,
         executor_cancellation: ExecutorInteractiveSessionCancellation,
     ) -> TerminalSessionContainmentReport:
-        deadline = time.monotonic() + self._containment_timeout_seconds
-        outer = self._attempt_outer(terminal_cancellation, deadline)
-        guardian = self._attempt_guardian(executor_cancellation, deadline)
+        # Each owner gets its own full window: a stalled outer must not
+        # starve the guardian attempt of its acknowledgement budget.
+        outer = self._attempt_outer(
+            terminal_cancellation,
+            time.monotonic() + self._containment_timeout_seconds,
+        )
+        guardian = self._attempt_guardian(
+            executor_cancellation,
+            time.monotonic() + self._containment_timeout_seconds,
+        )
         failures = tuple(
             attempt.error
             for attempt in (outer, guardian)
@@ -144,6 +152,10 @@ class OwnerMediatedTerminalSessionContainment:
             else:
                 raise AssertionError("outer endpoint outcome is a closed enum")
             return _ContainmentSucceeded(mapped)
+        except ProcessCancellationOwnerUnresponsiveError:
+            return _ContainmentSucceeded(
+                TerminalSessionOwnerContainmentOutcome.UNRESPONSIVE
+            )
         except BaseException as error:
             error.add_note("outer terminal owner containment failed")
             return _ContainmentFailed(error)
@@ -167,6 +179,10 @@ class OwnerMediatedTerminalSessionContainment:
             else:
                 raise AssertionError("guardian endpoint outcome is a closed enum")
             return _ContainmentSucceeded(mapped)
+        except ProcessCancellationOwnerUnresponsiveError:
+            return _ContainmentSucceeded(
+                TerminalSessionOwnerContainmentOutcome.UNRESPONSIVE
+            )
         except BaseException as error:
             error.add_note("executor guardian containment failed")
             return _ContainmentFailed(error)

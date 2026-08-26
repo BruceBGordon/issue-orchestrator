@@ -44,6 +44,10 @@ class ProcessCancellationEndpointError(RuntimeError):
     """A stable cancellation endpoint violated its ownership contract."""
 
 
+class ProcessCancellationOwnerUnresponsiveError(ProcessCancellationEndpointError):
+    """A live owner held its endpoint but never acknowledged in time."""
+
+
 class ProcessCancellationEndpointOutcome(StrEnum):
     """Exact resolution of one owner endpoint."""
 
@@ -76,6 +80,7 @@ class ProcessCancellationOwnerControls:
 
     listener_file_descriptor: int
     owner_lock_file_descriptor: int
+    record_path: Path
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -87,6 +92,11 @@ class ProcessCancellationOwnerControls:
                     f"ProcessCancellationOwnerControls.{field_name} must be "
                     "a non-negative integer"
                 )
+        if not isinstance(self.record_path, Path) or not self.record_path.is_absolute():
+            raise ValueError(
+                "ProcessCancellationOwnerControls.record_path must be an "
+                "absolute Path"
+            )
 
 
 @runtime_checkable
@@ -398,6 +408,7 @@ class ProcessCancellationEndpointLease:
         return ProcessCancellationOwnerControls(
             listener.fileno(),
             self._lock_handle.fileno(),
+            self._record_path,
         )
 
     def activate(self) -> None:
@@ -562,9 +573,15 @@ class ProcessCancellationEndpointLease:
             f"{file_status.st_dev:x}-{file_status.st_ino:x}.sock"
         )
         if endpoint.exists():
-            raise ProcessCancellationEndpointError(
-                f"managed cancellation endpoint already exists: {endpoint}"
-            )
+            # Lock-file inodes are recycled by the filesystem, so a leftover
+            # socket from a dead owner can collide with a fresh identity.
+            # Reclaim only a socket nobody is listening on; a live listener
+            # is a genuine ownership conflict and still fails.
+            if _endpoint_listener_is_live(endpoint):
+                raise ProcessCancellationEndpointError(
+                    f"managed cancellation endpoint already exists: {endpoint}"
+                )
+            endpoint.unlink(missing_ok=True)
         self._record_store.write(
             self._record_path,
             _EndpointRecord(
@@ -784,7 +801,13 @@ class ProcessCancellationEndpointRequester:
                 if request_delivered:
                     return ProcessCancellationEndpointOutcome.CONTAINED
                 return stale
-            record = _read_record(record_path)
+            try:
+                record = _read_record(record_path)
+            except FileNotFoundError:
+                # A containment actor retired the record mid-request; the
+                # owner lock will free as that containment completes.
+                _sleep_before_deadline(record_path, deadline)
+                continue
             if record.state is _EndpointState.SETTING_UP:
                 self._await_next_setup_state(lock_handle, record_path, deadline)
                 continue
@@ -796,7 +819,7 @@ class ProcessCancellationEndpointRequester:
                 )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise ProcessCancellationEndpointError(
+                raise ProcessCancellationOwnerUnresponsiveError(
                     "cancellation owner retained its lock past the absolute "
                     f"deadline: {record_path}"
                 )
@@ -816,7 +839,7 @@ class ProcessCancellationEndpointRequester:
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise ProcessCancellationEndpointError(
+                raise ProcessCancellationOwnerUnresponsiveError(
                     "cancellation endpoint remained in setup past the absolute "
                     f"deadline: {record_path}"
                 )
@@ -1038,11 +1061,11 @@ def _select_before_deadline(
 ) -> None:
     remaining = deadline - time.monotonic()
     if remaining <= 0 or not selector.select(remaining):
-        raise ProcessCancellationEndpointError(
+        raise ProcessCancellationOwnerUnresponsiveError(
             f"cancellation {phase} exceeded its absolute deadline: {endpoint}"
         )
     if time.monotonic() >= deadline:
-        raise ProcessCancellationEndpointError(
+        raise ProcessCancellationOwnerUnresponsiveError(
             f"cancellation {phase} exceeded its absolute deadline: {endpoint}"
         )
 
@@ -1104,17 +1127,42 @@ def _validated_endpoint(record: _EndpointRecord) -> Path:
     return endpoint
 
 
+def _endpoint_listener_is_live(endpoint: Path) -> bool:
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(0.2)
+        probe.connect(str(endpoint))
+    except (ConnectionRefusedError, FileNotFoundError, socket.timeout, OSError):
+        return False
+    else:
+        return True
+    finally:
+        probe.close()
+
+
 def _endpoint_root() -> Path:
     return Path("/tmp") / f"{_ENDPOINT_ROOT_PREFIX}{os.getuid()}"
+
+
+def _sleep_before_deadline(record_path: Path, deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProcessCancellationOwnerUnresponsiveError(
+            "cancellation owner retained its lock past the absolute "
+            f"deadline: {record_path}"
+        )
+    time.sleep(min(0.01, remaining))
 
 
 def _retire_without_owner(
     record_path: Path,
     record_store: AtomicRecordPersistence,
 ) -> ProcessCancellationEndpointOutcome:
-    if not record_path.exists():
+    try:
+        record = _read_record(record_path)
+    except FileNotFoundError:
         return ProcessCancellationEndpointOutcome.ABSENT
-    _retire_record(record_path, _read_record(record_path), record_store)
+    _retire_record(record_path, record, record_store)
     return ProcessCancellationEndpointOutcome.STALE_RETIRED
 
 

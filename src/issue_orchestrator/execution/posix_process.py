@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import math
 import os
+from pathlib import Path
 import resource
 import selectors
 import signal
@@ -1172,3 +1173,11 @@ def _close_unmapped_descriptors(inherited: tuple[int, ...]) -> None:
     preserved = tuple(sorted(set((0, 1, 2, *inherited))))
     for lower, upper in zip(preserved, (*preserved[1:], maximum), strict=True):
         os.closerange(lower + 1, upper)
+
+
+def descriptor_path(descriptor: int) -> Path:
+    """Resolve an open descriptor's filesystem path (macOS and Linux)."""
+    if hasattr(fcntl, "F_GETPATH"):
+        raw = fcntl.fcntl(descriptor, fcntl.F_GETPATH, bytes(1024))
+        return Path(raw.split(b"\x00", 1)[0].decode())
+    return Path(os.readlink(f"/proc/self/fd/{descriptor}"))

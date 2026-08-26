@@ -4,9 +4,15 @@
 from __future__ import annotations
 
 import logging
+import os
+import signal
 import time
 
-from ..domain.process_group import ProcessIdentityObservation
+from ..domain.process_group import (
+    ProcessGroupAbsent,
+    ProcessGroupZombiesOnly,
+    ProcessIdentityObservation,
+)
 from ..domain.terminal_session_termination import (
     TerminalSessionContainmentError,
     TerminalSessionContainmentReport,
@@ -112,6 +118,15 @@ class PosixTerminalSessionProcessGroupTerminator:
             return initial_outcome
         if (
             report.terminal_owner
+            is TerminalSessionOwnerContainmentOutcome.UNRESPONSIVE
+        ):
+            # A live owner that held its endpoint but never acknowledged is
+            # stalled (for example SIGSTOP).  Signal authority here is granted
+            # only through the verified birth identity of the exact persisted
+            # leader, never a bare numeric PID.
+            self._force_contain_unresponsive_outer(process)
+        elif (
+            report.terminal_owner
             is not TerminalSessionOwnerContainmentOutcome.CONTAINED
         ):
             raise TerminalSessionContainmentError(
@@ -119,14 +134,10 @@ class PosixTerminalSessionProcessGroupTerminator:
                 f"pid={process.process_id} "
                 f"owner={report.terminal_owner.value}"
             )
-        if (
-            report.guardian_owner
-            is TerminalSessionOwnerContainmentOutcome.STALE_RETIRED
-        ):
-            raise TerminalSessionContainmentError(
-                "active terminal session had a stale guardian owner; opaque "
-                f"descendant containment is unproven: pid={process.process_id}"
-            )
+        # A stale or unresponsive guardian owner is not trusted; the
+        # session-wide observation below is the proof.  Every group in the
+        # leader's session, including a guardian's descendants, must stop
+        # being executable before the deadline or this raises.
         observed = self._await_resolution(
             process,
             self._policy.forceful_shutdown_seconds,
@@ -141,6 +152,48 @@ class PosixTerminalSessionProcessGroupTerminator:
             "terminal session remains executable after its owner acknowledged "
             f"containment: pid={process.process_id}"
         )
+
+    def _force_contain_unresponsive_outer(
+        self,
+        process: TerminalSessionProcess,
+    ) -> None:
+        """Forcefully contain every group of a stalled session after proof.
+
+        Group ids are enumerated while the verified leader is still alive:
+        after leader death the platform stops attributing members to this
+        session, so each swept group is then verified by its own id.
+        """
+        if self.status(process) is not TerminalSessionStatus.ACTIVE:
+            return
+        group_ids = self._process_group_observer.observe_session_group_ids(
+            process.process_id
+        )
+        for group_id in (process.process_id, *group_ids):
+            try:
+                os.killpg(group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+            except PermissionError as error:
+                raise TerminalSessionContainmentError(
+                    "stalled terminal session group refused forced "
+                    f"containment: pgid={group_id}"
+                ) from error
+        self._await_group_ids_contained(group_ids)
+
+    def _await_group_ids_contained(self, group_ids: tuple[int, ...]) -> None:
+        deadline = time.monotonic() + self._policy.forceful_shutdown_seconds
+        pending = list(group_ids)
+        while pending:
+            observation = self._process_group_observer.observe_group(pending[0])
+            if type(observation) in (ProcessGroupAbsent, ProcessGroupZombiesOnly):
+                pending.pop(0)
+                continue
+            if time.monotonic() >= deadline:
+                raise TerminalSessionContainmentError(
+                    "stalled terminal session group remains executable after "
+                    f"forced containment: pgid={pending[0]}"
+                )
+            time.sleep(0.01)
 
     @staticmethod
     def _require_process(process: TerminalSessionProcess) -> None:

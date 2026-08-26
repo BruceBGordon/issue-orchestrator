@@ -161,6 +161,7 @@ class TerminalSessionOwnerContainmentOutcome(StrEnum):
     ABSENT = "absent"
     STALE_RETIRED = "stale-retired"
     CONTAINED = "contained"
+    UNRESPONSIVE = "unresponsive"
 
 
 @dataclass(frozen=True, slots=True)

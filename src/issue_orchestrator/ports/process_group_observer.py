@@ -31,3 +31,7 @@ class ProcessGroupObserver(Protocol):
     ) -> ProcessSessionObservation:
         """Observe the leader identity and group as one owner-level decision fact."""
         ...
+
+    def observe_session_group_ids(self, session_id: int) -> tuple[int, ...]:
+        """Enumerate the live process-group ids inside one session."""
+        ...

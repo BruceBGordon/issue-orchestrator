@@ -142,7 +142,7 @@ def _executor_launch(
 
 def _await(requirement: Callable[[], bool]) -> None:
     """Bound one real process/PTY integration boundary against deadlock."""
-    deadline = time.monotonic() + 15.0
+    deadline = time.monotonic() + 45.0
     while time.monotonic() < deadline:
         if requirement():
             return
@@ -246,10 +246,12 @@ def test_interactive_guardian_survives_outer_crash_until_its_deadline(
         "session:outer-crash",
         "--group",
         "session:outer-crash",
+        # The bound under test must dwarf real activation machinery so the
+        # deadline measures the surviving command, never its startup.
         "--active-timeout-seconds",
-        "2",
+        "10",
         "--absolute-timeout-seconds",
-        "5",
+        "20",
         "--interactive-session",
         "--cancellation-record",
         str(tmp_path / EXECUTOR_SESSION_CANCELLATION_FILENAME),

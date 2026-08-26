@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
+import json
 import os
 import shutil
 import signal
@@ -58,6 +58,7 @@ from ...ports.posix_process import (
 )
 from ...ports.executor_child_resources import ExecutorChildResourceObserver
 from ..process_cancellation_endpoint import ProcessCancellationOwnerControls
+from ..posix_process import descriptor_path
 from ..process_group_sentinel import (
     ProcessGroupSentinelController,
     ProcessGroupSentinelWithoutCancellation,
@@ -180,14 +181,6 @@ _GuardianResourceMeasurement = (
 )
 
 
-
-def _descriptor_path(descriptor: int) -> Path:
-    """Resolve an open descriptor's filesystem path (macOS and Linux)."""
-    if hasattr(fcntl, "F_GETPATH"):
-        raw = fcntl.fcntl(descriptor, fcntl.F_GETPATH, bytes(1024))
-        return Path(raw.split(b"\x00", 1)[0].decode())
-    return Path(os.readlink(f"/proc/self/fd/{descriptor}"))
-
 @dataclass(slots=True)
 class _SentinelGuardianGroupOwner:
     """Dual guardian/sentinel owner that survives either single failure."""
@@ -214,6 +207,15 @@ class _SentinelGuardianGroupOwner:
         # always means the guardian died without containing its work.
         if self.cancellation_record_path is not None:
             try:
+                payload = json.loads(
+                    self.cancellation_record_path.read_text(encoding="utf-8")
+                )
+                endpoint = payload.get("endpoint")
+                if isinstance(endpoint, str) and endpoint:
+                    Path(endpoint).unlink(missing_ok=True)
+            except (OSError, ValueError):
+                pass
+            try:
                 self.cancellation_record_path.unlink(missing_ok=True)
             except OSError:
                 pass
@@ -223,7 +225,7 @@ class _SentinelGuardianGroupOwner:
         # locks travel on the same descriptors and must survive.
         for descriptor in self.lease_file_descriptors:
             try:
-                record_path = _descriptor_path(descriptor)
+                record_path = descriptor_path(descriptor)
             except OSError:
                 continue
             if record_path.parent.name != "leases":
@@ -380,12 +382,13 @@ class PosixExecutorGuardianChild:
             sentinel_cancellation = ProcessGroupSentinelWithoutCancellation()
             cancellation_descriptors: tuple[int, ...] = ()
         elif type(cancellation) is GuardianInteractiveCancellationControlRecord:
+            cancellation_record_path = Path(cancellation.record_path)
             controls = ProcessCancellationOwnerControls(
                 cancellation.listener_file_descriptor,
                 cancellation.owner_lock_file_descriptor,
+                cancellation_record_path,
             )
             sentinel_cancellation = controls
-            cancellation_record_path = Path(cancellation.record_path)
             cancellation_descriptors = (
                 controls.listener_file_descriptor,
                 controls.owner_lock_file_descriptor,
