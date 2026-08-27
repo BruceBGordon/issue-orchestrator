@@ -177,48 +177,12 @@ class CondorLaneExecutor:
         # stdout/stderr/event logs are worthless if silently discarded
         # and unbounded if silently retained.
         retain_run_directory = True
-        submitted_at = time.monotonic()
-        execute_observed_at: float | None = None
         streams = _OutputStreamer(compiled)
         try:
-            while True:
-                streams.pump()
-                state = self._observe(compiled)
-                if execute_observed_at is None and type(state) is not LaneJobPending:
-                    execute_observed_at = time.monotonic()
-                terminal = self._map_terminal(
-                    state,
-                    execute_observed_at
-                    if execute_observed_at is not None
-                    else time.monotonic(),
-                )
-                if terminal is not None:
-                    streams.pump()
-                    if (
-                        type(terminal) is LaneCompleted
-                        and terminal.exit_code == 0
-                    ):
-                        retain_run_directory = False
-                    return terminal
-                now = time.monotonic()
-                if execute_observed_at is None:
-                    if now >= submitted_at + _ADMISSION_TIMEOUT_SECONDS:
-                        raise LaneExecutorError(
-                            "scheduler never started the lane: queued for "
-                            f"{_ADMISSION_TIMEOUT_SECONDS:.0f}s "
-                            f"(lane={command.work_key.value} job={job_id})"
-                        )
-                elif now >= (
-                    execute_observed_at
-                    + command.deadline.timeout_seconds
-                    + _SCHEDULER_SLACK_SECONDS
-                ):
-                    raise LaneExecutorError(
-                        "scheduler did not conclude the running lane inside its "
-                        f"deadline plus slack: lane={command.work_key.value} "
-                        f"job={job_id}"
-                    )
-                time.sleep(_POLL_INTERVAL_SECONDS)
+            terminal = self._follow_job(command, compiled, job_id, streams)
+            if type(terminal) is LaneCompleted and terminal.exit_code == 0:
+                retain_run_directory = False
+            return terminal
         except LaneExecutorError as error:
             self._remove(job_id)
             streams.pump()
@@ -239,6 +203,65 @@ class CondorLaneExecutor:
                 )
             else:
                 shutil.rmtree(run_directory, ignore_errors=True)
+
+    def _follow_job(
+        self,
+        command: LaneCommand,
+        compiled: CompiledSubmitDescription,
+        job_id: str,
+        streams: _OutputStreamer,
+    ) -> LaneOutcome:
+        """Poll the job to a terminal outcome under the two watchdogs.
+
+        Admission and runtime are bounded independently: queue wait is
+        scheduling machinery and is never billed to the lane's budget.
+        """
+        submitted_at = time.monotonic()
+        execute_observed_at: float | None = None
+        while True:
+            streams.pump()
+            state = self._observe(compiled)
+            if execute_observed_at is None and type(state) is not LaneJobPending:
+                execute_observed_at = time.monotonic()
+            terminal = self._map_terminal(
+                state,
+                execute_observed_at
+                if execute_observed_at is not None
+                else time.monotonic(),
+            )
+            if terminal is not None:
+                streams.pump()
+                return terminal
+            self._enforce_watchdogs(
+                command, job_id, submitted_at, execute_observed_at
+            )
+            time.sleep(_POLL_INTERVAL_SECONDS)
+
+    @staticmethod
+    def _enforce_watchdogs(
+        command: LaneCommand,
+        job_id: str,
+        submitted_at: float,
+        execute_observed_at: float | None,
+    ) -> None:
+        now = time.monotonic()
+        if execute_observed_at is None:
+            if now >= submitted_at + _ADMISSION_TIMEOUT_SECONDS:
+                raise LaneExecutorError(
+                    "scheduler never started the lane: queued for "
+                    f"{_ADMISSION_TIMEOUT_SECONDS:.0f}s "
+                    f"(lane={command.work_key.value} job={job_id})"
+                )
+        elif now >= (
+            execute_observed_at
+            + command.deadline.timeout_seconds
+            + _SCHEDULER_SLACK_SECONDS
+        ):
+            raise LaneExecutorError(
+                "scheduler did not conclude the running lane inside its "
+                f"deadline plus slack: lane={command.work_key.value} "
+                f"job={job_id}"
+            )
 
     def _map_terminal(
         self, state: LaneJobState, execute_observed_at: float

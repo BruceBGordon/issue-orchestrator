@@ -1,4 +1,4 @@
-.PHONY: help venv venv-fast semgrep-venv worktree-create worktree-setup install upgrade-deps deps-batch release release-pr prepare-release preview-readme typecheck lint-arch lint-complexity quality-guardrails quality-guardrails-stale sync-deps test test-unit test-unit-cov test-unit-cov-html test-integration test-integration-core test-integration-core-local test-integration-core-live-codex test-integration-agent test-simulated test-simulated-core test-simulated-agent test-e2e test-e2e-heavy test-e2e-onboarding-live test-e2e-one test-e2e-live test-real-claude-dev test-real-claude-review test-real-gh-labels test-real-gh test-real-gh-plus-e2e test-real-gh-plus-e2e-subprocess test-web test-web-headed playwright-install validate validate-raw validate-pr validate-pr-raw validate-quick validate-full verify-hooks-all _validate-impl _validate-static-impl _validate-core-tests-impl _validate-pr-impl _validate-agent-impl _validate-full-impl clean demo issues-validate issues-fix issues-fix-dry-run issues-create
+.PHONY: help venv venv-fast semgrep-venv worktree-create worktree-setup install upgrade-deps deps-batch release release-pr prepare-release preview-readme typecheck lint-arch lint-complexity quality-guardrails quality-guardrails-stale sync-deps test test-unit test-unit-cov test-unit-cov-html test-integration test-integration-core test-integration-core-local test-integration-core-live-codex test-integration-agent test-simulated test-simulated-core test-simulated-agent test-e2e test-e2e-heavy test-e2e-onboarding-live test-e2e-one test-e2e-live test-real-claude-dev test-real-claude-review test-real-gh-labels test-real-gh test-real-gh-plus-e2e test-real-gh-plus-e2e-subprocess test-web test-web-headed test-vscode install-vscode-extensions playwright-install validate validate-raw validate-pr validate-pr-raw validate-quick validate-full verify-hooks-all _validate-impl _validate-static-impl _validate-core-tests-impl _validate-pr-impl _validate-agent-impl _validate-full-impl _validate-pr-flat-impl test-integration-agent-claude test-integration-agent-codex test-integration-agent-chain clean demo issues-validate issues-fix issues-fix-dry-run issues-create
 
 # GNU make detection - required for parallel validation with grouped output
 # On macOS: brew install make (provides gmake)
@@ -553,7 +553,7 @@ endif
 
 # Condor-mode suite slices. Each is a full lane: the condor branch
 # submits itself, the direct branch is what runs inside the pool job.
-test-integration-core-slice-%: sync-deps
+test-integration-core-slice-%: sync-deps FORCE
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-core-slice-$*,\
 		$(LANE_RUN) --backend condor --work-key test-integration-core-slice-$* \
@@ -821,3 +821,6 @@ issues-fix-dry-run:
 
 issues-create:
 	$(PYTHON) scripts/issues.py create $(ARGS)
+
+# Unconditional prerequisite for pattern-rule lanes (they cannot be .PHONY).
+FORCE:
