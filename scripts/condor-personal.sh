@@ -65,6 +65,12 @@ DAEMON_LIST = MASTER COLLECTOR NEGOTIATOR SCHEDD STARTD
 UID_DOMAIN = $(FULL_HOSTNAME)
 TRUST_UID_DOMAIN = TRUE
 STARTER_ALLOW_RUNAS_OWNER = TRUE
+# Linux condor bind-mounts job scratch over /tmp (MOUNT_UNDER_SCRATCH),
+# giving jobs a private /tmp - so a lane whose initialdir lives under
+# the real /tmp fails with errno=2 regardless of ownership or systemd
+# PrivateTmp. A personal pool's lanes must see the submitter's real
+# filesystem.
+MOUNT_UNDER_SCRATCH =
 SEC_DEFAULT_AUTHENTICATION_METHODS = FS, IDTOKENS
 ALLOW_READ = *
 ALLOW_WRITE = $(CONDOR_HOST) $(IP_ADDRESS) 127.0.0.1
@@ -148,6 +154,67 @@ select_config_dir() {
   fi
   [ -n "$fallback" ] && echo "$fallback" && return 0
   return 1
+}
+
+# Readiness is not daemon topology - it is the ability to execute a
+# lane. This probe submits a minimal job whose working directory is a
+# fresh submitter-owned 0700 directory under the real /tmp (the exact
+# shape every pytest lane uses) and requires it to write a marker
+# there. It fails fast at startup - with the effective identity
+# configuration and any hold reasons - instead of letting every later
+# lane go on hold.
+assert_execution_invariant() {
+  local probe_dir marker cluster deadline
+  probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/io-condor-probe-XXXXXX")
+  chmod 700 "$probe_dir"
+  marker="$probe_dir/proof"
+  cat > "$probe_dir/probe.sh" <<'PROBE'
+#!/bin/sh
+echo alive > proof
+PROBE
+  chmod +x "$probe_dir/probe.sh"
+  cat > "$probe_dir/probe.sub" <<PROBESUB
+executable = $probe_dir/probe.sh
+universe = vanilla
+initialdir = $probe_dir
+output = $probe_dir/out
+error = $probe_dir/err
+log = $probe_dir/log
+request_cpus = 1
+should_transfer_files = NO
+queue
+PROBESUB
+  cluster=$(condor_submit -terse "$probe_dir/probe.sub" 2>&1 | awk -F. '{print $1; exit}')
+  if [ -z "$cluster" ]; then
+    echo "condor-personal: execution probe could not submit" >&2
+    rm -rf "$probe_dir"
+    exit 70
+  fi
+  deadline=$((SECONDS + 60))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    [ -s "$marker" ] && break
+    sleep 1
+  done
+  if [ ! -s "$marker" ]; then
+    echo "condor-personal: execution probe FAILED - the pool cannot run a lane in a submitter-owned directory" >&2
+    echo "--- identity and namespace configuration (effective values and origins):" >&2
+    condor_config_val -v UID_DOMAIN TRUST_UID_DOMAIN STARTER_ALLOW_RUNAS_OWNER SLOT1_USER MOUNT_UNDER_SCRATCH 2>&1 | sed 's/^/config: /' >&2 || true
+    if command -v systemctl >/dev/null 2>&1; then
+      echo "systemd PrivateTmp: $(systemctl show condor -p PrivateTmp --value 2>/dev/null)" >&2
+    fi
+    echo "--- held/queued probe state:" >&2
+    condor_q "$cluster" -af:jh JobStatus HoldReason Owner 2>&1 | sed 's/^/probe: /' >&2 || true
+    echo "--- StarterLog tail:" >&2
+    starterlog=$(condor_config_val LOG 2>/dev/null)/StarterLog.slot1_1
+    [ -f "$starterlog" ] || starterlog=$(condor_config_val LOG 2>/dev/null)/StarterLog
+    [ -f "$starterlog" ] && tail -15 "$starterlog" | sed 's/^/starter: /' >&2
+    condor_rm "$cluster" >/dev/null 2>&1 || true
+    rm -rf "$probe_dir"
+    exit 70
+  fi
+  condor_rm "$cluster" >/dev/null 2>&1 || true
+  rm -rf "$probe_dir"
+  echo "condor-personal: execution probe ok (lane ran in a submitter-owned directory)"
 }
 
 # Ubuntu's condor systemd unit runs with PrivateTmp: the daemons see a
@@ -272,6 +339,7 @@ case "${1:-}" in
     fi
     await_pool_ready
     assert_personal_role
+    assert_execution_invariant
     condor_status -total
     ;;
   down)
