@@ -43,6 +43,41 @@ CONCURRENCY_LIMIT_DEFAULT = 1
 EOF
 }
 
+# The plain Linux htcondor package boots DAEMON_LIST = MASTER and
+# nothing else - it is a component install, not a personal pool. This
+# overlay defines the personal role explicitly: all five daemons on
+# loopback, with CONDOR_HOST paired so discovery stays consistent
+# (loopback without a matching CONDOR_HOST strands clients - learned
+# the hard way in both directions).
+write_personal_role_config() {
+  local config_dir="$1"
+  cat > "${config_dir}/85-io-personal-role.conf" <<'ROLECONF'
+CONDOR_HOST = 127.0.0.1
+COLLECTOR_HOST = 127.0.0.1
+NETWORK_INTERFACE = 127.0.0.1
+BIND_ALL_INTERFACES = False
+DAEMON_LIST = MASTER COLLECTOR NEGOTIATOR SCHEDD STARTD
+SEC_DEFAULT_AUTHENTICATION_METHODS = FS, IDTOKENS
+ALLOW_READ = *
+ALLOW_WRITE = $(CONDOR_HOST) $(IP_ADDRESS) 127.0.0.1
+ALLOW_DAEMON = $(ALLOW_WRITE)
+ROLECONF
+}
+
+# Assert the running pool actually has the personal role: every daemon
+# a lane needs must be in the effective DAEMON_LIST, or fail loudly.
+assert_personal_role() {
+  local daemons missing=""
+  daemons=$(condor_config_val DAEMON_LIST 2>/dev/null || echo "")
+  for required in COLLECTOR NEGOTIATOR SCHEDD STARTD; do
+    case "$daemons" in *"$required"*) ;; *) missing="$missing $required";; esac
+  done
+  if [ -n "$missing" ]; then
+    echo "condor-personal: DAEMON_LIST='$daemons' is missing$missing - not a personal pool" >&2
+    exit 70
+  fi
+}
+
 # Per-job scratch directories become the job's TMPDIR. They must live
 # OUTSIDE $HOME: the repo's home-isolation guardrails wall agent work
 # off from real home configs, and a scratch dir under $HOME would put
@@ -127,10 +162,15 @@ linux_configure() {
   fi
   staging=$(mktemp -d)
   write_lane_config "$staging"
+  ambient_daemons=$(condor_config_val DAEMON_LIST 2>/dev/null || echo "")
+  case "$ambient_daemons" in
+    *SCHEDD*) ;;
+    *) write_personal_role_config "$staging" ;;
+  esac
   if [ -w "$config_dir" ]; then
-    cp "$staging/90-issue-orchestrator-lanes.conf" "$config_dir/"
+    cp "$staging"/*.conf "$config_dir/"
   else
-    sudo cp "$staging/90-issue-orchestrator-lanes.conf" "$config_dir/"
+    sudo cp "$staging"/*.conf "$config_dir/"
   fi
   rm -rf "$staging"
   if command -v systemctl >/dev/null 2>&1; then
@@ -191,6 +231,7 @@ case "${1:-}" in
       echo "condor-personal: pool starting"
     fi
     await_pool_ready
+    assert_personal_role
     condor_status -total
     ;;
   down)

@@ -56,3 +56,28 @@ def test_ubuntu_shaped_list_selects_the_etc_entry_when_neither_writable(
 def test_empty_value_fails(tmp_path: Path) -> None:
     result = _select("", tmp_path)
     assert result.returncode != 0
+
+
+def test_personal_role_overlay_defines_a_complete_loopback_pool(
+    tmp_path: Path,
+) -> None:
+    """The Linux role overlay must name every pool daemon and pair the
+    loopback interface with a loopback CONDOR_HOST - one without the
+    other strands discovery (proven in both directions on this PR)."""
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{SCRIPT}" && write_personal_role_config "$1"',
+            "_",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    generated = (tmp_path / "85-io-personal-role.conf").read_text()
+    for daemon in ("MASTER", "COLLECTOR", "NEGOTIATOR", "SCHEDD", "STARTD"):
+        assert daemon in generated
+    assert "CONDOR_HOST = 127.0.0.1" in generated
+    assert "NETWORK_INTERFACE = 127.0.0.1" in generated

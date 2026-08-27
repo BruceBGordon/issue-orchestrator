@@ -52,8 +52,11 @@ jobs:
 
       - name: Install HTCondor (personal pool)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y htcondor
+          # The official quick-install's minicondor variant IS the
+          # supported personal-pool role (the plain htcondor package
+          # boots only a master). The helper then layers lane tuning
+          # and asserts the role.
+          curl -fsSL https://get.htcondor.org | sudo /bin/bash -s -- --no-dry-run --minicondor
           bash scripts/condor-personal.sh up
 
       - name: Contract suite against the live pool
