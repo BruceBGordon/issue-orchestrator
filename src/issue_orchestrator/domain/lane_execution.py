@@ -74,10 +74,16 @@ class LaneResources:
 
     request_cpus: int
     exclusive: tuple[str, ...] = ()
+    # Scheduling hint: expected duration in seconds. A scheduling backend
+    # may start longer lanes first (the LPT makespan heuristic); the
+    # direct backend ignores it. Zero means no preference.
+    priority: int = 0
 
     def __post_init__(self) -> None:
         if type(self.request_cpus) is not int or self.request_cpus < 1:
             raise ValueError("LaneResources.request_cpus must be a positive integer")
+        if type(self.priority) is not int or self.priority < 0:
+            raise ValueError("LaneResources.priority must be a non-negative integer")
         if type(self.exclusive) is not tuple:
             raise ValueError("LaneResources.exclusive must be a tuple")
         for token in self.exclusive:

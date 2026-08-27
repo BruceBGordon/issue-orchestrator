@@ -334,7 +334,7 @@ endef
 typecheck:
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,typecheck,\
-		$(LANE_RUN) --backend condor --work-key typecheck --request-cpus $(LANE_CPUS_TYPECHECK) \
+		$(LANE_RUN) --backend condor --priority 10 --work-key typecheck --request-cpus $(LANE_CPUS_TYPECHECK) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) typecheck LANE_EXECUTOR=direct)
 else
@@ -386,6 +386,15 @@ LANE_CPUS_UNIT ?= 12
 LANE_CPUS_SIMULATED ?= 4
 LANE_CPUS_INTEGRATION ?= 4
 LANE_TIMEOUT_SECONDS ?= 1800
+
+# Suite slices (condor mode): the fat integration suites split into
+# balanced lanes so the flat gate's wall time tracks the longest SLICE,
+# not the longest suite. scripts/lane_slices.py computes the partition
+# from the live file list (coverage by construction) with LPT balancing
+# over measured durations; one dominant file is split at test-node
+# granularity. Direct mode never uses these targets.
+INTEGRATION_CORE_SLICES := 3
+INTEGRATION_CORE_FILES = $(filter-out $(INTEGRATION_AGENT_FILES),$(wildcard tests/integration/test_*.py))
 UNIT_PARALLEL ?= $(PARALLEL)
 SIMULATED_PARALLEL ?= $(PARALLEL)
 INTEGRATION_PARALLEL ?= $(PARALLEL)
@@ -425,7 +434,7 @@ sync-deps:
 test-unit: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-unit,\
-		$(LANE_RUN) --backend condor --work-key test-unit --request-cpus $(LANE_CPUS_UNIT) \
+		$(LANE_RUN) --backend condor --priority 40 --work-key test-unit --request-cpus $(LANE_CPUS_UNIT) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-unit LANE_EXECUTOR=direct)
 else ifeq ($(UNIT_PARALLEL),0)
@@ -446,7 +455,7 @@ endif
 test-simulated-core: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-simulated-core,\
-		$(LANE_RUN) --backend condor --work-key test-simulated-core --request-cpus $(LANE_CPUS_SIMULATED) \
+		$(LANE_RUN) --backend condor --priority 18 --work-key test-simulated-core --request-cpus $(LANE_CPUS_SIMULATED) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-simulated-core LANE_EXECUTOR=direct)
 else ifeq ($(SIMULATED_PARALLEL),0)
@@ -470,7 +479,7 @@ endif
 test-simulated-agent: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-simulated-agent,\
-		$(LANE_RUN) --backend condor --work-key test-simulated-agent --request-cpus 2 \
+		$(LANE_RUN) --backend condor --priority 11 --work-key test-simulated-agent --request-cpus 2 \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-simulated-agent LANE_EXECUTOR=direct)
 else ifeq ($(SIMULATED_PARALLEL),0)
@@ -541,6 +550,42 @@ else
 	$(call TIMED_RUN,test-integration-agent,\
 		$(PYTEST) $(INTEGRATION_AGENT_FILES) -x -q --tb=short -n $(INTEGRATION_AGENT_PARALLEL) --dist=loadgroup $(PYTEST_TIMINGS))
 endif
+
+# Condor-mode suite slices. Each is a full lane: the condor branch
+# submits itself, the direct branch is what runs inside the pool job.
+test-integration-core-slice-%: sync-deps
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,test-integration-core-slice-$*,\
+		$(LANE_RUN) --backend condor --work-key test-integration-core-slice-$* \
+			--request-cpus 3 --priority 40 \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) test-integration-core-slice-$* LANE_EXECUTOR=direct)
+else
+	$(call TIMED_RUN,test-integration-core-slice-$*,\
+		$(PYTEST) $$($(PYTHON) scripts/lane_slices.py --group $* --of $(INTEGRATION_CORE_SLICES) $(INTEGRATION_CORE_FILES)) \
+			-x -q --tb=short -m "not requires_infra and not live_codex" \
+			-n 4 --dist=loadgroup $(PYTEST_TIMINGS))
+endif
+
+# The live-agent suite splits by provider file, which keeps each
+# provider account serialized within its own lane.
+define AGENT_SLICE_RULE
+test-integration-agent-$(1): sync-deps
+ifeq ($$(LANE_EXECUTOR),condor)
+	$$(call TIMED_RUN,test-integration-agent-$(1),\
+		$$(LANE_RUN) --backend condor --work-key test-integration-agent-$(1) \
+			--request-cpus 2 --priority $(2) \
+			--timeout-seconds $$(LANE_TIMEOUT_SECONDS) -- \
+			$$(GMAKE) test-integration-agent-$(1) LANE_EXECUTOR=direct)
+else
+	$$(call TIMED_RUN,test-integration-agent-$(1),\
+		$$(PYTEST) $(3) -x -q --tb=short -n 2 --dist=loadgroup $$(PYTEST_TIMINGS))
+endif
+endef
+
+$(eval $(call AGENT_SLICE_RULE,claude,35,tests/integration/test_claude_execution.py))
+$(eval $(call AGENT_SLICE_RULE,codex,65,tests/integration/test_codex_execution.py))
+$(eval $(call AGENT_SLICE_RULE,chain,30,tests/integration/test_live_agent_chain.py))
 
 # Full integration tests including infrastructure-dependent ones (run in CI)
 test-integration-full: sync-deps
@@ -733,8 +778,10 @@ endif
 # (request_cpus, exclusives) replaces the sequential phase structure
 # that protected the direct path from oversubscription.
 _validate-pr-flat-impl: typecheck lint-arch lint-complexity test-unit \
-	test-simulated-core test-integration-core-local test-simulated-agent \
-	test-integration-agent test-integration-core-live-codex test-web
+	test-simulated-core test-simulated-agent \
+	test-integration-core-slice-1 test-integration-core-slice-2 test-integration-core-slice-3 \
+	test-integration-agent-claude test-integration-agent-codex test-integration-agent-chain \
+	test-integration-core-live-codex test-web test-vscode
 
 _validate-agent-impl: test-simulated-agent test-integration-agent
 

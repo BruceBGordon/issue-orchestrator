@@ -77,6 +77,8 @@ def compile_submit_description(
         "periodic_remove = (JobStatus == 2) && "
         f"((time() - JobCurrentStartDate) > {timeout})",
     ]
+    if resources.priority > 0:
+        lines.append(f"priority = {resources.priority}")
     if resources.exclusive:
         # Exclusive tokens rely on the pool being configured with
         # CONCURRENCY_LIMIT_DEFAULT = 1 (the personal-pool helper does

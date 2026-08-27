@@ -67,6 +67,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             LaneResources(
                 request_cpus=arguments.request_cpus,
                 exclusive=tuple(arguments.exclusive),
+                priority=arguments.priority,
             ),
         )
     except LaneExecutorUnavailableError as error:
@@ -102,6 +103,12 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         help="Machine-wide mutual-exclusion token (repeatable).",
     )
     parser.add_argument("--timeout-seconds", type=float, required=True)
+    parser.add_argument(
+        "--priority",
+        type=int,
+        default=0,
+        help="Expected duration in seconds; scheduling backends start longer lanes first.",
+    )
     parser.add_argument(
         "--backend",
         choices=(_DIRECT_BACKEND, _CONDOR_BACKEND),
