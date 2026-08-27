@@ -17,6 +17,12 @@ on:
       - 'tests/unit/lane_executor_contract.py'
       - 'tests/integration/test_condor_lane_executor.py'
       - 'scripts/condor-personal.sh'
+      - 'scripts/lane_slices.py'
+      - 'tests/unit/test_lane_slices.py'
+      - 'tests/unit/test_condor_personal_script.py'
+      - 'tests/unit/test_validate_gate_lane_coverage.py'
+      - 'Makefile'
+      - '.issue-orchestrator/config/modes/**'
       - '.github/workflows/condor-lanes.yml'
 
 concurrency:

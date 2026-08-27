@@ -171,3 +171,84 @@ def test_detached_session_escape_states_the_platform_boundary(
             "Linux cgroup tracking failed to contain the setsid escape - "
             "the execution environment's core guarantee has regressed"
         )
+
+
+def test_queue_wait_is_never_billed_to_the_lane_deadline(tmp_path: Path) -> None:
+    """Contract: scheduling wait is machinery, not lane budget. A lane
+    queued behind an exclusive token for longer than its own runtime
+    deadline must still run and complete once the token frees."""
+    import threading
+    import time as _time
+
+    def run_lane(name: str, sleep_seconds: float, deadline: float) -> object:
+        return CondorLaneExecutor(CondorTools.resolve()).run(
+            LaneCommand(
+                work_key=LaneWorkKey(f"contract.queuebill-{name}"),
+                arguments=(sys.executable, "-c", f"import time; time.sleep({sleep_seconds})"),
+                working_directory=tmp_path,
+                deadline=LaneDeadline(deadline),
+            ),
+            LaneResources(request_cpus=1, exclusive=("queuebilltoken",)),
+        )
+
+    results: dict[str, object] = {}
+    holder = threading.Thread(
+        target=lambda: results.__setitem__("holder", run_lane("holder", 8.0, 60.0))
+    )
+    holder.start()
+    _time.sleep(1.0)
+    # Queued behind an 8s holder with only a 4s deadline of its own.
+    results["queued"] = run_lane("queued", 1.0, 4.0)
+    holder.join(timeout=120)
+
+    assert type(results["holder"]) is LaneCompleted
+    assert type(results["queued"]) is LaneCompleted, (
+        "queue wait was billed to the lane deadline: "
+        f"{results['queued']!r}"
+    )
+
+
+def test_run_directory_lifecycle_deletes_on_success_retains_on_failure(
+    tmp_path: Path,
+) -> None:
+    """Clean completions leave nothing behind; failures keep their
+    diagnostics and say where (the retention owner is the adapter)."""
+    import glob as _glob
+    import tempfile as _tempfile
+
+    def lane_directories() -> set[str]:
+        return set(
+            _glob.glob(str(Path(_tempfile.gettempdir()) / "lane-contract.lifecycle*"))
+        )
+
+    executor = CondorLaneExecutor(CondorTools.resolve())
+    before = lane_directories()
+    ok = executor.run(
+        LaneCommand(
+            work_key=LaneWorkKey("contract.lifecycle-ok"),
+            arguments=(sys.executable, "-c", "pass"),
+            working_directory=tmp_path,
+            deadline=LaneDeadline(60.0),
+        ),
+        LaneResources(request_cpus=1),
+    )
+    assert type(ok) is LaneCompleted and ok.exit_code == 0
+    assert lane_directories() == before, "clean completion leaked its run directory"
+
+    failed = executor.run(
+        LaneCommand(
+            work_key=LaneWorkKey("contract.lifecycle-fail"),
+            arguments=(sys.executable, "-c", "raise SystemExit(3)"),
+            working_directory=tmp_path,
+            deadline=LaneDeadline(60.0),
+        ),
+        LaneResources(request_cpus=1),
+    )
+    assert type(failed) is LaneCompleted and failed.exit_code == 3
+    retained = [d for d in lane_directories() - before if "lifecycle-fail" in d]
+    assert retained, "failed lane did not retain its diagnostics"
+    for directory in retained:
+        assert (Path(directory) / "lane.events").exists()
+        import shutil as _shutil
+
+        _shutil.rmtree(directory, ignore_errors=True)

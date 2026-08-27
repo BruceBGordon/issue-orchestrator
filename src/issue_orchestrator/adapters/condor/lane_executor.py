@@ -41,6 +41,13 @@ _POLL_INTERVAL_SECONDS = 0.1
 # deadline removal can land this much after the exact bound; the outer
 # wait must tolerate it before declaring the backend unresponsive.
 _SCHEDULER_SLACK_SECONDS = 120.0
+# Queue-health bound, deliberately independent of the lane's own
+# deadline: queue wait is scheduling machinery and is never billed to
+# the lane's budget (a job may legitimately wait behind an exclusive
+# token or a full pool for longer than its own runtime deadline). This
+# bound only catches a structurally dead pool that accepts submissions
+# and never matches them.
+_ADMISSION_TIMEOUT_SECONDS = 600.0
 
 
 # Where scripts/condor-personal.sh installs the personal pool. Resolving
@@ -165,33 +172,76 @@ class CondorLaneExecutor:
         submit_path = run_directory / "lane.sub"
         submit_path.write_text(compiled.text, encoding="utf-8")
         job_id = self._submit(submit_path)
-        started_at = time.monotonic()
-        outer_deadline = (
-            started_at + command.deadline.timeout_seconds + _SCHEDULER_SLACK_SECONDS
-        )
+        # Run-directory lifecycle: a clean completion deletes it; every
+        # other ending retains it as the diagnostic record and says so —
+        # stdout/stderr/event logs are worthless if silently discarded
+        # and unbounded if silently retained.
+        retain_run_directory = True
+        submitted_at = time.monotonic()
+        execute_observed_at: float | None = None
         streams = _OutputStreamer(compiled)
         try:
             while True:
                 streams.pump()
                 state = self._observe(compiled)
-                terminal = self._map_terminal(state, started_at)
+                if execute_observed_at is None and type(state) is not LaneJobPending:
+                    execute_observed_at = time.monotonic()
+                terminal = self._map_terminal(
+                    state,
+                    execute_observed_at
+                    if execute_observed_at is not None
+                    else time.monotonic(),
+                )
                 if terminal is not None:
                     streams.pump()
+                    if (
+                        type(terminal) is LaneCompleted
+                        and terminal.exit_code == 0
+                    ):
+                        retain_run_directory = False
                     return terminal
-                if time.monotonic() >= outer_deadline:
+                now = time.monotonic()
+                if execute_observed_at is None:
+                    if now >= submitted_at + _ADMISSION_TIMEOUT_SECONDS:
+                        raise LaneExecutorError(
+                            "scheduler never started the lane: queued for "
+                            f"{_ADMISSION_TIMEOUT_SECONDS:.0f}s "
+                            f"(lane={command.work_key.value} job={job_id})"
+                        )
+                elif now >= (
+                    execute_observed_at
+                    + command.deadline.timeout_seconds
+                    + _SCHEDULER_SLACK_SECONDS
+                ):
                     raise LaneExecutorError(
-                        "scheduler did not conclude the lane inside its deadline "
-                        f"plus slack: lane={command.work_key.value} job={job_id}"
+                        "scheduler did not conclude the running lane inside its "
+                        f"deadline plus slack: lane={command.work_key.value} "
+                        f"job={job_id}"
                     )
                 time.sleep(_POLL_INTERVAL_SECONDS)
+        except LaneExecutorError as error:
+            self._remove(job_id)
+            streams.pump()
+            raise LaneExecutorError(
+                f"{error} (lane diagnostics retained at {run_directory})"
+            ) from error
         except BaseException:
             # Cancellation or supervisor death: the job must not outlive us.
             self._remove(job_id)
             streams.pump()
             raise
+        finally:
+            if retain_run_directory:
+                print(
+                    f"condor lane {command.work_key.value}: diagnostics "
+                    f"retained at {run_directory}",
+                    file=sys.stderr,
+                )
+            else:
+                shutil.rmtree(run_directory, ignore_errors=True)
 
     def _map_terminal(
-        self, state: LaneJobState, started_at: float
+        self, state: LaneJobState, execute_observed_at: float
     ) -> LaneOutcome | None:
         if type(state) is LaneJobPending or type(state) is LaneJobRunning:
             return None
@@ -200,7 +250,8 @@ class CondorLaneExecutor:
         if type(state) is LaneJobKilledBySignal:
             return LaneCompleted(128 + state.signal_number)
         if type(state) is LaneJobDeadlineRemoved:
-            return LaneTimedOut(time.monotonic() - started_at)
+            # Runtime only: queue wait is never billed to the lane.
+            return LaneTimedOut(time.monotonic() - execute_observed_at)
         if type(state) is LaneJobRemoved:
             raise LaneExecutorError(
                 f"the lane's job was removed outside its deadline: {state.detail}"
@@ -216,7 +267,12 @@ class CondorLaneExecutor:
             log_text = compiled.event_log_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return LaneJobPending()
-        return classify_event_log(log_text)
+        try:
+            return classify_event_log(log_text)
+        except ValueError as error:
+            raise LaneExecutorError(
+                f"scheduler event log is malformed: {error}"
+            ) from error
 
     def _submit(self, submit_path: Path) -> str:
         completed = self._run_tool(

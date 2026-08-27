@@ -7,6 +7,7 @@ ClassAd expressions) is compiled here and nowhere else.
 
 from __future__ import annotations
 
+import math
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,9 +59,9 @@ def compile_submit_description(
     error_path = run_directory / "lane.err"
     event_log_path = run_directory / "lane.events"
     exec_script_path = run_directory / "lane.exec"
-    timeout = int(command.deadline.timeout_seconds)
-    if timeout < 1:
-        timeout = 1
+    # Ceiling, never floor: a floored deadline would let the scheduler
+    # remove a lane before its promised budget elapsed.
+    timeout = max(1, math.ceil(command.deadline.timeout_seconds))
     lines = [
         f"# lane: {command.work_key.value}",
         "universe = vanilla",

@@ -83,10 +83,20 @@ LaneJobState = (
 
 
 def classify_event_log(log_text: str) -> LaneJobState:
-    """Return the job's current lifecycle state from its full event log."""
+    """Return the job's current lifecycle state from its full event log.
+
+    The scheduler writes records incrementally and this is read on a
+    poll, so the tail of the text may be a record still being written.
+    Only records closed by the scheduler's ``...`` delimiter are
+    classified; an unfinished trailing record leaves the state at
+    whatever the last complete record established. Without this, a poll
+    landing between a terminal banner and its body lines would either
+    raise (a termination with no verdict yet) or misclassify (an abort
+    whose deadline-removal reason has not been written yet).
+    """
     if type(log_text) is not str:
         raise ValueError("classify_event_log requires the log text")
-    events = _split_events(log_text)
+    events = _split_complete_events(log_text)
     state: LaneJobState = LaneJobPending()
     for code, body in events:
         if code == _EXECUTING:
@@ -107,12 +117,25 @@ def classify_event_log(log_text: str) -> LaneJobState:
     return state
 
 
-def _split_events(log_text: str) -> list[tuple[str, str]]:
-    banners = list(_EVENT_BANNER.finditer(log_text))
+_RECORD_DELIMITER = re.compile(r"^\.\.\.\s*$", re.MULTILINE)
+
+
+def _split_complete_events(log_text: str) -> list[tuple[str, str]]:
+    """Yield only records the scheduler has finished writing.
+
+    A record is complete when its terminating ``...`` line exists. The
+    region after the last delimiter is a record in progress and is
+    deliberately ignored.
+    """
     events: list[tuple[str, str]] = []
-    for index, banner in enumerate(banners):
-        end = banners[index + 1].start() if index + 1 < len(banners) else len(log_text)
-        events.append((banner.group(1), log_text[banner.start() : end]))
+    position = 0
+    for delimiter in _RECORD_DELIMITER.finditer(log_text):
+        record = log_text[position : delimiter.start()]
+        position = delimiter.end()
+        banner = _EVENT_BANNER.search(record)
+        if banner is None:
+            continue
+        events.append((banner.group(1), record[banner.start() :]))
     return events
 
 

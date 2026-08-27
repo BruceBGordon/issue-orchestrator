@@ -112,3 +112,19 @@ def test_relative_run_directory_is_rejected() -> None:
             LaneResources(request_cpus=1),
             Path("relative/dir"),
         )
+
+
+def test_fractional_deadlines_round_up_never_down(tmp_path: Path) -> None:
+    compiled = compile_submit_description(
+        _command(("/bin/true",), 1.9),
+        LaneResources(request_cpus=1),
+        tmp_path,
+    )
+    assert "> 2)" in compiled.text
+
+    compiled = compile_submit_description(
+        _command(("/bin/true",), 0.4),
+        LaneResources(request_cpus=1),
+        tmp_path,
+    )
+    assert "> 1)" in compiled.text

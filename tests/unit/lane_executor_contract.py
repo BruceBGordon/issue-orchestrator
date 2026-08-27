@@ -13,6 +13,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from issue_orchestrator.domain.lane_execution import (
     LANE_TIMEOUT_EXIT_CODE,
     LaneCommand,
@@ -118,6 +120,66 @@ class LaneExecutorContract:
         )
         assert type(outcome) is LaneCompleted
         assert outcome.exit_code == 17
+
+
+    def test_output_streams_before_the_lane_completes(
+        self, tmp_path: Path, capfd: "pytest.CaptureFixture[str]"
+    ) -> None:
+        """The port promises STREAMED output, not buffered-until-done.
+
+        The lane prints a marker and then refuses to exit until this
+        test creates a handshake file. Observing the marker while the
+        lane is provably still running is the streaming proof; a
+        backend that buffers until completion deadlocks here and fails
+        by timeout instead of passing dishonestly.
+        """
+        import threading
+
+        handshake = tmp_path / "proceed"
+        script = (
+            "import sys, time, pathlib\n"
+            "print('STREAM-MARKER', flush=True)\n"
+            "deadline = time.time() + 90\n"
+            "while not pathlib.Path(sys.argv[1]).exists():\n"
+            "    if time.time() > deadline:\n"
+            "        raise SystemExit(9)\n"
+            "    time.sleep(0.1)\n"
+        )
+        outcomes: list[object] = []
+
+        def run_lane() -> None:
+            outcomes.append(
+                self.build_executor().run(
+                    _command(
+                        "contract.streaming",
+                        (sys.executable, "-c", script, str(handshake)),
+                        tmp_path,
+                        self.completion_timeout_seconds,
+                    ),
+                    self.resources(),
+                )
+            )
+
+        thread = threading.Thread(target=run_lane)
+        thread.start()
+        observed = ""
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and "STREAM-MARKER" not in observed:
+            captured = capfd.readouterr()
+            observed += captured.out + captured.err
+            time.sleep(0.1)
+        marker_seen_while_running = (
+            "STREAM-MARKER" in observed and thread.is_alive()
+        )
+        handshake.write_text("go")
+        thread.join(timeout=60)
+        assert not thread.is_alive(), "lane never concluded"
+        assert marker_seen_while_running, (
+            "output was not observable before completion - the backend "
+            "buffers instead of streaming"
+        )
+        assert outcomes and type(outcomes[0]) is LaneCompleted
+        assert outcomes[0].exit_code == 0
 
     def test_signal_death_reports_as_128_plus_signal(self, tmp_path: Path) -> None:
         outcome = self.build_executor().run(

@@ -74,16 +74,52 @@ darwin_install() {
   export PATH="$POOL_HOME/$TARBALL_DIR_NAME/bin:$POOL_HOME/$TARBALL_DIR_NAME/sbin:$PATH"
 }
 
+# LOCAL_CONFIG_DIR may be a comma-separated LIST (Ubuntu 24.04 returns
+# "/usr/share/condor/config.d,/etc/condor/config.d/"). Select one real
+# directory from it: the first existing writable entry, else the first
+# entry under /etc (the local-admin location), else the first entry.
+select_config_dir() {
+  local raw="$1" entry fallback="" etc_entry=""
+  IFS=',' read -ra entries <<< "$raw"
+  for entry in "${entries[@]}"; do
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    entry="${entry%/}"
+    [ -n "$entry" ] || continue
+    [ -n "$fallback" ] || fallback="$entry"
+    if [ -z "$etc_entry" ] && [[ "$entry" == /etc/* ]]; then
+      etc_entry="$entry"
+    fi
+    if [ -d "$entry" ] && [ -w "$entry" ]; then
+      echo "$entry"
+      return 0
+    fi
+  done
+  if [ -n "$etc_entry" ]; then
+    echo "$etc_entry"
+    return 0
+  fi
+  [ -n "$fallback" ] && echo "$fallback" && return 0
+  return 1
+}
+
 linux_configure() {
   command -v condor_master >/dev/null 2>&1 || {
     echo "condor-personal: install HTCondor first: sudo apt-get install htcondor" >&2
     exit 78
   }
-  local config_dir staging
-  config_dir=$(condor_config_val LOCAL_CONFIG_DIR 2>/dev/null | head -1)
-  if [ -z "$config_dir" ]; then
+  local config_dir_list config_dir staging
+  config_dir_list=$(condor_config_val LOCAL_CONFIG_DIR 2>/dev/null | head -1)
+  if [ -z "$config_dir_list" ]; then
     echo "condor-personal: LOCAL_CONFIG_DIR is not configured" >&2
     exit 70
+  fi
+  config_dir=$(select_config_dir "$config_dir_list") || {
+    echo "condor-personal: no usable entry in LOCAL_CONFIG_DIR=$config_dir_list" >&2
+    exit 70
+  }
+  if [ ! -d "$config_dir" ]; then
+    sudo mkdir -p "$config_dir"
   fi
   staging=$(mktemp -d)
   write_lane_config "$staging"
@@ -117,6 +153,11 @@ await_pool_ready() {
   echo "condor-personal: pool did not become ready within 60s" >&2
   exit 70
 }
+
+# When sourced (tests), expose the functions without dispatching.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0 2>/dev/null || true
+fi
 
 case "${1:-}" in
   up)

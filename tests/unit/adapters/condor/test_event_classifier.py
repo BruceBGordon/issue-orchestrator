@@ -115,10 +115,39 @@ def test_held_job_is_a_fault_with_detail() -> None:
     assert "Failed to execute" in state.detail
 
 
-def test_termination_without_verdict_fails_loudly() -> None:
+def test_complete_termination_without_verdict_fails_loudly() -> None:
     corrupt = (
         "005 (002.000.000) 2026-08-26 14:08:32 Job terminated.\n"
         "\tunrecognized verdict line\n"
+        "...\n"
     )
     with pytest.raises(ValueError, match="neither a return value nor a signal"):
         classify_event_log(_SUBMITTED + _EXECUTING + corrupt)
+
+
+def test_unfinished_trailing_record_keeps_the_prior_state() -> None:
+    """A poll may land while the scheduler is mid-record. A terminal
+    banner whose body and delimiter have not been written yet must not
+    raise and must not be classified — the state stays at the last
+    complete record."""
+    torn_termination = "005 (002.000.000) 2026-08-26 14:08:32 Job terminated.\n"
+    torn_abort = "009 (002.000.000) 2026-08-26 14:09:32 Job was aborted.\n"
+    base = _SUBMITTED + _EXECUTING
+    assert type(classify_event_log(base + torn_termination)) is LaneJobRunning
+    assert type(classify_event_log(base + torn_abort)) is LaneJobRunning
+
+
+def test_every_prefix_of_a_full_log_classifies_without_error() -> None:
+    """Progressive truncation: every byte-prefix a poll could observe
+    yields a state, never an exception, and terminal classification
+    appears only once the closing delimiter is present."""
+    full = _SUBMITTED + _EXECUTING + _IMAGE_SIZE + _ABORTED_BY_DEADLINE
+    states = [classify_event_log(full[:cut]) for cut in range(len(full) + 1)]
+    assert type(states[-1]) is LaneJobDeadlineRemoved
+    for cut in range(len(full)):
+        state = states[cut]
+        if type(state) is LaneJobDeadlineRemoved:
+            # Only permissible once the abort record's delimiter is in.
+            assert "..." in full[:cut].rsplit("009 ", 1)[-1]
+        else:
+            assert type(state) in (LaneJobPending, LaneJobRunning)

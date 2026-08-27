@@ -742,7 +742,11 @@ validate-raw:
 validate-pr-raw:
 	$(VALIDATE_CONFIG)
 	@$(GMAKE) --output-sync=target _validate-pr-impl
+ifneq ($(LANE_EXECUTOR),condor)
+# In condor mode test-vscode rides in the flat fan (_validate-pr-flat-impl);
+# this tail is the direct mode's owner. Exactly one owner per mode.
 	@$(GMAKE) --output-sync=target test-vscode
+endif
 	@echo "✓ Required PR validations passed!"
 
 # Internal phased validation targets. Invoke through validate-raw,
