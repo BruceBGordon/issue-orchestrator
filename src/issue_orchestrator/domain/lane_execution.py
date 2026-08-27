@@ -78,10 +78,20 @@ class LaneResources:
     # may start longer lanes first (the LPT makespan heuristic); the
     # direct backend ignores it. Zero means no preference.
     priority: int = 0
+    # Memory the lane's whole tree may need, in MB. A scheduling backend
+    # sizes the lane's slot from this; without an explicit request,
+    # HTCondor derives the slot from the tiny exec wrapper's image size
+    # and the real workload is OOM-killed at a ~256MB ceiling. The
+    # default fits light lanes; heavy lanes must declare their budget.
+    request_memory_mb: int = 1024
 
     def __post_init__(self) -> None:
         if type(self.request_cpus) is not int or self.request_cpus < 1:
             raise ValueError("LaneResources.request_cpus must be a positive integer")
+        if type(self.request_memory_mb) is not int or self.request_memory_mb < 1:
+            raise ValueError(
+                "LaneResources.request_memory_mb must be a positive integer"
+            )
         if type(self.priority) is not int or self.priority < 0:
             raise ValueError("LaneResources.priority must be a non-negative integer")
         if type(self.exclusive) is not tuple:

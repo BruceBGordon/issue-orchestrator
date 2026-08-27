@@ -83,3 +83,15 @@ def test_environment_variable_selects_the_backend(
         PERSONAL_POOL_HOME_ENVIRONMENT_VARIABLE, str(tmp_path / "no-pool")
     )
     assert _run("/usr/bin/true") == 78
+
+
+def test_memory_budget_flag_is_accepted() -> None:
+    assert (
+        _run(
+            sys.executable,
+            "-c",
+            "raise SystemExit(0)",
+            flags=("--request-memory-mb", "2048"),
+        )
+        == 0
+    )

@@ -68,5 +68,10 @@ jobs:
           .venv/bin/python -m pytest tests/integration/test_condor_lane_executor.py \
             -q -m requires_infra --tb=short
 
+      # The typecheck lane is the demo deliberately: its pyright/node
+      # workload is what exposed the missing memory contract (a slot
+      # sized from the tiny exec wrapper's image OOMed node at ~259MB).
+      # It now runs under an explicit request_memory budget and must
+      # stay green as the end-to-end proof of that contract.
       - name: One real lane through the pool
         run: LANE_EXECUTOR=condor make typecheck

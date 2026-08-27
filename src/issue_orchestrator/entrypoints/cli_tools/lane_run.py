@@ -68,6 +68,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 request_cpus=arguments.request_cpus,
                 exclusive=tuple(arguments.exclusive),
                 priority=arguments.priority,
+                request_memory_mb=arguments.request_memory_mb,
             ),
         )
     except LaneExecutorUnavailableError as error:
@@ -96,6 +97,12 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--work-key", required=True)
     parser.add_argument("--request-cpus", type=int, required=True)
+    parser.add_argument(
+        "--request-memory-mb",
+        type=int,
+        default=1024,
+        help="Memory budget for the lane's whole tree; sizes the scheduler slot.",
+    )
     parser.add_argument(
         "--exclusive",
         action="append",

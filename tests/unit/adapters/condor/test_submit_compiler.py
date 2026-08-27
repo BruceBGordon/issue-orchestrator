@@ -47,6 +47,7 @@ def test_compiles_complete_description_with_runtime_deadline(
     assert "initialdir = /repo/worktree" in compiled.text
     assert "getenv = true" in compiled.text
     assert "request_cpus = 12" in compiled.text
+    assert "request_memory = 1024" in compiled.text
     assert "should_transfer_files = NO" in compiled.text
     assert (
         "periodic_remove = (JobStatus == 2) && "
@@ -128,3 +129,15 @@ def test_fractional_deadlines_round_up_never_down(tmp_path: Path) -> None:
         tmp_path,
     )
     assert "> 1)" in compiled.text
+
+
+def test_memory_budget_sizes_the_slot(tmp_path: Path) -> None:
+    """Without an explicit request, the scheduler derives the slot from
+    the tiny exec wrapper's image size and the real workload OOMs at a
+    ~256MB ceiling - the memory budget must always be emitted."""
+    compiled = compile_submit_description(
+        _command(("/bin/true",)),
+        LaneResources(request_cpus=1, request_memory_mb=4096),
+        tmp_path,
+    )
+    assert "request_memory = 4096" in compiled.text

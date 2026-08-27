@@ -334,7 +334,7 @@ endef
 typecheck:
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,typecheck,\
-		$(LANE_RUN) --backend condor --priority 10 --work-key typecheck --request-cpus $(LANE_CPUS_TYPECHECK) \
+		$(LANE_RUN) --backend condor --priority 10 --work-key typecheck --request-memory-mb 4096 --request-cpus $(LANE_CPUS_TYPECHECK) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) typecheck LANE_EXECUTOR=direct)
 else
@@ -434,7 +434,7 @@ sync-deps:
 test-unit: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-unit,\
-		$(LANE_RUN) --backend condor --priority 100 --work-key test-unit --request-cpus $(LANE_CPUS_UNIT) \
+		$(LANE_RUN) --backend condor --priority 100 --work-key test-unit --request-memory-mb 6144 --request-cpus $(LANE_CPUS_UNIT) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-unit LANE_EXECUTOR=direct UNIT_PARALLEL=$(LANE_CPUS_UNIT))
 else ifeq ($(UNIT_PARALLEL),0)
@@ -455,7 +455,7 @@ endif
 test-simulated-core: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-simulated-core,\
-		$(LANE_RUN) --backend condor --priority 18 --work-key test-simulated-core --request-cpus $(LANE_CPUS_SIMULATED) \
+		$(LANE_RUN) --backend condor --priority 18 --work-key test-simulated-core --request-memory-mb 2048 --request-cpus $(LANE_CPUS_SIMULATED) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-simulated-core LANE_EXECUTOR=direct)
 else ifeq ($(SIMULATED_PARALLEL),0)
@@ -479,7 +479,7 @@ endif
 test-simulated-agent: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-simulated-agent,\
-		$(LANE_RUN) --backend condor --priority 11 --work-key test-simulated-agent --request-cpus 2 \
+		$(LANE_RUN) --backend condor --priority 11 --work-key test-simulated-agent --request-memory-mb 1024 --request-cpus 2 \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-simulated-agent LANE_EXECUTOR=direct)
 else ifeq ($(SIMULATED_PARALLEL),0)
@@ -556,7 +556,7 @@ endif
 test-integration-core-slice-%: sync-deps FORCE
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-core-slice-$*,\
-		$(LANE_RUN) --backend condor --work-key test-integration-core-slice-$* \
+		$(LANE_RUN) --backend condor --work-key test-integration-core-slice-$* --request-memory-mb 2048 \
 			--request-cpus 4 --priority 40 \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-integration-core-slice-$* LANE_EXECUTOR=direct)
@@ -573,7 +573,7 @@ define AGENT_SLICE_RULE
 test-integration-agent-$(1): sync-deps
 ifeq ($$(LANE_EXECUTOR),condor)
 	$$(call TIMED_RUN,test-integration-agent-$(1),\
-		$$(LANE_RUN) --backend condor --work-key test-integration-agent-$(1) \
+		$$(LANE_RUN) --backend condor --work-key test-integration-agent-$(1) --request-memory-mb 1024 \
 			--request-cpus 2 --priority $(2) \
 			--timeout-seconds $$(LANE_TIMEOUT_SECONDS) -- \
 			$$(GMAKE) test-integration-agent-$(1) LANE_EXECUTOR=direct)

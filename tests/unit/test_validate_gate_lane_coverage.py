@@ -124,3 +124,19 @@ def test_repo_tree_contains_no_target_named_debris() -> None:
         "these vacuously skip gate lanes; delete them and find what "
         "created them"
     )
+
+
+def test_every_condor_lane_declares_a_memory_budget(tmp_path: Path) -> None:
+    """The scheduler sizes slots from request_memory; a lane submitted
+    without one inherits the tiny wrapper's image size and its real
+    workload is OOM-killed (proven live by pyright at a ~259MB heap
+    ceiling). Every wired lane must declare its budget."""
+    fan = _dry_run(tmp_path, "_validate-pr-flat-impl", "LANE_EXECUTOR=condor")
+    import re
+
+    for line in fan.splitlines():
+        for match in re.finditer(r"lane_run [^;]*?--work-key (\S+)", line):
+            segment = line[match.start() :]
+            assert "--request-memory-mb" in segment.split(";")[0], (
+                f"condor lane {match.group(1)!r} declares no memory budget"
+            )

@@ -72,6 +72,7 @@ def compile_submit_description(
         f"error = {error_path}",
         f"log = {event_log_path}",
         f"request_cpus = {resources.request_cpus}",
+        f"request_memory = {resources.request_memory_mb}",
         "should_transfer_files = NO",
         "notification = never",
         f"job_max_vacate_time = {_REMOVAL_GRACE_SECONDS}",
