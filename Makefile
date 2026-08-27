@@ -540,7 +540,7 @@ test-integration-no-infra: test-integration-core
 test-integration-agent: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-agent,\
-		$(LANE_RUN) --backend condor --work-key test-integration-agent --request-memory-mb 2048 --request-cpus 4 \
+		$(LANE_RUN) --backend condor --work-key test-integration-agent --not-suspendable --request-memory-mb 2048 --request-cpus 4 \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-integration-agent LANE_EXECUTOR=direct)
 else ifeq ($(INTEGRATION_AGENT_PARALLEL),0)
@@ -573,7 +573,7 @@ define AGENT_SLICE_RULE
 test-integration-agent-$(1): sync-deps
 ifeq ($$(LANE_EXECUTOR),condor)
 	$$(call TIMED_RUN,test-integration-agent-$(1),\
-		$$(LANE_RUN) --backend condor --work-key test-integration-agent-$(1) --request-memory-mb 1024 \
+		$$(LANE_RUN) --backend condor --work-key test-integration-agent-$(1) --not-suspendable --request-memory-mb 1024 \
 			--request-cpus 2 \
 			--timeout-seconds $$(LANE_TIMEOUT_SECONDS) -- \
 			$$(GMAKE) test-integration-agent-$(1) LANE_EXECUTOR=direct)

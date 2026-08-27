@@ -151,3 +151,42 @@ def test_every_prefix_of_a_full_log_classifies_without_error() -> None:
             assert "..." in full[:cut].rsplit("009 ", 1)[-1]
         else:
             assert type(state) in (LaneJobPending, LaneJobRunning)
+
+
+_SUSPENDED_EVENT = (
+    "010 (002.000.000) 2026-08-26 14:08:40 Job was suspended.\n"
+    "\tNumber of processes actually suspended: 1\n"
+    "...\n"
+)
+_UNSUSPENDED_EVENT = (
+    "011 (002.000.000) 2026-08-26 14:08:52 Job was unsuspended.\n"
+    "...\n"
+)
+
+
+def test_suspension_is_a_waiting_state_not_a_fault() -> None:
+    from issue_orchestrator.adapters.condor.event_classifier import (
+        LaneJobSuspended,
+    )
+
+    state = classify_event_log(_SUBMITTED + _EXECUTING + _SUSPENDED_EVENT)
+    assert type(state) is LaneJobSuspended
+
+
+def test_unsuspension_resumes_running() -> None:
+    state = classify_event_log(
+        _SUBMITTED + _EXECUTING + _SUSPENDED_EVENT + _UNSUSPENDED_EVENT
+    )
+    assert type(state) is LaneJobRunning
+
+
+def test_suspended_then_terminated_classifies_the_exit() -> None:
+    state = classify_event_log(
+        _SUBMITTED
+        + _EXECUTING
+        + _SUSPENDED_EVENT
+        + _UNSUSPENDED_EVENT
+        + _TERMINATED_ZERO
+    )
+    assert type(state) is LaneJobExited
+    assert state.exit_code == 0

@@ -206,3 +206,66 @@ def test_lane_config_always_disables_scratch_over_tmp(tmp_path: Path) -> None:
     generated = (tmp_path / "90-issue-orchestrator-lanes.conf").read_text()
     assert "MOUNT_UNDER_SCRATCH =" in generated
     assert "CONCURRENCY_LIMIT_DEFAULT = 1" in generated
+
+
+def _write_lane_config(tmp_path: Path, **env: str) -> None:
+    import os
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{SCRIPT}" && write_lane_config "$1"',
+            "_",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **env},
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_load_backoff_is_off_by_default(tmp_path: Path) -> None:
+    """Freezing running work is opt-in: without the switch, no
+    suspension policy is written at all."""
+    _write_lane_config(tmp_path)
+    assert not (tmp_path / "91-io-load-backoff.conf").exists()
+    assert "SUSPEND" not in (
+        tmp_path / "90-issue-orchestrator-lanes.conf"
+    ).read_text()
+
+
+def test_load_backoff_keys_on_owner_load_never_total(tmp_path: Path) -> None:
+    """SUSPEND over total LoadAvg would trip on the gate's own lane
+    fan and oscillate against its own reflection; the policy must
+    subtract condor's own load."""
+    _write_lane_config(tmp_path, IO_CONDOR_LOAD_BACKOFF="1")
+    generated = (tmp_path / "91-io-load-backoff.conf").read_text()
+    assert "OwnerLoadAvg = (LoadAvg - CondorLoadAvg)" in generated
+    assert "$(OwnerLoadAvg) > 5.0" in generated
+    assert "$(OwnerLoadAvg) < 2.0" in generated
+
+
+def test_load_backoff_freezes_only_lanes_that_declared_it_safe(
+    tmp_path: Path,
+) -> None:
+    """A live provider exchange frozen mid-turn thaws into a
+    manufactured provider-outage failure; only lanes carrying
+    SuspendableLane = True may freeze."""
+    _write_lane_config(tmp_path, IO_CONDOR_LOAD_BACKOFF="1")
+    generated = (tmp_path / "91-io-load-backoff.conf").read_text()
+    assert generated.count("TARGET.SuspendableLane =?= True") == 2
+    assert "WANT_SUSPEND = (TARGET.SuspendableLane =?= True)" in generated
+
+
+def test_load_backoff_thresholds_are_overridable(tmp_path: Path) -> None:
+    _write_lane_config(
+        tmp_path,
+        IO_CONDOR_LOAD_BACKOFF="1",
+        IO_CONDOR_SUSPEND_LOAD="8.5",
+        IO_CONDOR_CONTINUE_LOAD="3.0",
+    )
+    generated = (tmp_path / "91-io-load-backoff.conf").read_text()
+    assert "> 8.5" in generated
+    assert "< 3.0" in generated

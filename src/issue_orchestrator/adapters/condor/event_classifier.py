@@ -21,6 +21,8 @@ _SUBMITTED = "000"
 _EXECUTING = "001"
 _TERMINATED = "005"
 _ABORTED = "009"
+_SUSPENDED = "010"
+_UNSUSPENDED = "011"
 _HELD = "012"
 
 # The body of an abort event names the expression that removed the job;
@@ -36,6 +38,16 @@ class LaneJobPending:
 @dataclass(frozen=True, slots=True)
 class LaneJobRunning:
     """The job has started executing."""
+
+
+@dataclass(frozen=True, slots=True)
+class LaneJobSuspended:
+    """The job is frozen by machine-load backoff; it will resume.
+
+    Not a fault and not terminal: the executor must keep waiting, and
+    frozen time is charged to neither the lane's deadline nor its
+    observed runtime.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +86,7 @@ class LaneJobFaulted:
 LaneJobState = (
     LaneJobPending
     | LaneJobRunning
+    | LaneJobSuspended
     | LaneJobExited
     | LaneJobKilledBySignal
     | LaneJobDeadlineRemoved
@@ -99,21 +112,33 @@ def classify_event_log(log_text: str) -> LaneJobState:
     events = _split_complete_events(log_text)
     state: LaneJobState = LaneJobPending()
     for code, body in events:
-        if code == _EXECUTING:
-            state = LaneJobRunning()
-        elif code == _TERMINATED:
-            state = _classify_termination(body)
-        elif code == _ABORTED:
-            if _DEADLINE_REMOVAL_MARKER in body:
-                state = LaneJobDeadlineRemoved()
-            else:
-                state = LaneJobRemoved(_first_body_line(body))
-        elif code == _HELD:
-            state = LaneJobFaulted(_first_body_line(body))
-        elif code == _SUBMITTED:
-            continue
-        # Every other event code (image size, usage updates, …) is
-        # informational and does not change the lifecycle state.
+        state = _transition(state, code, body)
+    return state
+
+
+# Events whose new state needs nothing from the body. Unsuspension
+# returns to Running: suspension is a waiting interlude, not progress.
+_BODYLESS_TRANSITIONS: dict[str, type[LaneJobRunning] | type[LaneJobSuspended]] = {
+    _EXECUTING: LaneJobRunning,
+    _SUSPENDED: LaneJobSuspended,
+    _UNSUSPENDED: LaneJobRunning,
+}
+
+
+def _transition(state: LaneJobState, code: str, body: str) -> LaneJobState:
+    bodyless = _BODYLESS_TRANSITIONS.get(code)
+    if bodyless is not None:
+        return bodyless()
+    if code == _TERMINATED:
+        return _classify_termination(body)
+    if code == _ABORTED:
+        if _DEADLINE_REMOVAL_MARKER in body:
+            return LaneJobDeadlineRemoved()
+        return LaneJobRemoved(_first_body_line(body))
+    if code == _HELD:
+        return LaneJobFaulted(_first_body_line(body))
+    # Submission and every other event code (image size, usage
+    # updates, …) are informational and do not change the state.
     return state
 
 

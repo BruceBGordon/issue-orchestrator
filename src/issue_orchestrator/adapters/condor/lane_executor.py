@@ -31,6 +31,7 @@ from .event_classifier import (
     LaneJobRemoved,
     LaneJobRunning,
     LaneJobState,
+    LaneJobSuspended,
     classify_event_log,
 )
 from .submit_compiler import CompiledSubmitDescription, compile_submit_description
@@ -223,22 +224,34 @@ class CondorLaneExecutor:
         """
         submitted_at = time.monotonic()
         execute_observed_at: float | None = None
+        # Frozen time (machine-load backoff) is charged to nothing: not
+        # the runtime watchdog, not the observed runtime the learning
+        # loop records. Accumulated from observation, poll by poll.
+        suspension_observed_seconds = 0.0
+        previous_poll_at = time.monotonic()
         while True:
             streams.pump()
             state = self._observe(compiled)
+            now = time.monotonic()
+            if type(state) is LaneJobSuspended:
+                suspension_observed_seconds += now - previous_poll_at
+            previous_poll_at = now
             if execute_observed_at is None and type(state) is not LaneJobPending:
-                execute_observed_at = time.monotonic()
+                execute_observed_at = now
             terminal = self._map_terminal(
                 state,
-                execute_observed_at
-                if execute_observed_at is not None
-                else time.monotonic(),
+                execute_observed_at if execute_observed_at is not None else now,
+                suspension_observed_seconds,
             )
             if terminal is not None:
                 streams.pump()
                 return terminal
             self._enforce_watchdogs(
-                command, job_id, submitted_at, execute_observed_at
+                command,
+                job_id,
+                submitted_at,
+                execute_observed_at,
+                suspension_observed_seconds,
             )
             time.sleep(_POLL_INTERVAL_SECONDS)
 
@@ -248,6 +261,7 @@ class CondorLaneExecutor:
         job_id: str,
         submitted_at: float,
         execute_observed_at: float | None,
+        suspension_observed_seconds: float,
     ) -> None:
         now = time.monotonic()
         if execute_observed_at is None:
@@ -260,6 +274,7 @@ class CondorLaneExecutor:
         elif now >= (
             execute_observed_at
             + command.deadline.timeout_seconds
+            + suspension_observed_seconds
             + _SCHEDULER_SLACK_SECONDS
         ):
             raise LaneExecutorError(
@@ -269,14 +284,24 @@ class CondorLaneExecutor:
             )
 
     def _map_terminal(
-        self, state: LaneJobState, execute_observed_at: float
+        self,
+        state: LaneJobState,
+        execute_observed_at: float,
+        suspension_observed_seconds: float,
     ) -> LaneOutcome | None:
-        if type(state) is LaneJobPending or type(state) is LaneJobRunning:
+        if (
+            type(state) is LaneJobPending
+            or type(state) is LaneJobRunning
+            or type(state) is LaneJobSuspended
+        ):
             return None
-        # Runtime anchors at first observed execution: queue wait is
-        # never billed to the lane's deadline nor fed to the learning
-        # loop as if it were work.
-        observed_runtime = time.monotonic() - execute_observed_at
+        # Runtime anchors at first observed execution: neither queue
+        # wait nor frozen time is billed to the lane's deadline or fed
+        # to the learning loop as if it were work.
+        observed_runtime = max(
+            0.0,
+            time.monotonic() - execute_observed_at - suspension_observed_seconds,
+        )
         if type(state) is LaneJobExited:
             return LaneCompleted(state.exit_code, observed_runtime)
         if type(state) is LaneJobKilledBySignal:

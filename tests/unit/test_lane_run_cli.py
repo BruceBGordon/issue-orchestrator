@@ -229,3 +229,21 @@ def test_observed_runtime_domain_validation_rejects_nonsense() -> None:
         # guard does not — observed runtimes are always measured floats.
         LaneCompleted(0, 5)
     assert LaneCompleted(0, 0.0).observed_runtime_seconds == 0.0
+
+
+def test_suspendability_crosses_the_port_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live lanes declare they must never be frozen mid-run; the port
+    must receive that declaration, and the default must be suspendable."""
+    executor = _capture(monkeypatch, LaneCompleted(0, 1.0))
+    assert _run("/usr/bin/true") == 0
+    assert executor.resources[0].suspendable is True
+    assert _run("/usr/bin/true", flags=("--not-suspendable",)) == 0
+    assert executor.resources[1].suspendable is False
+
+
+def test_suspendable_domain_validation_rejects_non_bool() -> None:
+    for bad in (1, "yes", None):
+        with pytest.raises(ValueError):
+            LaneResources(request_cpus=1, suspendable=bad)  # type: ignore[arg-type]

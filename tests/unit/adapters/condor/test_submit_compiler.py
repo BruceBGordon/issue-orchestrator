@@ -51,7 +51,7 @@ def test_compiles_complete_description_with_runtime_deadline(
     assert "should_transfer_files = NO" in compiled.text
     assert (
         "periodic_remove = (JobStatus == 2) && "
-        "((time() - JobCurrentStartDate) > 600)" in compiled.text
+        "((time() - JobCurrentStartDate - (CumulativeSuspensionTime ?: 0)) > 600)" in compiled.text
     )
     assert compiled.text.rstrip().endswith("queue")
     assert compiled.output_path == tmp_path / "lane.out"
@@ -161,3 +161,38 @@ def test_naive_run_emits_no_priority_line(tmp_path: Path) -> None:
         tmp_path,
     )
     assert "priority" not in compiled.text
+
+
+def test_deadline_charges_executing_time_never_frozen_time(tmp_path: Path) -> None:
+    """Suspension (machine-load backoff) must not burn the lane's
+    budget: a frozen job's deadline clock stops, or a long freeze
+    manufactures a timeout the lane never earned. The ?: guard keeps
+    the expression defined before any suspension has happened."""
+    compiled = compile_submit_description(
+        _command(("/bin/true",), 60.0),
+        LaneResources(request_cpus=1),
+        tmp_path,
+    )
+    assert (
+        "periodic_remove = (JobStatus == 2) && "
+        "((time() - JobCurrentStartDate - (CumulativeSuspensionTime ?: 0)) > 60)"
+        in compiled.text
+    )
+
+
+def test_suspendability_is_declared_explicitly_both_ways(tmp_path: Path) -> None:
+    """Policy-by-absence would let a new live lane silently opt into
+    freezing; the attribute is always present, True or False."""
+    default = compile_submit_description(
+        _command(("/bin/true",)),
+        LaneResources(request_cpus=1),
+        tmp_path,
+    )
+    assert "+SuspendableLane = True" in default.text
+
+    live = compile_submit_description(
+        _command(("/bin/true",)),
+        LaneResources(request_cpus=1, suspendable=False),
+        tmp_path,
+    )
+    assert "+SuspendableLane = False" in live.text

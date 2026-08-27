@@ -27,6 +27,10 @@ def test_lane_resources_surface_is_pinned() -> None:
         "exclusive",
         "priority",
         "request_memory_mb",
+        # Deliberate widening (#7114): load-backoff eligibility is a
+        # client-known correctness fact (live exchanges must never be
+        # frozen mid-turn), not a tuning knob.
+        "suspendable",
     )
 
 

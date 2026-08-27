@@ -327,3 +327,141 @@ def test_run_directory_lifecycle_deletes_on_success_retains_on_failure(
         import shutil as _shutil
 
         _shutil.rmtree(directory, ignore_errors=True)
+
+
+def _pool_tool(name: str) -> tuple[Path, dict[str, str]]:
+    """Locate a scheduler tool beside the resolved submit binary, with
+    the environment its pool configuration requires."""
+    import os
+
+    tools = CondorTools.resolve()
+    binary = tools.submit.parent / name
+    assert binary.is_file(), f"{name} not found beside {tools.submit}"
+    environment = dict(os.environ)
+    if tools.pool_config is not None:
+        environment["CONDOR_CONFIG"] = str(tools.pool_config)
+    return binary, environment
+
+
+def test_suspension_charges_neither_deadline_nor_observed_runtime(
+    tmp_path: Path,
+) -> None:
+    """Freeze a running lane for ~6s mid-run. The lane sleeps 4s under
+    a 8s deadline: wall time (~10s+) exceeds the deadline, so a
+    deadline charging frozen time would remove it — the fixed
+    periodic_remove must not. And the frozen seconds must not appear
+    in observed runtime, or the learning loop would record the freeze
+    as work."""
+    import subprocess
+
+    marker = tmp_path / "running"
+    script = (
+        "import sys, time, pathlib\n"
+        "pathlib.Path(sys.argv[1]).write_text('up')\n"
+        "time.sleep(4)\n"
+    )
+    outcomes: list[object] = []
+
+    def run_lane() -> None:
+        outcomes.append(
+            CondorLaneExecutor(CondorTools.resolve()).run(
+                LaneCommand(
+                    work_key=LaneWorkKey("contract.suspension"),
+                    arguments=(sys.executable, "-c", script, str(marker)),
+                    working_directory=tmp_path,
+                    deadline=LaneDeadline(8.0),
+                ),
+                LaneResources(request_cpus=1),
+            )
+        )
+
+    thread = threading.Thread(target=run_lane)
+    thread.start()
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not marker.exists():
+        time.sleep(0.2)
+    assert marker.exists(), "suspension lane never started"
+
+    suspend, environment = _pool_tool("condor_suspend")
+    unsuspend, _ = _pool_tool("condor_continue")
+    result = subprocess.run(
+        [str(suspend), "-all"],
+        env=environment, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    time.sleep(6.0)
+    result = subprocess.run(
+        [str(unsuspend), "-all"],
+        env=environment, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    thread.join(timeout=120)
+    assert not thread.is_alive(), "suspension lane never concluded"
+    outcome = outcomes[0]
+    assert type(outcome) is LaneCompleted, (
+        "the deadline charged frozen time and removed a healthy lane: "
+        f"{outcome!r}"
+    )
+    assert outcome.exit_code == 0
+    assert outcome.observed_runtime_seconds < 8.0, (
+        "observed runtime includes frozen time: "
+        f"{outcome.observed_runtime_seconds:.1f}s for a 4s lane"
+    )
+
+
+def test_true_overrun_is_still_enforced_across_a_suspension(
+    tmp_path: Path,
+) -> None:
+    """The suspension subtraction must not disable the deadline: a lane
+    genuinely exceeding its executing-time budget is still removed."""
+    import subprocess
+
+    marker = tmp_path / "running-overrun"
+    script = (
+        "import sys, time, pathlib\n"
+        "pathlib.Path(sys.argv[1]).write_text('up')\n"
+        "time.sleep(600)\n"
+    )
+    outcomes: list[object] = []
+
+    def run_lane() -> None:
+        outcomes.append(
+            CondorLaneExecutor(CondorTools.resolve()).run(
+                LaneCommand(
+                    work_key=LaneWorkKey("contract.overrun"),
+                    arguments=(sys.executable, "-c", script, str(marker)),
+                    working_directory=tmp_path,
+                    deadline=LaneDeadline(6.0),
+                ),
+                LaneResources(request_cpus=1),
+            )
+        )
+
+    thread = threading.Thread(target=run_lane)
+    thread.start()
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not marker.exists():
+        time.sleep(0.2)
+    assert marker.exists(), "overrun lane never started"
+
+    suspend, environment = _pool_tool("condor_suspend")
+    unsuspend, _ = _pool_tool("condor_continue")
+    subprocess.run(
+        [str(suspend), "-all"],
+        env=environment, capture_output=True, text=True, check=False,
+    )
+    time.sleep(3.0)
+    subprocess.run(
+        [str(unsuspend), "-all"],
+        env=environment, capture_output=True, text=True, check=False,
+    )
+
+    thread.join(timeout=180)
+    assert not thread.is_alive(), "overrun lane never concluded"
+    from issue_orchestrator.domain.lane_execution import LaneTimedOut
+
+    assert type(outcomes[0]) is LaneTimedOut, (
+        "the suspension subtraction disabled the deadline: "
+        f"{outcomes[0]!r}"
+    )

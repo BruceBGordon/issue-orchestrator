@@ -84,6 +84,13 @@ class LaneResources:
     # and the real workload is OOM-killed at a ~256MB ceiling. The
     # default fits light lanes; heavy lanes must declare their budget.
     request_memory_mb: int = 1024
+    # Whether the lane tolerates being frozen mid-run (machine-load
+    # backoff). Only the client knows this: hermetic lanes freeze and
+    # thaw safely anywhere, but a lane holding a live provider exchange
+    # must never be paused mid-turn — the response window expires while
+    # frozen and the thaw manufactures a provider-outage failure
+    # indistinguishable from a real one.
+    suspendable: bool = True
 
     def __post_init__(self) -> None:
         if type(self.request_cpus) is not int or self.request_cpus < 1:
@@ -94,6 +101,8 @@ class LaneResources:
             )
         if type(self.priority) is not int or self.priority < 0:
             raise ValueError("LaneResources.priority must be a non-negative integer")
+        if type(self.suspendable) is not bool:
+            raise ValueError("LaneResources.suspendable must be a bool")
         if type(self.exclusive) is not tuple:
             raise ValueError("LaneResources.exclusive must be a tuple")
         for token in self.exclusive:

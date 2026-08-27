@@ -47,6 +47,33 @@ CONCURRENCY_LIMIT_DEFAULT = 1
 # working directory". Lanes must see the submitter's real filesystem.
 MOUNT_UNDER_SCRATCH =
 EOF
+  write_load_backoff_config "$config_dir"
+}
+
+# Opt-in machine-load backoff (IO_CONDOR_LOAD_BACKOFF=1 at `up` time):
+# freeze eligible running lanes when the machine's OWNER load - load
+# condor's own jobs did not cause - climbs, thaw when it clears. Three
+# non-negotiable rules, each learned in design review:
+#   1. Key on owner load, never total load: SUSPEND over total LoadAvg
+#      would trip on the gate's own lane fan and oscillate against its
+#      own reflection.
+#   2. Only lanes that declared themselves suspendable may freeze - a
+#      live provider exchange frozen mid-turn thaws into a manufactured
+#      provider-outage failure.
+#   3. The compiled lane deadline subtracts CumulativeSuspensionTime,
+#      so frozen time never burns a lane's budget (submit_compiler.py
+#      owns that half of the contract).
+write_load_backoff_config() {
+  local config_dir="$1"
+  if [ "${IO_CONDOR_LOAD_BACKOFF:-0}" != "1" ]; then
+    return 0
+  fi
+  cat > "${config_dir}/91-io-load-backoff.conf" <<EOF
+OwnerLoadAvg = (LoadAvg - CondorLoadAvg)
+WANT_SUSPEND = (TARGET.SuspendableLane =?= True)
+SUSPEND = (\$(OwnerLoadAvg) > ${IO_CONDOR_SUSPEND_LOAD:-5.0}) && (TARGET.SuspendableLane =?= True)
+CONTINUE = (\$(OwnerLoadAvg) < ${IO_CONDOR_CONTINUE_LOAD:-2.0})
+EOF
 }
 
 # The plain Linux htcondor package boots DAEMON_LIST = MASTER and
