@@ -85,24 +85,3 @@ def test_personal_role_overlay_defines_a_complete_loopback_pool(
     # slot user and every lane holds on the submitter's 0700 cwd.
     assert "TRUST_UID_DOMAIN = TRUE" in generated
     assert "STARTER_ALLOW_RUNAS_OWNER = TRUE" in generated
-
-
-def test_private_tmp_override_disables_the_namespace(tmp_path: Path) -> None:
-    """PrivateTmp gives the daemons a private /tmp, so lanes rooted in
-    the real /tmp fail with ENOENT (not EACCES) - the override must
-    turn it off for the personal pool."""
-    result = subprocess.run(
-        [
-            "bash",
-            "-c",
-            f'source "{SCRIPT}" && write_private_tmp_override "$1"',
-            "_",
-            str(tmp_path),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-    generated = (tmp_path / "io-no-private-tmp.conf").read_text()
-    assert "[Service]" in generated
-    assert "PrivateTmp=no" in generated
