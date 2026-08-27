@@ -87,3 +87,87 @@ def test_exclusive_token_serializes_concurrent_lanes(tmp_path: Path) -> None:
     assert lines[2].startswith("start:") and lines[3].startswith("end:"), lines
     assert lines[0].split(":")[1] == lines[1].split(":")[1], lines
     assert lines[2].split(":")[1] == lines[3].split(":")[1], lines
+
+
+def test_detached_session_escape_states_the_platform_boundary(
+    tmp_path: Path,
+) -> None:
+    """Executable statement of ADR-0001 (docs/architecture/execenv/).
+
+    A double-forked, setsid-detached grandchild — what agent jobs spawn
+    (dev servers, watchers) — escapes the scheduler's process tracking on
+    macOS, where cgroups do not exist: reproduced live 2026-08-27. On
+    Linux, cgroup tracking must kill it with the job. The macOS pool is
+    therefore scoped to validation lanes (non-detaching workloads); agent
+    jobs require the Linux execution environment.
+
+    The assertion is per-platform so the boundary stays DOCUMENTED TRUTH:
+    if macOS ever starts containing the escape, or Linux ever stops, the
+    record here is what fails.
+    """
+    import os
+    import signal
+    import time
+
+    marker = tmp_path / "grandchild.pid"
+    escape = (
+        "import os, sys, time\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    if os.fork() == 0:\n"
+        "        open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+        "        time.sleep(3600)\n"
+        "    os._exit(0)\n"
+        "time.sleep(3600)\n"
+    )
+    executor = CondorLaneExecutor(CondorTools.resolve())
+    import threading
+
+    outcome_box: list[object] = []
+
+    def run_lane() -> None:
+        outcome_box.append(
+            executor.run(
+                LaneCommand(
+                    work_key=LaneWorkKey("contract.session-escape"),
+                    arguments=(sys.executable, "-c", escape, str(marker)),
+                    working_directory=tmp_path,
+                    deadline=LaneDeadline(20.0),
+                ),
+                LaneResources(request_cpus=1),
+            )
+        )
+
+    thread = threading.Thread(target=run_lane)
+    thread.start()
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not marker.exists():
+        time.sleep(0.2)
+    assert marker.exists(), "escape grandchild never started"
+    grandchild = int(marker.read_text())
+    thread.join(timeout=180)
+    assert not thread.is_alive(), "lane did not conclude"
+
+    def alive() -> bool:
+        try:
+            os.kill(grandchild, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    settle = time.monotonic() + 20
+    while time.monotonic() < settle and alive():
+        time.sleep(0.5)
+    survived = alive()
+    if survived:
+        os.kill(grandchild, signal.SIGKILL)
+    if sys.platform == "darwin":
+        assert survived, (
+            "macOS unexpectedly contained the setsid escape - if process "
+            "tracking gained this, update ADR-0001 and the pool scoping"
+        )
+    else:
+        assert not survived, (
+            "Linux cgroup tracking failed to contain the setsid escape - "
+            "the execution environment's core guarantee has regressed"
+        )

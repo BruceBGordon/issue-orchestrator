@@ -32,6 +32,18 @@ There is **no silent fallback**: if the backend is opted in but the pool
 is unreachable, lanes fail loudly with exit code 78 and a message
 pointing here. `scripts/condor-personal.sh status` shows pool health.
 
+## Scope: validation lanes only on macOS
+
+The macOS personal pool tracks process **families**, not cgroups — a
+double-forked, `setsid`-detached grandchild escapes removal (reproduced
+live; see the executable boundary statement in
+`tests/integration/test_condor_lane_executor.py` and
+[ADR-0001](../architecture/execenv/adr/0001-linux-vm-for-execution-environment.md)).
+Validation lanes are non-detaching and are safely contained; **agent
+jobs are not in scope for the macOS pool** — they require the Linux
+execution environment designed in
+[docs/architecture/execenv/](../architecture/execenv/README.md).
+
 ## Platform notes
 
 - **macOS**: upstream ships x86_64 binaries only; the helper downloads

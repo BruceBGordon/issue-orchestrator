@@ -3,6 +3,11 @@ set -euo pipefail
 
 # Manage the opt-in personal HTCondor pool for validation lanes.
 #
+# SCOPE (ADR-0001, docs/architecture/execenv/): on macOS this pool tracks
+# process families, not cgroups - setsid-detached descendants escape
+# removal. Validation lanes are non-detaching and safe here; AGENT JOBS
+# ARE NOT and require the Linux execution environment.
+#
 #   scripts/condor-personal.sh up      # install (first run) and start
 #   scripts/condor-personal.sh down    # stop the daemons
 #   scripts/condor-personal.sh status  # pool and queue summary
