@@ -50,17 +50,45 @@ execution environment designed in
   the tarball to `~/.local/share/issue-orchestrator/condor` and runs the
   daemons under Rosetta 2 (measured scheduling overhead ≈ 2s per lane).
 - **Linux**: install the system package first
-  (`sudo apt-get install htcondor`); the helper writes the lane tuning
-  into `LOCAL_CONFIG_DIR` and restarts the service.
+  (`sudo apt-get install htcondor`); the plain package boots only a
+  master, so the helper also writes an explicit personal-role overlay
+  (all five daemons on loopback) and restarts the service. An ambient
+  config that is already a full pool keeps its own topology.
 
-The helper applies low-latency tuning (`NEGOTIATOR_INTERVAL=1`, claim
-reuse) plus two knobs the adapter depends on:
+On every pool it manages, the helper applies low-latency tuning
+(`NEGOTIATOR_INTERVAL=1`, claim reuse) plus three lane-compatibility
+settings the adapter depends on:
 
 - `CONCURRENCY_LIMIT_DEFAULT = 1` — makes every named concurrency limit
   a machine-wide mutex, which is how exclusive lane resources (for
   example a provider account) are enforced.
 - `PERIODIC_EXPR_INTERVAL = 5` — bounds how far past its deadline a lane
   can run before removal.
+- `MOUNT_UNDER_SCRATCH =` — disables HTCondor's per-job private `/tmp`
+  so lanes can use working directories under the real `/tmp` (pytest
+  temp dirs, notably); without it every such lane holds with "Cannot
+  access initial working directory".
+
+### Isolation tradeoff — read before pointing this at a repo
+
+The personal pool intentionally has **no job isolation**: on Linux the
+role overlay sets run-as-owner execution (`TRUST_UID_DOMAIN`,
+`STARTER_ALLOW_RUNAS_OWNER`), and on macOS the tarball pool already
+runs jobs as the invoking user. Lanes execute **as you, on your real
+filesystem, with your environment** — that is what lets them read your
+worktrees, and it is only acceptable under the trusted-repo scope
+([execenv ADR-0009](../architecture/execenv/adr/0009-trust-model.md)).
+The containerized execution environment
+([ADR-0013](../architecture/execenv/adr/0013-OPEN-privilege-boundary-is-not-real.md))
+is where a separate job user and any future isolation posture live;
+this helper deliberately does not attempt one.
+
+`scripts/condor-personal.sh up` verifies all of this at startup: after
+the daemons report, it asserts the personal role's daemon list and then
+runs a probe job in a fresh submitter-owned directory — readiness means
+"a lane can actually execute", and a failure prints the effective
+identity configuration and hold reason instead of leaving you nine
+held lanes later.
 
 ## Architecture
 

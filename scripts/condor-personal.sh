@@ -40,6 +40,12 @@ JOB_START_COUNT = 100
 CLAIM_WORKLIFE = 3600
 PERIODIC_EXPR_INTERVAL = 5
 CONCURRENCY_LIMIT_DEFAULT = 1
+# Lane compatibility, required on EVERY pool this helper manages (not
+# just ones it builds the role for): condor bind-mounts job scratch
+# over /tmp by default on Linux, so a lane whose working directory
+# lives under the real /tmp fails with errno=2 "Cannot access initial
+# working directory". Lanes must see the submitter's real filesystem.
+MOUNT_UNDER_SCRATCH =
 EOF
 }
 
@@ -65,12 +71,6 @@ DAEMON_LIST = MASTER COLLECTOR NEGOTIATOR SCHEDD STARTD
 UID_DOMAIN = $(FULL_HOSTNAME)
 TRUST_UID_DOMAIN = TRUE
 STARTER_ALLOW_RUNAS_OWNER = TRUE
-# Linux condor bind-mounts job scratch over /tmp (MOUNT_UNDER_SCRATCH),
-# giving jobs a private /tmp - so a lane whose initialdir lives under
-# the real /tmp fails with errno=2 regardless of ownership or systemd
-# PrivateTmp. A personal pool's lanes must see the submitter's real
-# filesystem.
-MOUNT_UNDER_SCRATCH =
 SEC_DEFAULT_AUTHENTICATION_METHODS = FS, IDTOKENS
 ALLOW_READ = *
 ALLOW_WRITE = $(CONDOR_HOST) $(IP_ADDRESS) 127.0.0.1
@@ -184,13 +184,19 @@ request_cpus = 1
 should_transfer_files = NO
 queue
 PROBESUB
-  cluster=$(condor_submit -terse "$probe_dir/probe.sub" 2>&1 | awk -F. '{print $1; exit}')
-  if [ -z "$cluster" ]; then
-    echo "condor-personal: execution probe could not submit" >&2
+  local submit_output
+  if ! submit_output=$(condor_submit -terse "$probe_dir/probe.sub" 2>&1); then
+    echo "condor-personal: execution probe could not submit: $submit_output" >&2
     rm -rf "$probe_dir"
     exit 70
   fi
-  deadline=$((SECONDS + 60))
+  cluster=$(printf '%s\n' "$submit_output" | awk -F. '{print $1; exit}')
+  if [ -z "$cluster" ]; then
+    echo "condor-personal: execution probe submit produced no cluster id: $submit_output" >&2
+    rm -rf "$probe_dir"
+    exit 70
+  fi
+  deadline=$((SECONDS + ${IO_CONDOR_PROBE_TIMEOUT:-60}))
   while [ "$SECONDS" -lt "$deadline" ]; do
     [ -s "$marker" ] && break
     sleep 1
@@ -248,6 +254,16 @@ disable_private_tmp_if_needed() {
   fi
 }
 
+# A component install (no SCHEDD in the ambient DAEMON_LIST) needs the
+# full personal role written; a complete ambient pool keeps its own
+# topology and receives only the always-applied lane config.
+ambient_needs_personal_role() {
+  case "$1" in
+    *SCHEDD*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 linux_configure() {
   command -v condor_master >/dev/null 2>&1 || {
     echo "condor-personal: install HTCondor first: sudo apt-get install htcondor" >&2
@@ -269,10 +285,9 @@ linux_configure() {
   staging=$(mktemp -d)
   write_lane_config "$staging"
   ambient_daemons=$(condor_config_val DAEMON_LIST 2>/dev/null || echo "")
-  case "$ambient_daemons" in
-    *SCHEDD*) ;;
-    *) write_personal_role_config "$staging" ;;
-  esac
+  if ambient_needs_personal_role "$ambient_daemons"; then
+    write_personal_role_config "$staging"
+  fi
   if [ -w "$config_dir" ]; then
     cp "$staging"/*.conf "$config_dir/"
   else
