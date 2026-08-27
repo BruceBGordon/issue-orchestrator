@@ -31,10 +31,6 @@ TARBALL_URL="https://research.cs.wisc.edu/htcondor/tarball/${CONDOR_SERIES}/${CO
 write_lane_config() {
   local config_dir="$1"
   cat > "${config_dir}/90-issue-orchestrator-lanes.conf" <<'EOF'
-# A laptop pool must survive network roaming: bind loopback so daemon
-# addresses never go stale when wifi changes (idle-forever jobs after
-# joining a new network were the symptom).
-NETWORK_INTERFACE = 127.0.0.1
 NEGOTIATOR_INTERVAL = 1
 NEGOTIATOR_CYCLE_DELAY = 1
 NEGOTIATOR_MIN_INTERVAL = 1
@@ -68,8 +64,16 @@ darwin_install() {
   fi
   write_lane_config "$POOL_HOME/$TARBALL_DIR_NAME/local/config.d"
   mkdir -p "$EXECUTE_DIR"
-  printf 'EXECUTE = %s\n' "$EXECUTE_DIR" \
-    >> "$POOL_HOME/$TARBALL_DIR_NAME/local/config.d/90-issue-orchestrator-lanes.conf"
+  {
+    printf 'EXECUTE = %s\n' "$EXECUTE_DIR"
+    # Darwin-only: a roaming laptop pool must bind loopback so daemon
+    # addresses never go stale when wifi changes (idle-forever jobs
+    # after joining a new network were the symptom). NOT applied to
+    # Linux system installs: there NETWORK_INTERFACE=127.0.0.1 without
+    # matching CONDOR_HOST/collector settings strands discovery and
+    # the pool never reports ready.
+    printf 'NETWORK_INTERFACE = 127.0.0.1\n'
+  } >> "$POOL_HOME/$TARBALL_DIR_NAME/local/config.d/90-issue-orchestrator-lanes.conf"
   export CONDOR_CONFIG="$POOL_HOME/$TARBALL_DIR_NAME/etc/condor_config"
   export PATH="$POOL_HOME/$TARBALL_DIR_NAME/bin:$POOL_HOME/$TARBALL_DIR_NAME/sbin:$PATH"
 }
@@ -151,6 +155,16 @@ await_pool_ready() {
     sleep 1
   done
   echo "condor-personal: pool did not become ready within 60s" >&2
+  echo "--- diagnostics -------------------------------------------" >&2
+  condor_config_val CONDOR_HOST NETWORK_INTERFACE COLLECTOR_HOST DAEMON_LIST 2>&1 | sed 's/^/config: /' >&2 || true
+  pgrep -fl condor_ 2>/dev/null | sed 's/^/proc: /' >&2 || echo "proc: no condor daemons running" >&2
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl status condor --no-pager 2>&1 | tail -5 | sed 's/^/systemd: /' >&2 || true
+  fi
+  for log in MasterLog CollectorLog StartLog; do
+    logpath=$(condor_config_val LOG 2>/dev/null)/$log
+    [ -f "$logpath" ] && { echo "--- tail $log:" >&2; tail -5 "$logpath" >&2; }
+  done
   exit 70
 }
 

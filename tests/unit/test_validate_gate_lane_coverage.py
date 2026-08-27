@@ -1,7 +1,17 @@
-"""Every lane appears exactly once per gate mode — no double-runs."""
+"""Every lane appears exactly once per gate mode — and cannot be
+vacuously skipped by files named after targets.
+
+Collision planting happens in an isolated temporary fixture (`make -C`
+into a temp dir against the repo's Makefile), never in the repo tree:
+an earlier version of this test planted collisions in the repo root
+and six of them escaped into a commit. The debris guard at the bottom
+exists so that class of escape fails loudly forever.
+"""
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -9,16 +19,34 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+FLAT_FAN_LANES = (
+    "typecheck",
+    "lint-arch",
+    "lint-complexity",
+    "test-unit",
+    "test-simulated-core",
+    "test-simulated-agent",
+    "test-integration-core-slice-1",
+    "test-integration-core-slice-2",
+    "test-integration-core-slice-3",
+    "test-integration-agent-claude",
+    "test-integration-agent-codex",
+    "test-integration-agent-chain",
+    "test-integration-core-live-codex",
+    "test-web",
+    "test-vscode",
+)
 
-def _dry_run(target: str, *variables: str) -> str:
+# Names whose collision-sensitivity has already bitten once.
+COLLISION_SENSITIVE_NAMES = (*FLAT_FAN_LANES, "FORCE", "ensure-uv")
+
+
+def _scrubbed_environment() -> dict[str, str]:
     # Hermetic against the hosting gate: when this test runs INSIDE a
     # make-driven lane, MAKEFLAGS carries the recursion's own
     # LANE_EXECUTOR and the publish command exports another — both
     # would leak into the subprocess and poison the mode under test.
-    import os
-    import shutil
-
-    scrubbed = {
+    return {
         key: value
         for key, value in os.environ.items()
         if key
@@ -30,27 +58,69 @@ def _dry_run(target: str, *variables: str) -> str:
             "ISSUE_ORCHESTRATOR_LANE_EXECUTOR",
         }
     }
+
+
+def _dry_run(working_directory: Path, target: str, *variables: str) -> str:
     make = shutil.which("gmake") or "make"
-    return subprocess.run(
-        [make, "-n", target, *variables],
+    completed = subprocess.run(
+        [
+            make,
+            "-C",
+            str(working_directory),
+            "-f",
+            str(REPO_ROOT / "Makefile"),
+            "-n",
+            target,
+            *variables,
+        ],
         capture_output=True,
         text=True,
-        cwd=REPO_ROOT,
-        env=scrubbed,
-    ).stdout
+        env=_scrubbed_environment(),
+    )
+    return completed.stdout
 
 
-def test_condor_mode_runs_vscode_only_inside_the_flat_fan() -> None:
-    tail = _dry_run("validate-pr-raw", "LANE_EXECUTOR=condor")
+def _plant_collisions(directory: Path) -> None:
+    for name in COLLISION_SENSITIVE_NAMES:
+        (directory / name).write_text("")
+
+
+def test_condor_fan_runs_every_lane_exactly_once_despite_collisions(
+    tmp_path: Path,
+) -> None:
+    _plant_collisions(tmp_path)
+    fan = _dry_run(tmp_path, "_validate-pr-flat-impl", "LANE_EXECUTOR=condor")
+    for lane in FLAT_FAN_LANES:
+        assert fan.count(f'target="{lane}"') == 1, (
+            f"lane {lane!r} must appear exactly once in the condor fan "
+            f"(collision files planted); found "
+            f"{fan.count(chr(116))} occurrences\n{fan[:2000]}"
+        )
+
+
+def test_condor_mode_has_no_sequential_vscode_tail(tmp_path: Path) -> None:
+    _plant_collisions(tmp_path)
+    tail = _dry_run(tmp_path, "validate-pr-raw", "LANE_EXECUTOR=condor")
     assert "test-vscode" not in tail, (
         "condor mode must not also run the sequential vscode tail"
     )
-    # -n does not recurse through sub-makes, so ask the flat target
-    # itself; the vscode lane's recipe (npm test) must appear exactly once.
-    fan = _dry_run("_validate-pr-flat-impl", "LANE_EXECUTOR=condor")
-    assert fan.count('target="test-vscode"') == 1, fan
 
 
-def test_direct_mode_keeps_the_sequential_vscode_tail() -> None:
-    tail = _dry_run("validate-pr-raw", "LANE_EXECUTOR=direct")
-    assert tail.count("test-vscode") == 1, tail  # the tail's sub-make line
+def test_direct_mode_keeps_the_sequential_vscode_tail(tmp_path: Path) -> None:
+    _plant_collisions(tmp_path)
+    tail = _dry_run(tmp_path, "validate-pr-raw", "LANE_EXECUTOR=direct")
+    assert tail.count("test-vscode") == 1, tail
+
+
+def test_repo_tree_contains_no_target_named_debris() -> None:
+    """Files named after make targets silently delete lanes from the
+    gate (and six such files once escaped into a commit). The repo tree
+    must never contain them."""
+    offenders = [
+        name for name in COLLISION_SENSITIVE_NAMES if (REPO_ROOT / name).is_file()
+    ]
+    assert not offenders, (
+        f"target-named files present in the repo tree: {offenders} — "
+        "these vacuously skip gate lanes; delete them and find what "
+        "created them"
+    )

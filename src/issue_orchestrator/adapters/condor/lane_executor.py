@@ -164,35 +164,40 @@ class CondorLaneExecutor:
         run_directory = Path(
             tempfile.mkdtemp(prefix=f"lane-{command.work_key.value}-")
         ).resolve()
-        compiled = compile_submit_description(command, resources, run_directory)
-        compiled.exec_script_path.write_text(
-            compiled.exec_script_text, encoding="utf-8"
-        )
-        compiled.exec_script_path.chmod(0o755)
-        submit_path = run_directory / "lane.sub"
-        submit_path.write_text(compiled.text, encoding="utf-8")
-        job_id = self._submit(submit_path)
-        # Run-directory lifecycle: a clean completion deletes it; every
-        # other ending retains it as the diagnostic record and says so —
-        # stdout/stderr/event logs are worthless if silently discarded
-        # and unbounded if silently retained.
+        # Run-directory lifecycle owns the directory from birth: a clean
+        # completion deletes it; every other ending — including
+        # preparation and submission failures — retains it as the
+        # diagnostic record and says so. Diagnostics are worthless if
+        # silently discarded and unbounded if silently retained.
         retain_run_directory = True
-        streams = _OutputStreamer(compiled)
+        job_id: str | None = None
+        streams: _OutputStreamer | None = None
         try:
+            compiled = compile_submit_description(command, resources, run_directory)
+            compiled.exec_script_path.write_text(
+                compiled.exec_script_text, encoding="utf-8"
+            )
+            compiled.exec_script_path.chmod(0o755)
+            submit_path = run_directory / "lane.sub"
+            submit_path.write_text(compiled.text, encoding="utf-8")
+            streams = _OutputStreamer(compiled)
+            job_id = self._submit(submit_path)
             terminal = self._follow_job(command, compiled, job_id, streams)
             if type(terminal) is LaneCompleted and terminal.exit_code == 0:
                 retain_run_directory = False
             return terminal
         except LaneExecutorError as error:
-            self._remove(job_id)
-            streams.pump()
+            if job_id is not None and streams is not None:
+                self._remove(job_id)
+                streams.pump()
             raise LaneExecutorError(
                 f"{error} (lane diagnostics retained at {run_directory})"
             ) from error
         except BaseException:
             # Cancellation or supervisor death: the job must not outlive us.
-            self._remove(job_id)
-            streams.pump()
+            if job_id is not None and streams is not None:
+                self._remove(job_id)
+                streams.pump()
             raise
         finally:
             if retain_run_directory:
