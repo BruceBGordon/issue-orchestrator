@@ -52,11 +52,15 @@ jobs:
 
       - name: Install HTCondor (personal pool)
         run: |
-          # The official quick-install's minicondor variant IS the
-          # supported personal-pool role (the plain htcondor package
-          # boots only a master). The helper then layers lane tuning
-          # and asserts the role.
-          curl -fsSL https://get.htcondor.org | sudo /bin/bash -s -- --no-dry-run --minicondor
+          # Deliberately the plain distro package - the exact path the
+          # user docs prescribe. It boots only a master (no schedd), so
+          # this job exercises the helper's personal-role fallback and
+          # role assertion rather than pre-satisfying them (a minicondor
+          # install would make this run vacuous). Version pinning comes
+          # from the distro archive of the pinned runner image, per
+          # ADR-0007's rejection of unpinned curl|bash installers.
+          sudo apt-get update
+          sudo apt-get install -y htcondor
           bash scripts/condor-personal.sh up
 
       - name: Contract suite against the live pool
