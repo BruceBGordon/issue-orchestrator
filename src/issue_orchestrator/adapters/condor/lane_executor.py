@@ -273,13 +273,16 @@ class CondorLaneExecutor:
     ) -> LaneOutcome | None:
         if type(state) is LaneJobPending or type(state) is LaneJobRunning:
             return None
+        # Runtime anchors at first observed execution: queue wait is
+        # never billed to the lane's deadline nor fed to the learning
+        # loop as if it were work.
+        observed_runtime = time.monotonic() - execute_observed_at
         if type(state) is LaneJobExited:
-            return LaneCompleted(state.exit_code)
+            return LaneCompleted(state.exit_code, observed_runtime)
         if type(state) is LaneJobKilledBySignal:
-            return LaneCompleted(128 + state.signal_number)
+            return LaneCompleted(128 + state.signal_number, observed_runtime)
         if type(state) is LaneJobDeadlineRemoved:
-            # Runtime only: queue wait is never billed to the lane.
-            return LaneTimedOut(time.monotonic() - execute_observed_at)
+            return LaneTimedOut(observed_runtime)
         if type(state) is LaneJobRemoved:
             raise LaneExecutorError(
                 f"the lane's job was removed outside its deadline: {state.detail}"

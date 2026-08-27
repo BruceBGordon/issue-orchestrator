@@ -121,6 +121,31 @@ class LaneExecutorContract:
         assert type(outcome) is LaneCompleted
         assert outcome.exit_code == 17
 
+    def test_observed_runtime_reflects_actual_execution(
+        self, tmp_path: Path
+    ) -> None:
+        """Completed lanes report how long they actually executed.
+
+        The lower bound proves the value tracks real execution; the
+        upper bound is the machinery allowance, deliberately loose —
+        precision belongs to the backends, plausibility to the
+        contract. Queue-wait exclusion is proven where queues exist
+        (the scheduler backend's integration suite)."""
+        outcome = self.build_executor().run(
+            _command(
+                "contract.runtime",
+                (sys.executable, "-c", "import time; time.sleep(2)"),
+                tmp_path,
+                self.completion_timeout_seconds,
+            ),
+            self.resources(),
+        )
+        assert type(outcome) is LaneCompleted
+        assert outcome.exit_code == 0
+        assert 1.5 <= outcome.observed_runtime_seconds <= (
+            self.completion_timeout_seconds
+        )
+
 
     def test_output_streams_before_the_lane_completes(
         self, tmp_path: Path, capfd: "pytest.CaptureFixture[str]"

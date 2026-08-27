@@ -76,10 +76,11 @@ class DirectLaneExecutor:
             # tree must not outlive its supervisor.
             self._contain_group(process)
             raise
+        observed_runtime = time.monotonic() - started_at
         if exit_code < 0:
             # Signal death reports as 128+N in every backend.
-            return LaneCompleted(128 - exit_code)
-        return LaneCompleted(exit_code)
+            return LaneCompleted(128 - exit_code, observed_runtime)
+        return LaneCompleted(exit_code, observed_runtime)
 
     def _contain_group(self, process: subprocess.Popen[bytes]) -> None:
         try:
