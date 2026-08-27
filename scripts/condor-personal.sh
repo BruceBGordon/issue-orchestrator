@@ -57,6 +57,14 @@ COLLECTOR_HOST = 127.0.0.1
 NETWORK_INTERFACE = 127.0.0.1
 BIND_ALL_INTERFACES = False
 DAEMON_LIST = MASTER COLLECTOR NEGOTIATOR SCHEDD STARTD
+# Personal pool = single trusted user: jobs run as the submitting
+# owner, matching the tarball pools. Without this, system installs run
+# jobs as the slot user (nobody), which cannot access the submitter's
+# 0700 working directories - every lane goes on hold with
+# "Cannot access initial working directory".
+UID_DOMAIN = $(FULL_HOSTNAME)
+TRUST_UID_DOMAIN = TRUE
+STARTER_ALLOW_RUNAS_OWNER = TRUE
 SEC_DEFAULT_AUTHENTICATION_METHODS = FS, IDTOKENS
 ALLOW_READ = *
 ALLOW_WRITE = $(CONDOR_HOST) $(IP_ADDRESS) 127.0.0.1

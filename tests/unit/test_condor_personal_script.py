@@ -81,3 +81,7 @@ def test_personal_role_overlay_defines_a_complete_loopback_pool(
         assert daemon in generated
     assert "CONDOR_HOST = 127.0.0.1" in generated
     assert "NETWORK_INTERFACE = 127.0.0.1" in generated
+    # Run-as-owner triplet: without it, system installs run jobs as the
+    # slot user and every lane holds on the submitter's 0700 cwd.
+    assert "TRUST_UID_DOMAIN = TRUE" in generated
+    assert "STARTER_ALLOW_RUNAS_OWNER = TRUE" in generated
