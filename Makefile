@@ -434,7 +434,7 @@ sync-deps:
 test-unit: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-unit,\
-		$(LANE_RUN) --backend condor --priority 40 --work-key test-unit --request-cpus $(LANE_CPUS_UNIT) \
+		$(LANE_RUN) --backend condor --priority 100 --work-key test-unit --request-cpus $(LANE_CPUS_UNIT) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-unit LANE_EXECUTOR=direct UNIT_PARALLEL=$(LANE_CPUS_UNIT))
 else ifeq ($(UNIT_PARALLEL),0)
