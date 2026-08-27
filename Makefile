@@ -382,7 +382,7 @@ PARALLEL ?= auto
 LANE_EXECUTOR := $(or $(LANE_EXECUTOR),$(ISSUE_ORCHESTRATOR_LANE_EXECUTOR),direct)
 LANE_RUN = $(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_run
 LANE_CPUS_TYPECHECK ?= 4
-LANE_CPUS_UNIT ?= 12
+LANE_CPUS_UNIT ?= 8
 LANE_CPUS_SIMULATED ?= 4
 LANE_CPUS_INTEGRATION ?= 4
 LANE_TIMEOUT_SECONDS ?= 1800
@@ -436,7 +436,7 @@ ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-unit,\
 		$(LANE_RUN) --backend condor --priority 40 --work-key test-unit --request-cpus $(LANE_CPUS_UNIT) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
-			$(GMAKE) test-unit LANE_EXECUTOR=direct)
+			$(GMAKE) test-unit LANE_EXECUTOR=direct UNIT_PARALLEL=$(LANE_CPUS_UNIT))
 else ifeq ($(UNIT_PARALLEL),0)
 	$(call TIMED_RUN,test-unit,\
 		$(PYTEST) tests/unit packages/agent_runner/tests -x -q --tb=short $(PYTEST_TIMINGS))
@@ -557,7 +557,7 @@ test-integration-core-slice-%: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-core-slice-$*,\
 		$(LANE_RUN) --backend condor --work-key test-integration-core-slice-$* \
-			--request-cpus 3 --priority 40 \
+			--request-cpus 4 --priority 40 \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-integration-core-slice-$* LANE_EXECUTOR=direct)
 else
@@ -583,9 +583,9 @@ else
 endif
 endef
 
-$(eval $(call AGENT_SLICE_RULE,claude,35,tests/integration/test_claude_execution.py))
-$(eval $(call AGENT_SLICE_RULE,codex,65,tests/integration/test_codex_execution.py))
-$(eval $(call AGENT_SLICE_RULE,chain,30,tests/integration/test_live_agent_chain.py))
+$(eval $(call AGENT_SLICE_RULE,claude,120,tests/integration/test_claude_execution.py))
+$(eval $(call AGENT_SLICE_RULE,codex,140,tests/integration/test_codex_execution.py))
+$(eval $(call AGENT_SLICE_RULE,chain,110,tests/integration/test_live_agent_chain.py))
 
 # Full integration tests including infrastructure-dependent ones (run in CI)
 test-integration-full: sync-deps
