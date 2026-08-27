@@ -29,10 +29,11 @@ You implement the solution locally and report completion via `coding-done`. The 
 
 ```
 My mandatory checklist before I can exit:
-[ ] 1. Verify my changes work (run validation)
-[ ] 2. Commit my changes (git add + git commit)
-[ ] 3. Call `coding-done` with implementation summary
-[ ] 4. Exit only AFTER coding-done succeeds
+[ ] 1. Verify my changes work (make validate-quick)
+[ ] 2. Classify each dirty file, then stage by name and commit
+[ ] 3. Run `make validate-pr` AT that commit (never before it)
+[ ] 4. Call `coding-done` with implementation summary
+[ ] 5. Exit only AFTER coding-done succeeds
 ```
 
 Then, as you complete each step, update the checklist in your response. **Do NOT skip any step.**
@@ -114,35 +115,48 @@ Write tests that verify **behavior**, not implementation details. Ask: "Would a 
 
 See `tests/AGENTS.md` for the project's testing principles.
 
-### 4. Validate Your Changes
+### 4. Validate Your Changes (fast loop)
 
-**This is the most critical step. Do NOT skip it.**
+**Do NOT skip validation.** Steps 4-6 are what stand between your work and a
+wasted retry.
 
 ```bash
-make validate  # Runs tests, type checks, linting
+make validate-quick  # typecheck + unit tests - your inner loop
 ```
 
-For a full local PR/pre-push gate, run `make validate-pr`, not
-`make validate-pr-raw`. `make validate-pr` is the cache-aware entrypoint: it
-records the successful `HEAD` + raw publish command result that the later
-pre-push hook reuses. `make validate-pr-raw` is the underlying uncached command
-used inside that gate; running it manually can make the real pre-push hook run
-the same expensive suite again.
+This is the cheap, uncached command. Iterate on it freely while you work. The
+expensive PR gate comes *after* you commit — see step 6.
+
+**Do not also run `make validate` as a required step.** The step 6 gate already
+subsumes it: `validate-pr-raw` runs `_validate-pr-impl`, which runs the very
+same `_validate-impl` suite that `make validate` runs, and both paths run the
+VS Code lane on top. Running both means running the whole standard suite twice
+per completion — the exact duplicate work this ordering exists to remove. Reach
+for `make validate` only if you deliberately want the full standard suite
+before committing.
 
 If validation fails:
 1. **Read the error output carefully** — identify the root cause, not just the first error
 2. **Check your diff** — `git diff` shows what you changed; the failure is in or caused by those changes
-3. **Fix and re-run** — iterate until `make validate` passes cleanly
+3. **Fix and re-run** — iterate until `make validate-quick` passes cleanly
 4. **Do NOT call coding-done until validation passes** — the orchestrator will reject it and you'll waste a retry
 
 ### 5. Commit Your Changes
 
 **You MUST commit your changes before calling `coding-done`.** The orchestrator does NOT commit for you.
 
+Classify each dirty file before staging anything. Then stage the paths that
+belong in this change explicitly by name:
+
 ```bash
-git add -A
+git status --short
+git add path/to/changed_file.py path/to/other_file.py
 git commit -m "Brief description of what you implemented"
 ```
+
+Never stage every changed file at once. The dirty list can include build
+output, local configuration, and secrets, and a bulk stage sweeps them into
+the branch.
 
 **If you skip this step, your work will be lost.** The orchestrator only pushes existing commits - it does not create them.
 
@@ -151,13 +165,60 @@ files BEFORE running validation AND AGAIN AFTER. If validation modifies the
 tree (auto-formatter, generated artifacts, integration-test side effects),
 the second check fails and `coding-done` exits non-zero.
 
-When that happens, decide for each dirty file:
-- **Part of your change** → `git add` + `git commit`
-- **Detritus** (build output, generated lock files, IDE droppings) → add to `.gitignore` or `rm`
-- **Cannot classify** → run `coding-done blocked --reason "unable to classify dirty file <path>"`
+When that happens, classify each dirty file again:
 
-**Do not** `git stash` — your work belongs in a commit or in `.gitignore`, not
-in a stash the orchestrator can't see. Re-run `coding-done` after fixing.
+- **Part of your change** → stage that path by name and commit it
+- **A disposable artifact you created yourself** (build output, a lock file or
+  generated source your change produced) → delete it, or add its path to
+  `.gitignore`. Only take this path when you created the file during this
+  session and can positively identify it as disposable.
+- **Anything else** — pre-existing edits, files you did not create, anything you
+  cannot positively classify → preserve it. Never delete or revert a file you
+  did not create. It may be operator or user work that cannot be recovered. Add
+  an untracked path to `.gitignore` to clear the guard without touching the
+  file, or run `coding-done blocked --reason "cannot classify dirty file <path>" --attempted "inspected the file and its history"`
+
+**Do not** `git stash` work that belongs in this push — it belongs in a commit,
+not in a stash the orchestrator can't see. Never stage every changed file at
+once either: that is how build output, local config, and secrets reach a
+branch. Re-run `coding-done` after fixing.
+
+### 6. Run the Full PR Gate — AT the Commit, Never Before It
+
+Once your work is committed, run the required local publish gate **once**, at
+that commit:
+
+```bash
+make validate-pr
+```
+
+**Order matters, and it is not a style preference.** `make validate-pr` is the
+cache-aware entrypoint (`scripts/verify-pr.sh` → `prepush-check -v`). It records
+the green result against the current `HEAD` SHA, and the git pre-push hook reuses
+that record when the branch is pushed. Run it before committing and you get
+neither:
+
+- The dirty-tree guard runs **first**, so on an uncommitted tree `make
+  validate-pr` exits non-zero without validating anything.
+- Commit after a green run and the record points at the *parent* commit, so the
+  pre-push hook misses and re-runs the entire suite — routinely 5-20 minutes,
+  long enough to burn the session's wall-clock budget and strand finished work.
+
+If the gate fails: fix it, **commit the fix**, then re-run `make validate-pr`.
+The green must land on the commit that actually gets pushed.
+
+This gate is a superset of `make validate`, so run it *instead of* a second
+`make validate`, not in addition to one.
+
+Do **not** run `make validate-pr-raw` by hand. It is the uncached command that
+runs *inside* the gate; invoking it directly validates without recording
+anything, so the pre-push hook runs the same expensive suite over again.
+
+Never `git stash` work that belongs in this push to satisfy the dirty guard —
+stashing leaves `HEAD` on the commit you are about to replace, so you would seed
+a record for a SHA that is already stale, and the stashed change would never be
+pushed. Unrelated files are the step 5 classification problem: preserve them,
+never destroy them, and never sweep them into the commit.
 
 ---
 

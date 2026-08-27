@@ -12,6 +12,18 @@ Architecture reminder:
 
 import json
 import pytest
+
+from issue_orchestrator.domain.dirty_remediation import (
+    ESCALATION_STATUSES,
+    NEVER_DESTROY_UNKNOWN,
+    DirtyTreeDisposition,
+    blocked_reason,
+    dirty_tree_disposition,
+)
+from issue_orchestrator.entrypoints.cli_tools.agent_done import (
+    STATUS_TO_ACTIONS,
+    AgentStatus,
+)
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -412,9 +424,13 @@ class TestStackPublishGateWiring:
         from issue_orchestrator.control.stack_publish_gate import StackPublishDecision
 
         processor.attach_stack_publish_gate(
-            _FakeStackGate(StackPublishDecision(
-                is_stack=True, allowed=True, base_branch="20-base",
-            ))
+            _FakeStackGate(
+                StackPublishDecision(
+                    is_stack=True,
+                    allowed=True,
+                    base_branch="20-base",
+                )
+            )
         )
         worktree = worktree_with_completion(self._publish_record())
 
@@ -434,10 +450,13 @@ class TestStackPublishGateWiring:
         from issue_orchestrator.control.stack_publish_gate import StackPublishDecision
 
         processor.attach_stack_publish_gate(
-            _FakeStackGate(StackPublishDecision(
-                is_stack=True, allowed=False,
-                reason="Stack publish gate blocked: publish: blocked (base_branch_conflict)",
-            ))
+            _FakeStackGate(
+                StackPublishDecision(
+                    is_stack=True,
+                    allowed=False,
+                    reason="Stack publish gate blocked: publish: blocked (base_branch_conflict)",
+                )
+            )
         )
         worktree = worktree_with_completion(self._publish_record())
 
@@ -585,14 +604,22 @@ class TestStackCreatedPRBaseEnforcement:
             StackPublishDecision(is_stack=True, allowed=True, base_branch="20-base")
         )
 
-    def _run(self, processor, mock_pr_adapter, mock_git_adapter, worktree_with_completion):
+    def _run(
+        self, processor, mock_pr_adapter, mock_git_adapter, worktree_with_completion
+    ):
         # Issue-scoped reuse preflight finds nothing, but create_pr is idempotent
         # and returns an existing PR targeting the wrong (default) base.
         mock_pr_adapter.get_prs_for_issue.return_value = []
         mock_git_adapter.get_current_branch.return_value = "123-feature"
         mock_pr_adapter.create_pr.return_value = PRInfo(
-            number=42, title="#123: Test", url="https://github.com/owner/repo/pull/42",
-            branch="123-feature", body="", state="open", labels=[], base_branch="main",
+            number=42,
+            title="#123: Test",
+            url="https://github.com/owner/repo/pull/42",
+            branch="123-feature",
+            body="",
+            state="open",
+            labels=[],
+            base_branch="main",
         )
         worktree = worktree_with_completion(self._publish_record())
         return processor.process(
@@ -607,7 +634,9 @@ class TestStackCreatedPRBaseEnforcement:
     ):
         processor.attach_stack_publish_gate(self._stack_gate())
 
-        result = self._run(processor, mock_pr_adapter, mock_git_adapter, worktree_with_completion)
+        result = self._run(
+            processor, mock_pr_adapter, mock_git_adapter, worktree_with_completion
+        )
 
         assert result.success
         mock_pr_adapter.set_pr_base.assert_called_once_with(42, "20-base")
@@ -618,13 +647,16 @@ class TestStackCreatedPRBaseEnforcement:
         processor.attach_stack_publish_gate(self._stack_gate())
         mock_pr_adapter.set_pr_base.side_effect = RuntimeError("403 forbidden")
 
-        result = self._run(processor, mock_pr_adapter, mock_git_adapter, worktree_with_completion)
+        result = self._run(
+            processor, mock_pr_adapter, mock_git_adapter, worktree_with_completion
+        )
 
         assert not result.success
         assert any("retarget failed" in e for e in result.errors)
         # Review-completion labels must not be applied to the wrong-base PR.
         assert not any(
-            c.args and c.args[0] == 42 for c in mock_pr_adapter.add_comment.call_args_list
+            c.args and c.args[0] == 42
+            for c in mock_pr_adapter.add_comment.call_args_list
         )
 
 
@@ -794,7 +826,9 @@ class TestReviewExchangeModeResolution:
         config.review_exchange_mode = "via-local-loop"
         processor = self._make_processor(config)
 
-        assert processor._resolve_review_exchange_mode("agent:coder") == "via-local-loop"  # noqa: SLF001
+        assert (
+            processor._resolve_review_exchange_mode("agent:coder") == "via-local-loop"
+        )  # noqa: SLF001
 
 
 class TestReviewExchangeExecution:
@@ -2214,7 +2248,9 @@ class TestReviewExchangeExecution:
             lambda *_args, **_kwargs: False,
         )
 
-        assert processor._resolve_review_exchange_mode("agent:coder") == "via-local-loop"  # noqa: SLF001
+        assert (
+            processor._resolve_review_exchange_mode("agent:coder") == "via-local-loop"
+        )  # noqa: SLF001
 
     def test_auto_mode_without_agent_label_returns_none(self, tmp_path):
         config = self._make_config(tmp_path)
@@ -2903,6 +2939,7 @@ class TestTechLeadCompletionEffects:
         from issue_orchestrator.control.tech_lead_approval_gate import (
             TechLeadDecisionApprovalGate,
         )
+
         review_runner = _CapturingReviewExchangeRunner()
         processor = self._make_processor(
             tmp_path,
@@ -2975,6 +3012,7 @@ class TestTechLeadCompletionEffects:
         from issue_orchestrator.control.completion_types import (
             ERROR_PREFIX_TECH_LEAD_DECISION,
         )
+
         processor = self._make_processor(
             tmp_path,
             mock_label_adapter,
@@ -3066,6 +3104,7 @@ class TestTechLeadCompletionEffects:
             TechLeadAssignment,
             TechLeadSessionFlavor,
         )
+
         processor = self._make_processor(
             tmp_path,
             mock_label_adapter,
@@ -3112,6 +3151,7 @@ class TestTechLeadCompletionEffects:
         from issue_orchestrator.control.completion_types import (
             ERROR_PREFIX_TECH_LEAD_DECISION,
         )
+
         processor = self._make_processor(
             tmp_path,
             mock_label_adapter,
@@ -3276,20 +3316,31 @@ class TestCompletionProcessorGitActions:
         branch via the stack work gate, not the default base."""
         from issue_orchestrator.control.stack_publish_gate import StackPublishDecision
 
-        processor.attach_stack_publish_gate(_FakeStackGate(
-            StackPublishDecision.not_stack(),
-            work_decision=StackPublishDecision(
-                is_stack=True, allowed=True, base_branch="20-base"
-            ),
-        ))
+        processor.attach_stack_publish_gate(
+            _FakeStackGate(
+                StackPublishDecision.not_stack(),
+                work_decision=StackPublishDecision(
+                    is_stack=True, allowed=True, base_branch="20-base"
+                ),
+            )
+        )
         mock_git_adapter.push.side_effect = [
-            PushResult(success=False, branch="issue-123", remote="origin", message="non-fast-forward"),
-            PushResult(success=True, branch="issue-123", remote="origin", message="Pushed"),
+            PushResult(
+                success=False,
+                branch="issue-123",
+                remote="origin",
+                message="non-fast-forward",
+            ),
+            PushResult(
+                success=True, branch="issue-123", remote="origin", message="Pushed"
+            ),
         ]
-        worktree = worktree_with_completion(make_record(
-            outcome=CompletionOutcome.COMPLETED,
-            requested_actions=[RequestedAction.PUSH_BRANCH],
-        ))
+        worktree = worktree_with_completion(
+            make_record(
+                outcome=CompletionOutcome.COMPLETED,
+                requested_actions=[RequestedAction.PUSH_BRANCH],
+            )
+        )
 
         result = processor.process(
             worktree,
@@ -3299,7 +3350,9 @@ class TestCompletionProcessorGitActions:
         )
 
         assert result.success
-        mock_git_adapter.rebase_on_branch.assert_called_once_with(worktree, "origin/20-base")
+        mock_git_adapter.rebase_on_branch.assert_called_once_with(
+            worktree, "origin/20-base"
+        )
         assert mock_git_adapter.push.call_count == 2
 
     def test_push_retry_fails_closed_when_stack_gate_blocked(
@@ -3309,21 +3362,32 @@ class TestCompletionProcessorGitActions:
         default-base rebase and no second push onto the wrong shape."""
         from issue_orchestrator.control.stack_publish_gate import StackPublishDecision
 
-        processor.attach_stack_publish_gate(_FakeStackGate(
-            StackPublishDecision.not_stack(),
-            work_decision=StackPublishDecision.blocked(
-                "Stack work gate blocked: work: blocked (ambiguous_stack_base)",
-                retryable=False,
-            ),
-        ))
+        processor.attach_stack_publish_gate(
+            _FakeStackGate(
+                StackPublishDecision.not_stack(),
+                work_decision=StackPublishDecision.blocked(
+                    "Stack work gate blocked: work: blocked (ambiguous_stack_base)",
+                    retryable=False,
+                ),
+            )
+        )
         mock_git_adapter.push.side_effect = [
-            PushResult(success=False, branch="issue-123", remote="origin", message="non-fast-forward"),
-            PushResult(success=True, branch="issue-123", remote="origin", message="Pushed"),
+            PushResult(
+                success=False,
+                branch="issue-123",
+                remote="origin",
+                message="non-fast-forward",
+            ),
+            PushResult(
+                success=True, branch="issue-123", remote="origin", message="Pushed"
+            ),
         ]
-        worktree = worktree_with_completion(make_record(
-            outcome=CompletionOutcome.COMPLETED,
-            requested_actions=[RequestedAction.PUSH_BRANCH],
-        ))
+        worktree = worktree_with_completion(
+            make_record(
+                outcome=CompletionOutcome.COMPLETED,
+                requested_actions=[RequestedAction.PUSH_BRANCH],
+            )
+        )
 
         result = processor.process(
             worktree,
@@ -3473,14 +3537,148 @@ class TestCompletionProcessorDirtyPolicy:
         assert result.failure_kind == "validation_failed"
         assert "working tree is dirty" in result.message.lower()
         assert "dirty files: src/feature.py, readme.md." in result.message.lower()
+        # Built from the remediation owner so the reason cannot drift from the
+        # policy the agent-facing surfaces render.
         assert result.errors == [
-            "Validation: Working tree is dirty; commit/add/stash before pushing. "
-            "Override with validation.publish.dirty_check. "
-            "Dirty files: src/feature.py, README.md."
+            "Validation: "
+            + blocked_reason("Override with validation.publish.dirty_check.")
+            + " Dirty files: src/feature.py, README.md."
         ]
+        assert NEVER_DESTROY_UNKNOWN in result.errors[0]
         mock_git_adapter.push.assert_not_called()
         mock_label_adapter.add_label.assert_called_once_with(123, "validation-failed")
         mock_pr_adapter.add_comment.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "outcome,label",
+        [
+            (CompletionOutcome.BLOCKED, "blocked"),
+            (CompletionOutcome.NEEDS_HUMAN, "needs_human"),
+        ],
+    )
+    def test_escalation_is_routed_to_a_human_despite_a_dirty_tree(
+        self,
+        outcome,
+        label,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """The escalation must survive the orchestrator, not just the CLI.
+
+        Scope: the record-validation boundary only -- no `pre_publish_gate` is
+        supplied here. The publish gate and the real pre-push hook are covered
+        against the production composition in
+        tests/integration/test_completion_command_contracts.py
+        (TestEscalationSurvivesTheEffectiveHookPath and
+        TestEscalationReachesTheHumanThroughTheProductionGate).
+
+        `coding-done blocked` is rung 3 of the remediation ladder: what an agent
+        runs when it finds a dirty file it must not resolve on its own. Round 3
+        made the CLI accept it. That is only half the path -- STATUS_TO_ACTIONS
+        gives both escalation statuses PUSH_BRANCH, so the record then reached
+        `validate_worktree_state`, which applied the dirty policy and rejected
+        it. The dead end had moved one boundary downstream: the agent exited 0
+        believing it had escalated, and the human was never told.
+        """
+        config = Config()
+        config.validation.publish.dirty_check = "tracked"
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            event_bus=event_bus,
+            session_output=FileSystemSessionOutput(),
+            label_config={label: label},
+            config=config,
+        )
+        mock_git_adapter.has_tracked_changes.return_value = True
+        mock_git_adapter.list_dirty_files.return_value = ["operator_notes.py"]
+        action = (
+            RequestedAction.ADD_BLOCKED_LABEL
+            if outcome is CompletionOutcome.BLOCKED
+            else RequestedAction.ADD_NEEDS_HUMAN_LABEL
+        )
+        record = make_record(
+            outcome=outcome,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                action,
+                RequestedAction.POST_COMMENT,
+            ],
+            summary="cannot classify dirty file operator_notes.py",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert result.success, (
+            "escalation must reach the human; got "
+            f"{result.failure_kind}: {result.message}"
+        )
+        assert result.failure_kind != "validation_failed"
+        # The human-routing action actually ran.
+        mock_label_adapter.add_label.assert_any_call(123, label)
+
+    def test_escalation_publishes_only_committed_content(
+        self,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """Accepting a dirty tree must not publish the uncommitted part of it.
+
+        Pushing sends commits, so the preserved files -- which are by definition
+        not in HEAD -- cannot ride along. This pins that the push is the only
+        publishing step taken, and that nothing stages or commits the dirty
+        files on the way.
+        """
+        config = Config()
+        config.validation.publish.dirty_check = "tracked"
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            event_bus=event_bus,
+            session_output=FileSystemSessionOutput(),
+            label_config={"blocked": "blocked"},
+            config=config,
+        )
+        mock_git_adapter.has_tracked_changes.return_value = True
+        mock_git_adapter.list_dirty_files.return_value = ["operator_notes.py"]
+        record = make_record(
+            outcome=CompletionOutcome.BLOCKED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.ADD_BLOCKED_LABEL,
+            ],
+            summary="cannot classify dirty file operator_notes.py",
+        )
+        worktree = worktree_with_completion(record)
+
+        processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        # Nothing may turn the preserved file into published content.
+        for forbidden in ("stage_all", "add_all", "commit", "commit_all"):
+            call = getattr(mock_git_adapter, forbidden, None)
+            if call is not None and hasattr(call, "assert_not_called"):
+                call.assert_not_called()
 
     def test_push_rejected_when_all_mode_and_untracked_present(
         self,
@@ -5245,3 +5443,260 @@ class TestRunScopedArtifacts:
 
         assert result.success is True
         assert (coding_run.run_dir / "completion-record.json").exists()
+
+
+class TestEscalationSurvivesAFailedPublish:
+    """A failed push must not swallow the escalation's whole point.
+
+    Both escalation statuses request PUSH_BRANCH before their label and
+    comment, and a push failure halted the remaining actions. The agent
+    therefore exited having successfully escalated while no label, no comment,
+    and no human ever appeared -- the same dead end as refusing the escalation,
+    arriving one step later.
+    """
+
+    @pytest.mark.parametrize(
+        "outcome,label,action",
+        [
+            (CompletionOutcome.BLOCKED, "blocked", RequestedAction.ADD_BLOCKED_LABEL),
+            (
+                CompletionOutcome.NEEDS_HUMAN,
+                "needs_human",
+                RequestedAction.ADD_NEEDS_HUMAN_LABEL,
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "push_message", ["non-fast-forward", "remote rejected: permission denied"]
+    )
+    def test_the_human_is_still_routed_when_the_push_fails(
+        self,
+        outcome,
+        label,
+        action,
+        push_message,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            event_bus=event_bus,
+            session_output=FileSystemSessionOutput(),
+            label_config={label: label},
+            config=Config(),
+        )
+        mock_git_adapter.push.return_value = PushResult(
+            success=False, branch="issue-123", remote="origin", message=push_message
+        )
+        record = make_record(
+            outcome=outcome,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                action,
+                RequestedAction.POST_COMMENT,
+            ],
+            summary="cannot classify dirty file operator_notes.py",
+        )
+        record.comment_body = "AGENT-CONTEXT: cannot classify operator_notes.py"
+        worktree = worktree_with_completion(record)
+
+        processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        mock_label_adapter.add_label.assert_any_call(123, label)
+        # Not `assert_called()`: processing also posts a generic failure comment,
+        # so that would pass even if the agent's context never reached anyone.
+        posted = [
+            call.args[1] if len(call.args) > 1 else call.kwargs.get("body", "")
+            for call in mock_pr_adapter.add_comment.call_args_list
+        ]
+        assert any("AGENT-CONTEXT" in str(body) for body in posted), (
+            f"the agent's escalation context was never posted; got {posted}"
+        )
+
+    def test_an_oversized_comment_body_still_reaches_the_human(
+        self,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """Publish-failure routing must not push a valid comment over the limit.
+
+        `CompletionRecord.from_dict` accepts a comment body up to GitHub's
+        64 KiB. An earlier revision appended a recovery notice *after* that
+        validation, so an accepted body became an oversized post, the bounded
+        adapter rejected it, and the escalation context the human needed was
+        never delivered.
+
+        Asserted at the adapter, not on the record: the processor deserializes
+        its own `CompletionRecord`, so the object built here is never the one
+        posted, and checking it would pass under the very bug this pins.
+        Processing also posts a later generic failure comment, so
+        `assert_called()` cannot tell the two apart -- the exact body has to be
+        found among the accepted calls.
+        """
+        accepted: list[str] = []
+
+        def bounded_add_comment(issue_number, body, *args, **kwargs):
+            if len(body.encode("utf-8")) > GITHUB_COMMENT_BODY_LIMIT:
+                raise ValueError("comment body exceeds GitHub limit")
+            accepted.append(body)
+            return True
+
+        mock_pr_adapter.add_comment.side_effect = bounded_add_comment
+
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            event_bus=event_bus,
+            session_output=FileSystemSessionOutput(),
+            label_config={"blocked": "blocked"},
+            config=Config(),
+        )
+        mock_git_adapter.push.return_value = PushResult(
+            success=False,
+            branch="issue-123",
+            remote="origin",
+            message="rejected " + "x" * 4096,
+        )
+        at_the_limit = "b" * GITHUB_COMMENT_BODY_LIMIT
+        record = make_record(
+            outcome=CompletionOutcome.BLOCKED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.ADD_BLOCKED_LABEL,
+                RequestedAction.POST_COMMENT,
+            ],
+            summary="blocked",
+        )
+        record.comment_body = at_the_limit
+        worktree = worktree_with_completion(record)
+
+        processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert at_the_limit in accepted, (
+            "the escalation context the human needs was never posted; "
+            f"accepted bodies of length {[len(b) for b in accepted]}"
+        )
+        mock_label_adapter.add_label.assert_any_call(123, "blocked")
+
+    def test_a_failed_publish_still_stops_a_completed_record(
+        self,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """For completed work the push *is* the result, so failure must halt."""
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=mock_label_adapter,
+            pr_adapter=mock_pr_adapter,
+            git_adapter=mock_git_adapter,
+            event_bus=event_bus,
+            session_output=FileSystemSessionOutput(),
+            label_config={},
+            config=Config(),
+        )
+        mock_git_adapter.push.return_value = PushResult(
+            success=False, branch="issue-123", remote="origin", message="rejected"
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[
+                RequestedAction.PUSH_BRANCH,
+                RequestedAction.CREATE_PR,
+            ],
+            summary="Done",
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert not result.success
+        mock_pr_adapter.create_pr.assert_not_called()
+
+
+class TestEscalationVocabularyIsShared:
+    """The disposition owner and the requested-action map must not diverge.
+
+    Round 4 found them contradicting each other on their first revision: the
+    owner's safety note asserted that escalation statuses do not request
+    PUSH_BRANCH, while STATUS_TO_ACTIONS gives it to both. The CLI therefore
+    accepted a dirty escalation that the orchestrator immediately rejected.
+    These tests make the two halves one decision, so the next edit to either
+    side has to face the other.
+    """
+
+    def test_escalation_statuses_exist_in_both_vocabularies(self):
+        """The set is read as AgentStatus at one boundary, CompletionOutcome at the other."""
+        cli_statuses = {
+            AgentStatus.COMPLETED,
+            AgentStatus.BLOCKED,
+            AgentStatus.NEEDS_HUMAN,
+            AgentStatus.APPROVED,
+            AgentStatus.CHANGES_REQUESTED,
+        }
+        outcome_values = {o.value for o in CompletionOutcome}
+        for status in ESCALATION_STATUSES:
+            assert status in cli_statuses, status
+            assert status in outcome_values, status
+
+    def test_escalation_statuses_still_request_push(self):
+        """The owner's exemption is justified by *what* a push publishes.
+
+        A push sends committed history, so preserved files cannot ride along,
+        and committed work still reaches the remote rather than being stranded
+        in a worktree that later gets cleaned. If PUSH_BRANCH is ever removed
+        from these statuses, that reasoning no longer applies and the owner's
+        exemption must be revisited -- so this pins it deliberately.
+        """
+        for status in ESCALATION_STATUSES:
+            assert RequestedAction.PUSH_BRANCH in STATUS_TO_ACTIONS[status], status
+
+    def test_the_owner_exempts_exactly_the_escalation_statuses(self):
+        for status in ESCALATION_STATUSES:
+            assert (
+                dirty_tree_disposition(status)
+                is DirtyTreeDisposition.PRESERVE_AND_ESCALATE
+            ), status
+
+        for outcome in CompletionOutcome:
+            expected = (
+                DirtyTreeDisposition.PRESERVE_AND_ESCALATE
+                if outcome.value in ESCALATION_STATUSES
+                else DirtyTreeDisposition.REJECT
+            )
+            assert dirty_tree_disposition(outcome.value) is expected, outcome
+
+    def test_completed_is_never_exempt(self):
+        """Publishing finished work still requires a clean tree."""
+        assert (
+            dirty_tree_disposition(CompletionOutcome.COMPLETED.value)
+            is DirtyTreeDisposition.REJECT
+        )

@@ -7,6 +7,13 @@ import tempfile
 import subprocess
 from pathlib import Path
 
+from issue_orchestrator.domain.dirty_remediation import (
+    CLASSIFY_BEFORE_STAGING,
+    ESCALATION_COMMAND,
+    COMMIT_WHAT_BELONGS,
+    NEVER_DESTROY_UNKNOWN,
+    NEVER_STASH_WHAT_BELONGS,
+)
 from issue_orchestrator.entrypoints.cli_tools.prepush_check import (
     _prepush_output_dir,
     load_validation_cmd,
@@ -753,6 +760,104 @@ validation:
             assert "README.md" in captured.out
         finally:
             os.chdir(orig_cwd)
+
+    def test_dirty_guard_tells_agents_to_commit_not_stash(self, temp_worktree, capsys):
+        """The dirty guard must not offer stashing as a way past it.
+
+        The gate records its result against HEAD, and the git pre-push hook
+        reuses that record only when it matches the commit being pushed. (The
+        orchestrator's own publish gate is attempt-scoped and deliberately does
+        not consult the SHA cache.) Stashing work that belongs in this push
+        hides it without moving HEAD, so the gate would certify a SHA that is
+        about to be replaced.
+        """
+
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
+        config_dir.mkdir(parents=True)
+        config_path = config_dir / "default.yaml"
+        config_path.write_text("""
+validation:
+  publish:
+    cmd: "echo 'ok'"
+    dirty_check: "tracked"
+""")
+
+        (temp_worktree / "README.md").write_text("dirty")
+
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(temp_worktree)
+            result = run_prepush_check(verbose=True)
+            captured = capsys.readouterr()
+        finally:
+            os.chdir(orig_cwd)
+
+        assert result == 1
+        assert COMMIT_WHAT_BELONGS in captured.out
+        assert NEVER_STASH_WHAT_BELONGS in captured.out
+        assert "must be recorded at the commit that gets pushed" in captured.out
+        # Classification comes first, and unknown files are preserved, never
+        # reverted -- "unrelated" is not proof that a file is disposable.
+        assert CLASSIFY_BEFORE_STAGING in captured.out
+        assert NEVER_DESTROY_UNKNOWN in captured.out
+        # No blanket commit order, no stash escape hatch, no destructive remedy.
+        assert "commit them before running this gate" not in captured.out
+        assert "or stash" not in captured.out
+        assert "git restore" not in captured.out
+        # Tracked mode lists no untracked paths, so it must not talk about them.
+        assert "also lists untracked paths" not in captured.out
+
+    def test_dirty_guard_all_mode_routes_untracked_detritus_away_from_commit(
+        self, temp_worktree, capsys
+    ):
+        """`all` mode lists arbitrary untracked paths, so "commit them" is unsafe.
+
+        `list_dirty_files` adds `ls-files --others --exclude-standard` for this
+        mode, which routinely surfaces build output, local configuration, and
+        secrets. A blanket instruction to commit every dirty file to clear the
+        gate is how those reach a branch, so the guard must give untracked
+        files a remove/ignore remedy instead.
+        """
+
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
+        config_dir.mkdir(parents=True)
+        config_path = config_dir / "default.yaml"
+        config_path.write_text("""
+validation:
+  publish:
+    cmd: "echo 'ok'"
+    dirty_check: "all"
+""")
+
+        (temp_worktree / "untracked.txt").write_text("x")
+
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(temp_worktree)
+            result = run_prepush_check(verbose=True)
+            captured = capsys.readouterr()
+        finally:
+            os.chdir(orig_cwd)
+
+        assert result == 1
+        # The commit-first rule still applies to work that belongs in the push...
+        assert COMMIT_WHAT_BELONGS in captured.out
+        assert NEVER_STASH_WHAT_BELONGS in captured.out
+        assert CLASSIFY_BEFORE_STAGING in captured.out
+        # ...but untracked paths are called out only in the mode that lists them,
+        # and the remedy preserves rather than destroys.
+        assert "also lists untracked paths" in captured.out
+        assert "Never commit one just to clear this gate" in captured.out
+        assert NEVER_DESTROY_UNKNOWN in captured.out
+        # An unclassifiable file is escalated, not ignored: an ignore rule is a
+        # repository policy change, and hiding someone else's file behind one
+        # is the failure this ladder exists to prevent.
+        assert "Do not add it to .gitignore either" in captured.out
+        assert ESCALATION_COMMAND in captured.out
+        # No blanket commit-everything order, stash escape, or destructive remedy.
+        assert "commit them before running this gate" not in captured.out
+        assert "or stash" not in captured.out
+        assert "git restore" not in captured.out
 
     def test_verbose_output_clips_dirty_file_list(self, temp_worktree, capsys):
         """Dirty file listing should be clipped with ellipsis for long lists."""

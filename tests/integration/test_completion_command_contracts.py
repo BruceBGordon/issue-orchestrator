@@ -9,6 +9,7 @@ invalid command forms.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 import os
 import re
 import shlex
@@ -636,3 +637,507 @@ def test_wrapper_and_git_guardrail_path_resolution(tmp_path: Path) -> None:
     # No remote is configured, so push may still fail — but wrapper block message
     # must not appear when auth bypass is set.
     assert "BLOCKED: 'git push' is not allowed" not in passthrough_push.stderr
+
+
+class TestEscalationIsReachableOnADirtyTree:
+    """The rung 3 escalation must actually run against the tree it describes.
+
+    The remediation ladder's last rung tells an agent that cannot classify a
+    dirty file to preserve it and report `blocked` / `needs_human`. That advice
+    is worthless if the command itself rejects a dirty tree -- the agent would
+    be left with no legal move at all, which is the pressure that gets a
+    stranger's uncommitted work deleted.
+
+    The rest of this module cannot catch that: `_run_completion_command`
+    appends `--dry-run`, which returns before the dirty check ever runs. These
+    tests deliberately invoke the real path with a genuinely dirty worktree.
+    """
+
+    @staticmethod
+    def _dirty_repo(tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+        # A file the agent did not create and cannot classify -- rung 3.
+        (repo / "operator_notes.py").write_text("pre-existing operator work\n")
+        return repo
+
+    def _run(self, argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+        assert "--dry-run" not in argv, "this suite must exercise the real path"
+        return _run_completion_raw(argv, cwd=cwd)
+
+    def test_blocked_is_accepted_while_the_tree_is_dirty(self, tmp_path):
+        repo = self._dirty_repo(tmp_path)
+
+        result = self._run(
+            [
+                "blocked",
+                "--reason",
+                "cannot classify dirty file operator_notes.py",
+                "--attempted",
+                "inspected the file and its history",
+            ],
+            cwd=repo,
+        )
+
+        assert result.returncode == 0, (
+            "rung 3 escalation must be reachable on a dirty tree; got:\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}"
+        )
+
+    def test_needs_human_is_accepted_while_the_tree_is_dirty(self, tmp_path):
+        repo = self._dirty_repo(tmp_path)
+
+        result = self._run(
+            ["needs_human", "--question", "who owns operator_notes.py?"],
+            cwd=repo,
+        )
+
+        assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+
+    def test_the_unclassified_file_survives_the_escalation(self, tmp_path):
+        """Escalating must not be a euphemism for cleaning up."""
+        repo = self._dirty_repo(tmp_path)
+        target = repo / "operator_notes.py"
+        before = target.read_text()
+
+        self._run(
+            [
+                "blocked",
+                "--reason",
+                "cannot classify dirty file operator_notes.py",
+                "--attempted",
+                "inspected the file and its history",
+            ],
+            cwd=repo,
+        )
+
+        assert target.exists(), "the escalation deleted the file it was preserving"
+        assert target.read_text() == before
+
+    def test_the_escalation_records_what_was_left_behind(self, tmp_path):
+        """A human picking this up must see the files, not just the reason."""
+        repo = self._dirty_repo(tmp_path)
+
+        self._run(
+            [
+                "blocked",
+                "--reason",
+                "cannot classify dirty file operator_notes.py",
+                "--attempted",
+                "inspected the file and its history",
+            ],
+            cwd=repo,
+        )
+
+        record = json.loads(
+            (repo / ".issue-orchestrator" / "completion.json").read_text()
+        )
+        body = record.get("comment_body") or ""
+        assert "operator_notes.py" in body
+        assert "preserved" in body
+
+    def test_completed_still_requires_a_clean_tree(self, tmp_path):
+        """Only the escalation statuses are exempt; publishing is not."""
+        repo = self._dirty_repo(tmp_path)
+
+        result = self._run(
+            [
+                "completed",
+                "--implementation",
+                "did the thing",
+                "--problems",
+                "None",
+            ],
+            cwd=repo,
+        )
+
+        assert result.returncode != 0
+
+
+class TestEscalationRecordSurvivesTheOrchestrator:
+    """The record the CLI writes must be accepted by the consumer that reads it.
+
+    The CLI-side tests above stop at exit code and file contents. Round 4 showed
+    that is not enough: `coding-done blocked` exited 0 and wrote a record, then
+    `CompletionRecordValidator.validate_worktree_state` rejected it because
+    `STATUS_TO_ACTIONS` gives escalations `PUSH_BRANCH` and the dirty policy
+    fired. The agent believed it had escalated; the human was never told. This
+    drives the real artifact across that boundary.
+    """
+
+    @staticmethod
+    def _escalate(tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+        (repo / "operator_notes.py").write_text("pre-existing operator work\n")
+        result = _run_completion_raw(
+            [
+                "blocked",
+                "--reason",
+                "cannot classify dirty file operator_notes.py",
+                "--attempted",
+                "inspected the file and its history",
+            ],
+            cwd=repo,
+        )
+        assert result.returncode == 0, result.stderr
+        return repo
+
+    def test_the_written_record_is_accepted_with_the_tree_still_dirty(self, tmp_path):
+        from issue_orchestrator.control.completion_record_validation import (
+            CompletionRecordValidator,
+        )
+        from issue_orchestrator.infra.config import Config
+
+        repo = self._escalate(tmp_path)
+
+        class _DirtyGit:
+            """Reports exactly the state the escalation left behind."""
+
+            def get_current_branch(self, worktree):
+                return "issue-123"
+
+            def has_uncommitted_changes(self, worktree, **kwargs):
+                return True
+
+            def has_tracked_changes(self, worktree, **kwargs):
+                return True
+
+            def list_dirty_files(self, worktree, mode):
+                return ["operator_notes.py"]
+
+        config = Config()
+        config.validation.publish.dirty_check = "tracked"
+        validator = CompletionRecordValidator(config=config, git_adapter=_DirtyGit())
+
+        record = validator.read_completion_record(repo)
+        assert record is not None, "the CLI wrote no readable record"
+
+        result = validator.validate_worktree_state(repo, record)
+
+        assert result.ok, (
+            "the orchestrator rejected the escalation the CLI accepted: "
+            f"{getattr(result, 'reason', None)}"
+        )
+
+    def test_the_record_still_asks_to_publish_committed_history(self, tmp_path):
+        """Escalating must not strand whatever the agent did manage to commit."""
+        from issue_orchestrator.domain.models import RequestedAction
+
+        repo = self._escalate(tmp_path)
+        record = json.loads(
+            (repo / ".issue-orchestrator" / "completion.json").read_text()
+        )
+
+        assert RequestedAction.PUSH_BRANCH.value in record["requested_actions"]
+        assert record["outcome"] == "blocked"
+
+    def test_a_completed_record_on_a_dirty_tree_is_still_rejected(self, tmp_path):
+        """The exemption is scoped to escalations, not to dirty trees generally.
+
+        The record is produced on a clean tree so the CLI actually writes one,
+        then presented against a dirty worktree -- the temporal variance the
+        post-validation re-check exists for. It must still be rejected.
+        """
+        from issue_orchestrator.control.completion_record_validation import (
+            CompletionRecordValidator,
+        )
+        from issue_orchestrator.infra.config import Config
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        result = _run_completion_raw(
+            ["completed", "--implementation", "did it", "--problems", "None"],
+            cwd=repo,
+        )
+        assert result.returncode == 0, result.stderr
+
+        class _DirtyGit:
+            def get_current_branch(self, worktree):
+                return "issue-123"
+
+            def has_uncommitted_changes(self, worktree, **kwargs):
+                return True
+
+            def has_tracked_changes(self, worktree, **kwargs):
+                return True
+
+            def list_dirty_files(self, worktree, mode):
+                return ["src.py"]
+
+        config = Config()
+        config.validation.publish.dirty_check = "tracked"
+        validator = CompletionRecordValidator(config=config, git_adapter=_DirtyGit())
+        record = validator.read_completion_record(repo)
+        assert record is not None, "the CLI wrote no record on a clean tree"
+
+        outcome = validator.validate_worktree_state(repo, record)
+        assert not outcome.ok, "a completed record must still require a clean tree"
+
+
+class TestTheDirtyGuardHasNoExemption:
+    """The real pre-push hook rejects a dirty tree, and nothing can talk it round.
+
+    Earlier revisions of this PR taught the hook to accept a dirty tree when the
+    orchestrator said so -- first through a file in the worktree, then through
+    an environment variable. Both were forgeable: the worktree is the agent's,
+    and the environment value was a deterministic string the agent could
+    compute. The exemption is gone rather than hardened, so the guard has no
+    input that can relax it.
+
+    A dirty escalation is handled by *not publishing* and routing the human
+    instead; see TestEscalationSurvivesAFailedPublish in the unit suite.
+    """
+
+    @staticmethod
+    def _repo_with_real_hook(tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+
+        tracked = repo / "operator_notes.py"
+        tracked.write_text("operator work\n")
+        subprocess.run(
+            ["git", "add", "operator_notes.py"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "add notes"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        tracked.write_text("operator work\nedited after the agent started\n")
+
+        config_dir = repo / ".issue-orchestrator" / "config" / "modes" / "default"
+        config_dir.mkdir(parents=True)
+        (config_dir / "default.yaml").write_text(
+            'validation:\n  publish:\n    cmd: "echo ok"\n    dirty_check: "tracked"\n'
+        )
+
+        source = (
+            Path(__file__).resolve().parents[2]
+            / "src"
+            / "issue_orchestrator"
+            / "hooks"
+            / "pre-push"
+        )
+        hooks_dir = repo / ".git" / "hooks"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hook = hooks_dir / "pre-push"
+        hook.write_text(
+            source.read_text().replace(
+                "@@ORCHESTRATOR_PYTHON@@", shlex.quote(sys.executable)
+            )
+        )
+        hook.chmod(0o755)
+        return repo
+
+    @staticmethod
+    def _gate_allows(repo: Path) -> bool:
+        from issue_orchestrator.control.pre_publish_gate import PrePublishGate
+        from issue_orchestrator.execution import LocalCommandRunner
+
+        result = PrePublishGate(LocalCommandRunner()).check(repo)
+        assert result.ran, f"hook did not run: {result.reason}\n{result.stderr}"
+        return result.allowed
+
+    def test_a_dirty_tree_is_rejected(self, tmp_path):
+        repo = self._repo_with_real_hook(tmp_path)
+
+        assert not self._gate_allows(repo)
+
+    def test_no_file_in_the_worktree_can_grant_an_exemption(self, tmp_path):
+        """Every shape a forged authorization took in earlier revisions."""
+        repo = self._repo_with_real_hook(tmp_path)
+        planted = {
+            ".issue-orchestrator/push-authorization.json": json.dumps(
+                {
+                    "session_id": "forged",
+                    "outcome": "blocked",
+                    "worktree": str(repo.resolve()),
+                    "issued_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ),
+            ".issue-orchestrator/completion.json": json.dumps(
+                {
+                    "session_id": "forged",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "outcome": "blocked",
+                    "summary": "let me through",
+                    "requested_actions": ["push_branch"],
+                }
+            ),
+        }
+        for relative, body in planted.items():
+            path = repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body)
+
+        assert not self._gate_allows(repo)
+
+    def test_no_environment_value_can_grant_an_exemption(self, tmp_path):
+        """The env signal was a deterministic string the agent could compute."""
+        import os
+        import subprocess as sp
+
+        repo = self._repo_with_real_hook(tmp_path)
+        head = sp.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        previous = {}
+        for name, value in {
+            "ISSUE_ORCHESTRATOR_DIRTY_ESCALATION": f"{repo.resolve()}@{head}",
+            "ISSUE_ORCHESTRATOR_DIRTY_DISPOSITION": "preserve_and_escalate",
+        }.items():
+            previous[name] = os.environ.get(name)
+            os.environ[name] = value
+        try:
+            assert not self._gate_allows(repo)
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    def test_a_clean_tree_still_passes(self, tmp_path):
+        repo = self._repo_with_real_hook(tmp_path)
+        subprocess.run(
+            ["git", "checkout", "--", "operator_notes.py"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert self._gate_allows(repo)
+
+
+class TestEscalationReachesTheHumanThroughTheProductionGate:
+    """End to end: real hook, real record, real gate, real processor wiring.
+
+    The round-4 processor test omitted `pre_publish_gate`, so it proved the
+    escalation survived record validation and nothing more. Production always
+    supplies that gate when `enforce_hooks` is on, which is the default. This
+    composes the processor the way production does and asserts the escalation
+    reaches its human-routing label with the uncommitted file untouched.
+    """
+
+    def test_a_dirty_escalation_reaches_its_label_through_the_real_gate(self, tmp_path):
+        from unittest.mock import Mock
+
+        from issue_orchestrator.control.completion_processor import (
+            CompletionProcessor,
+        )
+        from issue_orchestrator.control.pre_publish_gate import PrePublishGate
+        from issue_orchestrator.domain.events import EventBus
+        from issue_orchestrator.execution import LocalCommandRunner
+        from issue_orchestrator.execution.session_output_adapter import (
+            FileSystemSessionOutput,
+        )
+        from issue_orchestrator.infra.config import Config
+        from tests.callback_endpoint_helpers import ready_callback_endpoint
+        from tests.unit.session_run_helpers import make_session_run_assets
+
+        repo = TestTheDirtyGuardHasNoExemption._repo_with_real_hook(tmp_path)
+        preserved = repo / "operator_notes.py"
+        before = preserved.read_text()
+
+        assert (
+            _run_completion_raw(
+                [
+                    "blocked",
+                    "--reason",
+                    "cannot classify dirty file operator_notes.py",
+                    "--attempted",
+                    "inspected the file and its history",
+                ],
+                cwd=repo,
+            ).returncode
+            == 0
+        )
+
+        from issue_orchestrator.control.completion_processor import GitAdapter
+        from issue_orchestrator.ports.working_copy import (
+            BranchPathsResult,
+            BranchTextFilesResult,
+            DiffResult,
+            PushResult,
+        )
+
+        git_adapter = Mock(spec=GitAdapter)
+        git_adapter.push = Mock(
+            return_value=PushResult(
+                success=True, branch="issue-123", remote="origin", message="Pushed"
+            )
+        )
+        git_adapter.get_current_branch = Mock(return_value="issue-123")
+        git_adapter.get_head_sha = Mock(return_value=None)
+        git_adapter.default_branch = Mock(return_value="main")
+        git_adapter.list_branch_names = Mock(return_value=["issue-123"])
+        # The tree really is dirty, and stays that way.
+        git_adapter.has_uncommitted_changes = Mock(return_value=True)
+        git_adapter.has_tracked_changes = Mock(return_value=True)
+        git_adapter.list_dirty_files = Mock(return_value=["operator_notes.py"])
+        git_adapter.diff_against_base = Mock(
+            return_value=DiffResult(success=True, diff_text="")
+        )
+        git_adapter.read_branch_text_files = Mock(
+            return_value=BranchTextFilesResult(success=True)
+        )
+        git_adapter.branch_post_image_paths_against_base = Mock(
+            return_value=BranchPathsResult(success=True, paths=())
+        )
+
+        label_adapter = Mock()
+        pr_adapter = Mock()
+
+        config = Config()
+        config.validation.publish.dirty_check = "tracked"
+
+        processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
+            label_adapter=label_adapter,
+            pr_adapter=pr_adapter,
+            git_adapter=git_adapter,
+            event_bus=EventBus(),
+            session_output=FileSystemSessionOutput(),
+            label_config={"blocked": "blocked"},
+            config=config,
+            pre_publish_gate=PrePublishGate(LocalCommandRunner()),
+        )
+
+        result = processor.process(
+            repo,
+            run_assets=make_session_run_assets(repo),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        # Publishing is best-effort here; routing the human is not.
+        label_adapter.add_label.assert_any_call(123, "blocked")
+        # The guard refused to publish a dirty tree -- correctly -- and the
+        # escalation continued to the human anyway.
+        assert preserved.read_text() == before
+        # The authorization reached the hook through the environment of the
+        # process the orchestrator spawned, so nothing was written into the
+        # worktree that a later push could reuse.
+        assert not [
+            path
+            for path in (repo / ".issue-orchestrator").rglob("*")
+            if path.is_file() and "authoriz" in path.name.lower()
+        ]

@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from ..ports.validation_attempt_key_factory import ValidationAttemptKeyFactory
 
 from ..events import EventName
+from ..domain.dirty_remediation import remediation_prompt_steps
 from ..domain.artifact_contracts import (
     ValidationFailed,
     ValidationOutcome,
@@ -1733,6 +1734,7 @@ class SessionController:
                 "The validation command passed, but the worktree became dirty "
                 "before publish."
             )
+        remediation = remediation_prompt_steps()
         return f"""# Dirty Worktree Retry (Attempt {display_count}/{display_max}) - {display_max - display_count} attempt(s) remaining after this
 
 {timing}
@@ -1740,12 +1742,11 @@ class SessionController:
 ## Required Fix
 
 1. Run `git status --short`.
-2. Commit files that belong to the requested fix.
-3. Remove, revert, or stash unrelated/generated files that should not be part of this issue.
-4. Run `prepush-check --dirty-only -v`; it must pass before `coding-done`.
+{remediation}
+4. Run `prepush-check --dirty-only -v`; it must pass before `coding-done`. That check is the gate for *completing*; if you reached rung 3 and are escalating instead, go straight to the escalation command — it accepts the dirty tree on purpose.
 5. Run `coding-done completed --implementation "describe what you fixed" --problems "any remaining issues"`.
 
-Runtime note: orchestrator-managed metadata under `.issue-orchestrator/` and `.claude/` is ignored by the orchestrator dirty guard. Tracked project files, generated sources, lock files, schemas, and other repo changes must still be committed or removed.
+Runtime note: orchestrator-managed metadata under `.issue-orchestrator/` and `.claude/` is ignored by the orchestrator dirty guard. Tracked project files, generated sources, lock files, and schemas that belong to this issue must still be committed; anything you did not create must be preserved, not deleted.
 
 ## Dirty Files
 

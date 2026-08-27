@@ -8,16 +8,59 @@ Read the task-specific prompt file for what to do. Return here for how to signal
 
 ## IMPORTANT: Clean Working Tree Required
 
-Before calling `coding-done`, ensure your working tree is clean:
+Before calling `coding-done`, your working tree must be clean.
 
-1. Run `git status --short` — if there are uncommitted files, **commit them**.
-2. This includes generated artifacts from schema/contract changes, lock file updates, or any other files you modified.
-3. Run `prepush-check --dirty-only -v`; it must pass before `coding-done`.
-4. `coding-done` will **reject a dirty working tree** and exit non-zero.
+1. Run `git status --short`.
+2. Classify each dirty file before staging anything. For each one:
+   1. **Part of the work you are pushing** → stage that path explicitly by name and commit it. Do not stash work that belongs in this push — stashing leaves HEAD on the commit you are about to replace, and the stashed change never reaches the push.
+   2. **A disposable artifact you created yourself** → delete it, or add its path to `.gitignore`. Only take this path when you created the file during this session and can positively identify it as disposable, such as build output or a generated artifact you produced.
+   3. **Anything else** — pre-existing edits, files you did not create, anything you cannot positively classify → preserve it and clear the guard without touching its contents. Never delete or revert a file you did not create. It may be operator or user work that cannot be recovered. An untracked path can be added to `.gitignore`, which clears the guard and leaves the file on disk untouched — that edit makes `.gitignore` itself dirty, and it belongs in your commit. If it cannot be cleared that way, stop and report `coding-done blocked --reason "cannot classify dirty file <path>" --attempted "inspected the file and its history"` rather than destroying it.
+3. Stage the paths you classified under rung 1 explicitly by name. Never stage every changed file at once.
+4. Run `prepush-check --dirty-only -v`; it must pass before `coding-done`. That check is the gate for *completing*; if you reached rung 3 and are escalating instead, go straight to the escalation command — it accepts the dirty tree on purpose.
+5. `coding-done` will **reject a dirty working tree** and exit non-zero.
 
-Runtime-managed metadata under `.issue-orchestrator/` and `.claude/` is ignored by the orchestrator dirty guard. Tracked project files, generated sources, lock files, schemas, and other repo changes must still be committed or removed.
+Generated sources, lock files, and schemas that *your* change produced are rung 1 — they belong in the same commit as the change that caused them.
 
-If you genuinely cannot commit certain files (e.g., they shouldn't be tracked), explain why in the `--problems` field.
+Runtime-managed metadata under `.issue-orchestrator/` and `.claude/` is ignored by the orchestrator dirty guard.
+
+If you cannot resolve a file under any rung, explain why in the `--problems` field.
+
+---
+
+## IMPORTANT: Commit First, THEN Run the Publish Gate
+
+The publish validation suite is cached by **HEAD commit SHA**. A green result is
+reused by the git pre-push hook that actually publishes your branch — and by any
+later re-run of the gate itself — but only if it was recorded at the *exact
+commit that gets pushed*.
+
+So the order is:
+
+1. Iterate with the fast/quick validation command while you work.
+2. **Commit** once you believe the change is done.
+3. **Then** run the full publish gate: `prepush-check -v` (or this repo's
+   cache-aware wrapper around it, if it has one).
+4. If it fails: fix, **commit again**, and re-run `prepush-check -v`.
+
+Running the publish gate before committing is wasted work, twice over:
+
+- The dirty-tree guard runs **first**, so on an uncommitted tree the gate exits
+  non-zero without validating anything at all.
+- If you commit after a green run, the result is recorded against the *parent*
+  commit. Every later consumer misses the cache and re-runs the whole suite,
+  which on a large repo can exceed the session's time budget and strand your
+  work.
+
+**Do not `git stash` work that belongs in this push.** Stashing leaves HEAD on
+the parent commit, so the gate records a result for a SHA you are about to
+invalidate — and the stashed change never reaches the push at all. Commit it
+instead.
+
+Files that do *not* belong in this branch are a different case: resolve them
+under the rungs above. Never commit a file just to clear the dirty guard — in
+`all` mode the guard reports every untracked path, and committing them blindly
+is how detritus and secrets reach a branch — and never destroy one either,
+because unrelated does not mean disposable.
 
 ---
 

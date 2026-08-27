@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+
+from ..domain.dirty_remediation import publish_is_best_effort
 from ..domain.artifact_contracts import ValidationFailed
 from .needs_human_block import (
     NO_OTHER_NEEDS_HUMAN_CAUSES,
@@ -104,6 +106,7 @@ from .completion_types import (
     ProcessingResult,
     REVIEW_EXCHANGE_ERROR_PREFIX,
 )
+from .publish_failure import route_despite_publish_failure
 from .pre_publish_gate import PrePublishGate, PrePublishGateResult
 from .review_exchange_contracts import ReviewExchangeCanceller
 from .review_cache_boundary import review_cache_boundary_started_at
@@ -854,7 +857,7 @@ class CompletionProcessor:
             run_assets=run_assets,
         )
 
-        # Execute requested actions in order
+        # Execute requested actions in order.
         (
             branch,
             pr_url,
@@ -1389,7 +1392,11 @@ class CompletionProcessor:
         errors: list[str],
         run_assets: SessionRunAssets,
     ) -> ProcessingResult | None:
-        if self.pre_publish_gate is None:
+        if self.pre_publish_gate is None or publish_is_best_effort(
+            record.outcome.value
+        ):
+            # Nothing to learn from pre-checking a publish whose failure will not
+            # stop the completion; the push reports its own failure below.
             return None
         if RequestedAction.PUSH_BRANCH not in plan.ordered_actions:
             return None
@@ -1902,6 +1909,7 @@ class CompletionProcessor:
                 actions_taken,
                 errors,
                 error_details,
+                record=record,
             )
         elif action == RequestedAction.CREATE_PR:
             return self._execute_create_pr_action(
@@ -2059,10 +2067,13 @@ class CompletionProcessor:
         errors: list[str],
         error_details: list[dict[str, Any]],
         *,
+        record: CompletionRecord,
         skip_hooks: bool = False,
     ) -> "_ActionResult":
         """Execute push branch action."""
         skip_hooks = skip_hooks or os.environ.get("E2E_SKIP_PUSH_HOOKS") == "1"
+        # Resolved here rather than passed in: a rebase retry moves HEAD, and a
+        # signal bound to the old commit must not authorize the new one.
         result = self.git_adapter.push(worktree, skip_hooks=skip_hooks)
         if result.success:
             actions_taken.append("Pushed branch to remote")
@@ -2073,7 +2084,14 @@ class CompletionProcessor:
         retry_result: PushResult | None = None
         if self._push_rebase_retry and self._is_non_fast_forward(result.message):
             retry_result = self._attempt_rebase_and_retry_push(
-                worktree, issue_number, action, actions_taken, errors, error_details, skip_hooks
+                worktree,
+                issue_number,
+                action,
+                actions_taken,
+                errors,
+                error_details,
+                skip_hooks,
+                record,
             )
 
         if retry_result and retry_result.success:
@@ -2098,7 +2116,17 @@ class CompletionProcessor:
             retryable=result.retryable,
             branch=result.branch,
         )
-        return self._ActionResult(halt=True)
+        # Halt exactly when the outcome could not be routed without the push.
+        return self._ActionResult(
+            halt=not route_despite_publish_failure(
+                record=record,
+                worktree=worktree,
+                branch=result.branch,
+                reason=result.message,
+                step="push",
+                actions_taken=actions_taken,
+            )
+        )
 
     def _resolve_push_rebase_base(
         self,
@@ -2148,6 +2176,7 @@ class CompletionProcessor:
         errors: list[str],
         error_details: list[dict[str, Any]],
         skip_hooks: bool,
+        record: CompletionRecord,
     ) -> PushResult | None:
         """Attempt to rebase and retry push after non-fast-forward failure."""
         if self.git_adapter.has_uncommitted_changes(worktree):

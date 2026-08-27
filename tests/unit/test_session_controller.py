@@ -1455,7 +1455,7 @@ class TestSessionControllerValidationCaching:
         processor.review_exchange_running = True
         processor.worktree_state_valid = False
         processor.worktree_state_reason = (
-            "Working tree is dirty; commit/add/stash before pushing. "
+            "Working tree is dirty; commit the changes that belong in this push (stashing leaves HEAD stale) and revert, remove, or ignore the rest. "
             "Dirty files: scripts/dev.sh."
         )
 
@@ -1502,7 +1502,7 @@ class TestSessionControllerValidationCaching:
         )
         processor.dirty_policy_results = [
             WorktreeValidationResult.dirty_policy_failure(
-                "Working tree is dirty; commit/add/stash before pushing. "
+                "Working tree is dirty; commit the changes that belong in this push (stashing leaves HEAD stale) and revert, remove, or ignore the rest. "
                 "Dirty files: scripts/dev.sh.",
                 blocking_paths=("scripts/dev.sh",),
             )
@@ -1573,7 +1573,7 @@ class TestSessionControllerValidationCaching:
         )
         processor.dirty_policy_results = [
             WorktreeValidationResult.dirty_policy_failure(
-                "Working tree is dirty; commit/add/stash before pushing. "
+                "Working tree is dirty; commit the changes that belong in this push (stashing leaves HEAD stale) and revert, remove, or ignore the rest. "
                 "Dirty files: scripts/dev.sh.",
                 blocking_paths=("scripts/dev.sh",),
             )
@@ -1620,7 +1620,7 @@ class TestSessionControllerValidationCaching:
         processor.dirty_policy_results = [
             WorktreeValidationResult.pass_(),
             WorktreeValidationResult.dirty_policy_failure(
-                "Working tree is dirty; commit/add/stash before pushing. "
+                "Working tree is dirty; commit the changes that belong in this push (stashing leaves HEAD stale) and revert, remove, or ignore the rest. "
                 "Dirty files: generated.txt.",
                 blocking_paths=("generated.txt",),
             ),
@@ -1674,7 +1674,7 @@ class TestSessionControllerValidationCaching:
         processor.dirty_policy_results = [
             WorktreeValidationResult.pass_(),
             WorktreeValidationResult.dirty_policy_failure(
-                "Working tree is dirty; commit/add/stash before pushing. "
+                "Working tree is dirty; commit the changes that belong in this push (stashing leaves HEAD stale) and revert, remove, or ignore the rest. "
                 "Dirty files: generated.txt.",
                 blocking_paths=("generated.txt",),
             ),
