@@ -130,11 +130,17 @@ cleanup:
     remove_worktrees: true
 
 validation:
+  # This repo opts its validation lanes into the HTCondor backend
+  # (docs/user/condor_lanes.md): run `scripts/condor-personal.sh up`
+  # once per machine. There is no silent fallback — without a pool the
+  # gate fails loudly (exit 78). Override per invocation with
+  # `make ... LANE_EXECUTOR=direct`. The codespaces config keeps the
+  # direct backend.
   quick:
-    cmd: make validate-quick
+    cmd: LANE_EXECUTOR=condor make validate-quick
     timeout_seconds: 600
   publish:
-    cmd: make validate-pr-raw
+    cmd: LANE_EXECUTOR=condor make validate-pr-raw
     # This repo's local publish gate runs the full PR validation slice
     # (unit/integration/web/vscode) and routinely exceeds 300s on busy machines,
     # even without any live agent work in the loop.

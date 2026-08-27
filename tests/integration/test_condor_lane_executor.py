@@ -1,0 +1,254 @@
+"""HTCondor backend against the shared lane contract, on a live pool.
+
+Requires a reachable personal pool (``scripts/condor-personal.sh up``).
+Marked ``requires_infra``: the backend is opt-in, so these run in the
+dedicated condor CI job and on developer machines with a pool — never
+silently skipped inside the default gate, simply not selected by it.
+"""
+
+from __future__ import annotations
+
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from issue_orchestrator.adapters.condor import CondorLaneExecutor, CondorTools
+from issue_orchestrator.domain.lane_execution import (
+    LaneCommand,
+    LaneCompleted,
+    LaneDeadline,
+    LaneResources,
+    LaneWorkKey,
+)
+from issue_orchestrator.ports.lane_executor import LaneExecutor
+from tests.unit.lane_executor_contract import LaneExecutorContract
+
+pytestmark = [
+    pytest.mark.timeout(600),
+    pytest.mark.requires_infra,
+]
+
+
+class TestCondorLaneExecutorContract(LaneExecutorContract):
+    def build_executor(self) -> LaneExecutor:
+        return CondorLaneExecutor(CondorTools.resolve())
+
+
+def test_exclusive_token_serializes_concurrent_lanes(tmp_path: Path) -> None:
+    """Two lanes sharing an exclusive token must never overlap.
+
+    Each lane appends a start marker, sleeps, then appends an end
+    marker; overlap would interleave the markers. Relies on the pool
+    setting CONCURRENCY_LIMIT_DEFAULT = 1 (the personal-pool helper
+    does), which is exactly what the compiler documents.
+    """
+    journal = tmp_path / "journal.txt"
+    journal.write_text("")
+    script = (
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "journal = Path(sys.argv[1])\n"
+        "name = sys.argv[2]\n"
+        "with journal.open('a') as handle:\n"
+        "    handle.write(f'start:{name}\\n')\n"
+        "time.sleep(3)\n"
+        "with journal.open('a') as handle:\n"
+        "    handle.write(f'end:{name}\\n')\n"
+    )
+
+    def run_lane(name: str) -> None:
+        outcome = CondorLaneExecutor(CondorTools.resolve()).run(
+            LaneCommand(
+                work_key=LaneWorkKey(f"contract.exclusive-{name}"),
+                arguments=(sys.executable, "-c", script, str(journal), name),
+                working_directory=tmp_path,
+                deadline=LaneDeadline(300.0),
+            ),
+            LaneResources(request_cpus=1, exclusive=("lanetestmutex",)),
+        )
+        assert type(outcome) is LaneCompleted and outcome.exit_code == 0
+
+    threads = [
+        threading.Thread(target=run_lane, args=(name,)) for name in ("a", "b")
+    ]
+    for thread in threads:
+        thread.start()
+        time.sleep(0.2)
+    for thread in threads:
+        thread.join()
+
+    lines = journal.read_text().splitlines()
+    assert len(lines) == 4, lines
+    # Serialized execution is exactly start/end pairs, never interleaved.
+    assert lines[0].startswith("start:") and lines[1].startswith("end:"), lines
+    assert lines[2].startswith("start:") and lines[3].startswith("end:"), lines
+    assert lines[0].split(":")[1] == lines[1].split(":")[1], lines
+    assert lines[2].split(":")[1] == lines[3].split(":")[1], lines
+
+
+def test_detached_session_escape_states_the_platform_boundary(
+    tmp_path: Path,
+) -> None:
+    """Executable statement of ADR-0001 (docs/architecture/execenv/).
+
+    A double-forked, setsid-detached grandchild — what agent jobs spawn
+    (dev servers, watchers) — escapes the scheduler's process tracking on
+    macOS, where cgroups do not exist: reproduced live 2026-08-27. On
+    Linux, cgroup tracking must kill it with the job. The macOS pool is
+    therefore scoped to validation lanes (non-detaching workloads); agent
+    jobs require the Linux execution environment.
+
+    The assertion is per-platform so the boundary stays DOCUMENTED TRUTH:
+    if macOS ever starts containing the escape, or Linux ever stops, the
+    record here is what fails.
+    """
+    import os
+    import signal
+    import time
+
+    marker = tmp_path / "grandchild.pid"
+    escape = (
+        "import os, sys, time\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    if os.fork() == 0:\n"
+        "        open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+        "        time.sleep(3600)\n"
+        "    os._exit(0)\n"
+        "time.sleep(3600)\n"
+    )
+    executor = CondorLaneExecutor(CondorTools.resolve())
+    import threading
+
+    outcome_box: list[object] = []
+
+    def run_lane() -> None:
+        outcome_box.append(
+            executor.run(
+                LaneCommand(
+                    work_key=LaneWorkKey("contract.session-escape"),
+                    arguments=(sys.executable, "-c", escape, str(marker)),
+                    working_directory=tmp_path,
+                    deadline=LaneDeadline(20.0),
+                ),
+                LaneResources(request_cpus=1),
+            )
+        )
+
+    thread = threading.Thread(target=run_lane)
+    thread.start()
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not marker.exists():
+        time.sleep(0.2)
+    assert marker.exists(), "escape grandchild never started"
+    grandchild = int(marker.read_text())
+    thread.join(timeout=180)
+    assert not thread.is_alive(), "lane did not conclude"
+
+    def alive() -> bool:
+        try:
+            os.kill(grandchild, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    settle = time.monotonic() + 20
+    while time.monotonic() < settle and alive():
+        time.sleep(0.5)
+    survived = alive()
+    if survived:
+        os.kill(grandchild, signal.SIGKILL)
+    if sys.platform == "darwin":
+        assert survived, (
+            "macOS unexpectedly contained the setsid escape - if process "
+            "tracking gained this, update ADR-0001 and the pool scoping"
+        )
+    else:
+        assert not survived, (
+            "Linux cgroup tracking failed to contain the setsid escape - "
+            "the execution environment's core guarantee has regressed"
+        )
+
+
+def test_queue_wait_is_never_billed_to_the_lane_deadline(tmp_path: Path) -> None:
+    """Contract: scheduling wait is machinery, not lane budget. A lane
+    queued behind an exclusive token for longer than its own runtime
+    deadline must still run and complete once the token frees."""
+    import threading
+    import time as _time
+
+    def run_lane(name: str, sleep_seconds: float, deadline: float) -> object:
+        return CondorLaneExecutor(CondorTools.resolve()).run(
+            LaneCommand(
+                work_key=LaneWorkKey(f"contract.queuebill-{name}"),
+                arguments=(sys.executable, "-c", f"import time; time.sleep({sleep_seconds})"),
+                working_directory=tmp_path,
+                deadline=LaneDeadline(deadline),
+            ),
+            LaneResources(request_cpus=1, exclusive=("queuebilltoken",)),
+        )
+
+    results: dict[str, object] = {}
+    holder = threading.Thread(
+        target=lambda: results.__setitem__("holder", run_lane("holder", 8.0, 60.0))
+    )
+    holder.start()
+    _time.sleep(1.0)
+    # Queued behind an 8s holder with only a 4s deadline of its own.
+    results["queued"] = run_lane("queued", 1.0, 4.0)
+    holder.join(timeout=120)
+
+    assert type(results["holder"]) is LaneCompleted
+    assert type(results["queued"]) is LaneCompleted, (
+        "queue wait was billed to the lane deadline: "
+        f"{results['queued']!r}"
+    )
+
+
+def test_run_directory_lifecycle_deletes_on_success_retains_on_failure(
+    tmp_path: Path,
+) -> None:
+    """Clean completions leave nothing behind; failures keep their
+    diagnostics and say where (the retention owner is the adapter)."""
+    import glob as _glob
+    import tempfile as _tempfile
+
+    def lane_directories() -> set[str]:
+        return set(
+            _glob.glob(str(Path(_tempfile.gettempdir()) / "lane-contract.lifecycle*"))
+        )
+
+    executor = CondorLaneExecutor(CondorTools.resolve())
+    before = lane_directories()
+    ok = executor.run(
+        LaneCommand(
+            work_key=LaneWorkKey("contract.lifecycle-ok"),
+            arguments=(sys.executable, "-c", "pass"),
+            working_directory=tmp_path,
+            deadline=LaneDeadline(60.0),
+        ),
+        LaneResources(request_cpus=1),
+    )
+    assert type(ok) is LaneCompleted and ok.exit_code == 0
+    assert lane_directories() == before, "clean completion leaked its run directory"
+
+    failed = executor.run(
+        LaneCommand(
+            work_key=LaneWorkKey("contract.lifecycle-fail"),
+            arguments=(sys.executable, "-c", "raise SystemExit(3)"),
+            working_directory=tmp_path,
+            deadline=LaneDeadline(60.0),
+        ),
+        LaneResources(request_cpus=1),
+    )
+    assert type(failed) is LaneCompleted and failed.exit_code == 3
+    retained = [d for d in lane_directories() - before if "lifecycle-fail" in d]
+    assert retained, "failed lane did not retain its diagnostics"
+    for directory in retained:
+        assert (Path(directory) / "lane.events").exists()
+        import shutil as _shutil
+
+        _shutil.rmtree(directory, ignore_errors=True)

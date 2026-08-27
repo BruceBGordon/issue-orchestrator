@@ -1,4 +1,4 @@
-.PHONY: help venv venv-fast semgrep-venv worktree-create worktree-setup install upgrade-deps deps-batch release release-pr prepare-release preview-readme typecheck lint-arch lint-complexity quality-guardrails quality-guardrails-stale sync-deps test test-unit test-unit-cov test-unit-cov-html test-integration test-integration-core test-integration-core-local test-integration-core-live-codex test-integration-agent test-simulated test-simulated-core test-simulated-agent test-e2e test-e2e-heavy test-e2e-onboarding-live test-e2e-one test-e2e-live test-real-claude-dev test-real-claude-review test-real-gh-labels test-real-gh test-real-gh-plus-e2e test-real-gh-plus-e2e-subprocess test-web test-web-headed playwright-install validate validate-raw validate-pr validate-pr-raw validate-quick validate-full verify-hooks-all _validate-impl _validate-static-impl _validate-core-tests-impl _validate-pr-impl _validate-agent-impl _validate-full-impl clean demo issues-validate issues-fix issues-fix-dry-run issues-create
+.PHONY: help venv venv-fast semgrep-venv worktree-create worktree-setup install upgrade-deps deps-batch release release-pr prepare-release preview-readme typecheck lint-arch lint-complexity quality-guardrails quality-guardrails-stale sync-deps test test-unit test-unit-cov test-unit-cov-html test-integration test-integration-core test-integration-core-local test-integration-core-live-codex test-integration-agent test-simulated test-simulated-core test-simulated-agent test-e2e test-e2e-heavy test-e2e-onboarding-live test-e2e-one test-e2e-live test-real-claude-dev test-real-claude-review test-real-gh-labels test-real-gh test-real-gh-plus-e2e test-real-gh-plus-e2e-subprocess test-web test-web-headed test-vscode install-vscode-extensions playwright-install validate validate-raw validate-pr validate-pr-raw validate-quick validate-full verify-hooks-all _validate-impl _validate-static-impl _validate-core-tests-impl _validate-pr-impl _validate-agent-impl _validate-full-impl _validate-pr-flat-impl FORCE ensure-uv test-integration-agent-claude test-integration-agent-codex test-integration-agent-chain clean demo issues-validate issues-fix issues-fix-dry-run issues-create
 
 # GNU make detection - required for parallel validation with grouped output
 # On macOS: brew install make (provides gmake)
@@ -332,11 +332,18 @@ endef
 # Two-pass typecheck: strict for core (domain/ports/control), standard for rest
 # --warnings ensures 0 warnings required (exit code 1 if warnings reported)
 typecheck:
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,typecheck,\
+		$(LANE_RUN) --backend condor --priority 10 --work-key typecheck --request-memory-mb 4096 --request-cpus $(LANE_CPUS_TYPECHECK) \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) typecheck LANE_EXECUTOR=direct)
+else
 	$(call TIMED_RUN,typecheck,\
 		echo "Running pyright (standard mode, excluding core)..." && \
 		$(PYRIGHT) --project pyrightconfig.json --warnings && \
 		echo "Running pyright (strict mode, core only)..." && \
 		$(PYRIGHT) --project pyrightconfig.strict.json --warnings)
+endif
 
 LINT_IMPORTS ?= .venv/bin/lint-imports
 RUFF ?= .venv/bin/ruff
@@ -366,6 +373,28 @@ lint-complexity:
 # Parallel test execution with pytest-xdist (-n auto uses all CPU cores)
 # Use PARALLEL=0 to disable: make test-unit PARALLEL=0
 PARALLEL ?= auto
+
+# Opt-in lane execution backend. `direct` preserves historical behavior;
+# `condor` submits wired lanes to a personal HTCondor pool through the
+# LaneExecutor port (see docs/user/condor_lanes.md). Selection is one
+# composition decision here — lane recipes and callers are identical in
+# both modes, and a configured-but-missing pool fails loudly (exit 78).
+LANE_EXECUTOR := $(or $(LANE_EXECUTOR),$(ISSUE_ORCHESTRATOR_LANE_EXECUTOR),direct)
+LANE_RUN = $(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_run
+LANE_CPUS_TYPECHECK ?= 4
+LANE_CPUS_UNIT ?= 12
+LANE_CPUS_SIMULATED ?= 4
+LANE_CPUS_INTEGRATION ?= 4
+LANE_TIMEOUT_SECONDS ?= 1800
+
+# Suite slices (condor mode): the fat integration suites split into
+# balanced lanes so the flat gate's wall time tracks the longest SLICE,
+# not the longest suite. scripts/lane_slices.py computes the partition
+# from the live file list (coverage by construction) with LPT balancing
+# over measured durations; one dominant file is split at test-node
+# granularity. Direct mode never uses these targets.
+INTEGRATION_CORE_SLICES := 3
+INTEGRATION_CORE_FILES = $(filter-out $(INTEGRATION_AGENT_FILES),$(wildcard tests/integration/test_*.py))
 UNIT_PARALLEL ?= $(PARALLEL)
 SIMULATED_PARALLEL ?= $(PARALLEL)
 INTEGRATION_PARALLEL ?= $(PARALLEL)
@@ -403,7 +432,12 @@ sync-deps:
 	fi
 
 test-unit: sync-deps
-ifeq ($(UNIT_PARALLEL),0)
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,test-unit,\
+		$(LANE_RUN) --backend condor --priority 100 --work-key test-unit --request-memory-mb 6144 --request-cpus $(LANE_CPUS_UNIT) \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) test-unit LANE_EXECUTOR=direct UNIT_PARALLEL=$(LANE_CPUS_UNIT))
+else ifeq ($(UNIT_PARALLEL),0)
 	$(call TIMED_RUN,test-unit,\
 		$(PYTEST) tests/unit packages/agent_runner/tests -x -q --tb=short $(PYTEST_TIMINGS))
 else
@@ -419,7 +453,12 @@ else
 endif
 
 test-simulated-core: sync-deps
-ifeq ($(SIMULATED_PARALLEL),0)
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,test-simulated-core,\
+		$(LANE_RUN) --backend condor --priority 18 --work-key test-simulated-core --request-memory-mb 2048 --request-cpus $(LANE_CPUS_SIMULATED) \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) test-simulated-core LANE_EXECUTOR=direct)
+else ifeq ($(SIMULATED_PARALLEL),0)
 	$(call TIMED_RUN,test-simulated-core,\
 		$(PYTEST) tests/simulated_scenarios -x -q --tb=short \
 			--ignore=tests/simulated_scenarios/test_foreign_repo_lifecycle.py \
@@ -438,7 +477,12 @@ else
 endif
 
 test-simulated-agent: sync-deps
-ifeq ($(SIMULATED_PARALLEL),0)
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,test-simulated-agent,\
+		$(LANE_RUN) --backend condor --priority 11 --work-key test-simulated-agent --request-memory-mb 1024 --request-cpus 2 \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) test-simulated-agent LANE_EXECUTOR=direct)
+else ifeq ($(SIMULATED_PARALLEL),0)
 	$(call TIMED_RUN,test-simulated-agent,\
 		$(PYTEST) $(SIMULATED_AGENT_FILES) -x -q --tb=short $(PYTEST_TIMINGS))
 else
@@ -461,7 +505,12 @@ test-integration: sync-deps
 test-integration-core: test-integration-core-local test-integration-core-live-codex
 
 test-integration-core-local: sync-deps
-ifeq ($(INTEGRATION_PARALLEL),0)
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,test-integration-core-local,\
+		$(LANE_RUN) --backend condor --work-key test-integration-core-local --request-memory-mb 3072 --request-cpus $(LANE_CPUS_INTEGRATION) \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) test-integration-core-local LANE_EXECUTOR=direct)
+else ifeq ($(INTEGRATION_PARALLEL),0)
 	$(call TIMED_RUN,test-integration-core,\
 		$(PYTEST) tests/integration -x -q --tb=short -m "not requires_infra and not live_codex" \
 			--ignore=tests/integration/test_claude_execution.py \
@@ -489,13 +538,54 @@ test-integration-core-live-codex: sync-deps
 test-integration-no-infra: test-integration-core
 
 test-integration-agent: sync-deps
-ifeq ($(INTEGRATION_AGENT_PARALLEL),0)
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,test-integration-agent,\
+		$(LANE_RUN) --backend condor --work-key test-integration-agent --request-memory-mb 2048 --request-cpus 4 \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) test-integration-agent LANE_EXECUTOR=direct)
+else ifeq ($(INTEGRATION_AGENT_PARALLEL),0)
 	$(call TIMED_RUN,test-integration-agent,\
 		$(PYTEST) $(INTEGRATION_AGENT_FILES) -x -q --tb=short $(PYTEST_TIMINGS))
 else
 	$(call TIMED_RUN,test-integration-agent,\
 		$(PYTEST) $(INTEGRATION_AGENT_FILES) -x -q --tb=short -n $(INTEGRATION_AGENT_PARALLEL) --dist=loadgroup $(PYTEST_TIMINGS))
 endif
+
+# Condor-mode suite slices. Each is a full lane: the condor branch
+# submits itself, the direct branch is what runs inside the pool job.
+test-integration-core-slice-%: sync-deps FORCE
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,test-integration-core-slice-$*,\
+		$(LANE_RUN) --backend condor --work-key test-integration-core-slice-$* --request-memory-mb 2048 \
+			--request-cpus 4 --priority 40 \
+			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
+			$(GMAKE) test-integration-core-slice-$* LANE_EXECUTOR=direct)
+else
+	$(call TIMED_RUN,test-integration-core-slice-$*,\
+		$(PYTEST) $$($(PYTHON) scripts/lane_slices.py --group $* --of $(INTEGRATION_CORE_SLICES) $(INTEGRATION_CORE_FILES)) \
+			-x -q --tb=short -m "not requires_infra and not live_codex" \
+			-n 4 --dist=loadgroup $(PYTEST_TIMINGS))
+endif
+
+# The live-agent suite splits by provider file, which keeps each
+# provider account serialized within its own lane.
+define AGENT_SLICE_RULE
+test-integration-agent-$(1): sync-deps
+ifeq ($$(LANE_EXECUTOR),condor)
+	$$(call TIMED_RUN,test-integration-agent-$(1),\
+		$$(LANE_RUN) --backend condor --work-key test-integration-agent-$(1) --request-memory-mb 1024 \
+			--request-cpus 2 --priority $(2) \
+			--timeout-seconds $$(LANE_TIMEOUT_SECONDS) -- \
+			$$(GMAKE) test-integration-agent-$(1) LANE_EXECUTOR=direct)
+else
+	$$(call TIMED_RUN,test-integration-agent-$(1),\
+		$$(PYTEST) $(3) -x -q --tb=short -n 2 --dist=loadgroup $$(PYTEST_TIMINGS))
+endif
+endef
+
+$(eval $(call AGENT_SLICE_RULE,claude,120,tests/integration/test_claude_execution.py))
+$(eval $(call AGENT_SLICE_RULE,codex,140,tests/integration/test_codex_execution.py))
+$(eval $(call AGENT_SLICE_RULE,chain,110,tests/integration/test_live_agent_chain.py))
 
 # Full integration tests including infrastructure-dependent ones (run in CI)
 test-integration-full: sync-deps
@@ -652,7 +742,11 @@ validate-raw:
 validate-pr-raw:
 	$(VALIDATE_CONFIG)
 	@$(GMAKE) --output-sync=target _validate-pr-impl
+ifneq ($(LANE_EXECUTOR),condor)
+# In condor mode test-vscode rides in the flat fan (_validate-pr-flat-impl);
+# this tail is the direct mode's owner. Exactly one owner per mode.
 	@$(GMAKE) --output-sync=target test-vscode
+endif
 	@echo "✓ Required PR validations passed!"
 
 # Internal phased validation targets. Invoke through validate-raw,
@@ -673,10 +767,25 @@ _validate-static-impl: typecheck lint-arch lint-complexity
 _validate-core-tests-impl: test-unit test-simulated-core test-integration-core-local
 
 _validate-pr-impl:
+ifeq ($(LANE_EXECUTOR),condor)
+	$(call TIMED_RUN,validate-pr-flat-phase,\
+		$(GMAKE) -j12 --output-sync=target _validate-pr-flat-impl)
+else
 	$(call TIMED_RUN,validate-main-phase,\
 		$(GMAKE) --output-sync=target _validate-impl)
 	$(call TIMED_RUN,validate-agent-phase,\
 		$(GMAKE) -j$(VALIDATE_AGENT_JOBS) --output-sync=target _validate-agent-impl)
+endif
+
+# Flat condor-mode gate: ordering between lanes is scheduling, not
+# policy — every lane must pass either way, and the pool's admission
+# (request_cpus, exclusives) replaces the sequential phase structure
+# that protected the direct path from oversubscription.
+_validate-pr-flat-impl: typecheck lint-arch lint-complexity test-unit \
+	test-simulated-core test-simulated-agent \
+	test-integration-core-slice-1 test-integration-core-slice-2 test-integration-core-slice-3 \
+	test-integration-agent-claude test-integration-agent-codex test-integration-agent-chain \
+	test-integration-core-live-codex test-web test-vscode
 
 _validate-agent-impl: test-simulated-agent test-integration-agent
 
@@ -712,3 +821,6 @@ issues-fix-dry-run:
 
 issues-create:
 	$(PYTHON) scripts/issues.py create $(ARGS)
+
+# Unconditional prerequisite for pattern-rule lanes (they cannot be .PHONY).
+FORCE:

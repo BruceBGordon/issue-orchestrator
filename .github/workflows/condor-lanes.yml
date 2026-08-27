@@ -1,0 +1,77 @@
+name: condor-lanes
+
+# Opt-in lane backend verification: proves the HTCondor adapter honors
+# the LaneExecutor port contract on Linux, and that a real lane routes
+# through the pool end to end. The default validate workflow stays
+# scheduler-free; this job only runs when the backend's own surface
+# changes.
+
+on:
+  pull_request:
+    paths:
+      - 'src/issue_orchestrator/adapters/condor/**'
+      - 'src/issue_orchestrator/adapters/direct_lane_executor.py'
+      - 'src/issue_orchestrator/domain/lane_execution.py'
+      - 'src/issue_orchestrator/ports/lane_executor.py'
+      - 'src/issue_orchestrator/entrypoints/cli_tools/lane_run.py'
+      - 'tests/unit/lane_executor_contract.py'
+      - 'tests/integration/test_condor_lane_executor.py'
+      - 'scripts/condor-personal.sh'
+      - 'scripts/lane_slices.py'
+      - 'tests/unit/test_lane_slices.py'
+      - 'tests/unit/test_condor_personal_script.py'
+      - 'tests/unit/test_validate_gate_lane_coverage.py'
+      - 'Makefile'
+      - '.issue-orchestrator/config/modes/**'
+      - '.github/workflows/condor-lanes.yml'
+
+concurrency:
+  group: condor-lanes-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  condor-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version-file: .python-version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+
+      - name: Install HTCondor (personal pool)
+        run: |
+          # Deliberately the plain distro package - the exact path the
+          # user docs prescribe. It boots only a master (no schedd), so
+          # this job exercises the helper's personal-role fallback and
+          # role assertion rather than pre-satisfying them (a minicondor
+          # install would make this run vacuous). Version pinning comes
+          # from the distro archive of the pinned runner image, per
+          # ADR-0007's rejection of unpinned curl|bash installers.
+          sudo apt-get update
+          sudo apt-get install -y htcondor
+          bash scripts/condor-personal.sh up
+
+      - name: Contract suite against the live pool
+        run: |
+          .venv/bin/python -m pytest tests/integration/test_condor_lane_executor.py \
+            -q -m requires_infra --tb=short
+
+      # The typecheck lane is the demo deliberately: its pyright/node
+      # workload is what exposed the missing memory contract (a slot
+      # sized from the tiny exec wrapper's image OOMed node at ~259MB).
+      # It now runs under an explicit request_memory budget and must
+      # stay green as the end-to-end proof of that contract.
+      - name: One real lane through the pool
+        run: LANE_EXECUTOR=condor make typecheck

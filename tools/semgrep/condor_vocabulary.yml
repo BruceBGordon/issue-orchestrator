@@ -1,0 +1,11 @@
+rules:
+  - id: issue-orchestrator.condor-vocabulary-outside-adapter
+    languages:
+      - python
+    severity: ERROR
+    message: >
+      Scheduler vocabulary must stay inside the adapters/condor
+      anti-corruption layer. Translate to the typed lane contracts in
+      domain/lane_execution instead of leaking scheduler concepts upward.
+    patterns:
+      - pattern-regex: (?i)\b(condor|classad|schedd|startd|negotiator)\b
