@@ -26,6 +26,10 @@ TARBALL_URL="https://research.cs.wisc.edu/htcondor/tarball/${CONDOR_SERIES}/${CO
 write_lane_config() {
   local config_dir="$1"
   cat > "${config_dir}/90-issue-orchestrator-lanes.conf" <<'EOF'
+# A laptop pool must survive network roaming: bind loopback so daemon
+# addresses never go stale when wifi changes (idle-forever jobs after
+# joining a new network were the symptom).
+NETWORK_INTERFACE = 127.0.0.1
 NEGOTIATOR_INTERVAL = 1
 NEGOTIATOR_CYCLE_DELAY = 1
 NEGOTIATOR_MIN_INTERVAL = 1
