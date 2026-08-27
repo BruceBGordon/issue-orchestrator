@@ -150,6 +150,37 @@ select_config_dir() {
   return 1
 }
 
+# Ubuntu's condor systemd unit runs with PrivateTmp: the daemons see a
+# private /tmp namespace, so a lane whose working directory lives under
+# the real /tmp fails with errno=2 "Cannot access initial working
+# directory" - ENOENT, not EACCES, which is how namespace problems
+# masquerade as path problems. A personal pool must see the submitter's
+# real filesystem.
+write_private_tmp_override() {
+  local unit_dir="$1"
+  mkdir -p "$unit_dir"
+  cat > "${unit_dir}/io-no-private-tmp.conf" <<'DROPIN'
+[Service]
+PrivateTmp=no
+DROPIN
+}
+
+disable_private_tmp_if_needed() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local private_tmp
+  private_tmp=$(systemctl show condor -p PrivateTmp --value 2>/dev/null || echo "")
+  if [ "$private_tmp" = "yes" ]; then
+    echo "condor-personal: disabling PrivateTmp on the condor unit (lanes need the real /tmp)"
+    local staging
+    staging=$(mktemp -d)
+    write_private_tmp_override "$staging"
+    sudo mkdir -p /etc/systemd/system/condor.service.d
+    sudo cp "$staging/io-no-private-tmp.conf" /etc/systemd/system/condor.service.d/
+    rm -rf "$staging"
+    sudo systemctl daemon-reload
+  fi
+}
+
 linux_configure() {
   command -v condor_master >/dev/null 2>&1 || {
     echo "condor-personal: install HTCondor first: sudo apt-get install htcondor" >&2
@@ -181,6 +212,7 @@ linux_configure() {
     sudo cp "$staging"/*.conf "$config_dir/"
   fi
   rm -rf "$staging"
+  disable_private_tmp_if_needed
   if command -v systemctl >/dev/null 2>&1; then
     sudo systemctl restart condor
   else
