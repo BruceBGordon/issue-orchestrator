@@ -85,13 +85,53 @@ def test_environment_variable_selects_the_backend(
     assert _run("/usr/bin/true") == 78
 
 
-def test_memory_budget_flag_is_accepted() -> None:
-    assert (
-        _run(
-            sys.executable,
-            "-c",
-            "raise SystemExit(0)",
-            flags=("--request-memory-mb", "2048"),
-        )
-        == 0
+def test_memory_budget_crosses_the_port_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direct adapter ignores scheduling hints, so a run-and-check
+    test is vacuous: main() could drop the flag and still exit 0. A
+    capturing executor at the composition seam proves the value the
+    port actually receives."""
+    from issue_orchestrator.domain.lane_execution import (
+        LaneCommand,
+        LaneCompleted,
+        LaneResources,
     )
+    import issue_orchestrator.entrypoints.cli_tools.lane_run as lane_run_module
+
+    captured: list[LaneResources] = []
+
+    class _CapturingExecutor:
+        def run(
+            self, command: LaneCommand, resources: LaneResources
+        ) -> LaneCompleted:
+            captured.append(resources)
+            return LaneCompleted(0)
+
+    monkeypatch.setattr(
+        lane_run_module, "_build_executor", lambda backend: _CapturingExecutor()
+    )
+    code = _run(
+        "/usr/bin/true",
+        flags=("--request-memory-mb", "2048", "--priority", "7"),
+    )
+    assert code == 0
+    assert len(captured) == 1
+    resources = captured[0]
+    assert resources.request_memory_mb == 2048
+    assert resources.priority == 7
+
+
+def test_memory_budget_domain_validation_rejects_nonsense() -> None:
+    from issue_orchestrator.domain.lane_execution import LaneResources
+
+    bad_values: tuple[int, ...] = (0, -5, True)
+    for bad in bad_values:
+        with pytest.raises(ValueError):
+            LaneResources(request_cpus=1, request_memory_mb=bad)
+    with pytest.raises(ValueError):
+        LaneResources(
+            request_cpus=1,
+            request_memory_mb=1.5,  # type: ignore[arg-type]
+        )
+    assert LaneResources(request_cpus=1, request_memory_mb=2048).request_memory_mb == 2048

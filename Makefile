@@ -507,7 +507,7 @@ test-integration-core: test-integration-core-local test-integration-core-live-co
 test-integration-core-local: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-core-local,\
-		$(LANE_RUN) --backend condor --work-key test-integration-core-local --request-cpus $(LANE_CPUS_INTEGRATION) \
+		$(LANE_RUN) --backend condor --work-key test-integration-core-local --request-memory-mb 3072 --request-cpus $(LANE_CPUS_INTEGRATION) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-integration-core-local LANE_EXECUTOR=direct)
 else ifeq ($(INTEGRATION_PARALLEL),0)
@@ -540,7 +540,7 @@ test-integration-no-infra: test-integration-core
 test-integration-agent: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-agent,\
-		$(LANE_RUN) --backend condor --work-key test-integration-agent --request-cpus 4 \
+		$(LANE_RUN) --backend condor --work-key test-integration-agent --request-memory-mb 2048 --request-cpus 4 \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-integration-agent LANE_EXECUTOR=direct)
 else ifeq ($(INTEGRATION_AGENT_PARALLEL),0)

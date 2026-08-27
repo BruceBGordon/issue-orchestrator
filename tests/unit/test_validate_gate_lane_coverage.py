@@ -15,7 +15,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -140,3 +139,21 @@ def test_every_condor_lane_declares_a_memory_budget(tmp_path: Path) -> None:
             assert "--request-memory-mb" in segment.split(";")[0], (
                 f"condor lane {match.group(1)!r} declares no memory budget"
             )
+
+
+def test_no_lane_run_declaration_anywhere_lacks_a_memory_budget() -> None:
+    """Complete-owner-surface guard: the dry-run test above sees only
+    the flat fan's consumer graph, and two supported monolith lanes
+    (test-integration-core-local, test-integration-agent) drifted onto
+    the silent CLI default unseen. Every LANE_RUN invocation in the
+    Makefile - regardless of which gate path consumes it - must declare
+    its budget explicitly."""
+    offenders = [
+        line.strip()
+        for line in (REPO_ROOT / "Makefile").read_text().splitlines()
+        if "$(LANE_RUN)" in line and "--request-memory-mb" not in line
+    ]
+    assert not offenders, (
+        "condor lane declarations without a memory budget:\n"
+        + "\n".join(offenders)
+    )
