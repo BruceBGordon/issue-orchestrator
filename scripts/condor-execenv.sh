@@ -101,7 +101,11 @@ diagnose)
     exit 0
     ;;
 down)
-    if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
+    # --type container is load-bearing: a bare inspect resolves the
+    # IMAGE io-execenv:latest when no such container exists (observed
+    # on the CI runner: teardown succeeded, the postcondition matched
+    # the image forever and reported failure).
+    if ! docker inspect --type container "$CONTAINER" >/dev/null 2>&1; then
         echo "execenv: container $CONTAINER already absent"
         exit 0
     fi
@@ -116,7 +120,7 @@ down)
     # not in racing the daemon.
     removed=""
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
+        if ! docker inspect --type container "$CONTAINER" >/dev/null 2>&1; then
             removed="yes"
             break
         fi
