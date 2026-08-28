@@ -58,17 +58,28 @@ adr/                       every decision and why
 
 Amended in rev 2: ADR-0004, ADR-0008, ADR-0014. Challenged and reaffirmed: ADR-0005.
 
-## Before this builds
+## Before this builds — resolution status
 
-Deliberate placeholders, all in the Dockerfile (ADR-0007):
+The validation-lane increment (#7119) resolved the Dockerfile
+placeholders; what remains open belongs to the io-in-container half:
 
-1. `BASE_DIGEST` — resolve with `docker buildx imagetools inspect ubuntu:24.04`.
-2. `CONDOR_VERSION` — confirm it is a current LTS point release with `aarch64`
-   packages for this distro.
-3. `requirements.lock` and `job-wrapper/requirements.lock` — not included here;
-   generate from IO's actual dependencies.
-4. `IO` / `IO_ARGS` in the condor config assume an `io-server` entry point on
-   `--port` and `--work-root`. Adjust to match reality.
+1. `BASE_DIGEST` — **resolved**: ubuntu:24.04 pinned by digest in
+   `docker/execenv/Dockerfile`.
+2. `CONDOR_VERSION` — **resolved, amended by evidence**: pinned as the
+   `CONDOR_PACKAGE_VERSION` build arg (htcondor.org 24.0 LTS point
+   release). Two empirical amendments to the original design: the
+   distro's own package (23.4) silently declines cgroup-v2 family
+   tracking and cannot be used, and htcondor.org ships **amd64 only**,
+   so the image is built and run `linux/amd64` (native on CI; emulated
+   under Rosetta on Apple Silicon, matching the macOS pool's posture).
+   There are no aarch64 packages to confirm.
+3. `requirements.lock` — **superseded for this increment**: the
+   container builds io's Linux venv from the repo's own `uv.lock`
+   (`uv sync --frozen`); a separate lock set returns with the
+   job-wrapper work if that layer materializes (ADR-0010).
+4. `IO` / `IO_ARGS` in the condor config — **still open**: io does not
+   run in-container yet; this entry-point reconciliation lands with the
+   io-supervision half (ADR-0003) after ADR-0016.
 
 ## Running it
 

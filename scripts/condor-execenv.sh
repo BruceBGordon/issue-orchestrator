@@ -5,11 +5,19 @@
 #
 #   scripts/condor-execenv.sh build      build the image
 #   scripts/condor-execenv.sh up         start the pool container
+#   scripts/condor-execenv.sh preflight  fast cgroup-delegation probe
 #   scripts/condor-execenv.sh selftest   run the in-container proofs
+#   scripts/condor-execenv.sh diagnose   dump container + pool logs
 #   scripts/condor-execenv.sh down       stop and remove the container
 #
 # The repo this script lives in is mounted read-only at /repo; the
 # container builds its own Linux venv in the io-work volume.
+#
+# IO_EXECENV_PRIVILEGED=1 launches with --privileged instead of the
+# default CAP_SYS_ADMIN: GitHub-hosted runners write-protect the cgroup
+# mount so no capability set can remount it there, while --privileged
+# arrives with it already read-write. Ephemeral CI runners are inside
+# ADR-0013's trust posture; local Docker Desktop stays least-privilege.
 set -eu
 
 IMAGE="${IO_EXECENV_IMAGE:-io-execenv:latest}"
@@ -22,6 +30,14 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # the same posture as the macOS pool's x86_64 tarball.
 PLATFORM="linux/amd64"
 
+privilege_flags() {
+    if [ "${IO_EXECENV_PRIVILEGED:-0}" = "1" ]; then
+        printf -- "--privileged"
+    else
+        printf -- "--cap-add SYS_ADMIN"
+    fi
+}
+
 case "${1:-}" in
 build)
     exec docker build --platform "$PLATFORM" -t "$IMAGE" "$REPO_ROOT/docker/execenv"
@@ -31,32 +47,77 @@ up)
     docker volume create io-spool >/dev/null
     # --stop-timeout 60: docker stop's default 10s SIGTERM-to-SIGKILL
     # defeats condor_master's clean drain (ADR-0003; #7115 finding 8).
-    # --cgroupns private + cgroup v2 delegation is what the entrypoint
-    # verifies before starting anything.
-    # CAP_SYS_ADMIN: solely so the entrypoint can remount the
-    # read-only cgroup fs and delegate controllers (Docker Desktop
-    # mounts it ro even with a private cgroup namespace). Not
-    # --privileged - ADR-0013's posture, minimally.
+    # The entrypoint verifies writable cgroup-v2 delegation before
+    # starting anything, whichever privilege path launched it.
+    # shellcheck disable=SC2046
     exec docker run -d --name "$CONTAINER" \
         --platform "$PLATFORM" \
         --stop-timeout 60 \
         --cgroupns private \
-        --cap-add SYS_ADMIN \
+        $(privilege_flags) \
         -v io-work:/work \
         -v io-spool:/var/lib/condor \
         -v "$REPO_ROOT":/repo:ro \
         "$IMAGE"
     ;;
+preflight)
+    # Fast, lifecycle-free probe of the one property CI environments
+    # keep getting wrong: writable cgroup v2 under this driver's launch
+    # flags. Seconds, not minutes, to a definitive answer.
+    # shellcheck disable=SC2046
+    exec docker run --rm \
+        --platform "$PLATFORM" \
+        --cgroupns private \
+        $(privilege_flags) \
+        --entrypoint sh \
+        "$IMAGE" -c '
+            set -e
+            [ "$(stat -f -c %T /sys/fs/cgroup)" = "cgroup2fs" ] \
+                || { echo "preflight: not cgroup v2"; exit 64; }
+            if ! mkdir /sys/fs/cgroup/.preflight 2>/dev/null; then
+                mount -o remount,rw /sys/fs/cgroup \
+                    || { echo "preflight: cgroup fs read-only and not remountable"; exit 64; }
+                mkdir /sys/fs/cgroup/.preflight \
+                    || { echo "preflight: cgroup fs still read-only"; exit 64; }
+            fi
+            rmdir /sys/fs/cgroup/.preflight
+            echo "preflight: writable cgroup v2 available"
+        '
+    ;;
 selftest)
     exec docker exec --user io "$CONTAINER" /usr/local/bin/execenv-selftest
     ;;
+diagnose)
+    # The lifecycle owner's diagnostic surface: consumers (the CI
+    # workflow included) call this instead of reaching into docker or
+    # the pool's log layout themselves (A1, #7119 review).
+    echo "=== container status"
+    docker ps -a --filter "name=$CONTAINER" --format '{{.Names}} {{.Status}}' || true
+    echo "=== container log (tail)"
+    docker logs --tail 50 "$CONTAINER" 2>&1 || true
+    echo "=== pool daemon logs (tail)"
+    docker exec "$CONTAINER" sh -c 'tail -n 40 /var/log/condor/*Log 2>/dev/null' \
+        || echo "(pool logs unavailable - container not running)"
+    exit 0
+    ;;
 down)
-    docker stop "$CONTAINER" >/dev/null 2>&1 || true
-    docker rm "$CONTAINER" >/dev/null 2>&1 || true
+    if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
+        echo "execenv: container $CONTAINER already absent"
+        exit 0
+    fi
+    docker stop "$CONTAINER" >/dev/null
+    docker rm "$CONTAINER" >/dev/null
+    # Postcondition, verified: a false "removed" would hide daemon or
+    # authorization failures behind a comforting message (B4, #7119
+    # review).
+    if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+        echo "execenv: FAILED to remove container $CONTAINER" >&2
+        exit 70
+    fi
     echo "execenv: container removed (volumes io-work/io-spool kept)"
     ;;
 *)
-    echo "usage: $0 {build|up|selftest|down}" >&2
+    echo "usage: $0 {build|up|preflight|selftest|diagnose|down}" >&2
     exit 64
     ;;
 esac

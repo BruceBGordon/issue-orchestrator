@@ -25,11 +25,19 @@ fatal() {
 # base group the starter demands be writable before it will track jobs.
 CGROUP_ROOT=/sys/fs/cgroup
 # Docker Desktop mounts the cgroup fs read-only even in a private
-# namespace; the run recipe grants CAP_SYS_ADMIN for exactly this
-# remount and nothing else (least privilege that works - --privileged
-# is not needed and not used).
-mount -o remount,rw "$CGROUP_ROOT" \
-    || fatal "cannot remount $CGROUP_ROOT read-write (run with --cap-add SYS_ADMIN)"
+# namespace and CAP_SYS_ADMIN suffices to remount it. GitHub-hosted
+# runners write-protect the mount so no capability set can remount it
+# there - those launches need --privileged (IO_EXECENV_PRIVILEGED=1 in
+# the driver), which arrives with the mount already read-write. Either
+# way the property, not the path, is what gets verified: remount only
+# when actually read-only, then prove writability by using it.
+if ! mkdir "$CGROUP_ROOT/.probe" 2>/dev/null; then
+    mount -o remount,rw "$CGROUP_ROOT" \
+        || fatal "cannot remount $CGROUP_ROOT read-write (Docker Desktop: run with --cap-add SYS_ADMIN; GitHub-hosted runners: IO_EXECENV_PRIVILEGED=1)"
+    mkdir "$CGROUP_ROOT/.probe" \
+        || fatal "$CGROUP_ROOT still not writable after remount"
+fi
+rmdir "$CGROUP_ROOT/.probe"
 mkdir -p "$CGROUP_ROOT/init" "$CGROUP_ROOT/htcondor"
 echo $$ > "$CGROUP_ROOT/init/cgroup.procs" \
     || fatal "cannot move PID 1 out of the root cgroup"

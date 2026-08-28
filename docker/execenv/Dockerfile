@@ -16,6 +16,11 @@
 # Apple Silicon, matching the macOS pool's own Rosetta posture).
 FROM ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 
+# ADR-0007's reproducible version contract: the exact LTS point release
+# is a build argument, so today's build and next month's build resolve
+# identically unless someone deliberately edits the pin.
+ARG CONDOR_PACKAGE_VERSION=24.0.23-1+ubu24
+
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -31,12 +36,13 @@ RUN apt-get update \
     && echo "deb [signed-by=/etc/apt/keyrings/htcondor.gpg] https://research.cs.wisc.edu/htcondor/repo/ubuntu/24.0 noble main" \
         > /etc/apt/sources.list.d/htcondor.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends htcondor \
+    && apt-get install -y --no-install-recommends "htcondor=${CONDOR_PACKAGE_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 # uv builds the repo's Linux venv inside the container (the mounted
 # repo's own .venv is a macOS artifact and must not be touched).
-COPY --from=ghcr.io/astral-sh/uv:0.9.27 /uv /usr/local/bin/uv
+# Digest-pinned like the base image: a movable tag is not a pin.
+COPY --from=ghcr.io/astral-sh/uv:0.9.27@sha256:143b40f4ab56a780f43377604702107b5a35f83a4453daf1e4be691358718a6a /uv /usr/local/bin/uv
 
 # Single trusted user, matching the personal-pool posture (ADR-0009/0013:
 # the job privilege boundary is not a security boundary). Ubuntu 24.04
