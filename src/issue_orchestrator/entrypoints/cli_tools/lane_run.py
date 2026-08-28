@@ -99,20 +99,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"lane-run: {error}", file=sys.stderr)
         return _BACKEND_FAULT_EXIT_CODE
     if type(outcome) is LaneCompleted:
-        try:
-            _record_dispatch(arguments, priority, outcome)
-        except OSError as error:
-            print(f"lane-run: dispatch record failed: {error}", file=sys.stderr)
-            return _BACKEND_FAULT_EXIT_CODE
-        if outcome.exit_code == 0:
-            # Only successes teach: a failed run's duration is the
-            # failure's, not the lane's.
-            try:
-                history.record_success(work_key, outcome.observed_runtime_seconds)
-            except LaneRuntimeHistoryError as error:
-                print(f"lane-run: {error}", file=sys.stderr)
-                return _BACKEND_FAULT_EXIT_CODE
-        return outcome.exit_code
+        return _conclude_completed(
+            arguments, priority, history, work_key, outcome
+        )
     if type(outcome) is LaneTimedOut:
         print(
             f"lane-run: lane {arguments.work_key!r} exceeded its "
@@ -122,6 +111,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return outcome.exit_code
     raise AssertionError("lane outcome is a closed union")
+
+
+def _conclude_completed(
+    arguments: argparse.Namespace,
+    priority: int,
+    history: LaneRuntimeHistory,
+    work_key: LaneWorkKey,
+    outcome: LaneCompleted,
+) -> int:
+    """Record what the completed lane teaches, then report its exit."""
+    try:
+        _record_dispatch(arguments, priority, outcome)
+    except OSError as error:
+        print(f"lane-run: dispatch record failed: {error}", file=sys.stderr)
+        return _BACKEND_FAULT_EXIT_CODE
+    if outcome.exit_code == 0:
+        # Only successes teach: a failed run's duration is the
+        # failure's, not the lane's.
+        try:
+            history.record_success(work_key, outcome.observed_runtime_seconds)
+        except LaneRuntimeHistoryError as error:
+            print(f"lane-run: {error}", file=sys.stderr)
+            return _BACKEND_FAULT_EXIT_CODE
+    return outcome.exit_code
 
 
 def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:

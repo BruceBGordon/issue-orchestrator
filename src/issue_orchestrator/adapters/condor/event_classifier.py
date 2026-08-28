@@ -136,32 +136,44 @@ def classify_event_log(log_text: str) -> LaneJobState:
     state: LaneJobState = LaneJobPending()
     span = _ExecutionSpan()
     for code, occurred_at, body in events:
-        if code == _SUBMITTED:
-            # Not a state change, but the anchor of the queue-wait
-            # clock the terminal states report.
-            span.submitted(occurred_at)
-        elif code == _EXECUTING:
-            span.executing(occurred_at)
-            state = LaneJobRunning()
-        elif code == _SUSPENDED:
-            span.suspend(occurred_at)
-            state = LaneJobSuspended()
-        elif code == _UNSUSPENDED:
-            span.resume(occurred_at)
-            state = LaneJobRunning()
-        elif code == _TERMINATED:
-            state = _classify_termination(
-                body, span.runtime_at(occurred_at), span.queue_wait()
-            )
-        elif code == _ABORTED:
-            if _DEADLINE_REMOVAL_MARKER in body:
-                state = LaneJobDeadlineRemoved(span.runtime_at(occurred_at))
-            else:
-                state = LaneJobRemoved(_first_body_line(body))
-        elif code == _HELD:
-            state = LaneJobFaulted(_first_body_line(body))
-        # Every other event code (image size, usage updates, …) is
-        # informational and does not change the state.
+        state = _transition(state, code, occurred_at, body, span)
+    return state
+
+
+def _transition(
+    state: LaneJobState,
+    code: str,
+    occurred_at: datetime,
+    body: str,
+    span: _ExecutionSpan,
+) -> LaneJobState:
+    """One event record's effect on the lifecycle state and the span."""
+    if code == _SUBMITTED:
+        # Not a state change, but the anchor of the queue-wait clock
+        # the terminal states report.
+        span.submitted(occurred_at)
+        return state
+    if code == _EXECUTING:
+        span.executing(occurred_at)
+        return LaneJobRunning()
+    if code == _SUSPENDED:
+        span.suspend(occurred_at)
+        return LaneJobSuspended()
+    if code == _UNSUSPENDED:
+        span.resume(occurred_at)
+        return LaneJobRunning()
+    if code == _TERMINATED:
+        return _classify_termination(
+            body, span.runtime_at(occurred_at), span.queue_wait()
+        )
+    if code == _ABORTED:
+        if _DEADLINE_REMOVAL_MARKER in body:
+            return LaneJobDeadlineRemoved(span.runtime_at(occurred_at))
+        return LaneJobRemoved(_first_body_line(body))
+    if code == _HELD:
+        return LaneJobFaulted(_first_body_line(body))
+    # Every other event code (image size, usage updates, …) is
+    # informational and does not change the state.
     return state
 
 
