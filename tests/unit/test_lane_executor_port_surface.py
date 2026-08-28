@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 
 from issue_orchestrator.domain import lane_execution
+from issue_orchestrator.ports import lane_dispatch_journal
 from issue_orchestrator.ports.lane_executor import LaneExecutor
 from issue_orchestrator.ports.lane_runtime_history import LaneRuntimeHistory
 
@@ -63,6 +64,26 @@ def test_executor_port_has_exactly_one_operation() -> None:
         if not name.startswith("_") and callable(getattr(LaneExecutor, name))
     ]
     assert operations == ["run"]
+
+
+def test_dispatch_journal_surface_is_pinned() -> None:
+    """New port (A1, #7122 review): one operation, one typed record —
+    dispatch observability without the CLI owning storage transport."""
+    operations = [
+        name
+        for name in vars(lane_dispatch_journal.LaneDispatchJournal)
+        if not name.startswith("_")
+        and callable(getattr(lane_dispatch_journal.LaneDispatchJournal, name))
+    ]
+    assert operations == ["record"]
+    assert _field_names(lane_dispatch_journal.LaneDispatchRecord) == (
+        "work_key",
+        "backend",
+        "priority",
+        "queue_wait_seconds",
+        "observed_runtime_seconds",
+        "exit_code",
+    )
 
 
 def test_history_port_has_exactly_two_operations() -> None:

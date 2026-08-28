@@ -384,9 +384,15 @@ LANE_RUN = $(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_run
 # Lane scheduling facts (measured cpu requests, memory budgets,
 # suspendability, exclusive tokens) live in ONE schema-validated home:
 # .issue-orchestrator/lanes.yaml, resolved by lane-run per work
-# key. Only suite-command facts live here — a worker count is part of
-# the command text, not a scheduling declaration.
+# key. Only suite-command facts live here — worker counts are part of
+# the command text, not scheduling declarations — and each is declared
+# ONCE below and consumed identically by both execution modes: the
+# measured CPU requests in lanes.yaml were taken at these worker
+# counts, so a mode running a different count would invalidate them
+# (B1, #7122 review). Guardrail: no literal -n in lane recipes.
 LANE_WORKERS_UNIT ?= 12
+LANE_WORKERS_INTEGRATION_SLICE ?= 4
+LANE_WORKERS_AGENT_SLICE ?= 2
 LANE_TIMEOUT_SECONDS ?= 1800
 
 # Suite slices (condor mode): the fat integration suites split into
@@ -397,7 +403,7 @@ LANE_TIMEOUT_SECONDS ?= 1800
 # granularity. Direct mode never uses these targets.
 INTEGRATION_CORE_SLICES := 3
 INTEGRATION_CORE_FILES = $(filter-out $(INTEGRATION_AGENT_FILES),$(wildcard tests/integration/test_*.py))
-UNIT_PARALLEL ?= $(PARALLEL)
+UNIT_PARALLEL ?= $(LANE_WORKERS_UNIT)
 SIMULATED_PARALLEL ?= $(PARALLEL)
 INTEGRATION_PARALLEL ?= $(PARALLEL)
 # Live provider-backed integration tests share authenticated local CLIs and
@@ -565,7 +571,7 @@ else
 	$(call TIMED_RUN,test-integration-core-slice-$*,\
 		$(PYTEST) $$($(PYTHON) scripts/lane_slices.py --group $* --of $(INTEGRATION_CORE_SLICES) $(INTEGRATION_CORE_FILES)) \
 			-x -q --tb=short -m "not requires_infra and not live_codex" \
-			-n 4 --dist=loadgroup $(PYTEST_TIMINGS))
+			-n $(LANE_WORKERS_INTEGRATION_SLICE) --dist=loadgroup $(PYTEST_TIMINGS))
 endif
 
 # The live-agent suite splits by provider file, which keeps each
@@ -579,7 +585,7 @@ ifeq ($$(LANE_EXECUTOR),condor)
 			$$(GMAKE) test-integration-agent-$(1) LANE_EXECUTOR=direct)
 else
 	$$(call TIMED_RUN,test-integration-agent-$(1),\
-		$$(PYTEST) $(2) -x -q --tb=short -n 2 --dist=loadgroup $$(PYTEST_TIMINGS))
+		$$(PYTEST) $(2) -x -q --tb=short -n $$(LANE_WORKERS_AGENT_SLICE) --dist=loadgroup $$(PYTEST_TIMINGS))
 endif
 endef
 

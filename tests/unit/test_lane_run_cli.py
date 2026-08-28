@@ -25,6 +25,10 @@ from issue_orchestrator.infra.lane_declarations import (
     LaneDeclaration,
     LaneDeclarationError,
 )
+from issue_orchestrator.ports.lane_dispatch_journal import (
+    LaneDispatchJournalError,
+    LaneDispatchRecord,
+)
 from issue_orchestrator.entrypoints.cli_tools.lane_run import (
     BACKEND_ENVIRONMENT_VARIABLE,
     main,
@@ -63,17 +67,24 @@ def declared_lane(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+class _FakeJournal:
+    """Captures records; the CLI is tested against the PORT, never the
+    storage transport (A1, #7122 review)."""
+
+    def __init__(self) -> None:
+        self.records: list[LaneDispatchRecord] = []
+
+    def record(self, record: LaneDispatchRecord) -> None:
+        self.records.append(record)
+
+
 @pytest.fixture(autouse=True)
-def isolated_dispatch_log(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> Path:
-    """Every test gets its own dispatch log, for the same reason the
+def fake_journal(monkeypatch: pytest.MonkeyPatch) -> _FakeJournal:
+    """Every test gets a faked journal, for the same reason the
     history store is isolated: tests run inside the real repository."""
-    log_path = tmp_path / "lane-dispatch.jsonl"
-    monkeypatch.setattr(
-        lane_run_module, "_dispatch_log_path", lambda: log_path
-    )
-    return log_path
+    journal = _FakeJournal()
+    monkeypatch.setattr(lane_run_module, "_build_journal", lambda: journal)
+    return journal
 
 
 def _run(*command: str, flags: tuple[str, ...] = (), timeout: str = "60") -> int:
@@ -233,33 +244,27 @@ def test_failed_lane_teaches_nothing(
     assert isolated_history.learned_priority(LaneWorkKey("cli.test")) == 0
 
 
-def test_completed_lane_writes_one_dispatch_record(
+def test_completed_lane_journals_one_dispatch_record(
     monkeypatch: pytest.MonkeyPatch,
     isolated_history: JsonLaneRuntimeHistory,
-    isolated_dispatch_log: Path,
+    fake_journal: _FakeJournal,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Priority used, queue wait, runtime, and exit land in the shared
-    dispatch log AND on stderr — dispatch quality must be readable in
-    the gate log and queryable across runs without pool archaeology."""
-    import json
-
+    """Priority used, queue wait, runtime, and exit reach the journal
+    port as a typed record AND the gate log as a stderr line —
+    dispatch quality must be readable in place and queryable across
+    runs without pool archaeology."""
     key = LaneWorkKey("cli.test")
     for runtime in (30.0, 90.0, 60.0):
         isolated_history.record_success(key, runtime)
     _capture(monkeypatch, LaneCompleted(0, 45.0, 12.0))
     assert _run("/usr/bin/true") == 0
-    records = [
-        json.loads(line)
-        for line in isolated_dispatch_log.read_text().splitlines()
-    ]
-    assert len(records) == 1
-    record = records[0]
-    assert record["work_key"] == "cli.test"
-    assert record["priority"] == 60
-    assert record["queue_wait_seconds"] == 12.0
-    assert record["observed_runtime_seconds"] == 45.0
-    assert record["exit_code"] == 0
+    (record,) = fake_journal.records
+    assert record.work_key == LaneWorkKey("cli.test")
+    assert record.priority == 60
+    assert record.queue_wait_seconds == 12.0
+    assert record.observed_runtime_seconds == 45.0
+    assert record.exit_code == 0
     stderr = capsys.readouterr().err
     assert (
         "[lane-dispatch] cli.test backend=direct priority=60 "
@@ -267,21 +272,33 @@ def test_completed_lane_writes_one_dispatch_record(
     )
 
 
-def test_failed_lane_still_records_its_dispatch_facts(
-    monkeypatch: pytest.MonkeyPatch, isolated_dispatch_log: Path
+def test_failed_lane_still_journals_its_dispatch_facts(
+    monkeypatch: pytest.MonkeyPatch, fake_journal: _FakeJournal
 ) -> None:
     """Failures teach the learning loop nothing, but their dispatch
-    facts are diagnosis — the record is written either way."""
-    import json
-
+    facts are diagnosis — the record is journaled either way."""
     _capture(monkeypatch, LaneCompleted(1, 482.0, 3.0))
     assert _run("/usr/bin/true") == 1
-    (record,) = [
-        json.loads(line)
-        for line in isolated_dispatch_log.read_text().splitlines()
-    ]
-    assert record["exit_code"] == 1
-    assert record["observed_runtime_seconds"] == 482.0
+    (record,) = fake_journal.records
+    assert record.exit_code == 1
+    assert record.observed_runtime_seconds == 482.0
+
+
+def test_journal_failure_is_a_backend_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistence failure has one explicit owner: the journal raises
+    its typed error and the CLI reports a backend fault (70)."""
+
+    class _BrokenJournal:
+        def record(self, record: LaneDispatchRecord) -> None:
+            raise LaneDispatchJournalError("disk gone")
+
+    monkeypatch.setattr(
+        lane_run_module, "_build_journal", lambda: _BrokenJournal()
+    )
+    _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
+    assert _run("/usr/bin/true") == 70
 
 
 def test_corrupt_history_fails_loudly_not_naively(

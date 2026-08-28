@@ -335,6 +335,18 @@ def test_capacity_dial_unset_removes_the_previous_setting(
     assert not (tmp_path / "92-io-pool-capacity.conf").exists()
 
 
+def test_capacity_dial_normalizes_leading_zeros_as_base_ten(
+    tmp_path: Path,
+) -> None:
+    """B2 (#7122 review): bash arithmetic reads a leading zero as
+    octal — an unnormalized '08' passed the digits-only check and then
+    died with 'value too great for base', writing no config."""
+    _write_lane_config(tmp_path, IO_POOL_CAPACITY_PERCENT="08")
+    generated = (tmp_path / "92-io-pool-capacity.conf").read_text()
+    assert f"NUM_CPUS = {max(1, _physical_cores() * 8 // 100)}" in generated
+    assert "8% of" in generated
+
+
 def test_capacity_dial_rejects_nonsense_loudly(tmp_path: Path) -> None:
     import os
 

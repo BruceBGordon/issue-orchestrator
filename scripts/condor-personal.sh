@@ -72,18 +72,23 @@ write_capacity_config() {
       return 64
       ;;
   esac
-  if [ "$IO_POOL_CAPACITY_PERCENT" -lt 1 ]; then
+  # Normalize to base 10 BEFORE any arithmetic: bash treats a leading
+  # zero as octal, so an unnormalized "08" passes the digits-only
+  # check and then dies with "value too great for base" (B2, #7122
+  # review). The normalized value is the only one used from here on.
+  local capacity_percent physical_cores scaled_cores
+  capacity_percent=$(( 10#$IO_POOL_CAPACITY_PERCENT ))
+  if [ "$capacity_percent" -lt 1 ]; then
     echo "condor-personal: IO_POOL_CAPACITY_PERCENT must be at least 1, got '${IO_POOL_CAPACITY_PERCENT}'" >&2
     return 64
   fi
-  local physical_cores scaled_cores
   physical_cores=$(sysctl -n hw.ncpu 2>/dev/null || nproc)
-  scaled_cores=$(( physical_cores * IO_POOL_CAPACITY_PERCENT / 100 ))
+  scaled_cores=$(( physical_cores * capacity_percent / 100 ))
   if [ "$scaled_cores" -lt 1 ]; then
     scaled_cores=1
   fi
   cat > "${config_dir}/92-io-pool-capacity.conf" <<EOF
-# ${IO_POOL_CAPACITY_PERCENT}% of ${physical_cores} physical cores.
+# ${capacity_percent}% of ${physical_cores} physical cores.
 NUM_CPUS = ${scaled_cores}
 EOF
 }

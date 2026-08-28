@@ -18,7 +18,6 @@ import argparse
 import os
 import shutil
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -29,6 +28,10 @@ from ...adapters.direct_lane_executor import (
 from ...adapters.json_lane_runtime_history import (
     JsonLaneRuntimeHistory,
     LaneRuntimeHistoryError,
+)
+from ...adapters.jsonl_lane_dispatch_journal import (
+    InertLaneDispatchJournal,
+    JsonlLaneDispatchJournal,
 )
 from ...domain.lane_execution import (
     LaneCommand,
@@ -45,7 +48,12 @@ from ...infra.lane_declarations import (
     LaneDeclarationError,
     load_lane_declaration,
 )
-from ...infra.validation_timings import append_jsonl, resolve_git_common_dir
+from ...infra.validation_timings import resolve_git_common_dir
+from ...ports.lane_dispatch_journal import (
+    LaneDispatchJournal,
+    LaneDispatchJournalError,
+    LaneDispatchRecord,
+)
 from ...ports.lane_executor import LaneExecutor
 from ...ports.lane_runtime_history import LaneRuntimeHistory
 
@@ -75,6 +83,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         executor = _build_executor(arguments.backend)
         history = _build_history()
+        journal = _build_journal()
         work_key = LaneWorkKey(str(arguments.work_key))
         # Scheduling facts are declared in ONE place —
         # .issue-orchestrator/lanes.yaml — resolved here by the
@@ -113,7 +122,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _BACKEND_FAULT_EXIT_CODE
     if type(outcome) is LaneCompleted:
         return _conclude_completed(
-            arguments, priority, history, work_key, outcome
+            arguments, priority, history, journal, work_key, outcome
         )
     if type(outcome) is LaneTimedOut:
         print(
@@ -130,14 +139,37 @@ def _conclude_completed(
     arguments: argparse.Namespace,
     priority: int,
     history: LaneRuntimeHistory,
+    journal: LaneDispatchJournal,
     work_key: LaneWorkKey,
     outcome: LaneCompleted,
 ) -> int:
-    """Record what the completed lane teaches, then report its exit."""
+    """Record what the completed lane teaches, then report its exit.
+
+    The stderr line puts priority, queue wait, and runtime in the gate
+    log where a reader already is; the journal (a behavior-level port)
+    owns persistence and its failure semantics. Failed lanes are
+    journaled too — a kill's dispatch facts are diagnosis, even though
+    only successes feed the learning loop."""
+    print(
+        f"[lane-dispatch] {arguments.work_key} backend={arguments.backend} "
+        f"priority={priority} queue_wait={outcome.queue_wait_seconds:.1f}s "
+        f"runtime={outcome.observed_runtime_seconds:.1f}s "
+        f"exit={outcome.exit_code}",
+        file=sys.stderr,
+    )
     try:
-        _record_dispatch(arguments, priority, outcome)
-    except OSError as error:
-        print(f"lane-run: dispatch record failed: {error}", file=sys.stderr)
+        journal.record(
+            LaneDispatchRecord(
+                work_key=work_key,
+                backend=str(arguments.backend),
+                priority=priority,
+                queue_wait_seconds=outcome.queue_wait_seconds,
+                observed_runtime_seconds=outcome.observed_runtime_seconds,
+                exit_code=outcome.exit_code,
+            )
+        )
+    except LaneDispatchJournalError as error:
+        print(f"lane-run: {error}", file=sys.stderr)
         return _BACKEND_FAULT_EXIT_CODE
     if outcome.exit_code == 0:
         # Only successes teach: a failed run's duration is the
@@ -173,54 +205,18 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _record_dispatch(
-    arguments: argparse.Namespace, priority: int, outcome: LaneCompleted
-) -> None:
-    """One dispatch-quality record per completed lane, said and stored.
-
-    The stderr line puts priority, queue wait, and runtime in the gate
-    log where a reader already is; the JSONL row (shared across
-    worktrees like the runtime history) makes dispatch quality
-    queryable across runs without pool archaeology. Failed lanes are
-    recorded too — a kill's dispatch facts are diagnosis, even though
-    only successes feed the learning loop.
-    """
-    print(
-        f"[lane-dispatch] {arguments.work_key} backend={arguments.backend} "
-        f"priority={priority} queue_wait={outcome.queue_wait_seconds:.1f}s "
-        f"runtime={outcome.observed_runtime_seconds:.1f}s "
-        f"exit={outcome.exit_code}",
-        file=sys.stderr,
-    )
-    append_jsonl(
-        _dispatch_log_path(),
-        {
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
-            "worktree": Path.cwd().name,
-            "backend": str(arguments.backend),
-            "work_key": str(arguments.work_key),
-            "priority": priority,
-            "queue_wait_seconds": round(outcome.queue_wait_seconds, 1),
-            "observed_runtime_seconds": round(
-                outcome.observed_runtime_seconds, 1
-            ),
-            "exit_code": outcome.exit_code,
-        },
-    )
-
-
 def _load_declaration(work_key: str) -> LaneDeclaration:
     """The declared scheduling facts for this work key (test seam)."""
     return load_lane_declaration(Path.cwd(), work_key)
 
 
-def _dispatch_log_path() -> Path | None:
-    """Repo-shared dispatch log beside the runtime history; None (a
-    no-op append) outside a repository, like the history's inertness."""
+def _build_journal() -> LaneDispatchJournal:
+    """The repo-shared dispatch journal, or an inert one outside a repo
+    (mirroring the runtime history's inertness)."""
     common_dir = resolve_git_common_dir(Path.cwd())
     if common_dir is None:
-        return None
-    return common_dir / "issue-orchestrator" / "lane-dispatch.jsonl"
+        return InertLaneDispatchJournal()
+    return JsonlLaneDispatchJournal(common_dir / "issue-orchestrator")
 
 
 def _build_history() -> LaneRuntimeHistory:
