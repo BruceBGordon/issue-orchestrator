@@ -206,3 +206,135 @@ def test_lane_config_always_disables_scratch_over_tmp(tmp_path: Path) -> None:
     generated = (tmp_path / "90-issue-orchestrator-lanes.conf").read_text()
     assert "MOUNT_UNDER_SCRATCH =" in generated
     assert "CONCURRENCY_LIMIT_DEFAULT = 1" in generated
+
+
+def _write_lane_config(tmp_path: Path, **env: str) -> None:
+    import os
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{SCRIPT}" && write_lane_config "$1"',
+            "_",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **env},
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_load_backoff_is_off_by_default(tmp_path: Path) -> None:
+    """Freezing running work is opt-in: without the switch, no
+    suspension policy is written at all."""
+    _write_lane_config(tmp_path)
+    assert not (tmp_path / "91-io-load-backoff.conf").exists()
+    assert "SUSPEND" not in (
+        tmp_path / "90-issue-orchestrator-lanes.conf"
+    ).read_text()
+
+
+def test_load_backoff_keys_on_machine_wide_owner_load(tmp_path: Path) -> None:
+    """Two invariants: subtract condor's own load (or the policy trips
+    on the gate's own fan), and use the MACHINE-wide Total* attributes
+    (the unprefixed pair is per-slot on multi-core machines and gives
+    different answers on different slots of the same host)."""
+    _write_lane_config(tmp_path, IO_CONDOR_LOAD_BACKOFF="1")
+    generated = (tmp_path / "91-io-load-backoff.conf").read_text()
+    assert "OwnerLoadAvg = (TotalLoadAvg - TotalCondorLoadAvg)" in generated
+    assert "$(OwnerLoadAvg) > 5.0" in generated
+    assert "$(OwnerLoadAvg) < 2.0" in generated
+    import re as _re
+
+    assert not _re.search(r"[^l]\bLoadAvg\b", generated.replace("TotalLoadAvg", "").replace("TotalCondorLoadAvg", "").replace("CondorLoadAvg", "")), generated
+
+
+def test_load_backoff_disable_removes_the_previous_policy(tmp_path: Path) -> None:
+    """Enable then plain re-run must leave NO suspension policy behind:
+    darwin writes into the persistent directory and linux copies only
+    staged files, so a stale 91 file keeps freezing lanes after the
+    operator opted out (B2, #7118 review)."""
+    _write_lane_config(tmp_path, IO_CONDOR_LOAD_BACKOFF="1")
+    assert (tmp_path / "91-io-load-backoff.conf").exists()
+    _write_lane_config(tmp_path)
+    assert not (tmp_path / "91-io-load-backoff.conf").exists()
+
+
+def test_load_backoff_freezes_only_lanes_that_declared_it_safe(
+    tmp_path: Path,
+) -> None:
+    """A live provider exchange frozen mid-turn thaws into a
+    manufactured provider-outage failure; only lanes carrying
+    SuspendableLane = True may freeze."""
+    _write_lane_config(tmp_path, IO_CONDOR_LOAD_BACKOFF="1")
+    generated = (tmp_path / "91-io-load-backoff.conf").read_text()
+    assert generated.count("TARGET.SuspendableLane =?= True") == 2
+    assert "WANT_SUSPEND = (TARGET.SuspendableLane =?= True)" in generated
+
+
+def test_load_backoff_thresholds_are_overridable(tmp_path: Path) -> None:
+    _write_lane_config(
+        tmp_path,
+        IO_CONDOR_LOAD_BACKOFF="1",
+        IO_CONDOR_SUSPEND_LOAD="8.5",
+        IO_CONDOR_CONTINUE_LOAD="3.0",
+    )
+    generated = (tmp_path / "91-io-load-backoff.conf").read_text()
+    assert "> 8.5" in generated
+    assert "< 3.0" in generated
+
+
+def test_install_boundary_reconciles_managed_files(tmp_path: Path) -> None:
+    """B2 round two (#7118 review): the Linux path stages fresh and
+    COPIES staged .conf files over the persistent destination — copying
+    cannot delete, so a stale opt-in policy in the destination survived
+    a disabled re-run. The install boundary must reconcile: a managed
+    file absent from staging is removed from the destination."""
+    staging = tmp_path / "staging"
+    destination = tmp_path / "config.d"
+    staging.mkdir()
+    destination.mkdir()
+    (destination / "91-io-load-backoff.conf").write_text("SUSPEND = stale\n")
+    (staging / "90-issue-orchestrator-lanes.conf").write_text("x = 1\n")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{SCRIPT}" && install_staged_configs "$1" "$2"',
+            "_",
+            str(staging),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not (destination / "91-io-load-backoff.conf").exists(), (
+        "a disabled install left the stale opt-in policy in the destination"
+    )
+    assert (destination / "90-issue-orchestrator-lanes.conf").exists()
+
+
+def test_install_boundary_installs_staged_managed_files(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    destination = tmp_path / "config.d"
+    staging.mkdir()
+    destination.mkdir()
+    (staging / "91-io-load-backoff.conf").write_text("SUSPEND = fresh\n")
+    (staging / "90-issue-orchestrator-lanes.conf").write_text("x = 1\n")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{SCRIPT}" && install_staged_configs "$1" "$2"',
+            "_",
+            str(staging),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (destination / "91-io-load-backoff.conf").read_text() == "SUSPEND = fresh\n"

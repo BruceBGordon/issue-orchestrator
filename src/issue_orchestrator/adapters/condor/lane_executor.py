@@ -31,6 +31,7 @@ from .event_classifier import (
     LaneJobRemoved,
     LaneJobRunning,
     LaneJobState,
+    LaneJobSuspended,
     classify_event_log,
 )
 from .submit_compiler import CompiledSubmitDescription, compile_submit_description
@@ -223,22 +224,30 @@ class CondorLaneExecutor:
         """
         submitted_at = time.monotonic()
         execute_observed_at: float | None = None
+        # Frozen time (machine-load backoff) is charged to nothing: not
+        # the runtime watchdog, not the observed runtime the learning
+        # loop records. Accumulated from observation, poll by poll.
+        suspension_observed_seconds = 0.0
+        previous_poll_at = time.monotonic()
         while True:
             streams.pump()
             state = self._observe(compiled)
+            now = time.monotonic()
+            if type(state) is LaneJobSuspended:
+                suspension_observed_seconds += now - previous_poll_at
+            previous_poll_at = now
             if execute_observed_at is None and type(state) is not LaneJobPending:
-                execute_observed_at = time.monotonic()
-            terminal = self._map_terminal(
-                state,
-                execute_observed_at
-                if execute_observed_at is not None
-                else time.monotonic(),
-            )
+                execute_observed_at = now
+            terminal = self._map_terminal(state)
             if terminal is not None:
                 streams.pump()
                 return terminal
             self._enforce_watchdogs(
-                command, job_id, submitted_at, execute_observed_at
+                command,
+                job_id,
+                submitted_at,
+                execute_observed_at,
+                suspension_observed_seconds,
             )
             time.sleep(_POLL_INTERVAL_SECONDS)
 
@@ -248,6 +257,7 @@ class CondorLaneExecutor:
         job_id: str,
         submitted_at: float,
         execute_observed_at: float | None,
+        suspension_observed_seconds: float,
     ) -> None:
         now = time.monotonic()
         if execute_observed_at is None:
@@ -260,6 +270,7 @@ class CondorLaneExecutor:
         elif now >= (
             execute_observed_at
             + command.deadline.timeout_seconds
+            + suspension_observed_seconds
             + _SCHEDULER_SLACK_SECONDS
         ):
             raise LaneExecutorError(
@@ -268,18 +279,27 @@ class CondorLaneExecutor:
                 f"job={job_id}"
             )
 
-    def _map_terminal(
-        self, state: LaneJobState, execute_observed_at: float
-    ) -> LaneOutcome | None:
-        if type(state) is LaneJobPending or type(state) is LaneJobRunning:
+    def _map_terminal(self, state: LaneJobState) -> LaneOutcome | None:
+        if (
+            type(state) is LaneJobPending
+            or type(state) is LaneJobRunning
+            or type(state) is LaneJobSuspended
+        ):
             return None
+        # Runtime is the scheduler's own record: the classifier computes
+        # execute→terminal from the event-log timestamps and subtracts
+        # suspended intervals, so neither queue wait, frozen time, nor
+        # this process's poll-observation lag reaches the number. The
+        # poll-side suspension accumulator below serves only the
+        # watchdog.
         if type(state) is LaneJobExited:
-            return LaneCompleted(state.exit_code)
+            return LaneCompleted(state.exit_code, state.runtime_seconds)
         if type(state) is LaneJobKilledBySignal:
-            return LaneCompleted(128 + state.signal_number)
+            return LaneCompleted(
+                128 + state.signal_number, state.runtime_seconds
+            )
         if type(state) is LaneJobDeadlineRemoved:
-            # Runtime only: queue wait is never billed to the lane.
-            return LaneTimedOut(time.monotonic() - execute_observed_at)
+            return LaneTimedOut(state.runtime_seconds)
         if type(state) is LaneJobRemoved:
             raise LaneExecutorError(
                 f"the lane's job was removed outside its deadline: {state.detail}"

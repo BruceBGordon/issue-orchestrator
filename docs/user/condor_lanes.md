@@ -90,11 +90,69 @@ runs a probe job in a fresh submitter-owned directory — readiness means
 identity configuration and hold reason instead of leaving you nine
 held lanes later.
 
+## Machine-load backoff (opt-in)
+
+The pool can defer to the machine's real owner: when load that condor's
+own jobs did not cause climbs, eligible running lanes are frozen
+(SIGSTOP) and thawed when it clears. Off by default; enable at pool
+start:
+
+```bash
+IO_CONDOR_LOAD_BACKOFF=1 scripts/condor-personal.sh up
+# thresholds (owner load average): IO_CONDOR_SUSPEND_LOAD (default 5.0),
+# IO_CONDOR_CONTINUE_LOAD (default 2.0)
+```
+
+Three rules are built in, each load-bearing:
+
+- **Owner load, never total load.** The policy subtracts the load
+  condor's own jobs cause; suspending on total load would trip on the
+  gate's own lane fan and oscillate against its own reflection.
+- **Only lanes that declared it safe.** Hermetic lanes carry
+  `--suspendable`; lanes holding live provider exchanges carry
+  `--not-suspendable` (frozen mid-turn, their response window expires
+  and the thaw manufactures a provider-outage failure). The
+  unclassified default is **non-suspendable** — freezing requires an
+  explicit declaration, never an author's memory — and a guard test
+  forces every lane declaration to say which side it is on.
+- **Frozen time is charged to nothing.** The compiled lane deadline
+  subtracts suspension time (a freeze must not manufacture a timeout),
+  and observed runtime excludes it (a freeze must not teach the
+  learning loop that a lane got slower).
+
+## Learned dispatch order
+
+Lanes carry no tuning knobs: the system orders its own queue. Every
+successful run's observed execution time (queue wait excluded) is
+recorded per work key under
+`<git-common-dir>/issue-orchestrator/lane-runtime-history/`, and the
+next submission's dispatch priority is the rolling median of the last
+five — longest lanes first (the LPT makespan heuristic). Priority
+decides which of the *simultaneously eligible queued* lanes matches
+first; a large lane can still wait on slot shape (its cpu/memory
+request needs a big enough hole) or on lanes that arrived while it was
+not yet submitted. The properties to know:
+
+- **The first run is naive by design.** No history means no priority —
+  identical to pre-learning behavior. One gate run seeds everything.
+- **Only successes teach.** A failed run's duration is the failure's,
+  not the lane's, so provider stalls never poison the ordering.
+- **Nothing to invalidate.** The rolling window re-converges by itself
+  when a lane's cost drifts or the hardware changes. To reset one lane
+  anyway, delete its file from the history directory; delete the
+  directory to reset everything.
+- History is shared across all worktrees of a repository (it lives in
+  the git common dir, like the validation timings).
+
 ## Architecture
 
 - `domain/lane_execution.py` — the typed contracts (the only vocabulary
   that crosses the port).
 - `ports/lane_executor.py` — the port.
+- `ports/lane_runtime_history.py` +
+  `adapters/json_lane_runtime_history.py` — the learning loop
+  (backend-neutral: every backend reports runtime, every backend's
+  submissions may consume the ordering).
 - `adapters/direct_lane_executor.py` — default backend.
 - `adapters/condor/` — the anti-corruption layer: `submit_compiler.py`
   translates lane specs outbound into job descriptions;

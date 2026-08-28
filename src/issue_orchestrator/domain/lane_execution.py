@@ -44,10 +44,16 @@ class LaneWorkKey:
 
 @dataclass(frozen=True, slots=True)
 class LaneDeadline:
-    """Wall-clock bound for one lane run.
+    """Active-execution-time bound for one lane run.
 
-    Every backend must terminate the lane's entire process tree at the
-    bound and report :data:`LANE_TIMEOUT_EXIT_CODE`.
+    The budget charges time the lane actually executes: scheduler queue
+    wait before execution and machine-load suspension (a backend
+    freezing the lane to defer to the machine's owner) are charged to
+    nothing — a lane must never time out for waiting or for being
+    frozen. On the direct backend, which neither queues nor suspends,
+    this is indistinguishable from a wall-clock bound. Every backend
+    terminates the lane's entire process tree at the bound and reports
+    :data:`LANE_TIMEOUT_EXIT_CODE`.
     """
 
     timeout_seconds: float
@@ -84,6 +90,15 @@ class LaneResources:
     # and the real workload is OOM-killed at a ~256MB ceiling. The
     # default fits light lanes; heavy lanes must declare their budget.
     request_memory_mb: int = 1024
+    # Whether the lane tolerates being frozen mid-run (machine-load
+    # backoff). Only the client knows this: hermetic lanes freeze and
+    # thaw safely anywhere, but a lane holding a live provider exchange
+    # must never be paused mid-turn — the response window expires while
+    # frozen and the thaw manufactures a provider-outage failure
+    # indistinguishable from a real one. The default is the FAIL-SAFE
+    # direction: a lane nobody classified is never frozen — freezing
+    # requires an explicit declaration, not an author's memory.
+    suspendable: bool = False
 
     def __post_init__(self) -> None:
         if type(self.request_cpus) is not int or self.request_cpus < 1:
@@ -94,6 +109,8 @@ class LaneResources:
             )
         if type(self.priority) is not int or self.priority < 0:
             raise ValueError("LaneResources.priority must be a non-negative integer")
+        if type(self.suspendable) is not bool:
+            raise ValueError("LaneResources.suspendable must be a bool")
         if type(self.exclusive) is not tuple:
             raise ValueError("LaneResources.exclusive must be a tuple")
         for token in self.exclusive:
@@ -141,13 +158,32 @@ class LaneCommand:
 
 @dataclass(frozen=True, slots=True)
 class LaneCompleted:
-    """The lane's process tree ran to its own exit."""
+    """The lane's process tree ran to its own exit.
+
+    ``observed_runtime_seconds`` is the time the lane actually
+    executed — the same active-execution clock as
+    :class:`LaneDeadline`: scheduler queue wait and machine-load
+    suspension are both excluded. It feeds the runtime-history learning
+    loop, which is why neither may leak into it: queue-inflated numbers
+    would chase their own scheduling delays, and frozen time would
+    teach the loop that a lane got slower when the machine got busier.
+    """
 
     exit_code: int
+    observed_runtime_seconds: float
 
     def __post_init__(self) -> None:
         if type(self.exit_code) is not int:
             raise ValueError("LaneCompleted.exit_code must be an integer")
+        if (
+            type(self.observed_runtime_seconds) is not float
+            or not math.isfinite(self.observed_runtime_seconds)
+            or self.observed_runtime_seconds < 0
+        ):
+            raise ValueError(
+                "LaneCompleted.observed_runtime_seconds must be finite and "
+                "non-negative"
+            )
 
 
 @dataclass(frozen=True, slots=True)

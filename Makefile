@@ -334,7 +334,7 @@ endef
 typecheck:
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,typecheck,\
-		$(LANE_RUN) --backend condor --priority 10 --work-key typecheck --request-memory-mb 4096 --request-cpus $(LANE_CPUS_TYPECHECK) \
+		$(LANE_RUN) --backend condor --work-key typecheck --suspendable --request-memory-mb 4096 --request-cpus $(LANE_CPUS_TYPECHECK) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) typecheck LANE_EXECUTOR=direct)
 else
@@ -434,7 +434,7 @@ sync-deps:
 test-unit: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-unit,\
-		$(LANE_RUN) --backend condor --priority 100 --work-key test-unit --request-memory-mb 6144 --request-cpus $(LANE_CPUS_UNIT) \
+		$(LANE_RUN) --backend condor --work-key test-unit --suspendable --request-memory-mb 6144 --request-cpus $(LANE_CPUS_UNIT) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-unit LANE_EXECUTOR=direct UNIT_PARALLEL=$(LANE_CPUS_UNIT))
 else ifeq ($(UNIT_PARALLEL),0)
@@ -455,7 +455,7 @@ endif
 test-simulated-core: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-simulated-core,\
-		$(LANE_RUN) --backend condor --priority 18 --work-key test-simulated-core --request-memory-mb 2048 --request-cpus $(LANE_CPUS_SIMULATED) \
+		$(LANE_RUN) --backend condor --work-key test-simulated-core --suspendable --request-memory-mb 2048 --request-cpus $(LANE_CPUS_SIMULATED) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-simulated-core LANE_EXECUTOR=direct)
 else ifeq ($(SIMULATED_PARALLEL),0)
@@ -479,7 +479,7 @@ endif
 test-simulated-agent: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-simulated-agent,\
-		$(LANE_RUN) --backend condor --priority 11 --work-key test-simulated-agent --request-memory-mb 1024 --request-cpus 2 \
+		$(LANE_RUN) --backend condor --work-key test-simulated-agent --suspendable --request-memory-mb 1024 --request-cpus 2 \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-simulated-agent LANE_EXECUTOR=direct)
 else ifeq ($(SIMULATED_PARALLEL),0)
@@ -507,7 +507,7 @@ test-integration-core: test-integration-core-local test-integration-core-live-co
 test-integration-core-local: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-core-local,\
-		$(LANE_RUN) --backend condor --work-key test-integration-core-local --request-memory-mb 3072 --request-cpus $(LANE_CPUS_INTEGRATION) \
+		$(LANE_RUN) --backend condor --work-key test-integration-core-local --suspendable --request-memory-mb 3072 --request-cpus $(LANE_CPUS_INTEGRATION) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-integration-core-local LANE_EXECUTOR=direct)
 else ifeq ($(INTEGRATION_PARALLEL),0)
@@ -540,7 +540,7 @@ test-integration-no-infra: test-integration-core
 test-integration-agent: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-agent,\
-		$(LANE_RUN) --backend condor --work-key test-integration-agent --request-memory-mb 2048 --request-cpus 4 \
+		$(LANE_RUN) --backend condor --work-key test-integration-agent --not-suspendable --request-memory-mb 2048 --request-cpus 4 \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-integration-agent LANE_EXECUTOR=direct)
 else ifeq ($(INTEGRATION_AGENT_PARALLEL),0)
@@ -556,8 +556,8 @@ endif
 test-integration-core-slice-%: sync-deps FORCE
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-core-slice-$*,\
-		$(LANE_RUN) --backend condor --work-key test-integration-core-slice-$* --request-memory-mb 2048 \
-			--request-cpus 4 --priority 40 \
+		$(LANE_RUN) --backend condor --work-key test-integration-core-slice-$* --suspendable --request-memory-mb 2048 \
+			--request-cpus 4 \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-integration-core-slice-$* LANE_EXECUTOR=direct)
 else
@@ -573,19 +573,19 @@ define AGENT_SLICE_RULE
 test-integration-agent-$(1): sync-deps
 ifeq ($$(LANE_EXECUTOR),condor)
 	$$(call TIMED_RUN,test-integration-agent-$(1),\
-		$$(LANE_RUN) --backend condor --work-key test-integration-agent-$(1) --request-memory-mb 1024 \
-			--request-cpus 2 --priority $(2) \
+		$$(LANE_RUN) --backend condor --work-key test-integration-agent-$(1) --not-suspendable --request-memory-mb 1024 \
+			--request-cpus 2 \
 			--timeout-seconds $$(LANE_TIMEOUT_SECONDS) -- \
 			$$(GMAKE) test-integration-agent-$(1) LANE_EXECUTOR=direct)
 else
 	$$(call TIMED_RUN,test-integration-agent-$(1),\
-		$$(PYTEST) $(3) -x -q --tb=short -n 2 --dist=loadgroup $$(PYTEST_TIMINGS))
+		$$(PYTEST) $(2) -x -q --tb=short -n 2 --dist=loadgroup $$(PYTEST_TIMINGS))
 endif
 endef
 
-$(eval $(call AGENT_SLICE_RULE,claude,120,tests/integration/test_claude_execution.py))
-$(eval $(call AGENT_SLICE_RULE,codex,140,tests/integration/test_codex_execution.py))
-$(eval $(call AGENT_SLICE_RULE,chain,110,tests/integration/test_live_agent_chain.py))
+$(eval $(call AGENT_SLICE_RULE,claude,tests/integration/test_claude_execution.py))
+$(eval $(call AGENT_SLICE_RULE,codex,tests/integration/test_codex_execution.py))
+$(eval $(call AGENT_SLICE_RULE,chain,tests/integration/test_live_agent_chain.py))
 
 # Full integration tests including infrastructure-dependent ones (run in CI)
 test-integration-full: sync-deps
