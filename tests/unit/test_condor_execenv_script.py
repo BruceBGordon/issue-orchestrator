@@ -61,15 +61,24 @@ def test_down_with_no_docker_fails_loudly_never_reports_absence(
 ) -> None:
     """B4 round two's exact reproduction: a missing docker binary (or
     unreachable daemon) must be a loud error, never 'already absent' +
-    exit 0 - command failure and empty result are distinct outcomes."""
+    exit 0 - command failure and empty result are distinct outcomes.
+
+    PATH contains ONLY this test's stub dir (real dirname symlinked in,
+    sleep shimmed, docker deliberately absent): appending /usr/bin
+    found the runner's real docker and made the scenario vanish - the
+    original form of this test failed on CI for exactly that reason."""
+    import shutil
+
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
-    # No docker in PATH at all - only the sleep shim.
     instant_sleep = stub_dir / "sleep"
     instant_sleep.write_text("#!/bin/sh\nexit 0\n")
     instant_sleep.chmod(instant_sleep.stat().st_mode | stat.S_IEXEC)
+    real_dirname = shutil.which("dirname")
+    assert real_dirname, "dirname must exist for the script's REPO_ROOT"
+    (stub_dir / "dirname").symlink_to(real_dirname)
     environment = dict(os.environ)
-    environment["PATH"] = f"{stub_dir}:/usr/bin:/bin"
+    environment["PATH"] = str(stub_dir)
     result = _run_down(environment)
     assert result.returncode != 0
     assert "already absent" not in result.stdout
