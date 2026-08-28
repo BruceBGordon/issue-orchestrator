@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from issue_orchestrator.adapters.condor.lane_executor import (
+from issue_orchestrator.adapters.condor.tools import (
     PERSONAL_POOL_HOME_ENVIRONMENT_VARIABLE,
 )
 from issue_orchestrator.adapters.json_lane_runtime_history import (
@@ -31,11 +31,11 @@ from issue_orchestrator.ports.lane_dispatch_journal import (
     LaneDispatchJournalError,
     LaneDispatchRecord,
 )
-from issue_orchestrator.ports.machine_state import MachineState
-from issue_orchestrator.entrypoints.cli_tools.lane_run import (
+from issue_orchestrator.execution.lane_backends import (
     BACKEND_ENVIRONMENT_VARIABLE,
-    main,
 )
+from issue_orchestrator.ports.machine_state import MachineState
+from issue_orchestrator.entrypoints.cli_tools.lane_run import main
 
 pytestmark = pytest.mark.timeout(180)
 
@@ -51,7 +51,7 @@ def isolated_history(
     runtime history — polluting the store that orders the actual gate.
     """
     history = JsonLaneRuntimeHistory(tmp_path / "lane-runtime-history")
-    monkeypatch.setattr(lane_run_module, "_build_history", lambda: history)
+    monkeypatch.setattr(lane_run_module, "build_runtime_history", lambda: history)
     return history
 
 
@@ -380,7 +380,7 @@ def test_corrupt_history_fails_loudly_not_naively(
     (directory / "cli.test.json").write_text("{not json", encoding="utf-8")
     monkeypatch.setattr(
         lane_run_module,
-        "_build_history",
+        "build_runtime_history",
         lambda: JsonLaneRuntimeHistory(directory),
     )
     assert _run("/usr/bin/true") == 70

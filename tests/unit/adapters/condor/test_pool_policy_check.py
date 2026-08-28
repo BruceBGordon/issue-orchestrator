@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from issue_orchestrator.adapters.condor.lane_executor import CondorTools
+from issue_orchestrator.adapters.condor.tools import CondorTools
 from issue_orchestrator.adapters.condor.pool_policy import (
     _REQUIRED_SETTINGS,
     CondorPoolPolicyCheck,
@@ -93,6 +93,7 @@ def _stub_tools(
         remove=binaries / "condor_rm",
         query=binaries / "condor_q",
         config_query=binaries / "condor_config_val",
+        pool_query=binaries / "condor_status",
     )
 
 
@@ -474,6 +475,7 @@ def _echoing_tools(tmp_path: Path, answers: dict[str, str]) -> CondorTools:
         remove=binaries / "condor_rm",
         query=binaries / "condor_q",
         config_query=binaries / "condor_config_val",
+        pool_query=binaries / "condor_status",
     )
 
 
@@ -667,6 +669,7 @@ def test_a_failing_setting_read_is_a_backend_fault(tmp_path: Path) -> None:
         remove=binaries / "condor_rm",
         query=binaries / "condor_q",
         config_query=binaries / "condor_config_val",
+        pool_query=binaries / "condor_status",
     )
 
     with pytest.raises(LaneExecutorError, match="could not read pool setting"):
@@ -805,6 +808,7 @@ def test_the_check_costs_a_handful_of_tool_calls(tmp_path: Path) -> None:
         remove=binaries / "condor_rm",
         query=binaries / "condor_q",
         config_query=binaries / "condor_config_val",
+        pool_query=binaries / "condor_status",
     )
 
     _inspect(tools)

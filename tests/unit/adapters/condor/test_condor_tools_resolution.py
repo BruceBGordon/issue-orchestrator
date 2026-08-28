@@ -7,13 +7,19 @@ from pathlib import Path
 
 import pytest
 
-from issue_orchestrator.adapters.condor.lane_executor import (
+from issue_orchestrator.adapters.condor.tools import (
     PERSONAL_POOL_HOME_ENVIRONMENT_VARIABLE,
     CondorTools,
 )
 from issue_orchestrator.domain.lane_execution import LaneExecutorUnavailableError
 
-_TOOL_NAMES = ("condor_submit", "condor_rm", "condor_q", "condor_config_val")
+_TOOL_NAMES = (
+    "condor_submit",
+    "condor_rm",
+    "condor_q",
+    "condor_config_val",
+    "condor_status",
+)
 
 
 def _write_tools(binaries: Path) -> None:

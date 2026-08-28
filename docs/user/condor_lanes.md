@@ -476,11 +476,66 @@ immediately re-EXCEPTs on the same queued job, forever. So:
 - The execenv image makes the same guarantee at build time, and the
   build fails if the directory is not world-writable.
 
+## Seeing what the pool is doing: `executor-status`
+
+```bash
+issue-orchestrator executor-status            # summarize the last 400 records
+issue-orchestrator executor-status --scan 20  # only the most recent 20
+```
+
+Read-only, from any directory in the repository. It answers one
+question — *why is validation work running or waiting?* — by joining two
+things that are otherwise checked separately:
+
+```
+Executor pool — backend condor, captured 2026-08-28 23:37:14Z
+
+POOL: online — 1 machine, 18 cpus, 2 in use; 1 running, 1 queued
+  STATE      FOR  CPUS  PRI  LANE          SUBMITTED BY             EXCLUSIVE
+  running  27.0s     2   71  test-unit     issue-orchestrator-wt-a  codexlogin
+  queued   24.0s     2   72  test-web      issue-orchestrator-wt-b  codexlogin
+
+RECENT DISPATCH: /repo/.git/issue-orchestrator/lane-dispatch.jsonl (…)
+  LANE       RUNS  LAST RUNTIME  LAST QUEUE WAIT  PRI  EXIT  WHEN
+  test-unit     9         1m04s             0.0s   59     0  2026-08-28 23:12:15Z
+```
+
+The mental model, top to bottom:
+
+- **POOL** is *now*. Capacity is the machine's real cpus; "in use" is
+  totalled from the jobs listed underneath, so the header can never
+  disagree with the rows. Every row names the lane, the **worktree that
+  submitted it** (the pool is machine-wide — concurrent gates from
+  different worktrees are normal), how long it has been in that state,
+  and any exclusive token it holds. A queued row sitting behind a
+  running row that holds the same token is the answer to "why is my
+  lane waiting".
+- **RECENT DISPATCH** is *history*, one row per lane, read from the
+  journal every completed lane writes. `PRI` is the learned dispatch
+  priority the **next** run will carry, so the table is printed in the
+  order the next gate will dispatch in.
+- **FAULTS**, when present, means an input is broken rather than empty.
+
+Nothing is ever silently omitted. A machine with no pool prints
+`POOL: unavailable` and the reason (the direct backend has no pool at
+all; an opted-in pool may simply not be running), and still prints the
+dispatch history. A repository that has never run a lane prints the
+journal path it will appear at. Absence exits `0` — it is the ordinary
+state of an opt-in backend — while a *broken* input (a corrupt journal
+row, an untranslatable answer from the pool) is printed under `FAULTS`
+and exits `70`, so a script cannot mistake damage for quiet.
+
+The command never prints command lines, arguments, environments, or
+output paths: the pool query does not even ask for those attributes, so
+a prompt or a token cannot reach the terminal through it.
 ## Architecture
 
 - `domain/lane_execution.py` — the typed contracts (the only vocabulary
   that crosses the port).
-- `ports/lane_executor.py` — the port.
+- `ports/lane_executor.py` — the execution port;
+  `ports/lane_policy_check.py` — the backend's policy self-check;
+  `ports/executor_pool.py` — the read-only pool-inspection port. All
+  three speak the same backend-neutral vocabulary.
 - `ports/lane_runtime_history.py` +
   `adapters/json_lane_runtime_history.py` — the dispatch-order learning
   loop (backend-neutral: every backend reports runtime, every backend's
@@ -490,25 +545,39 @@ immediately re-EXCEPTs on the same queued job, forever. So:
   loop, with `infra/file_duration_store.py` resolving its one shared
   home, `infra/pytest_file_durations.py` capturing, and
   `scripts/lane_slices.py` consuming.
-- `adapters/direct_lane_executor.py` — default backend.
+- `observation/executor_status.py` — joins the pool, the dispatch
+  journal, and the learning loop into one snapshot, and owns what
+  happens when a source is absent or broken.
+- `adapters/direct_lane_executor.py` — default backend, including the
+  policy check whose honest answer is an empty invariant set and the
+  inspector that states precisely why it has no pool.
 - `ports/machine_state.py` + `infra/machine_state.py` — the forensics
   envelope every timing and dispatch record carries (backend-neutral,
-  and the single owner of probe-failure semantics).
+  and the single owner of probe-failure semantics, in both directions:
+  it writes the envelope and reads it back).
 - `adapters/condor/` — the anti-corruption layer: `submit_compiler.py`
   translates lane specs outbound into job descriptions;
   `event_classifier.py` translates job event logs inbound into typed
-  lifecycle states. Scheduler vocabulary is forbidden outside this
+  lifecycle states; `pool_policy.py` reads the pool's effective
+  configuration into a typed policy report; `pool_inspector.py`
+  translates queue and slot answers inbound into pool contracts;
+  `lane_executor.py` holds `CondorTools`, which locates the scheduler's
+  command-line tools and is the single boundary through which this
+  package invokes them. Scheduler vocabulary is forbidden outside this
   package by the `semgrep_condor_vocabulary` guardrail.
 - `execution/lane_backends.py` — the backend registry: one entry per
-  backend carrying BOTH factories (executor and policy check), with the
-  selectable names derived from it. A backend cannot be runnable
-  without also being checkable.
+  backend carrying EVERY factory (executor, policy check, pool
+  inspector), with the selectable names derived from it. A backend
+  cannot be runnable without also being checkable and inspectable. It
+  is the guardrail's only exemption outside `adapters/condor`.
 - `ports/lane_policy_check.py` + `adapters/condor/pool_policy.py` —
   the pool-policy self-check (above).
 - `entrypoints/cli_tools/lane_run.py` — the per-lane entrypoint the
-  Makefile invokes; `entrypoints/cli_tools/lane_preflight.py` — the
-  once-per-gate policy preflight. Both resolve their backend through
-  the registry.
+  Makefile invokes (it also wires the lane runner's own persistence
+  adapters); `lane_preflight.py` — the once-per-gate policy preflight;
+  `executor_status.py` — renders the operator snapshot for
+  `issue-orchestrator executor-status`. All three resolve their backend
+  through the registry.
 
 Interactive agent sessions (PTY) are out of scope for this backend —
 see issue #7112. Multi-machine pools are a follow-on; everything here

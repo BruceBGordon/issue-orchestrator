@@ -42,6 +42,7 @@ class CLICommandHandlers:
     doctor: CommandHandler
     demo: CommandHandler
     trace: CommandHandler
+    executor_status: CommandHandler
 
 
 class CLIStability(StrEnum):
@@ -112,6 +113,7 @@ CLI_COMMAND_SURFACE: tuple[CLICommandSpec, ...] = (
     CLICommandSpec("audit", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
     CLICommandSpec("trace", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
     CLICommandSpec("demo", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
+    CLICommandSpec("executor-status", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
     # Development only - these operate on test and E2E state and carry no
     # compatibility promise of any kind.
     CLICommandSpec("test-reset", CLIGroup.DEVELOPMENT, CLIStability.INTERNAL),
@@ -579,3 +581,21 @@ def _register_utility_commands(subparsers, handlers: CLICommandHandlers) -> None
     )
     trace_parser.add_argument("issue_number", type=int, help="Issue number to trace")
     trace_parser.set_defaults(func=handlers.trace)
+
+    executor_status_parser = subparsers.add_parser(
+        "executor-status",
+        help="Show the validation-lane executor pool and recent lane dispatch",
+    )
+    executor_status_parser.add_argument(
+        "--backend",
+        default=None,
+        help="Backend to report on (defaults to the configured lane backend)",
+    )
+    executor_status_parser.add_argument(
+        "--scan",
+        type=int,
+        default=None,
+        metavar="RECORDS",
+        help="How many recent dispatch records to summarize",
+    )
+    executor_status_parser.set_defaults(func=handlers.executor_status)

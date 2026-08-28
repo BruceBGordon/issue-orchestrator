@@ -15,6 +15,19 @@ from typing import Protocol, runtime_checkable
 from ..domain.lane_execution import LaneWorkKey
 
 
+class LaneRuntimeHistoryError(RuntimeError):
+    """The history store itself is broken — corrupt state, not absence.
+
+    Part of the port's vocabulary rather than any one adapter's, like
+    ``LaneDispatchJournalError``: every consumer of the loop has to
+    handle "the store is garbage" no matter which store it is talking
+    to. Raised loudly instead of degrading to naive behavior — a corrupt
+    store means something wrote garbage, and hiding that behind a silent
+    reset would hide the writer's bug. Absence is never an error: an
+    empty store is the naive first run.
+    """
+
+
 @runtime_checkable
 class LaneRuntimeHistory(Protocol):
     """Learn each lane's runtime; answer with a dispatch-order hint.

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from ..domain.lane_execution import LaneWorkKey
@@ -72,8 +73,80 @@ class LaneDispatchRecord:
             raise ValueError("LaneDispatchRecord.exit_code must be an integer")
 
 
+@dataclass(frozen=True, slots=True)
+class LaneDispatchEntry:
+    """One persisted record, plus the facts persistence itself added.
+
+    ``recorded_at`` and ``worktree`` are not part of what a lane
+    *reports* — they are what the journal *observes* about the report —
+    so they belong to the read side rather than to
+    :class:`LaneDispatchRecord`.
+    """
+
+    recorded_at: datetime
+    worktree: str
+    record: LaneDispatchRecord
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.recorded_at) is not datetime
+            or self.recorded_at.tzinfo is None
+        ):
+            raise ValueError(
+                "LaneDispatchEntry.recorded_at must be a timezone-aware datetime"
+            )
+        if type(self.worktree) is not str or not self.worktree:
+            raise ValueError(
+                "LaneDispatchEntry.worktree must be a non-empty string"
+            )
+        if type(self.record) is not LaneDispatchRecord:
+            raise ValueError(
+                "LaneDispatchEntry.record must be a LaneDispatchRecord"
+            )
+
+    def age_seconds(self, now: datetime) -> float:
+        """Seconds between this record landing and ``now`` (never negative)."""
+        if type(now) is not datetime or now.tzinfo is None:
+            raise ValueError("age_seconds requires a timezone-aware datetime")
+        return max(
+            0.0,
+            (now.astimezone(timezone.utc) - self.recorded_at).total_seconds(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LaneDispatchHistory:
+    """What the journal holds, and where the reader looked for it.
+
+    ``location`` is a human-readable description owned by the adapter:
+    the operator's first question about an empty history is "which file
+    did you read?", and answering it must not require the caller to know
+    the storage layout.
+    """
+
+    location: str
+    entries: tuple[LaneDispatchEntry, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.location) is not str or not self.location:
+            raise ValueError(
+                "LaneDispatchHistory.location must be a non-empty string"
+            )
+        if type(self.entries) is not tuple or any(
+            type(entry) is not LaneDispatchEntry for entry in self.entries
+        ):
+            raise ValueError(
+                "LaneDispatchHistory.entries must be a tuple of LaneDispatchEntry"
+            )
+
+
 class LaneDispatchJournalError(RuntimeError):
-    """The journal could not persist a record — the one failure owner."""
+    """The journal could not persist or read back a record.
+
+    The one failure owner for both directions. Absence is never an
+    error — an unwritten journal is simply an empty history — but a
+    record that cannot be parsed is, because something wrote garbage.
+    """
 
 
 @runtime_checkable
@@ -82,4 +155,23 @@ class LaneDispatchJournal(Protocol):
 
     def record(self, record: LaneDispatchRecord) -> None:
         """Persist the record; raise LaneDispatchJournalError on failure."""
+        ...
+
+
+@runtime_checkable
+class LaneDispatchJournalReader(Protocol):
+    """Read back the most recent dispatch records.
+
+    Separate from :class:`LaneDispatchJournal` so a read-only consumer —
+    an operator snapshot, a future UI panel — depends on reading alone
+    and cannot accidentally acquire the ability to write.
+    """
+
+    def read_recent(self, limit: int) -> LaneDispatchHistory:
+        """Return at most ``limit`` most-recent entries, oldest first.
+
+        Raises LaneDispatchJournalError when the stored records cannot
+        be parsed. An absent journal yields an empty history, not an
+        error.
+        """
         ...

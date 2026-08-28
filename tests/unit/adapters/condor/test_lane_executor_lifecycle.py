@@ -16,10 +16,9 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.adapters.condor import lane_executor as lane_executor_module
-from issue_orchestrator.adapters.condor.lane_executor import (
-    CondorLaneExecutor,
-    CondorTools,
-)
+from issue_orchestrator.adapters.condor import tools as tools_module
+from issue_orchestrator.adapters.condor.lane_executor import CondorLaneExecutor
+from issue_orchestrator.adapters.condor.tools import CondorTools
 from issue_orchestrator.domain.lane_execution import (
     LaneCommand,
     LaneCompleted,
@@ -61,6 +60,7 @@ def _stub_tools(tmp_path: Path, submit_exit: int) -> CondorTools:
             "condor_rm": "#!/bin/sh\nexit 0\n",
             "condor_q": "#!/bin/sh\nexit 0\n",
             "condor_config_val": "#!/bin/sh\nexit 0\n",
+            "condor_status": "#!/bin/sh\nexit 0\n",
         },
     )
     return CondorTools(
@@ -68,6 +68,7 @@ def _stub_tools(tmp_path: Path, submit_exit: int) -> CondorTools:
         remove=binaries / "condor_rm",
         query=binaries / "condor_q",
         config_query=binaries / "condor_config_val",
+        pool_query=binaries / "condor_status",
     )
 
 
@@ -94,6 +95,7 @@ def _completing_tools(tmp_path: Path, *, history_directory: str) -> CondorTools:
             "condor_rm": "#!/bin/sh\nexit 0\n",
             "condor_q": "#!/bin/sh\nexit 0\n",
             "condor_config_val": f"#!/bin/sh\necho '{history_directory}'\n",
+            "condor_status": "#!/bin/sh\nexit 0\n",
         },
     )
     return CondorTools(
@@ -101,6 +103,7 @@ def _completing_tools(tmp_path: Path, *, history_directory: str) -> CondorTools:
         remove=binaries / "condor_rm",
         query=binaries / "condor_q",
         config_query=binaries / "condor_config_val",
+        pool_query=binaries / "condor_status",
     )
 
 
@@ -310,6 +313,7 @@ def _cancellable_tools(
             "condor_rm": removal,
             "condor_q": "#!/bin/sh\nexit 0\n",
             "condor_config_val": lookup_body or f"#!/bin/sh\necho '{history}'\n",
+            "condor_status": "#!/bin/sh\nexit 0\n",
         },
     )
     return CondorTools(
@@ -317,6 +321,7 @@ def _cancellable_tools(
         remove=binaries / "condor_rm",
         query=binaries / "condor_q",
         config_query=binaries / "condor_config_val",
+        pool_query=binaries / "condor_status",
     )
 
 
@@ -424,7 +429,7 @@ def test_the_cancellation_budget_bounds_the_whole_collection(
 
 
 class _ToolThatRaises:
-    """Stands in for the executor module's ``subprocess``.
+    """Stands in for the tool boundary's ``subprocess``.
 
     An interrupt can arrive while the executor is blocked on a scheduler
     TOOL, not only while it is sleeping — and the removal is the first
@@ -626,7 +631,7 @@ def test_a_second_interrupt_during_the_removal_still_chains(
     second = KeyboardInterrupt("second")
     monkeypatch.setattr(lane_executor_module, "time", _WaitsThatRaise(first))
     monkeypatch.setattr(
-        lane_executor_module,
+        tools_module,
         "subprocess",
         _ToolThatRaises("condor_rm", second),
     )
@@ -663,7 +668,7 @@ def test_a_system_exit_during_the_removal_is_contained_and_recorded(
     original = KeyboardInterrupt("the real ending")
     monkeypatch.setattr(lane_executor_module, "time", _WaitsThatRaise(original))
     monkeypatch.setattr(
-        lane_executor_module,
+        tools_module,
         "subprocess",
         _ToolThatRaises("condor_rm", SystemExit("cleanup exit")),
     )
