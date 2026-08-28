@@ -1,0 +1,90 @@
+# Containerized execution environment proofs (issue #7115, ADR-0012):
+# build the image and run the in-container selftest — pool readiness,
+# the lane executor contract inside cgroup containment (including the
+# boundary test's Linux-containment branch), and the hard memory
+# ceiling. Path-scoped: this is opt-in infrastructure, not the gate.
+#
+# The pull_request path surface must cover EVERYTHING the selftest
+# executes (the workflow-shape test pins this): fork pushes do not run
+# here, so a fork PR touching any dependency below must still trigger
+# the proof. The push leg is main-only, like validate.yml — running
+# both legs on internal branches duplicated every job.
+name: execenv
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker/execenv/**"
+      - "scripts/condor-execenv.sh"
+      - ".github/workflows/execenv.yml"
+      - "src/issue_orchestrator/adapters/condor/**"
+      - "src/issue_orchestrator/adapters/direct_lane_executor.py"
+      - "src/issue_orchestrator/domain/lane_execution.py"
+      - "src/issue_orchestrator/ports/lane_executor.py"
+      - "src/issue_orchestrator/ports/lane_runtime_history.py"
+      - "src/issue_orchestrator/adapters/json_lane_runtime_history.py"
+      - "src/issue_orchestrator/entrypoints/cli_tools/lane_run.py"
+      - "tests/unit/lane_executor_contract.py"
+      - "tests/integration/test_condor_lane_executor.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".python-version"
+  pull_request:
+    paths:
+      - "docker/execenv/**"
+      - "scripts/condor-execenv.sh"
+      - ".github/workflows/execenv.yml"
+      - "src/issue_orchestrator/adapters/condor/**"
+      - "src/issue_orchestrator/adapters/direct_lane_executor.py"
+      - "src/issue_orchestrator/domain/lane_execution.py"
+      - "src/issue_orchestrator/ports/lane_executor.py"
+      - "src/issue_orchestrator/ports/lane_runtime_history.py"
+      - "src/issue_orchestrator/adapters/json_lane_runtime_history.py"
+      - "src/issue_orchestrator/entrypoints/cli_tools/lane_run.py"
+      - "tests/unit/lane_executor_contract.py"
+      - "tests/integration/test_condor_lane_executor.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".python-version"
+
+concurrency:
+  group: execenv-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  execenv-selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # GitHub-hosted runners write-protect the cgroup mount; no
+      # capability set can remount it there. --privileged arrives with
+      # it read-write, the entrypoint's fail-hard delegation check
+      # stays authoritative, and the ephemeral runner is inside
+      # ADR-0013's trust posture (B5, #7119 review).
+      IO_EXECENV_PRIVILEGED: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Build the execution environment image
+        run: scripts/condor-execenv.sh build
+
+      - name: Preflight cgroup delegation
+        run: scripts/condor-execenv.sh preflight
+
+      - name: Start the pool container
+        run: scripts/condor-execenv.sh up
+
+      - name: Run the in-container proofs
+        run: scripts/condor-execenv.sh selftest
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: scripts/condor-execenv.sh diagnose
+
+      - name: Tear down
+        if: always()
+        run: scripts/condor-execenv.sh down

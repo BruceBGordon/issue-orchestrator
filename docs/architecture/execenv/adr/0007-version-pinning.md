@@ -30,6 +30,13 @@ series that moves faster and carries newer cgroup handling and better defaults.
   surface for about a year. We give up newer cgroup improvements in the feature series.
 - Digests must be refreshed deliberately, which is the point — a visible commit rather
   than a silent drift.
-- **TODO before first build:** resolve the actual base image digest and confirm the
-  chosen HTCondor LTS point release has `aarch64` packages for the chosen distro. Both
-  are placeholders in the Dockerfile.
+- ~~TODO before first build: resolve the actual base image digest and confirm the
+  chosen HTCondor LTS point release has `aarch64` packages for the chosen distro.~~
+  **Resolved by #7119 (rev 3):** the base image is digest-pinned and the LTS point
+  release is the `CONDOR_PACKAGE_VERSION` build arg. The `aarch64` confirmation
+  resolved NEGATIVELY: htcondor.org publishes amd64 debs only, so the image is
+  built and run `linux/amd64` everywhere (native on CI, Rosetta-emulated on Apple
+  Silicon — the same posture as the macOS pool's x86_64 tarball). An empirical
+  addendum with teeth: the distro's own arm64 htcondor (23.4) silently declines
+  cgroup-v2 family tracking, so "use the distro package for arm64" is not a
+  fallback — containment is the point, and only the LTS delivers it.

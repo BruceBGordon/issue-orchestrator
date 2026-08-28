@@ -194,12 +194,19 @@ def test_queue_wait_is_never_billed_to_the_lane_deadline(tmp_path: Path) -> None
 
     results: dict[str, object] = {}
     holder = threading.Thread(
-        target=lambda: results.__setitem__("holder", run_lane("holder", 8.0, 60.0))
+        target=lambda: results.__setitem__("holder", run_lane("holder", 12.0, 60.0))
     )
     holder.start()
     _time.sleep(1.0)
-    # Queued behind an 8s holder with only a 4s deadline of its own.
-    results["queued"] = run_lane("queued", 1.0, 4.0)
+    # Queued behind a 12s holder with only an 8s deadline of its own:
+    # the ~11s queue wait exceeds the deadline, which is the
+    # discriminator. The runtime margin (8s budget for ~1s of work) is
+    # deliberately generous: under emulation (this amd64 execution
+    # environment on Apple Silicon) interpreter startup alone can eat
+    # several seconds, and a native-calibrated margin turns this test
+    # into an emulation-speed test - observed live: a 4s deadline
+    # removed a healthy 1s lane 5s after its execute event.
+    results["queued"] = run_lane("queued", 1.0, 8.0)
     holder.join(timeout=120)
 
     assert type(results["holder"]) is LaneCompleted
@@ -211,7 +218,10 @@ def test_queue_wait_is_never_billed_to_the_lane_deadline(tmp_path: Path) -> None
     # The learning loop's precondition: the ~7s token wait must not
     # appear in observed runtime (the lane slept 1s). A queue-inflated
     # number here would make learned ordering chase its own delays.
-    assert queued.observed_runtime_seconds < 6.0, (
+    # Bound matches the widened emulation margins: the ~11s token wait
+    # is the discriminator, and a completed lane already proves the 8s
+    # deadline charged runtime only.
+    assert queued.observed_runtime_seconds < 8.0, (
         "observed runtime includes queue wait: "
         f"{queued.observed_runtime_seconds:.1f}s for a 1s lane"
     )
