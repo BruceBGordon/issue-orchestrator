@@ -287,11 +287,21 @@ def test_load_backoff_thresholds_are_overridable(tmp_path: Path) -> None:
 
 
 def _physical_cores() -> int:
-    import os
+    """The script's own oracle, verbatim (sysctl, nproc fallback).
 
-    cores = os.cpu_count()
-    assert cores
-    return cores
+    NOT os.cpu_count(): pytest-xdist sets PYTHON_CPU_COUNT to the
+    worker count in worker processes, so os.cpu_count() reports the
+    xdist -n value, not the hardware — this test failed in the condor
+    lane (12 workers) while passing on the host (18 workers = 18
+    cores, a coincidence). Two different core detectors will always
+    drift; the test must ask the one the script asks."""
+    result = subprocess.run(
+        ["sysctl", "-n", "hw.ncpu"], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        result = subprocess.run(["nproc"], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return int(result.stdout.strip())
 
 
 def test_capacity_dial_is_unset_by_default(tmp_path: Path) -> None:
