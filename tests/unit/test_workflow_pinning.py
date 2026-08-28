@@ -26,18 +26,36 @@ def _workflow_files(workflows_dir: Path) -> list[Path]:
     )
 
 
+def _uses_references(node: object) -> list[str]:
+    """Every `uses` value anywhere in the parsed workflow graph: step
+    actions in block OR flow form, and job-level reusable workflows. A
+    physical-line scan missed valid YAML like `- {uses: x@v4}` (B1
+    round three) — GitHub loads the object graph, so the guardrail
+    must walk the object graph."""
+    references: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "uses" and isinstance(value, str):
+                references.append(value)
+            else:
+                references.extend(_uses_references(value))
+    elif isinstance(node, list):
+        for item in node:
+            references.extend(_uses_references(item))
+    return references
+
+
 def _unpinned_uses(workflows: list[Path]) -> list[str]:
     offenders: list[str] = []
     for workflow in workflows:
-        for line_number, line in enumerate(
-            workflow.read_text().splitlines(), start=1
-        ):
-            stripped = line.strip()
-            if not stripped.startswith(("uses:", "- uses:")):
+        document = yaml.safe_load(workflow.read_text())
+        for reference in _uses_references(document):
+            if reference.startswith("./"):
+                # Local actions live in this commit; there is nothing
+                # to pin.
                 continue
-            reference = stripped.split("uses:", 1)[1].split("#", 1)[0].strip()
             if not _PINNED_USES.match(reference):
-                offenders.append(f"{workflow.name}:{line_number}: {reference}")
+                offenders.append(f"{workflow.name}: {reference}")
     return offenders
 
 
@@ -67,10 +85,25 @@ def test_discovery_covers_both_supported_suffixes(tmp_path: Path) -> None:
     (workflows / "sneaky.yaml").write_text(
         "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v4\n"
     )
+    # Valid YAML flow-map form: loaded by GitHub as an unpinned step,
+    # invisible to any physical-line scan (B1 round three).
+    (workflows / "flowmap.yml").write_text(
+        "jobs:\n  a:\n    steps:\n      - {uses: actions/checkout@v4}\n"
+    )
+    # Job-level reusable workflow, also unpinned.
+    (workflows / "reusable.yml").write_text(
+        "jobs:\n  call:\n    uses: octo/repo/.github/workflows/x.yml@main\n"
+    )
     found = _workflow_files(workflows)
-    assert [path.name for path in found] == ["pinned.yml", "sneaky.yaml"]
+    assert [path.name for path in found] == [
+        "flowmap.yml",
+        "pinned.yml",
+        "reusable.yml",
+        "sneaky.yaml",
+    ]
     offenders = _unpinned_uses(found)
-    assert offenders and "sneaky.yaml" in offenders[0], offenders
+    flagged = {offender.split(":")[0] for offender in offenders}
+    assert flagged == {"sneaky.yaml", "flowmap.yml", "reusable.yml"}, offenders
 
 
 def _execenv_triggers() -> dict:
