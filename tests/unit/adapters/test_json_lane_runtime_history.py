@@ -149,3 +149,42 @@ def test_boolean_entry_is_corrupt(tmp_path: Path) -> None:
     path.write_text('{"runtimes": [true]}', encoding="utf-8")
     with pytest.raises(LaneRuntimeHistoryError, match="non-runtime"):
         store.learned_priority(KEY)
+
+
+def test_short_write_never_replaces_valid_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B5 (#7117 review): POSIX os.write may persist fewer bytes than
+    asked without raising (storage exhausted). That must fail loudly,
+    keep the previous valid history intact, and leave no temporary —
+    never install a truncated file and report success."""
+    import os as _os
+
+    store = _store(tmp_path)
+    store.record_success(KEY, 30.0)
+    path = tmp_path / "history" / f"{KEY.value}.json"
+    intact = path.read_text()
+
+    real_write = _os.write
+
+    def half_write(fd: int, data: bytes) -> int:
+        half = data[: len(data) // 2]
+        real_write(fd, half)
+        return len(half)
+
+    monkeypatch.setattr(
+        "issue_orchestrator.adapters.json_lane_runtime_history.os.write",
+        half_write,
+    )
+    with pytest.raises(LaneRuntimeHistoryError, match="short write"):
+        store.record_success(KEY, 60.0)
+    monkeypatch.undo()
+
+    assert path.read_text() == intact, "a short write replaced valid history"
+    survivors = [
+        name.name
+        for name in (tmp_path / "history").iterdir()
+        if name.name not in (f"{KEY.value}.json", f"{KEY.value}.lock")
+    ]
+    assert not survivors, f"short write leaked temporaries: {survivors}"
+    assert store.learned_priority(KEY) == 30
