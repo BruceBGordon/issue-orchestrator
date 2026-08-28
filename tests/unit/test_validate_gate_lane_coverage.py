@@ -45,17 +45,26 @@ def _scrubbed_environment() -> dict[str, str]:
     # make-driven lane, MAKEFLAGS carries the recursion's own
     # LANE_EXECUTOR and the publish command exports another — both
     # would leak into the subprocess and poison the mode under test.
+    # The worker-width family leaks the same way: the condor wrapper's
+    # command-line UNIT_PARALLEL=12 is exported into the lane's
+    # environment, and environment-origin variables beat ?= defaults,
+    # so the override-matrix dry-runs would test the hosting lane's
+    # width instead of the Makefile's (failed live in the gate's own
+    # unit lane while passing on a clean host shell).
+    blocked = {
+        "MAKEFLAGS",
+        "MFLAGS",
+        "MAKELEVEL",
+        "LANE_EXECUTOR",
+        "ISSUE_ORCHESTRATOR_LANE_EXECUTOR",
+        "PARALLEL",
+    }
     return {
         key: value
         for key, value in os.environ.items()
-        if key
-        not in {
-            "MAKEFLAGS",
-            "MFLAGS",
-            "MAKELEVEL",
-            "LANE_EXECUTOR",
-            "ISSUE_ORCHESTRATOR_LANE_EXECUTOR",
-        }
+        if key not in blocked
+        and not key.endswith("_PARALLEL")
+        and not key.startswith("LANE_WORKERS_")
     }
 
 
