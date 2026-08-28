@@ -16,6 +16,7 @@ from .recorded_session_runs import (
     InvalidRecordedRunReference,
     RecordedRunIssueMismatch,
     RecordedRunNotFound,
+    RecordedRunUntrusted,
     RecordedRunUnreadable,
     resolve_exact_recorded_run,
 )
@@ -180,6 +181,11 @@ def _validated_available_run(
                 "timeline event has an untrusted run_dir: "
                 f"issue={issue_number} event={event_name} run_dir={run_dir}; {detail}"
             )
+        case RecordedRunUntrusted(detail=detail):
+            raise RuntimeError(
+                "timeline event has an untrusted run_dir: "
+                f"issue={issue_number} event={event_name} run_dir={run_dir}; {detail}"
+            )
         case RecordedRunUnreadable(detail=detail):
             return UnavailableRunArtifacts(
                 run_dir=run_dir,
@@ -198,7 +204,9 @@ def available_run_artifacts(
     match run_artifacts:
         case AvailableRunArtifacts():
             return run_artifacts
-        case MissingRunArtifacts() | UnavailableRunArtifacts() | UnscopedTimelineEvent():
+        case (
+            MissingRunArtifacts() | UnavailableRunArtifacts() | UnscopedTimelineEvent()
+        ):
             return None
         case _:
             assert_never(run_artifacts)

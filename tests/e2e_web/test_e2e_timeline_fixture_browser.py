@@ -219,7 +219,7 @@ def _wire_event_to_session_dir(
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """
-            SELECT sequence, data_json FROM timeline_events
+            SELECT sequence, source_event, data_json FROM timeline_events
             WHERE issue_number = ? AND event = ? AND run_dir != ''
             ORDER BY sequence ASC LIMIT 1
             """,
@@ -233,6 +233,7 @@ def _wire_event_to_session_dir(
         data = json.loads(row["data_json"]) if row["data_json"] else {}
         if isinstance(data, dict):
             data["run_dir"] = run_dir_str
+            canonical_event_name = str(row["source_event"] or event_name)
             for field in TimelineFixturePathField:
                 value = data.get(field.value)
                 if not isinstance(value, str):
@@ -242,6 +243,8 @@ def _wire_event_to_session_dir(
                         field=field,
                         run_dir=session_dir,
                         original_value=value,
+                        event_name=canonical_event_name,
+                        event_data=data,
                     )
                 )
         conn.execute(
@@ -255,11 +258,18 @@ def _materialize_fixture_run_dirs(worktree_db: Path, run_dir_root: Path) -> None
     """Replace sanitized fixture run_dir paths with real directories."""
     import sqlite3
 
-    rows: list[tuple[int, int, str, str, str]] = []
+    rows: list[tuple[int, int, str, str, str, str]] = []
     with sqlite3.connect(str(worktree_db)) as conn:
-        for sequence, issue_number, event_name, run_dir, data_json in conn.execute(
+        for (
+            sequence,
+            issue_number,
+            event_name,
+            source_event,
+            run_dir,
+            data_json,
+        ) in conn.execute(
             """
-            SELECT sequence, issue_number, event, run_dir, data_json
+            SELECT sequence, issue_number, event, source_event, run_dir, data_json
             FROM timeline_events
             WHERE run_dir != ''
             ORDER BY sequence ASC
@@ -270,13 +280,21 @@ def _materialize_fixture_run_dirs(worktree_db: Path, run_dir_root: Path) -> None
                     int(sequence),
                     int(issue_number),
                     str(event_name),
+                    str(source_event),
                     str(run_dir),
                     str(data_json or "{}"),
                 )
             )
 
         replacements: dict[str, tuple[Path, int]] = {}
-        for _sequence, issue_number, _event_name, original_run_dir, _data_json in rows:
+        for (
+            _sequence,
+            issue_number,
+            _event_name,
+            _source_event,
+            original_run_dir,
+            _data_json,
+        ) in rows:
             if original_run_dir not in replacements:
                 run_index = len(replacements) + 1
                 synthetic_run_dir = (
@@ -297,11 +315,19 @@ def _materialize_fixture_run_dirs(worktree_db: Path, run_dir_root: Path) -> None
                     f"run_dir={original_run_dir}"
                 )
 
-        for sequence, _issue_number, event_name, original_run_dir, data_json in rows:
+        for (
+            sequence,
+            _issue_number,
+            event_name,
+            source_event,
+            original_run_dir,
+            data_json,
+        ) in rows:
             synthetic_run_dir = replacements[original_run_dir][0]
             data = json.loads(data_json)
             if isinstance(data, dict):
                 data["run_dir"] = str(synthetic_run_dir)
+                canonical_event_name = source_event or event_name
                 role = FIXTURE_REVIEW_PHASE_RECORDING_ROLES.get(event_name)
                 round_index = data.get("round_index")
                 if role is not None and isinstance(round_index, int):
@@ -319,6 +345,8 @@ def _materialize_fixture_run_dirs(worktree_db: Path, run_dir_root: Path) -> None
                             field=field,
                             run_dir=synthetic_run_dir,
                             original_value=value,
+                            event_name=canonical_event_name,
+                            event_data=data,
                         )
                     )
             conn.execute(

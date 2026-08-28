@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from ..events import EventName
+from ..events.artifact_semantics import (
+    CompletionPathSemantics,
+    completion_path_semantics,
+)
 from ..ports.event_sink import run_scoped_event_names
 
 _REVIEW_PHASE_LOG_EVENTS = frozenset({
@@ -28,15 +32,6 @@ REVIEW_PHASE_LOG_TIMELINE_EVENTS: frozenset[str] = frozenset(
 RUN_SCOPED_TIMELINE_EVENTS: frozenset[str] = frozenset(
     event.value for event in _RUN_SCOPED_EVENTS
 )
-
-_EXISTING_PATH_REQUIREMENTS: dict[EventName, tuple[str, str]] = {
-    EventName.SESSION_COMPLETED: ("completion_path_absolute", "missing_path"),
-    EventName.SESSION_INVALID_COMPLETION_RECORD: (
-        "completion_path_absolute",
-        "missing_completion_record",
-    ),
-}
-
 
 def event_requires_run_dir(event_name: str) -> bool:
     """Return True if this event must carry run_dir."""
@@ -62,10 +57,22 @@ def validate_event_artifact_expectations(event_name: str, payload: dict[str, Any
         _require_run_dir_with_session_artifact(event_name, payload)
         return
 
-    path_requirement = _EXISTING_PATH_REQUIREMENTS.get(event) if event is not None else None
-    if path_requirement is not None:
-        field, missing_label = path_requirement
-        _require_existing_path(event_name, payload, field, missing_label)
+    completion_semantics = completion_path_semantics(event_name, payload)
+    if completion_semantics is CompletionPathSemantics.REQUIRED_EXISTING_ARTIFACT or (
+        completion_semantics is CompletionPathSemantics.OPTIONAL_EXISTING_ARTIFACT
+        and "completion_path_absolute" in payload
+    ):
+        missing_label = (
+            "missing_path"
+            if event is EventName.SESSION_COMPLETED
+            else "missing_completion_record"
+        )
+        _require_existing_path(
+            event_name,
+            payload,
+            "completion_path_absolute",
+            missing_label,
+        )
         return
 
     if event is EventName.REVIEW_COMMENT_ADDED:

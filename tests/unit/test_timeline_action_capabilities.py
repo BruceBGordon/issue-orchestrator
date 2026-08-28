@@ -113,6 +113,64 @@ def test_existing_run_with_legacy_unreadable_manifest_has_unavailable_capability
     assert "started_at" in str(unavailable_run_artifacts_detail(state))
 
 
+def test_existing_run_without_manifest_has_unavailable_capability(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run-without-manifest"
+    run_dir.mkdir()
+
+    state = classify_timeline_run_artifacts(
+        raw_run_dir=str(run_dir),
+        issue_number=42,
+        event_name=EventName.SESSION_STARTED.value,
+    )
+
+    assert isinstance(state, UnavailableRunArtifacts)
+    assert "no manifest" in str(unavailable_run_artifacts_detail(state))
+
+
+def test_untrusted_run_topology_still_fails_fast(tmp_path: Path) -> None:
+    _, run = _available_run(tmp_path)
+    lookalike = (
+        tmp_path
+        / "worktree"
+        / ".issue-orchestrator"
+        / "not-sessions"
+        / run.run_dir.name
+    )
+    lookalike.mkdir(parents=True)
+    manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
+    manifest["run_dir"] = str(lookalike)
+    manifest["log_path"] = str(lookalike / "terminal-recording.jsonl")
+    (lookalike / "manifest.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="untrusted run_dir"):
+        classify_timeline_run_artifacts(
+            raw_run_dir=str(lookalike),
+            issue_number=42,
+            event_name=EventName.SESSION_STARTED.value,
+        )
+
+
+def test_issue_mismatch_precedes_legacy_unavailable_classification(
+    tmp_path: Path,
+) -> None:
+    _, run = _available_run(tmp_path, issue_number=123)
+    manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("started_at")
+    run.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="belongs to another issue"):
+        classify_timeline_run_artifacts(
+            raw_run_dir=str(run.run_dir),
+            issue_number=42,
+            event_name=EventName.SESSION_STARTED.value,
+        )
+
+
 def test_existing_run_owned_by_another_issue_fails_fast(tmp_path: Path) -> None:
     _, run = _available_run(tmp_path, issue_number=123)
 

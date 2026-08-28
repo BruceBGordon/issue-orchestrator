@@ -19,7 +19,10 @@ from .domain.event_taxonomy import (
     is_session_event_name,
     is_validation_event_name,
 )
-from .events import EventName
+from .events.artifact_semantics import (
+    CompletionPathSemantics,
+    completion_path_semantics,
+)
 from .events.spec import spec_for
 from .ports.timeline_store import TimelineRecord
 
@@ -817,7 +820,11 @@ def _artifacts_from_data(
     if (
         isinstance(completion_path, str)
         and completion_path
-        and _event_owns_completion_record(event_name, data)
+        and completion_path_semantics(event_name, data)
+        in {
+            CompletionPathSemantics.OPTIONAL_EXISTING_ARTIFACT,
+            CompletionPathSemantics.REQUIRED_EXISTING_ARTIFACT,
+        }
     ):
         _append_artifact(
             artifacts, seen, "completion_record", "Completion", completion_path
@@ -832,19 +839,6 @@ def _artifacts_from_data(
     if isinstance(run_dir, str) and run_dir:
         _append_artifact(artifacts, seen, "run_dir", "Run Dir", run_dir)
     return artifacts
-
-
-def _event_owns_completion_record(event_name: str, data: Mapping[str, Any]) -> bool:
-    """Return whether this event asserts that its completion output exists."""
-    if event_name in {
-        EventName.SESSION_COMPLETED,
-        EventName.SESSION_INVALID_COMPLETION_RECORD,
-    }:
-        return True
-    return (
-        event_name == EventName.SESSION_FAILED
-        and data.get("failure_kind") == "invalid_completion_record"
-    )
 
 
 def _explicit_artifacts_from_data(

@@ -69,7 +69,14 @@ class RecordedRunIssueMismatch:
 
 @dataclass(frozen=True, slots=True)
 class RecordedRunUnreadable:
-    """The exact requested run exists but cannot be trusted or read."""
+    """The exact requested run exists but its evidence cannot be read."""
+
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedRunUntrusted:
+    """The run manifest violates exact-run ownership invariants."""
 
     detail: str
 
@@ -80,6 +87,7 @@ ExactRecordedRunResult: TypeAlias = (
     | RecordedRunNotFound
     | RecordedRunIssueMismatch
     | RecordedRunUnreadable
+    | RecordedRunUntrusted
 )
 
 
@@ -89,6 +97,7 @@ class _LoadedExactRun:
 
     manifest: RunManifest
     assets: SessionRunAssets
+
 
 _RunDirectoryResult: TypeAlias = (
     Path | InvalidRecordedRunReference | RecordedRunNotFound
@@ -106,19 +115,19 @@ def resolve_exact_recorded_run(
         return run_result
     resolved_run_dir = run_result
 
-    manifest_result = _load_exact_run(resolved_run_dir)
-    if isinstance(manifest_result, RecordedRunNotFound | RecordedRunUnreadable):
+    manifest_result = _load_exact_run(
+        resolved_run_dir,
+        issue_number=issue_number,
+    )
+    if isinstance(
+        manifest_result,
+        RecordedRunNotFound
+        | RecordedRunIssueMismatch
+        | RecordedRunUnreadable
+        | RecordedRunUntrusted,
+    ):
         return manifest_result
     manifest = manifest_result.manifest
-    if manifest.issue_number is None:
-        return RecordedRunUnreadable(
-            detail=f"Requested run manifest has no issue number: {resolved_run_dir}"
-        )
-    if manifest.issue_number != issue_number:
-        return RecordedRunIssueMismatch(
-            expected_issue_number=issue_number,
-            actual_issue_number=manifest.issue_number,
-        )
     assets = manifest_result.assets
     run_dir = assets.run_dir.resolve()
     return ExactRecordedRun(
@@ -158,18 +167,21 @@ def _resolve_run_directory(raw_run_dir: str) -> _RunDirectoryResult:
 
 def _load_exact_run(
     resolved_run_dir: Path,
-) -> _LoadedExactRun | RecordedRunNotFound | RecordedRunUnreadable:
+    *,
+    issue_number: int,
+) -> (
+    _LoadedExactRun
+    | RecordedRunNotFound
+    | RecordedRunIssueMismatch
+    | RecordedRunUnreadable
+    | RecordedRunUntrusted
+):
     try:
         manifest_path = resolved_run_dir / "manifest.json"
         raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(raw_manifest, dict):
             raise ValueError("manifest root must be an object")
         manifest = RunManifest.load(resolved_run_dir)
-        assets = SessionRunAssets.from_manifest_payload(
-            run_dir=resolved_run_dir,
-            manifest=raw_manifest,
-        )
-        return _LoadedExactRun(manifest=manifest, assets=assets)
     except FileNotFoundError:
         return RecordedRunNotFound(
             detail=f"Requested run has no manifest: {resolved_run_dir}"
@@ -178,6 +190,51 @@ def _load_exact_run(
         return RecordedRunUnreadable(
             detail=f"Failed to read requested run manifest: {exc}"
         )
+
+    if manifest.issue_number is None:
+        return RecordedRunUnreadable(
+            detail=f"Requested run manifest has no issue number: {resolved_run_dir}"
+        )
+    if manifest.issue_number != issue_number:
+        return RecordedRunIssueMismatch(
+            expected_issue_number=issue_number,
+            actual_issue_number=manifest.issue_number,
+        )
+
+    missing_asset_field = _missing_run_asset_manifest_field(raw_manifest)
+    if missing_asset_field is not None:
+        return RecordedRunUnreadable(
+            detail=(
+                "Failed to read requested run manifest: "
+                f"session run manifest missing required {missing_asset_field!r}"
+            )
+        )
+    try:
+        assets = SessionRunAssets.from_manifest_payload(
+            run_dir=resolved_run_dir,
+            manifest=raw_manifest,
+        )
+    except (TypeError, ValueError) as exc:
+        return RecordedRunUntrusted(
+            detail=f"Requested run manifest violates ownership constraints: {exc}"
+        )
+    return _LoadedExactRun(manifest=manifest, assets=assets)
+
+
+def _missing_run_asset_manifest_field(manifest: Mapping[str, object]) -> str | None:
+    """Return the first legacy field absent from the typed run-asset contract."""
+    for field in (
+        "session_name",
+        "run_id",
+        "started_at",
+        "worktree",
+        "run_dir",
+        "log_path",
+    ):
+        value = manifest.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return field
+    return None
 
 
 @dataclass(frozen=True, slots=True)

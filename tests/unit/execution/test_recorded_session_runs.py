@@ -7,6 +7,7 @@ from issue_orchestrator.execution.recorded_session_runs import (
     InvalidRecordedRunReference,
     RecordedRunIssueMismatch,
     RecordedRunNotFound,
+    RecordedRunUntrusted,
     RecordedRunUnreadable,
     RecordedSessionRunLookup,
     resolve_exact_recorded_run,
@@ -141,8 +142,29 @@ def test_exact_recorded_run_rejects_lookalike_directory(tmp_path):
 
     result = resolve_exact_recorded_run(str(lookalike), issue_number=123)
 
-    assert isinstance(result, RecordedRunUnreadable)
+    assert isinstance(result, RecordedRunUntrusted)
     assert "run_dir must live under worktree session artifacts" in result.detail
+
+
+def test_exact_recorded_run_checks_issue_before_legacy_asset_fields(tmp_path):
+    session_output = FileSystemSessionOutput()
+    run = session_output.start_run(
+        tmp_path,
+        "coding-123",
+        issue_number=123,
+        agent_label="agent:web",
+    )
+    manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
+    manifest["issue_number"] = 456
+    manifest.pop("started_at")
+    run.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = resolve_exact_recorded_run(str(run.run_dir), issue_number=123)
+
+    assert result == RecordedRunIssueMismatch(
+        expected_issue_number=123,
+        actual_issue_number=456,
+    )
 
 
 def test_exact_recorded_run_rejects_relative_reference() -> None:
@@ -160,4 +182,17 @@ def test_exact_recorded_run_does_not_fallback_when_requested_run_is_missing(
 
     assert result == RecordedRunNotFound(
         detail=f"Requested run directory not found: {missing}"
+    )
+
+
+def test_exact_recorded_run_reports_existing_directory_without_manifest(tmp_path):
+    run_dir = (
+        tmp_path / ".issue-orchestrator" / "sessions" / "20260828-120000Z__coding-123"
+    )
+    run_dir.mkdir(parents=True)
+
+    result = resolve_exact_recorded_run(str(run_dir), issue_number=123)
+
+    assert result == RecordedRunNotFound(
+        detail=f"Requested run has no manifest: {run_dir}"
     )
