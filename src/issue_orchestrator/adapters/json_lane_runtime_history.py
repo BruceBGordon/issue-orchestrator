@@ -151,18 +151,38 @@ class JsonLaneRuntimeHistory:
 
     def _write(self, work_key: LaneWorkKey, runtimes: list[float]) -> None:
         path = self._path(work_key)
+        temporary: str | None = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            payload = json.dumps({"runtimes": runtimes}, sort_keys=True)
+            payload = json.dumps({"runtimes": runtimes}, sort_keys=True).encode(
+                "utf-8"
+            )
             handle, temporary = tempfile.mkstemp(
                 dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
             )
             try:
-                os.write(handle, payload.encode("utf-8"))
+                # POSIX may write fewer bytes without raising (storage
+                # exhausted, notably). Replacing on a short write would
+                # install a TRUNCATED file over valid history and report
+                # success — the corruption surfacing only on a later
+                # run. Verify the full payload landed before the swap
+                # (B5, #7117 review; same check as infra append_jsonl).
+                written = os.write(handle, payload)
+                if written != len(payload):
+                    raise OSError(
+                        f"short write: {written} of {len(payload)} bytes"
+                    )
             finally:
                 os.close(handle)
             os.replace(temporary, path)
+            temporary = None
         except OSError as error:
             raise LaneRuntimeHistoryError(
                 f"cannot persist lane runtime history at {path}: {error}"
             ) from error
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
