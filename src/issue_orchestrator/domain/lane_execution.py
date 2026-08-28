@@ -227,6 +227,107 @@ class LaneTimedOut:
 LaneOutcome = LaneCompleted | LaneTimedOut
 
 
+@dataclass(frozen=True, slots=True)
+class LanePolicyInvariant:
+    """One backend setting the lane contracts depend on, plus what the
+    backend actually reports for it.
+
+    ``knob`` is a backend-chosen name and is opaque here: callers only
+    ever print it. That is deliberate — "a setting lanes depend on
+    drifted, and here is which one" is a lane-contract fact every
+    caller understands, while the setting's meaning stays inside the
+    adapter that named it. ``expected`` and ``observed`` are compared
+    verbatim, so the adapter owns normalization.
+    """
+
+    knob: str
+    expected: str
+    observed: str
+
+    def __post_init__(self) -> None:
+        if type(self.knob) is not str or not self.knob:
+            raise ValueError("LanePolicyInvariant.knob must be a non-empty string")
+        if type(self.expected) is not str:
+            raise ValueError("LanePolicyInvariant.expected must be a string")
+        if type(self.observed) is not str:
+            raise ValueError("LanePolicyInvariant.observed must be a string")
+
+    @property
+    def satisfied(self) -> bool:
+        return self.observed == self.expected
+
+    def describe(self) -> str:
+        return (
+            f"{self.knob}: expected {self.expected!r}, "
+            f"backend reports {self.observed!r}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LanePolicyObservation:
+    """A backend policy fact reported rather than asserted.
+
+    Some policy is legitimately optional, and whether it *should* be
+    installed is a deployment decision the check cannot read back at
+    check time. Inventing an intent there would either fail correct
+    pools or bless drifted ones, so the fact is surfaced in the gate
+    log and left to the reader instead.
+    """
+
+    name: str
+    detail: str
+
+    def __post_init__(self) -> None:
+        if type(self.name) is not str or not self.name:
+            raise ValueError("LanePolicyObservation.name must be a non-empty string")
+        if type(self.detail) is not str or not self.detail:
+            raise ValueError("LanePolicyObservation.detail must be a non-empty string")
+
+
+@dataclass(frozen=True, slots=True)
+class LanePolicyReport:
+    """Everything one backend's policy self-check found, in one pass.
+
+    Drift is data, not an exception: a single run names *every* drifted
+    setting, so a degraded backend is fixed in one round rather than
+    one knob per gate attempt. ``source`` identifies the configuration
+    the backend read (human-readable, opaque to callers) and ``remedy``
+    is the backend's own restore instruction, printed verbatim when
+    drift is found — keeping backend-specific advice out of callers.
+    """
+
+    source: str
+    remedy: str
+    invariants: tuple[LanePolicyInvariant, ...]
+    observations: tuple[LanePolicyObservation, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.source) is not str or not self.source:
+            raise ValueError("LanePolicyReport.source must be a non-empty string")
+        if type(self.remedy) is not str or not self.remedy:
+            raise ValueError("LanePolicyReport.remedy must be a non-empty string")
+        if type(self.invariants) is not tuple or any(
+            type(invariant) is not LanePolicyInvariant for invariant in self.invariants
+        ):
+            raise ValueError(
+                "LanePolicyReport.invariants must be a tuple of LanePolicyInvariant"
+            )
+        if type(self.observations) is not tuple or any(
+            type(observation) is not LanePolicyObservation
+            for observation in self.observations
+        ):
+            raise ValueError(
+                "LanePolicyReport.observations must be a tuple of "
+                "LanePolicyObservation"
+            )
+
+    @property
+    def drifted(self) -> tuple[LanePolicyInvariant, ...]:
+        return tuple(
+            invariant for invariant in self.invariants if not invariant.satisfied
+        )
+
+
 class LaneExecutorError(RuntimeError):
     """The backend itself failed — distinct from the lane failing.
 

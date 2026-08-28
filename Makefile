@@ -1,4 +1,4 @@
-.PHONY: help venv venv-fast semgrep-venv worktree-create worktree-setup install upgrade-deps deps-batch release release-pr prepare-release preview-readme typecheck lint-arch lint-complexity quality-guardrails quality-guardrails-stale sync-deps test test-unit test-unit-cov test-unit-cov-html test-integration test-integration-core test-integration-core-local test-integration-core-live-codex test-integration-agent test-simulated test-simulated-core test-simulated-agent test-e2e test-e2e-heavy test-e2e-onboarding-live test-e2e-one test-e2e-live test-real-claude-dev test-real-claude-review test-real-gh-labels test-real-gh test-real-gh-plus-e2e test-real-gh-plus-e2e-subprocess test-web test-web-headed test-vscode install-vscode-extensions playwright-install validate validate-raw validate-pr validate-pr-raw validate-quick validate-full verify-hooks-all _validate-impl _validate-static-impl _validate-core-tests-impl _validate-pr-impl _validate-agent-impl _validate-full-impl _validate-pr-flat-impl FORCE ensure-uv test-integration-agent-claude test-integration-agent-codex test-integration-agent-chain clean demo issues-validate issues-fix issues-fix-dry-run issues-create
+.PHONY: help venv venv-fast semgrep-venv worktree-create worktree-setup install upgrade-deps deps-batch release release-pr prepare-release preview-readme typecheck lint-arch lint-complexity quality-guardrails quality-guardrails-stale lane-preflight sync-deps test test-unit test-unit-cov test-unit-cov-html test-integration test-integration-core test-integration-core-local test-integration-core-live-codex test-integration-agent test-simulated test-simulated-core test-simulated-agent test-e2e test-e2e-heavy test-e2e-onboarding-live test-e2e-one test-e2e-live test-real-claude-dev test-real-claude-review test-real-gh-labels test-real-gh test-real-gh-plus-e2e test-real-gh-plus-e2e-subprocess test-web test-web-headed test-vscode install-vscode-extensions playwright-install validate validate-raw validate-pr validate-pr-raw validate-quick validate-full verify-hooks-all _validate-impl _validate-static-impl _validate-core-tests-impl _validate-pr-impl _validate-agent-impl _validate-full-impl _validate-pr-flat-impl FORCE ensure-uv test-integration-agent-claude test-integration-agent-codex test-integration-agent-chain clean demo issues-validate issues-fix issues-fix-dry-run issues-create
 
 # GNU make detection - required for parallel validation with grouped output
 # On macOS: brew install make (provides gmake)
@@ -381,6 +381,7 @@ PARALLEL ?= auto
 # both modes, and a configured-but-missing pool fails loudly (exit 78).
 LANE_EXECUTOR := $(or $(LANE_EXECUTOR),$(ISSUE_ORCHESTRATOR_LANE_EXECUTOR),direct)
 LANE_RUN = $(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_run
+LANE_PREFLIGHT = $(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_preflight
 # Lane scheduling facts (measured cpu requests, memory budgets,
 # suspendability, exclusive tokens) live in ONE schema-validated home:
 # .issue-orchestrator/lanes.yaml, resolved by lane-run per work
@@ -782,8 +783,25 @@ _validate-static-impl: typecheck lint-arch lint-complexity
 
 _validate-core-tests-impl: test-unit test-simulated-core test-integration-core-local
 
+# Backend policy self-check. Cheap (a handful of local config reads),
+# so the gate can afford it unconditionally — and the ONE owner of the
+# check for every caller: `make lane-preflight LANE_EXECUTOR=<mode>`
+# answers the same question by hand. Direct mode has no external
+# policy and the entrypoint reports an empty invariant set, so no
+# caller branches on the mode.
+lane-preflight:
+	$(call TIMED_RUN,lane-preflight,$(LANE_PREFLIGHT) --backend $(LANE_EXECUTOR))
+
 _validate-pr-impl:
 ifeq ($(LANE_EXECUTOR),condor)
+# Preflight is a GATE step, not a lane step: it runs exactly once here,
+# serially, before the fan — 10+ lanes must not each re-answer whether
+# the pool still carries its policy, and a drifted pool must stop the
+# gate before it dispatches work that would silently run degraded. A
+# marker file or TTL memo would buy nothing here and would need its own
+# invalidation story; the gate's own head is already a once-per-gate
+# seam, so it is the owner.
+	@$(GMAKE) lane-preflight
 # -j must cover EVERY flat target: a lane waiting for a make slot is
 # invisible to the scheduler, so the learned dispatch order cannot
 # reach it and make's arbitrary ordering decides instead. Submission

@@ -118,7 +118,7 @@ def _capture(
 ) -> _CapturingExecutor:
     executor = _CapturingExecutor(outcome)
     monkeypatch.setattr(
-        lane_run_module, "_build_executor", lambda backend: executor
+        lane_run_module, "build_lane_executor", lambda backend: executor
     )
     return executor
 

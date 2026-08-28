@@ -15,6 +15,7 @@ import dataclasses
 from issue_orchestrator.domain import lane_execution
 from issue_orchestrator.ports import lane_dispatch_journal
 from issue_orchestrator.ports.lane_executor import LaneExecutor
+from issue_orchestrator.ports.lane_policy_check import LanePolicyCheck
 from issue_orchestrator.ports.lane_runtime_history import LaneRuntimeHistory
 
 
@@ -84,6 +85,31 @@ def test_dispatch_journal_surface_is_pinned() -> None:
         "observed_runtime_seconds",
         "exit_code",
     )
+
+
+def test_policy_check_port_surface_is_pinned() -> None:
+    """New port (#7129): one read-only operation, one typed report.
+
+    Kept deliberately narrow — a self-check that could also *repair*
+    would give the gate a way to mutate the backend it is judging."""
+    operations = [
+        name
+        for name in vars(LanePolicyCheck)
+        if not name.startswith("_") and callable(getattr(LanePolicyCheck, name))
+    ]
+    assert operations == ["inspect"]
+    assert _field_names(lane_execution.LanePolicyReport) == (
+        "source",
+        "remedy",
+        "invariants",
+        "observations",
+    )
+    assert _field_names(lane_execution.LanePolicyInvariant) == (
+        "knob",
+        "expected",
+        "observed",
+    )
+    assert _field_names(lane_execution.LanePolicyObservation) == ("name", "detail")
 
 
 def test_history_port_has_exactly_two_operations() -> None:

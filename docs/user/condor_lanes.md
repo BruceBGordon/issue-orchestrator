@@ -90,6 +90,50 @@ runs a probe job in a fresh submitter-owned directory — readiness means
 identity configuration and hold reason instead of leaving you nine
 held lanes later.
 
+## Pool-policy self-check (runs at the head of every gate)
+
+`up` verifies the pool the moment it starts it. Nothing verified it
+again afterwards — and a pool is long-lived: files get hand-edited,
+packages get reinstalled, an experiment gets left behind. A pool that
+has lost one of the three settings above keeps accepting work and keeps
+reporting lanes as completed, so the damage (exclusives that no longer
+exclude, deadline overruns that surface as "backend unresponsive",
+lanes held on their own working directory) shows up as flaky lanes
+rather than as a configuration problem.
+
+`make validate-pr LANE_EXECUTOR=condor` therefore preflights the pool
+**once per gate**, before the lane fan:
+
+```bash
+make lane-preflight LANE_EXECUTOR=condor   # the same check, by hand
+```
+
+```
+[lane-preflight] 91-io-load-backoff.conf: not installed
+[lane-preflight] 92-io-pool-capacity.conf: not installed
+[lane-preflight] condor: 3 required setting(s) hold — …/etc/condor_config
+```
+
+It asserts the three settings above and nothing else, exits **78**
+naming every drifted knob at once (no warn-and-continue: a drifted pool
+stops the gate before a single lane is dispatched), and exits 70 if the
+pool cannot be read at all — a pool that will not answer is never
+reported as healthy. Cost is four `condor_config_val` reads, measured
+at about one second on the Rosetta macOS pool, which is why the gate can
+afford it unconditionally and why it runs once rather than once per lane.
+
+The two opt-in policy files are **reported, not asserted**. Whether
+they *should* be installed depends on an environment variable
+(`IO_CONDOR_LOAD_BACKOFF`, `IO_POOL_CAPACITY_PERCENT`) read once, at
+`up` time, by a different process; nothing on the pool records that it
+was set. Requiring them would fail every pool that correctly opted out,
+and ignoring them would hide a hand-removed backoff policy — so their
+presence goes in the gate log for the reader to judge. Presence means
+the pool actually parses the file, not that it exists on disk.
+
+Direct mode runs lanes in your own environment and has no external
+policy, so the same target reports an empty invariant set and exits 0.
+
 ## Which parameters belong to which mode
 
 The concurrency controls are three separate layers; each parameter

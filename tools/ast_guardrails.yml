@@ -14,7 +14,11 @@ layer_boundaries:
       - src/issue_orchestrator/entrypoints/bootstrap.py
       # provider factory (when introduced) is part of composition wiring
       - src/issue_orchestrator/entrypoints/repository_host_factory.py
-      # lane_run is the composition root for lane execution backends
+      # lane_run wires the lane runner's own persistence adapters
+      # (runtime history, dispatch journal). Backend selection itself
+      # is no longer here - it has one owner in
+      # execution/lane_backends.py, which is why lane_preflight.py
+      # needs no exemption.
       - src/issue_orchestrator/entrypoints/cli_tools/lane_run.py
   - name: core_no_github_adapter_imports
     description: "Core control and observation layers must not import GitHub adapters directly"

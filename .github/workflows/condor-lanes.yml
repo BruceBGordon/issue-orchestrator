@@ -13,9 +13,13 @@ on:
       - 'src/issue_orchestrator/adapters/direct_lane_executor.py'
       - 'src/issue_orchestrator/domain/lane_execution.py'
       - 'src/issue_orchestrator/ports/lane_executor.py'
+      - 'src/issue_orchestrator/ports/lane_policy_check.py'
+      - 'src/issue_orchestrator/execution/lane_backends.py'
       - 'src/issue_orchestrator/entrypoints/cli_tools/lane_run.py'
+      - 'src/issue_orchestrator/entrypoints/cli_tools/lane_preflight.py'
       - 'tests/unit/lane_executor_contract.py'
       - 'tests/integration/test_condor_lane_executor.py'
+      - 'tests/integration/test_condor_pool_policy.py'
       - 'scripts/condor-personal.sh'
       - 'scripts/lane_slices.py'
       - 'tests/unit/test_lane_slices.py'
@@ -66,7 +70,16 @@ jobs:
       - name: Contract suite against the live pool
         run: |
           .venv/bin/python -m pytest tests/integration/test_condor_lane_executor.py \
+            tests/integration/test_condor_pool_policy.py \
             -q -m "requires_infra and not requires_backoff_pool" --tb=short
+
+      # The pool-policy self-check on a LINUX pool, which is where the
+      # settings it guards actually differ from the shipped defaults
+      # (MOUNT_UNDER_SCRATCH ships as /tmp,/var/tmp here). Runs the
+      # target the gate itself runs, so a drifted helper fails CI the
+      # same way it would fail a developer's gate.
+      - name: Pool-policy preflight
+        run: make lane-preflight LANE_EXECUTOR=condor
 
       # The typecheck lane is the demo deliberately: its pyright/node
       # workload is what exposed the missing memory contract (a slot

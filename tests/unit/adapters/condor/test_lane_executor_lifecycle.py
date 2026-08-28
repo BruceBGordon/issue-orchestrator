@@ -31,6 +31,7 @@ def _stub_tools(tmp_path: Path, submit_exit: int) -> CondorTools:
         "condor_submit": f"#!/bin/sh\necho 'submit refused' >&2\nexit {submit_exit}\n",
         "condor_rm": "#!/bin/sh\nexit 0\n",
         "condor_q": "#!/bin/sh\nexit 0\n",
+        "condor_config_val": "#!/bin/sh\nexit 0\n",
     }
     for name, body in stubs.items():
         tool = binaries / name
@@ -40,6 +41,7 @@ def _stub_tools(tmp_path: Path, submit_exit: int) -> CondorTools:
         submit=binaries / "condor_submit",
         remove=binaries / "condor_rm",
         query=binaries / "condor_q",
+        config_query=binaries / "condor_config_val",
     )
 
 
