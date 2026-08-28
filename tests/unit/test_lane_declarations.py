@@ -194,6 +194,27 @@ def _submitted_work_keys(tmp_path: Path) -> set[str]:
     return keys
 
 
+def test_selftest_lane_run_calls_parse_against_the_current_cli() -> None:
+    """D1 (#7122 review): the container selftest is a supported
+    lane-run consumer that a CLI migration once left behind (its
+    removed flags failed argparse in CI). Every lane-run invocation in
+    the selftest is extracted and parsed with TODAY'S parser, so a
+    future flag change strands it here first, loudly."""
+    import shlex
+
+    from issue_orchestrator.entrypoints.cli_tools.lane_run import (
+        _parse_arguments,
+    )
+
+    text = (REPO_ROOT / "docker/execenv/selftest.sh").read_text()
+    joined = text.replace("\\\n", " ")
+    invocations = re.findall(r"\$LANE_RUN\s+(.*?)\s+--\s", joined)
+    assert invocations, "selftest lane-run invocations not found - probe broken"
+    for invocation in invocations:
+        parsed = _parse_arguments(shlex.split(invocation))
+        assert str(parsed.work_key).startswith("execenv.")
+
+
 def test_every_submitted_lane_is_declared_and_vice_versa(
     tmp_path: Path,
 ) -> None:
