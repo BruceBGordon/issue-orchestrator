@@ -44,10 +44,16 @@ class LaneWorkKey:
 
 @dataclass(frozen=True, slots=True)
 class LaneDeadline:
-    """Wall-clock bound for one lane run.
+    """Active-execution-time bound for one lane run.
 
-    Every backend must terminate the lane's entire process tree at the
-    bound and report :data:`LANE_TIMEOUT_EXIT_CODE`.
+    The budget charges time the lane actually executes: scheduler queue
+    wait before execution and machine-load suspension (a backend
+    freezing the lane to defer to the machine's owner) are charged to
+    nothing — a lane must never time out for waiting or for being
+    frozen. On the direct backend, which neither queues nor suspends,
+    this is indistinguishable from a wall-clock bound. Every backend
+    terminates the lane's entire process tree at the bound and reports
+    :data:`LANE_TIMEOUT_EXIT_CODE`.
     """
 
     timeout_seconds: float
@@ -89,8 +95,10 @@ class LaneResources:
     # thaw safely anywhere, but a lane holding a live provider exchange
     # must never be paused mid-turn — the response window expires while
     # frozen and the thaw manufactures a provider-outage failure
-    # indistinguishable from a real one.
-    suspendable: bool = True
+    # indistinguishable from a real one. The default is the FAIL-SAFE
+    # direction: a lane nobody classified is never frozen — freezing
+    # requires an explicit declaration, not an author's memory.
+    suspendable: bool = False
 
     def __post_init__(self) -> None:
         if type(self.request_cpus) is not int or self.request_cpus < 1:
@@ -152,11 +160,13 @@ class LaneCommand:
 class LaneCompleted:
     """The lane's process tree ran to its own exit.
 
-    ``observed_runtime_seconds`` is the time the lane actually executed,
-    excluding any scheduler queue wait. It feeds the runtime-history
-    learning loop, which is why queue wait must never leak into it: a
-    learned ordering derived from queue-inflated numbers would chase its
-    own scheduling delays.
+    ``observed_runtime_seconds`` is the time the lane actually
+    executed — the same active-execution clock as
+    :class:`LaneDeadline`: scheduler queue wait and machine-load
+    suspension are both excluded. It feeds the runtime-history learning
+    loop, which is why neither may leak into it: queue-inflated numbers
+    would chase their own scheduling delays, and frozen time would
+    teach the loop that a lane got slower when the machine got busier.
     """
 
     exit_code: int

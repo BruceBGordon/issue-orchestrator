@@ -64,6 +64,10 @@ def compile_submit_description(
     timeout = max(1, math.ceil(command.deadline.timeout_seconds))
     lines = [
         f"# lane: {command.work_key.value}",
+        # The work key doubles as the job's batch name: queue tooling
+        # (and tests) can then address exactly this lane's job by
+        # constraint instead of pool-wide operations.
+        f"batch_name = {command.work_key.value}",
         "universe = vanilla",
         f"executable = {exec_script_path}",
         f"initialdir = {command.working_directory}",

@@ -157,3 +157,23 @@ def test_no_lane_run_declaration_anywhere_lacks_a_memory_budget() -> None:
         "condor lane declarations without a memory budget:\n"
         + "\n".join(offenders)
     )
+
+
+def test_every_lane_declaration_classifies_suspendability() -> None:
+    """A1 (#7118 review): freezing eligibility must be an explicit
+    declaration on EVERY lane, never an author's memory. The domain
+    default is fail-safe (non-suspendable), and this guard forces each
+    declaration to say which side it is on — a new lane cannot be
+    silently frozen, and a hermetic lane cannot silently lose backoff
+    coverage."""
+    offenders = [
+        line.strip()
+        for line in (REPO_ROOT / "Makefile").read_text().splitlines()
+        if "$(LANE_RUN)" in line
+        and "--suspendable" not in line
+        and "--not-suspendable" not in line
+    ]
+    assert not offenders, (
+        "condor lane declarations without a suspendability classification:\n"
+        + "\n".join(offenders)
+    )

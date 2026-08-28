@@ -108,11 +108,13 @@ Three rules are built in, each load-bearing:
 - **Owner load, never total load.** The policy subtracts the load
   condor's own jobs cause; suspending on total load would trip on the
   gate's own lane fan and oscillate against its own reflection.
-- **Only lanes that declared it safe.** Hermetic lanes freeze and thaw
-  anywhere; a lane holding a live provider exchange must never be
-  paused mid-turn (the response window expires while frozen and the
-  thaw manufactures a provider-outage failure). Live lanes carry
-  `--not-suspendable` and the policy skips them.
+- **Only lanes that declared it safe.** Hermetic lanes carry
+  `--suspendable`; lanes holding live provider exchanges carry
+  `--not-suspendable` (frozen mid-turn, their response window expires
+  and the thaw manufactures a provider-outage failure). The
+  unclassified default is **non-suspendable** — freezing requires an
+  explicit declaration, never an author's memory — and a guard test
+  forces every lane declaration to say which side it is on.
 - **Frozen time is charged to nothing.** The compiled lane deadline
   subtracts suspension time (a freeze must not manufacture a timeout),
   and observed runtime excludes it (a freeze must not teach the

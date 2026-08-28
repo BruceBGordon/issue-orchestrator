@@ -236,15 +236,30 @@ def test_load_backoff_is_off_by_default(tmp_path: Path) -> None:
     ).read_text()
 
 
-def test_load_backoff_keys_on_owner_load_never_total(tmp_path: Path) -> None:
-    """SUSPEND over total LoadAvg would trip on the gate's own lane
-    fan and oscillate against its own reflection; the policy must
-    subtract condor's own load."""
+def test_load_backoff_keys_on_machine_wide_owner_load(tmp_path: Path) -> None:
+    """Two invariants: subtract condor's own load (or the policy trips
+    on the gate's own fan), and use the MACHINE-wide Total* attributes
+    (the unprefixed pair is per-slot on multi-core machines and gives
+    different answers on different slots of the same host)."""
     _write_lane_config(tmp_path, IO_CONDOR_LOAD_BACKOFF="1")
     generated = (tmp_path / "91-io-load-backoff.conf").read_text()
-    assert "OwnerLoadAvg = (LoadAvg - CondorLoadAvg)" in generated
+    assert "OwnerLoadAvg = (TotalLoadAvg - TotalCondorLoadAvg)" in generated
     assert "$(OwnerLoadAvg) > 5.0" in generated
     assert "$(OwnerLoadAvg) < 2.0" in generated
+    import re as _re
+
+    assert not _re.search(r"[^l]\bLoadAvg\b", generated.replace("TotalLoadAvg", "").replace("TotalCondorLoadAvg", "").replace("CondorLoadAvg", "")), generated
+
+
+def test_load_backoff_disable_removes_the_previous_policy(tmp_path: Path) -> None:
+    """Enable then plain re-run must leave NO suspension policy behind:
+    darwin writes into the persistent directory and linux copies only
+    staged files, so a stale 91 file keeps freezing lanes after the
+    operator opted out (B2, #7118 review)."""
+    _write_lane_config(tmp_path, IO_CONDOR_LOAD_BACKOFF="1")
+    assert (tmp_path / "91-io-load-backoff.conf").exists()
+    _write_lane_config(tmp_path)
+    assert not (tmp_path / "91-io-load-backoff.conf").exists()
 
 
 def test_load_backoff_freezes_only_lanes_that_declared_it_safe(

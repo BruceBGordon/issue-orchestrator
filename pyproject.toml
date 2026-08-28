@@ -116,6 +116,7 @@ markers = [
     "xdist_group(name): Group tests to run serially under pytest-xdist --dist=loadgroup",
     "gh_activity_limit: Enforce GH API activity limits per test (test_gh_activity_limit, system_gh_activity_limit)",
     "requires_infra: Tests requiring external infrastructure (GitHub token, running services). Run in CI, excluded from pre-push.",
+    "requires_backoff_pool: Live tests that need a pool started with IO_CONDOR_LOAD_BACKOFF=1; run only by the dedicated CI acceptance job.",
 ]
 
 [tool.pyright]

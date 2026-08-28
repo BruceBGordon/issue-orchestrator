@@ -181,18 +181,31 @@ def test_deadline_charges_executing_time_never_frozen_time(tmp_path: Path) -> No
 
 
 def test_suspendability_is_declared_explicitly_both_ways(tmp_path: Path) -> None:
-    """Policy-by-absence would let a new live lane silently opt into
-    freezing; the attribute is always present, True or False."""
+    """The attribute is always present, True or False — and the
+    unclassified default serializes as False: an undeclared lane is
+    never eligible for freezing (fail-safe, A1 #7118 review)."""
     default = compile_submit_description(
         _command(("/bin/true",)),
         LaneResources(request_cpus=1),
         tmp_path,
     )
-    assert "+SuspendableLane = True" in default.text
+    assert "+SuspendableLane = False" in default.text
 
-    live = compile_submit_description(
+    hermetic = compile_submit_description(
         _command(("/bin/true",)),
-        LaneResources(request_cpus=1, suspendable=False),
+        LaneResources(request_cpus=1, suspendable=True),
         tmp_path,
     )
-    assert "+SuspendableLane = False" in live.text
+    assert "+SuspendableLane = True" in hermetic.text
+
+
+def test_work_key_is_the_batch_name(tmp_path: Path) -> None:
+    """Targeted queue operations (suspend THIS lane, remove THIS lane)
+    need a job-addressable handle; pool-wide -all operations from tests
+    or tooling can freeze unrelated work (B4, #7118 review)."""
+    compiled = compile_submit_description(
+        _command(("/bin/true",)),
+        LaneResources(request_cpus=1),
+        tmp_path,
+    )
+    assert "batch_name = test-unit" in compiled.text
