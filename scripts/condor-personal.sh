@@ -47,6 +47,64 @@ CONCURRENCY_LIMIT_DEFAULT = 1
 # working directory". Lanes must see the submitter's real filesystem.
 MOUNT_UNDER_SCRATCH =
 EOF
+  write_load_backoff_config "$config_dir"
+}
+
+# Opt-in machine-load backoff (IO_CONDOR_LOAD_BACKOFF=1 at `up` time):
+# freeze eligible running lanes when the machine's OWNER load - load
+# condor's own jobs did not cause - climbs, thaw when it clears. Three
+# non-negotiable rules, each learned in design review:
+#   1. Key on owner load, never total load: SUSPEND over total LoadAvg
+#      would trip on the gate's own lane fan and oscillate against its
+#      own reflection.
+#   2. Only lanes that declared themselves suspendable may freeze - a
+#      live provider exchange frozen mid-turn thaws into a manufactured
+#      provider-outage failure.
+#   3. The compiled lane deadline subtracts CumulativeSuspensionTime,
+#      so frozen time never burns a lane's budget (submit_compiler.py
+#      owns that half of the contract).
+write_load_backoff_config() {
+  local config_dir="$1"
+  if [ "${IO_CONDOR_LOAD_BACKOFF:-0}" != "1" ]; then
+    # Symmetric lifecycle: opting out removes the policy this helper
+    # previously wrote, or "off by default" is only true before the
+    # first opt-in (B2, #7118 review).
+    rm -f "${config_dir}/91-io-load-backoff.conf"
+    return 0
+  fi
+  # TotalLoadAvg/TotalCondorLoadAvg are the MACHINE-wide pair; the
+  # unprefixed LoadAvg/CondorLoadAvg are per-slot on multi-core
+  # machines and would make different suspension decisions for jobs on
+  # the same host (B1, #7118 review — verified live: two busy dynamic
+  # slots on one 18-core host advertised LoadAvg 3.16 and 0.0 while
+  # TotalLoadAvg was 3.16).
+  cat > "${config_dir}/91-io-load-backoff.conf" <<EOF
+OwnerLoadAvg = (TotalLoadAvg - TotalCondorLoadAvg)
+WANT_SUSPEND = (TARGET.SuspendableLane =?= True)
+SUSPEND = (\$(OwnerLoadAvg) > ${IO_CONDOR_SUSPEND_LOAD:-5.0}) && (TARGET.SuspendableLane =?= True)
+CONTINUE = (\$(OwnerLoadAvg) < ${IO_CONDOR_CONTINUE_LOAD:-2.0})
+EOF
+}
+
+# Files this helper manages whose ABSENCE from staging is meaningful:
+# copying staged files over a destination cannot delete anything, so a
+# previously-installed opt-in policy would survive every later plain
+# `up`. The install boundary owns that reconciliation (B2, #7118
+# review): a managed file not present in staging is removed from the
+# destination.
+MANAGED_OPTIONAL_CONFIGS="91-io-load-backoff.conf"
+
+install_staged_configs() {
+  local staging="$1" destination="$2" runner=""
+  if [ ! -w "$destination" ]; then
+    runner="sudo"
+  fi
+  $runner cp "$staging"/*.conf "$destination/"
+  for managed in $MANAGED_OPTIONAL_CONFIGS; do
+    if [ ! -f "$staging/$managed" ] && [ -f "$destination/$managed" ]; then
+      $runner rm -f "$destination/$managed"
+    fi
+  done
 }
 
 # The plain Linux htcondor package boots DAEMON_LIST = MASTER and
@@ -257,11 +315,7 @@ linux_configure() {
   if ambient_needs_personal_role "$ambient_daemons"; then
     write_personal_role_config "$staging"
   fi
-  if [ -w "$config_dir" ]; then
-    cp "$staging"/*.conf "$config_dir/"
-  else
-    sudo cp "$staging"/*.conf "$config_dir/"
-  fi
+  install_staged_configs "$staging" "$config_dir"
   rm -rf "$staging"
   if command -v systemctl >/dev/null 2>&1; then
     sudo systemctl restart condor

@@ -90,6 +90,36 @@ runs a probe job in a fresh submitter-owned directory — readiness means
 identity configuration and hold reason instead of leaving you nine
 held lanes later.
 
+## Machine-load backoff (opt-in)
+
+The pool can defer to the machine's real owner: when load that condor's
+own jobs did not cause climbs, eligible running lanes are frozen
+(SIGSTOP) and thawed when it clears. Off by default; enable at pool
+start:
+
+```bash
+IO_CONDOR_LOAD_BACKOFF=1 scripts/condor-personal.sh up
+# thresholds (owner load average): IO_CONDOR_SUSPEND_LOAD (default 5.0),
+# IO_CONDOR_CONTINUE_LOAD (default 2.0)
+```
+
+Three rules are built in, each load-bearing:
+
+- **Owner load, never total load.** The policy subtracts the load
+  condor's own jobs cause; suspending on total load would trip on the
+  gate's own lane fan and oscillate against its own reflection.
+- **Only lanes that declared it safe.** Hermetic lanes carry
+  `--suspendable`; lanes holding live provider exchanges carry
+  `--not-suspendable` (frozen mid-turn, their response window expires
+  and the thaw manufactures a provider-outage failure). The
+  unclassified default is **non-suspendable** — freezing requires an
+  explicit declaration, never an author's memory — and a guard test
+  forces every lane declaration to say which side it is on.
+- **Frozen time is charged to nothing.** The compiled lane deadline
+  subtracts suspension time (a freeze must not manufacture a timeout),
+  and observed runtime excludes it (a freeze must not teach the
+  learning loop that a lane got slower).
+
 ## Learned dispatch order
 
 Lanes carry no tuning knobs: the system orders its own queue. Every

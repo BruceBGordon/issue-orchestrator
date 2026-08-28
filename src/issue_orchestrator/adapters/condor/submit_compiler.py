@@ -64,6 +64,10 @@ def compile_submit_description(
     timeout = max(1, math.ceil(command.deadline.timeout_seconds))
     lines = [
         f"# lane: {command.work_key.value}",
+        # The work key doubles as the job's batch name: queue tooling
+        # (and tests) can then address exactly this lane's job by
+        # constraint instead of pool-wide operations.
+        f"batch_name = {command.work_key.value}",
         "universe = vanilla",
         f"executable = {exec_script_path}",
         f"initialdir = {command.working_directory}",
@@ -76,8 +80,17 @@ def compile_submit_description(
         "should_transfer_files = NO",
         "notification = never",
         f"job_max_vacate_time = {_REMOVAL_GRACE_SECONDS}",
+        # The deadline charges executing time only: suspension (machine
+        # load backoff freezing the job) must not burn the budget, or a
+        # long freeze manufactures a timeout the lane never earned. The
+        # ?: guard keeps the expression defined before any suspension.
         "periodic_remove = (JobStatus == 2) && "
-        f"((time() - JobCurrentStartDate) > {timeout})",
+        "((time() - JobCurrentStartDate - (CumulativeSuspensionTime ?: 0)) "
+        f"> {timeout})",
+        # Load-backoff eligibility is declared per lane, both ways
+        # explicitly — policy-by-absence would let a new live lane
+        # silently opt into freezing.
+        f"+SuspendableLane = {'True' if resources.suspendable else 'False'}",
     ]
     if resources.priority > 0:
         lines.append(f"priority = {resources.priority}")

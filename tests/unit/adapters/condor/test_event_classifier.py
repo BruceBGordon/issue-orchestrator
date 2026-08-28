@@ -153,6 +153,49 @@ def test_every_prefix_of_a_full_log_classifies_without_error() -> None:
             assert type(state) in (LaneJobPending, LaneJobRunning)
 
 
+
+_SUSPENDED_EVENT = (
+    "010 (002.000.000) 2026-08-26 14:08:40 Job was suspended.\n"
+    "\tNumber of processes actually suspended: 1\n"
+    "...\n"
+)
+_UNSUSPENDED_EVENT = (
+    "011 (002.000.000) 2026-08-26 14:08:52 Job was unsuspended.\n"
+    "...\n"
+)
+
+
+def test_suspension_is_a_waiting_state_not_a_fault() -> None:
+    from issue_orchestrator.adapters.condor.event_classifier import (
+        LaneJobSuspended,
+    )
+
+    state = classify_event_log(_SUBMITTED + _EXECUTING + _SUSPENDED_EVENT)
+    assert type(state) is LaneJobSuspended
+
+
+def test_unsuspension_resumes_running() -> None:
+    state = classify_event_log(
+        _SUBMITTED + _EXECUTING + _SUSPENDED_EVENT + _UNSUSPENDED_EVENT
+    )
+    assert type(state) is LaneJobRunning
+
+
+def test_suspended_then_terminated_classifies_the_exit() -> None:
+    # Terminated at 14:08:32? The fixture's terminal precedes the
+    # suspension timestamps - use the later terminal for coherence.
+    state = classify_event_log(
+        _SUBMITTED
+        + _EXECUTING
+        + _SUSPENDED_EVENT
+        + _UNSUSPENDED_EVENT
+        + _TERMINATED_ZERO.replace("14:08:32", "14:08:55")
+    )
+    assert type(state) is LaneJobExited
+    assert state.exit_code == 0
+
+
+
 _EXECUTING_LATER = _EXECUTING.replace("14:08:32", "14:08:40")
 _TERMINATED_AT_0905 = _TERMINATED_ZERO.replace("14:08:32", "14:09:05")
 
@@ -188,3 +231,34 @@ def test_deadline_removal_carries_the_span() -> None:
     state = classify_event_log(_SUBMITTED + _EXECUTING + aborted_later)
     assert type(state) is LaneJobDeadlineRemoved
     assert state.runtime_seconds == 60.0
+
+
+def test_suspended_intervals_are_subtracted_from_the_runtime() -> None:
+    """The merged truth of 7117-B1 and the suspension exclusion: the
+    scheduler's record is execute 14:08:32 → terminate 14:09:05 (33s)
+    with a 12s frozen interval (14:08:40 → 14:08:52) inside it, so the
+    lane executed for 21s — all from event-log arithmetic, no poll
+    clock anywhere."""
+    state = classify_event_log(
+        _SUBMITTED
+        + _EXECUTING
+        + _SUSPENDED_EVENT
+        + _UNSUSPENDED_EVENT
+        + _TERMINATED_AT_0905
+    )
+    assert state == LaneJobExited(0, 21.0)
+
+
+def test_terminal_while_frozen_closes_the_open_suspension() -> None:
+    state = classify_event_log(
+        _SUBMITTED + _EXECUTING + _SUSPENDED_EVENT + _TERMINATED_AT_0905
+    )
+    # execute 14:08:32 → terminate 14:09:05 is 33s; frozen from
+    # 14:08:40 to the terminal event is 25s; executed 8s.
+    assert state == LaneJobExited(0, 8.0)
+
+
+def test_unsuspend_without_suspension_fails_loudly() -> None:
+    with pytest.raises(ValueError, match="no suspension open"):
+        classify_event_log(_SUBMITTED + _EXECUTING + _UNSUSPENDED_EVENT)
+

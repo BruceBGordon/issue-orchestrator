@@ -66,7 +66,7 @@ jobs:
       - name: Contract suite against the live pool
         run: |
           .venv/bin/python -m pytest tests/integration/test_condor_lane_executor.py \
-            -q -m requires_infra --tb=short
+            -q -m "requires_infra and not requires_backoff_pool" --tb=short
 
       # The typecheck lane is the demo deliberately: its pyright/node
       # workload is what exposed the missing memory contract (a slot
@@ -75,3 +75,40 @@ jobs:
       # stay green as the end-to-end proof of that contract.
       - name: One real lane through the pool
         run: LANE_EXECUTOR=condor make typecheck
+
+  # Acceptance for the opt-in load backoff policy itself, on its own
+  # pool: a machine-owner load spike must freeze a suspendable lane,
+  # leave a non-suspendable lane running, and thaw the frozen lane to
+  # completion. Runs on a dedicated fresh-runner pool started WITH the
+  # policy and aggressive thresholds — never against a shared pool,
+  # where a manufactured load spike would freeze unrelated work.
+  condor-backoff-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version-file: .python-version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+
+      - name: Install HTCondor with load backoff enabled
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y htcondor
+          IO_CONDOR_LOAD_BACKOFF=1 \
+          IO_CONDOR_SUSPEND_LOAD=1.5 \
+          IO_CONDOR_CONTINUE_LOAD=1.0 \
+            bash scripts/condor-personal.sh up
+
+      - name: Load-spike acceptance
+        run: |
+          .venv/bin/python -m pytest tests/integration/test_condor_lane_executor.py \
+            -q -m requires_backoff_pool --tb=short

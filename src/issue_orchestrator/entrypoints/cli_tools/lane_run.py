@@ -81,6 +81,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # the naive first run.
                 priority=history.learned_priority(work_key),
                 request_memory_mb=arguments.request_memory_mb,
+                suspendable=arguments.suspendable,
             ),
         )
     except LaneExecutorUnavailableError as error:
@@ -136,6 +137,27 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         help="Machine-wide mutual-exclusion token (repeatable).",
     )
     parser.add_argument("--timeout-seconds", type=float, required=True)
+    suspendability = parser.add_mutually_exclusive_group()
+    suspendability.add_argument(
+        "--suspendable",
+        dest="suspendable",
+        action="store_true",
+        help=(
+            "The lane tolerates being frozen mid-run by machine-load "
+            "backoff (declare for hermetic lanes)."
+        ),
+    )
+    suspendability.add_argument(
+        "--not-suspendable",
+        dest="suspendable",
+        action="store_false",
+        help=(
+            "The lane must never be frozen mid-run (lanes holding live "
+            "provider exchanges). This is also the unclassified default: "
+            "freezing requires an explicit declaration."
+        ),
+    )
+    parser.set_defaults(suspendable=False)
     parser.add_argument(
         "--backend",
         choices=(_DIRECT_BACKEND, _CONDOR_BACKEND),

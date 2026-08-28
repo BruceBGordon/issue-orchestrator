@@ -27,6 +27,8 @@ _SUBMITTED = "000"
 _EXECUTING = "001"
 _TERMINATED = "005"
 _ABORTED = "009"
+_SUSPENDED = "010"
+_UNSUSPENDED = "011"
 _HELD = "012"
 
 # The body of an abort event names the expression that removed the job;
@@ -42,6 +44,16 @@ class LaneJobPending:
 @dataclass(frozen=True, slots=True)
 class LaneJobRunning:
     """The job has started executing."""
+
+
+@dataclass(frozen=True, slots=True)
+class LaneJobSuspended:
+    """The job is frozen by machine-load backoff; it will resume.
+
+    Not a fault and not terminal: the executor must keep waiting, and
+    frozen time is charged to neither the lane's deadline nor its
+    observed runtime.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +102,7 @@ class LaneJobFaulted:
 LaneJobState = (
     LaneJobPending
     | LaneJobRunning
+    | LaneJobSuspended
     | LaneJobExited
     | LaneJobKilledBySignal
     | LaneJobDeadlineRemoved
@@ -114,52 +127,89 @@ def classify_event_log(log_text: str) -> LaneJobState:
         raise ValueError("classify_event_log requires the log text")
     events = _split_complete_events(log_text)
     state: LaneJobState = LaneJobPending()
-    execute_at: datetime | None = None
+    span = _ExecutionSpan()
     for code, occurred_at, body in events:
         if code == _EXECUTING:
-            # The LAST execute event anchors the span: a restarted job's
-            # final execution is the runtime signal, not its false starts.
-            execute_at = occurred_at
+            span.executing(occurred_at)
+            state = LaneJobRunning()
+        elif code == _SUSPENDED:
+            span.suspend(occurred_at)
+            state = LaneJobSuspended()
+        elif code == _UNSUSPENDED:
+            span.resume(occurred_at)
             state = LaneJobRunning()
         elif code == _TERMINATED:
-            state = _classify_termination(
-                body, _runtime_seconds(execute_at, occurred_at)
-            )
+            state = _classify_termination(body, span.runtime_at(occurred_at))
         elif code == _ABORTED:
             if _DEADLINE_REMOVAL_MARKER in body:
-                state = LaneJobDeadlineRemoved(
-                    _runtime_seconds(execute_at, occurred_at)
-                )
+                state = LaneJobDeadlineRemoved(span.runtime_at(occurred_at))
             else:
                 state = LaneJobRemoved(_first_body_line(body))
         elif code == _HELD:
             state = LaneJobFaulted(_first_body_line(body))
-        elif code == _SUBMITTED:
-            continue
-        # Every other event code (image size, usage updates, …) is
-        # informational and does not change the lifecycle state.
+        # Submission and every other event code (image size, usage
+        # updates, …) are informational and do not change the state.
     return state
 
 
-def _runtime_seconds(execute_at: datetime | None, terminal_at: datetime) -> float:
-    """The scheduler's own execution span, execute → terminal.
+class _ExecutionSpan:
+    """Executing-time bookkeeping from the log's own timestamps.
 
-    Second-granular (the log's timestamp resolution) — plenty for a
-    dispatch-ordering rank, and honest in a way a poll clock can never
-    be: a job first observed already-terminal still reports its true
-    span instead of collapsing toward zero.
+    The runtime a terminal state reports is the scheduler's record —
+    (last) execute → terminal, minus every suspended interval — never
+    this process's poll clock, whose observation lag would masquerade
+    as execution time. Second-granular, matching the log.
     """
-    if execute_at is None:
-        raise ValueError(
-            "job reached a terminal event with no execute event before it"
+
+    def __init__(self) -> None:
+        self._execute_at: datetime | None = None
+        self._suspended_at: datetime | None = None
+        self._suspended_seconds = 0.0
+
+    def executing(self, occurred_at: datetime) -> None:
+        # The LAST execute anchors the span: a restarted job's final
+        # execution is the runtime signal, not its false starts.
+        self._execute_at = occurred_at
+        self._suspended_at = None
+        self._suspended_seconds = 0.0
+
+    def suspend(self, occurred_at: datetime) -> None:
+        self._suspended_at = occurred_at
+
+    def resume(self, occurred_at: datetime) -> None:
+        if self._suspended_at is None:
+            raise ValueError(
+                "job log records an unsuspend with no suspension open"
+            )
+        self._suspended_seconds += self._interval(
+            self._suspended_at, occurred_at
         )
-    span = (terminal_at - execute_at).total_seconds()
-    if span < 0:
-        raise ValueError(
-            "job event log timestamps run backwards: execute "
-            f"{execute_at} after terminal {terminal_at}"
-        )
-    return span
+        self._suspended_at = None
+
+    def runtime_at(self, terminal_at: datetime) -> float:
+        if self._execute_at is None:
+            raise ValueError(
+                "job reached a terminal event with no execute event before it"
+            )
+        frozen = self._suspended_seconds
+        if self._suspended_at is not None:
+            # Terminal while frozen: the open suspension ends here.
+            frozen += self._interval(self._suspended_at, terminal_at)
+        runtime = self._interval(self._execute_at, terminal_at) - frozen
+        if runtime < 0:
+            raise ValueError(
+                "job event log suspension intervals exceed the execution span"
+            )
+        return runtime
+
+    @staticmethod
+    def _interval(start: datetime, end: datetime) -> float:
+        seconds = (end - start).total_seconds()
+        if seconds < 0:
+            raise ValueError(
+                f"job event log timestamps run backwards: {start} after {end}"
+            )
+        return seconds
 
 
 _RECORD_DELIMITER = re.compile(r"^\.\.\.\s*$", re.MULTILINE)

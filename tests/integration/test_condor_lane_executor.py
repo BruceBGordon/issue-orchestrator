@@ -8,6 +8,7 @@ silently skipped inside the default gate, simply not selected by it.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import threading
 import time
@@ -327,3 +328,288 @@ def test_run_directory_lifecycle_deletes_on_success_retains_on_failure(
         import shutil as _shutil
 
         _shutil.rmtree(directory, ignore_errors=True)
+
+
+def _pool_tool(name: str) -> tuple[Path, dict[str, str]]:
+    """Locate a scheduler tool beside the resolved submit binary, with
+    the environment its pool configuration requires."""
+    import os
+
+    tools = CondorTools.resolve()
+    binary = tools.submit.parent / name
+    assert binary.is_file(), f"{name} not found beside {tools.submit}"
+    environment = dict(os.environ)
+    if tools.pool_config is not None:
+        environment["CONDOR_CONFIG"] = str(tools.pool_config)
+    return binary, environment
+
+
+def _unique_lane_key(prefix: str) -> str:
+    """A per-submission unique work key for tests that address their
+    own job through the queue. The stable logical work keys are shared
+    by concurrent gates of the same repo (B4, #7118 review): targeting
+    one would let this test freeze or remove ANOTHER worktree's run of
+    the same lane. Uniqueness makes the batch constraint an execution
+    identity."""
+    import uuid
+
+    return f"{prefix}-{uuid.uuid4().hex[:10]}"
+
+
+def _batch_constraint(work_key: str) -> str:
+    return f'JobBatchName == "{work_key}"'
+
+
+def _run_pool_tool(name: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+    binary, environment = _pool_tool(name)
+    return subprocess.run(
+        [str(binary), *arguments],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _job_status(work_key: str) -> str:
+    """The job's JobStatus for this lane's batch ('' when not queued)."""
+    result = _run_pool_tool(
+        "condor_q", "-constraint", _batch_constraint(work_key), "-af", "JobStatus"
+    )
+    return result.stdout.strip()
+
+_RUNNING = "2"
+_SUSPENDED_STATUS = "7"
+
+
+def _await_status(work_key: str, wanted: str, deadline_seconds: float) -> None:
+    deadline = time.monotonic() + deadline_seconds
+    last = ""
+    while time.monotonic() < deadline:
+        last = _job_status(work_key)
+        if last == wanted:
+            return
+        time.sleep(0.5)
+    raise AssertionError(
+        f"lane {work_key} never reached JobStatus {wanted}; last={last!r}"
+    )
+
+
+def _release_batch(work_key: str) -> None:
+    """Guaranteed cleanup: nothing of this lane stays frozen or queued."""
+    _run_pool_tool("condor_continue", "-constraint", _batch_constraint(work_key))
+    _run_pool_tool("condor_rm", "-constraint", _batch_constraint(work_key))
+
+
+def test_suspension_charges_neither_deadline_nor_observed_runtime(
+    tmp_path: Path,
+) -> None:
+    """Freeze THIS lane's job (targeted by batch name — never the whole
+    shared queue) for ~6s mid-run. The lane sleeps 4s under an 8s
+    deadline: wall time (~10s+) exceeds the deadline, so a deadline
+    charging frozen time would remove it. The suspended state is
+    asserted as observed scheduler fact, not assumed from the command's
+    exit code."""
+    work_key = _unique_lane_key("contract.suspension")
+    marker = tmp_path / "running"
+    script = (
+        "import sys, time, pathlib\n"
+        "pathlib.Path(sys.argv[1]).write_text('up')\n"
+        "time.sleep(4)\n"
+    )
+    outcomes: list[object] = []
+
+    def run_lane() -> None:
+        outcomes.append(
+            CondorLaneExecutor(CondorTools.resolve()).run(
+                LaneCommand(
+                    work_key=LaneWorkKey(work_key),
+                    arguments=(sys.executable, "-c", script, str(marker)),
+                    working_directory=tmp_path,
+                    deadline=LaneDeadline(8.0),
+                ),
+                LaneResources(request_cpus=1),
+            )
+        )
+
+    thread = threading.Thread(target=run_lane)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.2)
+        assert marker.exists(), "suspension lane never started"
+
+        suspended = _run_pool_tool(
+            "condor_suspend", "-constraint", _batch_constraint(work_key)
+        )
+        assert suspended.returncode == 0, suspended.stderr
+        _await_status(work_key, _SUSPENDED_STATUS, 30.0)
+        time.sleep(6.0)
+        resumed = _run_pool_tool(
+            "condor_continue", "-constraint", _batch_constraint(work_key)
+        )
+        assert resumed.returncode == 0, resumed.stderr
+
+        thread.join(timeout=120)
+        assert not thread.is_alive(), "suspension lane never concluded"
+    finally:
+        _release_batch(work_key)
+        thread.join(timeout=30)
+    outcome = outcomes[0]
+    assert type(outcome) is LaneCompleted, (
+        "the deadline charged frozen time and removed a healthy lane: "
+        f"{outcome!r}"
+    )
+    assert outcome.exit_code == 0
+    assert outcome.observed_runtime_seconds < 8.0, (
+        "observed runtime includes frozen time: "
+        f"{outcome.observed_runtime_seconds:.1f}s for a 4s lane"
+    )
+
+
+def test_true_overrun_is_still_enforced_across_a_suspension(
+    tmp_path: Path,
+) -> None:
+    """The suspension subtraction must not disable the deadline: a lane
+    genuinely exceeding its executing-time budget is still removed —
+    across a targeted freeze/thaw of exactly this lane's job."""
+    work_key = _unique_lane_key("contract.overrun")
+    marker = tmp_path / "running-overrun"
+    script = (
+        "import sys, time, pathlib\n"
+        "pathlib.Path(sys.argv[1]).write_text('up')\n"
+        "time.sleep(600)\n"
+    )
+    outcomes: list[object] = []
+
+    def run_lane() -> None:
+        outcomes.append(
+            CondorLaneExecutor(CondorTools.resolve()).run(
+                LaneCommand(
+                    work_key=LaneWorkKey(work_key),
+                    arguments=(sys.executable, "-c", script, str(marker)),
+                    working_directory=tmp_path,
+                    deadline=LaneDeadline(6.0),
+                ),
+                LaneResources(request_cpus=1),
+            )
+        )
+
+    thread = threading.Thread(target=run_lane)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.2)
+        assert marker.exists(), "overrun lane never started"
+
+        suspended = _run_pool_tool(
+            "condor_suspend", "-constraint", _batch_constraint(work_key)
+        )
+        assert suspended.returncode == 0, suspended.stderr
+        _await_status(work_key, _SUSPENDED_STATUS, 30.0)
+        time.sleep(3.0)
+        resumed = _run_pool_tool(
+            "condor_continue", "-constraint", _batch_constraint(work_key)
+        )
+        assert resumed.returncode == 0, resumed.stderr
+
+        thread.join(timeout=180)
+        assert not thread.is_alive(), "overrun lane never concluded"
+    finally:
+        _release_batch(work_key)
+        thread.join(timeout=30)
+    from issue_orchestrator.domain.lane_execution import LaneTimedOut
+
+    assert type(outcomes[0]) is LaneTimedOut, (
+        "the suspension subtraction disabled the deadline: "
+        f"{outcomes[0]!r}"
+    )
+
+
+@pytest.mark.requires_backoff_pool
+def test_owner_load_spike_freezes_only_suspendable_lanes(tmp_path: Path) -> None:
+    """Acceptance for the opt-in policy itself (B4, #7118 review): with
+    a pool started under IO_CONDOR_LOAD_BACKOFF=1, a machine-owner load
+    spike (busy processes OUTSIDE the scheduler) must freeze a
+    suspendable lane, leave a non-suspendable lane running, and thaw
+    the frozen lane to completion when the load clears."""
+    import os
+
+    # condor_config_val returns the EXPANDED expression — macro names
+    # like OwnerLoadAvg do not survive expansion (B6, #7118 review).
+    # Assert the effective policy: the machine-wide owner-load pair and
+    # the per-lane eligibility guard.
+    policy = _run_pool_tool("condor_config_val", "SUSPEND").stdout
+    assert "TotalLoadAvg - TotalCondorLoadAvg" in policy, (
+        "this test requires a pool started with IO_CONDOR_LOAD_BACKOFF=1 "
+        "and the machine-wide owner-load policy; the running pool's "
+        f"effective SUSPEND is: {policy!r}"
+    )
+    assert "SuspendableLane" in policy, (
+        "the effective SUSPEND lacks the per-lane eligibility guard: "
+        f"{policy!r}"
+    )
+
+    freezable_key = _unique_lane_key("backoff.freezable")
+    exempt_key = _unique_lane_key("backoff.exempt")
+    script = "import time; time.sleep(90)"
+    outcomes: dict[str, object] = {}
+
+    def run_lane(work_key: str, suspendable: bool) -> None:
+        outcomes[work_key] = CondorLaneExecutor(CondorTools.resolve()).run(
+            LaneCommand(
+                work_key=LaneWorkKey(work_key),
+                arguments=(sys.executable, "-c", script),
+                working_directory=tmp_path,
+                deadline=LaneDeadline(300.0),
+            ),
+            LaneResources(request_cpus=1, suspendable=suspendable),
+        )
+
+    threads = [
+        threading.Thread(target=run_lane, args=(freezable_key, True)),
+        threading.Thread(target=run_lane, args=(exempt_key, False)),
+    ]
+    burners: list[subprocess.Popen[bytes]] = []
+    try:
+        for thread in threads:
+            thread.start()
+        _await_status(freezable_key, _RUNNING, 90.0)
+        _await_status(exempt_key, _RUNNING, 90.0)
+
+        burner_count = (os.cpu_count() or 4) + 2
+        burners = [
+            subprocess.Popen([sys.executable, "-c", "while True: pass"])
+            for _ in range(burner_count)
+        ]
+        _await_status(freezable_key, _SUSPENDED_STATUS, 180.0)
+        assert _job_status(exempt_key) == _RUNNING, (
+            "the owner-load policy froze a lane that declared itself "
+            "not suspendable"
+        )
+        for burner in burners:
+            burner.kill()
+        burners = []
+        _await_status(freezable_key, _RUNNING, 300.0)
+
+        for thread in threads:
+            thread.join(timeout=300)
+            assert not thread.is_alive(), "a backoff lane never concluded"
+    finally:
+        for burner in burners:
+            burner.kill()
+        _release_batch(freezable_key)
+        _release_batch(exempt_key)
+        for thread in threads:
+            thread.join(timeout=30)
+
+    frozen_outcome = outcomes[freezable_key]
+    exempt_outcome = outcomes[exempt_key]
+    assert type(frozen_outcome) is LaneCompleted and frozen_outcome.exit_code == 0, (
+        f"the frozen lane did not thaw to completion: {frozen_outcome!r}"
+    )
+    assert type(exempt_outcome) is LaneCompleted and exempt_outcome.exit_code == 0
+    # Frozen time must not appear in the learning signal either.
+    assert frozen_outcome.observed_runtime_seconds < 150.0
