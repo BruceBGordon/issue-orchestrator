@@ -39,9 +39,14 @@ class LaneDeclaration(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    request_cpus: int = Field(ge=1)
-    memory_mb: int = Field(ge=1)
-    suspendable: bool
+    # strict=True per scalar (C1, #7122 review): lax pydantic coerces
+    # `true` to 1, "8" to 8, and 1 to True — a YAML typo could silently
+    # under-request one CPU or flip suspension policy. The exclusive
+    # tuple stays lax only for the YAML-list-to-tuple container step;
+    # its tokens are re-validated strictly by LaneResources.
+    request_cpus: int = Field(ge=1, strict=True)
+    memory_mb: int = Field(ge=1, strict=True)
+    suspendable: bool = Field(strict=True)
     exclusive: tuple[str, ...] = ()
 
 

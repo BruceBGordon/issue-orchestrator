@@ -82,6 +82,24 @@ def test_suspendability_must_be_declared_explicitly(tmp_path: Path) -> None:
         load_lane_declaration(tmp_path, "test-unit")
 
 
+def test_field_types_are_strict_never_coerced(tmp_path: Path) -> None:
+    """C1 (#7122 review): lax pydantic coerces `true` to 1, "8" to 8,
+    and 1 to True — a YAML typo could silently under-request one CPU
+    or flip suspension policy. Every coercion is a loud error."""
+    coercion_typos = (
+        "request_cpus: true\n    memory_mb: 6144\n    suspendable: true",
+        'request_cpus: "8"\n    memory_mb: 6144\n    suspendable: true',
+        'request_cpus: 8\n    memory_mb: "1024"\n    suspendable: true',
+        "request_cpus: 8\n    memory_mb: 6144\n    suspendable: 1",
+    )
+    for body in coercion_typos:
+        _write_lanes(tmp_path, f"lanes:\n  test-unit:\n    {body}\n")
+        with pytest.raises(LaneDeclarationError, match="schema validation"):
+            load_lane_declaration(tmp_path, "test-unit")
+        (tmp_path / LANES_FILE_RELATIVE).unlink()
+        (tmp_path / LANES_FILE_RELATIVE).parent.rmdir()
+
+
 def test_memory_budget_must_be_declared(tmp_path: Path) -> None:
     """No silent slot sizing: without a declared budget the scheduler
     derives the slot from the tiny exec wrapper and the workload is

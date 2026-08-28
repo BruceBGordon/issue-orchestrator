@@ -125,36 +125,64 @@ def test_repo_tree_contains_no_target_named_debris() -> None:
     )
 
 
-def test_worker_counts_are_declared_once_and_mode_consistent(
-    tmp_path: Path,
-) -> None:
-    """B1 (#7122 review): the measured CPU requests in lanes.yaml were
-    taken at specific worker counts, so a mode running a different
-    count invalidates them silently. Two guards: no literal -n in any
-    pytest lane recipe (worker counts are declared variables), and the
-    two modes provably run the unit suite at the same width."""
+def test_no_worker_count_literal_anywhere_in_the_makefile() -> None:
+    """B1 round two (#7122 review): the first guard examined only
+    single source lines containing both PYTEST) and the literal, so a
+    multi-line recipe with `-n 4` on a continuation line — exactly the
+    prior integration-slice shape — passed unnoticed. The whole file
+    is clean of `-n <number>` today, so the strongest guard is a
+    whole-file ban: any future literal (lane recipe or otherwise)
+    must become a declared variable."""
     import re
 
     literal_lines = [
         line.strip()
         for line in (REPO_ROOT / "Makefile").read_text().splitlines()
-        if "PYTEST)" in line and re.search(r"-n [0-9]", line)
+        if re.search(r"-n [0-9]", line)
     ]
     assert not literal_lines, (
-        "lane recipes with literal worker counts (declare a "
+        "literal worker counts in the Makefile (declare a "
         f"LANE_WORKERS_* variable instead): {literal_lines}"
     )
 
-    direct = _dry_run(tmp_path, "test-unit", "LANE_EXECUTOR=direct")
-    condor = _dry_run(tmp_path, "test-unit", "LANE_EXECUTOR=condor")
-    direct_workers = re.search(r"-n (\w+)", direct)
-    condor_workers = re.search(r"UNIT_PARALLEL=(\w+)", condor)
-    assert direct_workers and condor_workers, "probe broken"
-    assert direct_workers.group(1) == condor_workers.group(1), (
-        f"unit suite width drifts by mode: direct -n "
-        f"{direct_workers.group(1)} vs condor "
-        f"UNIT_PARALLEL={condor_workers.group(1)}"
-    )
+
+def test_unit_worker_width_is_mode_consistent_including_overrides(
+    tmp_path: Path,
+) -> None:
+    """B1 round two (#7122 review): the measured CPU requests were
+    taken at declared worker widths, and the documented overrides must
+    flow identically through both modes — the first fix defaulted the
+    width correctly but let the condor wrapper clobber an explicit
+    UNIT_PARALLEL and broke PARALLEL=0's disable semantics."""
+    import re
+
+    def direct_width(*variables: str) -> str:
+        expansion = _dry_run(
+            tmp_path, "test-unit", "LANE_EXECUTOR=direct", *variables
+        )
+        found = re.search(r"-n (\w+)", expansion)
+        if found is None:
+            assert "--dist=loadgroup" not in expansion
+            return "disabled"
+        return found.group(1)
+
+    def condor_width(*variables: str) -> str:
+        expansion = _dry_run(
+            tmp_path, "test-unit", "LANE_EXECUTOR=condor", *variables
+        )
+        found = re.search(r"UNIT_PARALLEL=(\w+)", expansion)
+        assert found, "condor wrapper did not forward a unit width"
+        return found.group(1)
+
+    # Default: both modes run the declared width.
+    assert direct_width() == condor_width() == "12"
+    # Explicit UNIT_PARALLEL flows through both modes unchanged.
+    assert direct_width("UNIT_PARALLEL=6") == "6"
+    assert condor_width("UNIT_PARALLEL=6") == "6"
+    # Documented disable: PARALLEL=0 turns xdist off in direct mode
+    # and forwards 0 through the condor wrapper.
+    assert direct_width("PARALLEL=0") == "disabled"
+    assert condor_width("PARALLEL=0") == "0"
 
 
 def test_every_condor_lane_resolves_declared_scheduling_facts(

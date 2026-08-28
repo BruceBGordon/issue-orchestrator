@@ -403,7 +403,11 @@ LANE_TIMEOUT_SECONDS ?= 1800
 # granularity. Direct mode never uses these targets.
 INTEGRATION_CORE_SLICES := 3
 INTEGRATION_CORE_FILES = $(filter-out $(INTEGRATION_AGENT_FILES),$(wildcard tests/integration/test_*.py))
-UNIT_PARALLEL ?= $(LANE_WORKERS_UNIT)
+# Default to the declared lane width so both modes run the same
+# shape, but keep the documented overrides working: an explicit
+# PARALLEL=N (0 disables xdist) or UNIT_PARALLEL=N wins (B1 round two,
+# #7122 review).
+UNIT_PARALLEL ?= $(if $(filter auto,$(PARALLEL)),$(LANE_WORKERS_UNIT),$(PARALLEL))
 SIMULATED_PARALLEL ?= $(PARALLEL)
 INTEGRATION_PARALLEL ?= $(PARALLEL)
 # Live provider-backed integration tests share authenticated local CLIs and
@@ -444,7 +448,7 @@ ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-unit,\
 		$(LANE_RUN) --backend condor --work-key test-unit \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
-			$(GMAKE) test-unit LANE_EXECUTOR=direct UNIT_PARALLEL=$(LANE_WORKERS_UNIT))
+			$(GMAKE) test-unit LANE_EXECUTOR=direct UNIT_PARALLEL=$(UNIT_PARALLEL))
 else ifeq ($(UNIT_PARALLEL),0)
 	$(call TIMED_RUN,test-unit,\
 		$(PYTEST) tests/unit packages/agent_runner/tests -x -q --tb=short $(PYTEST_TIMINGS))
