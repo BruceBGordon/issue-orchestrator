@@ -60,6 +60,7 @@ adr/                                   every decision and why
 | [0013](adr/0013-OPEN-privilege-boundary-is-not-real.md) | Job privilege boundary is not a security boundary | **Open** |
 | [0014](adr/0014-OPEN-testcontainers-path-mismatch.md) | Bind-mount paths disagree with the host daemon | **Open** |
 | [0015](adr/0015-host-vm-sizing.md) | Size the host VM deliberately — it is the real ceiling | Accepted |
+| [0016](adr/0016-provider-credentials-in-container.md) | Provider credentials reach container jobs as isolated, copy-per-job material | Accepted |
 
 Amended in rev 2: ADR-0004, ADR-0008, ADR-0014. Challenged and reaffirmed: ADR-0005.
 
