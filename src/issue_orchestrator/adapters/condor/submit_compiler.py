@@ -55,6 +55,14 @@ def compile_submit_description(
         raise ValueError("compile_submit_description requires LaneResources")
     if not run_directory.is_absolute():
         raise ValueError("compile_submit_description run_directory must be absolute")
+    submitter = command.working_directory.name
+    if any(character in submitter for character in ('"', "\\", "\n")):
+        # ClassAd string literals would need escaping for these; no
+        # legitimate worktree directory contains them, so refuse loudly
+        # instead of compiling a description that misparses.
+        raise ValueError(
+            f"working directory name unusable as submitter tag: {submitter!r}"
+        )
     output_path = run_directory / "lane.out"
     error_path = run_directory / "lane.err"
     event_log_path = run_directory / "lane.events"
@@ -91,6 +99,11 @@ def compile_submit_description(
         # explicitly — policy-by-absence would let a new live lane
         # silently opt into freezing.
         f"+SuspendableLane = {'True' if resources.suspendable else 'False'}",
+        # The pool is shared by every worktree of every repo on the
+        # machine (concurrent gates are normal, not an anomaly), so
+        # each job names its submitter. Without this, attributing a
+        # job means digging through Iwd paths after the fact.
+        f'+LaneSubmitter = "{submitter}"',
     ]
     if resources.priority > 0:
         lines.append(f"priority = {resources.priority}")

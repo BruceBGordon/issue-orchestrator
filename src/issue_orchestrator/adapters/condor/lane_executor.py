@@ -293,10 +293,14 @@ class CondorLaneExecutor:
         # poll-side suspension accumulator below serves only the
         # watchdog.
         if type(state) is LaneJobExited:
-            return LaneCompleted(state.exit_code, state.runtime_seconds)
+            return LaneCompleted(
+                state.exit_code, state.runtime_seconds, state.queue_wait_seconds
+            )
         if type(state) is LaneJobKilledBySignal:
             return LaneCompleted(
-                128 + state.signal_number, state.runtime_seconds
+                128 + state.signal_number,
+                state.runtime_seconds,
+                state.queue_wait_seconds,
             )
         if type(state) is LaneJobDeadlineRemoved:
             return LaneTimedOut(state.runtime_seconds)

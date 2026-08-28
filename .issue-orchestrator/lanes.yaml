@@ -1,0 +1,89 @@
+# Validation-lane scheduling declarations — the SINGLE home for every
+# lane's scheduling facts (schema: src/issue_orchestrator/infra/
+# lane_declarations.py; loaded by lane-run per work key). Lives
+# beside config/, not inside it: the config/ namespace is the engine's
+# mode-config contract (modes/<mode>/ only) with its own loader.
+#
+#   request_cpus  MEASURED demand: busy cores = (user+sys)/wall from
+#                 `/usr/bin/time -l gmake <target> LANE_EXECUTOR=direct`.
+#                 Never the suite's worker count — an I/O-bound suite
+#                 keeps many workers busy on few cores. Consumed only
+#                 by the scheduling backend's admission; the direct
+#                 backend's protection is make's own job graph.
+#   memory_mb     budget for the lane's whole tree; sizes the slot and
+#                 the container's kernel ceiling where enforced.
+#   suspendable   REQUIRED, both ways explicit: hermetic lanes freeze
+#                 and thaw safely under machine-load backoff; a lane
+#                 holding a live provider exchange must never be
+#                 frozen mid-turn.
+#
+# Measurements 2026-08-28 (18-core host): test-unit 8.0 busy cores at
+# 12 workers; typecheck 1.8; integration slice 0.85 at 4 workers
+# (subprocess-wait dominated); simulated-core 6.6 against its old
+# request of 4 (scenarios spawn orchestrator subprocesses — it was
+# UNDER-requesting); live agent lanes wait on provider turns, ~1.
+# Unmeasured lanes keep their historical requests until measured — do
+# not guess.
+
+lanes:
+  typecheck:
+    request_cpus: 2 # measured 1.8
+    memory_mb: 4096
+    suspendable: true
+  test-unit:
+    request_cpus: 8 # measured 8.0 at 12 workers
+    memory_mb: 6144
+    suspendable: true
+  test-simulated-core:
+    request_cpus: 7 # measured 6.6 — spawns orchestrator subprocesses
+    memory_mb: 2048
+    suspendable: true
+  test-simulated-agent:
+    request_cpus: 2 # unmeasured; historical
+    memory_mb: 1024
+    suspendable: true
+  test-integration-core-local:
+    request_cpus: 4 # unmeasured; historical
+    memory_mb: 3072
+    suspendable: true
+  test-integration-core-slice-1:
+    request_cpus: 2 # measured 0.85 at 4 workers; headroom for bursts
+    memory_mb: 2048
+    suspendable: true
+  test-integration-core-slice-2:
+    request_cpus: 2 # slices are homogeneous by construction
+    memory_mb: 2048
+    suspendable: true
+  test-integration-core-slice-3:
+    request_cpus: 2
+    memory_mb: 2048
+    suspendable: true
+  test-integration-agent:
+    request_cpus: 4 # unmeasured; historical
+    memory_mb: 2048
+    suspendable: false
+  test-integration-agent-claude:
+    request_cpus: 1 # provider-wait dominated
+    memory_mb: 1024
+    suspendable: false
+  test-integration-agent-codex:
+    request_cpus: 1
+    memory_mb: 1024
+    suspendable: false
+  test-integration-agent-chain:
+    request_cpus: 1
+    memory_mb: 1024
+    suspendable: false
+  # Kernel-ceiling proof lanes, submitted by docker/execenv/selftest.sh
+  # (not the Makefile): the same 400MB allocation must SUCCEED under
+  # the first budget and be kernel-killed under the second — the
+  # deliberately insufficient memory_mb below is the proof's subject,
+  # not a sizing mistake.
+  execenv.memory-ok:
+    request_cpus: 1
+    memory_mb: 1024
+    suspendable: false
+  execenv.memory-oom:
+    request_cpus: 1
+    memory_mb: 128
+    suspendable: false

@@ -75,16 +75,25 @@ cd /work
 # the settled ceiling is kernel-enforced, not advisory.
 ALLOCATE="import time; time.sleep(10); block = bytearray(400 * 1024 * 1024); print(len(block))"
 
+# lane-run resolves scheduling facts (cpus, memory, suspendability)
+# from .issue-orchestrator/lanes.yaml under its WORKING directory —
+# and /work is deliberately not a git repository so the runtime
+# history and dispatch journal stay inert (the repo mount is
+# read-only; they could not write there anyway). Copy the
+# declarations beside the working dir so resolution finds them.
+mkdir -p /work/.issue-orchestrator
+cp /repo/.issue-orchestrator/lanes.yaml /work/.issue-orchestrator/
+
 say "memory ceiling: sufficient budget must succeed"
 LANE_RUN="$PYTHON -m issue_orchestrator.entrypoints.cli_tools.lane_run"
 $LANE_RUN --backend condor --work-key execenv.memory-ok \
-    --request-cpus 1 --request-memory-mb 1024 --timeout-seconds 120 -- \
+    --timeout-seconds 120 -- \
     "$PYTHON" -c "$ALLOCATE" \
     || { say "FATAL: a 400MB workload died under a 1024MB budget"; exit 1; }
 
 say "memory ceiling: insufficient budget must be enforced by the kernel"
 if $LANE_RUN --backend condor --work-key execenv.memory-oom \
-    --request-cpus 1 --request-memory-mb 128 --timeout-seconds 120 -- \
+    --timeout-seconds 120 -- \
     "$PYTHON" -c "$ALLOCATE"
 then
     say "FATAL: a 400MB workload survived a 128MB budget - the ceiling is advisory"

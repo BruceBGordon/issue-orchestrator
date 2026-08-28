@@ -48,6 +48,49 @@ CONCURRENCY_LIMIT_DEFAULT = 1
 MOUNT_UNDER_SCRATCH =
 EOF
   write_load_backoff_config "$config_dir"
+  write_capacity_config "$config_dir"
+}
+
+# One throughput dial (IO_POOL_CAPACITY_PERCENT at `up` time): the
+# pool's admission capacity as a percentage of physical cores. Lane
+# CPU requests are MEASURED demand, and most lanes are I/O-bound, so
+# 100% of physical cores is a conservative default — raising the dial
+# admits more concurrent lanes (deliberate oversubscription), lowering
+# it throttles the whole pool uniformly. This is the static half of
+# load control; the load-backoff policy above is the reactive half.
+# Unset means condor's own physical detection (no file). Takes effect
+# at `up`, when the startd re-detects its resources.
+write_capacity_config() {
+  local config_dir="$1"
+  if [ -z "${IO_POOL_CAPACITY_PERCENT:-}" ]; then
+    rm -f "${config_dir}/92-io-pool-capacity.conf"
+    return 0
+  fi
+  case "$IO_POOL_CAPACITY_PERCENT" in
+    ''|*[!0-9]*)
+      echo "condor-personal: IO_POOL_CAPACITY_PERCENT must be a positive integer percentage, got '${IO_POOL_CAPACITY_PERCENT}'" >&2
+      return 64
+      ;;
+  esac
+  # Normalize to base 10 BEFORE any arithmetic: bash treats a leading
+  # zero as octal, so an unnormalized "08" passes the digits-only
+  # check and then dies with "value too great for base" (B2, #7122
+  # review). The normalized value is the only one used from here on.
+  local capacity_percent physical_cores scaled_cores
+  capacity_percent=$(( 10#$IO_POOL_CAPACITY_PERCENT ))
+  if [ "$capacity_percent" -lt 1 ]; then
+    echo "condor-personal: IO_POOL_CAPACITY_PERCENT must be at least 1, got '${IO_POOL_CAPACITY_PERCENT}'" >&2
+    return 64
+  fi
+  physical_cores=$(sysctl -n hw.ncpu 2>/dev/null || nproc)
+  scaled_cores=$(( physical_cores * capacity_percent / 100 ))
+  if [ "$scaled_cores" -lt 1 ]; then
+    scaled_cores=1
+  fi
+  cat > "${config_dir}/92-io-pool-capacity.conf" <<EOF
+# ${capacity_percent}% of ${physical_cores} physical cores.
+NUM_CPUS = ${scaled_cores}
+EOF
 }
 
 # Opt-in machine-load backoff (IO_CONDOR_LOAD_BACKOFF=1 at `up` time):
@@ -92,7 +135,7 @@ EOF
 # `up`. The install boundary owns that reconciliation (B2, #7118
 # review): a managed file not present in staging is removed from the
 # destination.
-MANAGED_OPTIONAL_CONFIGS="91-io-load-backoff.conf"
+MANAGED_OPTIONAL_CONFIGS="91-io-load-backoff.conf 92-io-pool-capacity.conf"
 
 install_staged_configs() {
   local staging="$1" destination="$2" runner=""

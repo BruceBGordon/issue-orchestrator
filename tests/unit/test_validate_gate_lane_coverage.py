@@ -45,17 +45,26 @@ def _scrubbed_environment() -> dict[str, str]:
     # make-driven lane, MAKEFLAGS carries the recursion's own
     # LANE_EXECUTOR and the publish command exports another — both
     # would leak into the subprocess and poison the mode under test.
+    # The worker-width family leaks the same way: the condor wrapper's
+    # command-line UNIT_PARALLEL=12 is exported into the lane's
+    # environment, and environment-origin variables beat ?= defaults,
+    # so the override-matrix dry-runs would test the hosting lane's
+    # width instead of the Makefile's (failed live in the gate's own
+    # unit lane while passing on a clean host shell).
+    blocked = {
+        "MAKEFLAGS",
+        "MFLAGS",
+        "MAKELEVEL",
+        "LANE_EXECUTOR",
+        "ISSUE_ORCHESTRATOR_LANE_EXECUTOR",
+        "PARALLEL",
+    }
     return {
         key: value
         for key, value in os.environ.items()
-        if key
-        not in {
-            "MAKEFLAGS",
-            "MFLAGS",
-            "MAKELEVEL",
-            "LANE_EXECUTOR",
-            "ISSUE_ORCHESTRATOR_LANE_EXECUTOR",
-        }
+        if key not in blocked
+        and not key.endswith("_PARALLEL")
+        and not key.startswith("LANE_WORKERS_")
     }
 
 
@@ -125,55 +134,89 @@ def test_repo_tree_contains_no_target_named_debris() -> None:
     )
 
 
-def test_every_condor_lane_declares_a_memory_budget(tmp_path: Path) -> None:
-    """The scheduler sizes slots from request_memory; a lane submitted
-    without one inherits the tiny wrapper's image size and its real
-    workload is OOM-killed (proven live by pyright at a ~259MB heap
-    ceiling). Every wired lane must declare its budget."""
-    fan = _dry_run(tmp_path, "_validate-pr-flat-impl", "LANE_EXECUTOR=condor")
+def test_no_worker_count_literal_anywhere_in_the_makefile() -> None:
+    """B1 round two (#7122 review): the first guard examined only
+    single source lines containing both PYTEST) and the literal, so a
+    multi-line recipe with `-n 4` on a continuation line — exactly the
+    prior integration-slice shape — passed unnoticed. The whole file
+    is clean of `-n <number>` today, so the strongest guard is a
+    whole-file ban: any future literal (lane recipe or otherwise)
+    must become a declared variable."""
     import re
 
-    for line in fan.splitlines():
-        for match in re.finditer(r"lane_run [^;]*?--work-key (\S+)", line):
-            segment = line[match.start() :]
-            assert "--request-memory-mb" in segment.split(";")[0], (
-                f"condor lane {match.group(1)!r} declares no memory budget"
-            )
-
-
-def test_no_lane_run_declaration_anywhere_lacks_a_memory_budget() -> None:
-    """Complete-owner-surface guard: the dry-run test above sees only
-    the flat fan's consumer graph, and two supported monolith lanes
-    (test-integration-core-local, test-integration-agent) drifted onto
-    the silent CLI default unseen. Every LANE_RUN invocation in the
-    Makefile - regardless of which gate path consumes it - must declare
-    its budget explicitly."""
-    offenders = [
+    literal_lines = [
         line.strip()
         for line in (REPO_ROOT / "Makefile").read_text().splitlines()
-        if "$(LANE_RUN)" in line and "--request-memory-mb" not in line
+        if re.search(r"-n [0-9]", line)
     ]
-    assert not offenders, (
-        "condor lane declarations without a memory budget:\n"
-        + "\n".join(offenders)
+    assert not literal_lines, (
+        "literal worker counts in the Makefile (declare a "
+        f"LANE_WORKERS_* variable instead): {literal_lines}"
     )
 
 
-def test_every_lane_declaration_classifies_suspendability() -> None:
-    """A1 (#7118 review): freezing eligibility must be an explicit
-    declaration on EVERY lane, never an author's memory. The domain
-    default is fail-safe (non-suspendable), and this guard forces each
-    declaration to say which side it is on — a new lane cannot be
-    silently frozen, and a hermetic lane cannot silently lose backoff
-    coverage."""
-    offenders = [
-        line.strip()
-        for line in (REPO_ROOT / "Makefile").read_text().splitlines()
-        if "$(LANE_RUN)" in line
-        and "--suspendable" not in line
-        and "--not-suspendable" not in line
-    ]
-    assert not offenders, (
-        "condor lane declarations without a suspendability classification:\n"
-        + "\n".join(offenders)
+def test_unit_worker_width_is_mode_consistent_including_overrides(
+    tmp_path: Path,
+) -> None:
+    """B1 round two (#7122 review): the measured CPU requests were
+    taken at declared worker widths, and the documented overrides must
+    flow identically through both modes — the first fix defaulted the
+    width correctly but let the condor wrapper clobber an explicit
+    UNIT_PARALLEL and broke PARALLEL=0's disable semantics."""
+    import re
+
+    def direct_width(*variables: str) -> str:
+        expansion = _dry_run(
+            tmp_path, "test-unit", "LANE_EXECUTOR=direct", *variables
+        )
+        found = re.search(r"-n (\w+)", expansion)
+        if found is None:
+            assert "--dist=loadgroup" not in expansion
+            return "disabled"
+        return found.group(1)
+
+    def condor_width(*variables: str) -> str:
+        expansion = _dry_run(
+            tmp_path, "test-unit", "LANE_EXECUTOR=condor", *variables
+        )
+        found = re.search(r"UNIT_PARALLEL=(\w+)", expansion)
+        assert found, "condor wrapper did not forward a unit width"
+        return found.group(1)
+
+    # Default: both modes run the declared width.
+    assert direct_width() == condor_width() == "12"
+    # Explicit UNIT_PARALLEL flows through both modes unchanged.
+    assert direct_width("UNIT_PARALLEL=6") == "6"
+    assert condor_width("UNIT_PARALLEL=6") == "6"
+    # Documented disable: PARALLEL=0 turns xdist off in direct mode
+    # and forwards 0 through the condor wrapper.
+    assert direct_width("PARALLEL=0") == "disabled"
+    assert condor_width("PARALLEL=0") == "0"
+
+
+def test_every_condor_lane_resolves_declared_scheduling_facts(
+    tmp_path: Path,
+) -> None:
+    """The invariants formerly enforced as recipe flags — every lane
+    declares a memory budget (a lane without one inherits the tiny
+    wrapper's image size and its workload is OOM-killed at a ~259MB
+    ceiling, proven live) and classifies suspendability explicitly
+    (A1, #7118 review) — kept, with a new owner: both are
+    schema-required fields in .issue-orchestrator/lanes.yaml, resolved
+    per work key. Proven end-to-end here: every work key the flat fan
+    actually submits resolves to a declaration carrying both facts.
+    Lanes outside the flat fan are held to the same bar by the
+    bidirectional drift test in test_lane_declarations.py."""
+    import re
+
+    from issue_orchestrator.infra.lane_declarations import (
+        load_lane_declaration,
     )
+
+    fan = _dry_run(tmp_path, "_validate-pr-flat-impl", "LANE_EXECUTOR=condor")
+    work_keys = re.findall(r"--work-key (\S+)", fan)
+    assert work_keys, "flat fan submitted no lanes - probe broken"
+    for work_key in work_keys:
+        declaration = load_lane_declaration(REPO_ROOT, work_key)
+        assert declaration.memory_mb >= 1
+        assert isinstance(declaration.suspendable, bool)

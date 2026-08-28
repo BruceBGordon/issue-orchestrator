@@ -29,6 +29,10 @@ from ...adapters.json_lane_runtime_history import (
     JsonLaneRuntimeHistory,
     LaneRuntimeHistoryError,
 )
+from ...adapters.jsonl_lane_dispatch_journal import (
+    InertLaneDispatchJournal,
+    JsonlLaneDispatchJournal,
+)
 from ...domain.lane_execution import (
     LaneCommand,
     LaneCompleted,
@@ -39,7 +43,17 @@ from ...domain.lane_execution import (
     LaneTimedOut,
     LaneWorkKey,
 )
+from ...infra.lane_declarations import (
+    LaneDeclaration,
+    LaneDeclarationError,
+    load_lane_declaration,
+)
 from ...infra.validation_timings import resolve_git_common_dir
+from ...ports.lane_dispatch_journal import (
+    LaneDispatchJournal,
+    LaneDispatchJournalError,
+    LaneDispatchRecord,
+)
 from ...ports.lane_executor import LaneExecutor
 from ...ports.lane_runtime_history import LaneRuntimeHistory
 
@@ -69,21 +83,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         executor = _build_executor(arguments.backend)
         history = _build_history()
+        journal = _build_journal()
         work_key = LaneWorkKey(str(arguments.work_key))
+        # Scheduling facts are declared in ONE place —
+        # .issue-orchestrator/lanes.yaml — resolved here by the
+        # lane's logical work key. The Makefile carries commands and
+        # work keys only.
+        declaration = _load_declaration(work_key.value)
+        # Dispatch order is learned, never declared: the rolling
+        # median of this lane's past runtimes (LPT — longer
+        # lanes first). Zero history means priority 0, exactly
+        # the naive first run.
+        priority = history.learned_priority(work_key)
         outcome = executor.run(
             _build_command(arguments),
             LaneResources(
-                request_cpus=arguments.request_cpus,
-                exclusive=tuple(arguments.exclusive),
-                # Dispatch order is learned, never declared: the rolling
-                # median of this lane's past runtimes (LPT — longer
-                # lanes first). Zero history means priority 0, exactly
-                # the naive first run.
-                priority=history.learned_priority(work_key),
-                request_memory_mb=arguments.request_memory_mb,
-                suspendable=arguments.suspendable,
+                request_cpus=declaration.request_cpus,
+                exclusive=declaration.exclusive,
+                priority=priority,
+                request_memory_mb=declaration.memory_mb,
+                suspendable=declaration.suspendable,
             ),
         )
+    except LaneDeclarationError as error:
+        print(f"lane-run: {error}", file=sys.stderr)
+        return _UNAVAILABLE_EXIT_CODE
     except LaneExecutorUnavailableError as error:
         print(f"lane-run: {error}", file=sys.stderr)
         return _UNAVAILABLE_EXIT_CODE
@@ -97,15 +121,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"lane-run: {error}", file=sys.stderr)
         return _BACKEND_FAULT_EXIT_CODE
     if type(outcome) is LaneCompleted:
-        if outcome.exit_code == 0:
-            # Only successes teach: a failed run's duration is the
-            # failure's, not the lane's.
-            try:
-                history.record_success(work_key, outcome.observed_runtime_seconds)
-            except LaneRuntimeHistoryError as error:
-                print(f"lane-run: {error}", file=sys.stderr)
-                return _BACKEND_FAULT_EXIT_CODE
-        return outcome.exit_code
+        return _conclude_completed(
+            arguments, priority, history, journal, work_key, outcome
+        )
     if type(outcome) is LaneTimedOut:
         print(
             f"lane-run: lane {arguments.work_key!r} exceeded its "
@@ -117,47 +135,64 @@ def main(argv: Sequence[str] | None = None) -> int:
     raise AssertionError("lane outcome is a closed union")
 
 
+def _conclude_completed(
+    arguments: argparse.Namespace,
+    priority: int,
+    history: LaneRuntimeHistory,
+    journal: LaneDispatchJournal,
+    work_key: LaneWorkKey,
+    outcome: LaneCompleted,
+) -> int:
+    """Record what the completed lane teaches, then report its exit.
+
+    The stderr line puts priority, queue wait, and runtime in the gate
+    log where a reader already is; the journal (a behavior-level port)
+    owns persistence and its failure semantics. Failed lanes are
+    journaled too — a kill's dispatch facts are diagnosis, even though
+    only successes feed the learning loop."""
+    print(
+        f"[lane-dispatch] {arguments.work_key} backend={arguments.backend} "
+        f"priority={priority} queue_wait={outcome.queue_wait_seconds:.1f}s "
+        f"runtime={outcome.observed_runtime_seconds:.1f}s "
+        f"exit={outcome.exit_code}",
+        file=sys.stderr,
+    )
+    try:
+        journal.record(
+            LaneDispatchRecord(
+                work_key=work_key,
+                backend=str(arguments.backend),
+                priority=priority,
+                queue_wait_seconds=outcome.queue_wait_seconds,
+                observed_runtime_seconds=outcome.observed_runtime_seconds,
+                exit_code=outcome.exit_code,
+            )
+        )
+    except LaneDispatchJournalError as error:
+        print(f"lane-run: {error}", file=sys.stderr)
+        return _BACKEND_FAULT_EXIT_CODE
+    if outcome.exit_code == 0:
+        # Only successes teach: a failed run's duration is the
+        # failure's, not the lane's.
+        try:
+            history.record_success(work_key, outcome.observed_runtime_seconds)
+        except LaneRuntimeHistoryError as error:
+            print(f"lane-run: {error}", file=sys.stderr)
+            return _BACKEND_FAULT_EXIT_CODE
+    return outcome.exit_code
+
+
 def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="lane-run",
         description="Run one validation lane through the configured backend.",
     )
     parser.add_argument("--work-key", required=True)
-    parser.add_argument("--request-cpus", type=int, required=True)
-    parser.add_argument(
-        "--request-memory-mb",
-        type=int,
-        default=1024,
-        help="Memory budget for the lane's whole tree; sizes the scheduler slot.",
-    )
-    parser.add_argument(
-        "--exclusive",
-        action="append",
-        default=[],
-        help="Machine-wide mutual-exclusion token (repeatable).",
-    )
     parser.add_argument("--timeout-seconds", type=float, required=True)
-    suspendability = parser.add_mutually_exclusive_group()
-    suspendability.add_argument(
-        "--suspendable",
-        dest="suspendable",
-        action="store_true",
-        help=(
-            "The lane tolerates being frozen mid-run by machine-load "
-            "backoff (declare for hermetic lanes)."
-        ),
-    )
-    suspendability.add_argument(
-        "--not-suspendable",
-        dest="suspendable",
-        action="store_false",
-        help=(
-            "The lane must never be frozen mid-run (lanes holding live "
-            "provider exchanges). This is also the unclassified default: "
-            "freezing requires an explicit declaration."
-        ),
-    )
-    parser.set_defaults(suspendable=False)
+    # Scheduling facts (cpus, memory, suspendability, exclusives) are
+    # NOT flags: they are declared once per work key in
+    # .issue-orchestrator/lanes.yaml and resolved by name, so
+    # no second configuration surface can drift from the first.
     parser.add_argument(
         "--backend",
         choices=(_DIRECT_BACKEND, _CONDOR_BACKEND),
@@ -168,6 +203,20 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         ),
     )
     return parser.parse_args(argv)
+
+
+def _load_declaration(work_key: str) -> LaneDeclaration:
+    """The declared scheduling facts for this work key (test seam)."""
+    return load_lane_declaration(Path.cwd(), work_key)
+
+
+def _build_journal() -> LaneDispatchJournal:
+    """The repo-shared dispatch journal, or an inert one outside a repo
+    (mirroring the runtime history's inertness)."""
+    common_dir = resolve_git_common_dir(Path.cwd())
+    if common_dir is None:
+        return InertLaneDispatchJournal()
+    return JsonlLaneDispatchJournal(common_dir / "issue-orchestrator")
 
 
 def _build_history() -> LaneRuntimeHistory:

@@ -146,6 +146,28 @@ class LaneExecutorContract:
             self.completion_timeout_seconds
         )
 
+    def test_queue_wait_is_reported_and_plausible(self, tmp_path: Path) -> None:
+        """Completed lanes price their scheduling wait separately.
+
+        No upper bound on purpose (B3, #7122 review): queue wait is
+        explicitly excluded from the lane's deadline and may
+        legitimately exceed it under pool contention — capping it by
+        the runtime allowance would fail this shared contract for
+        correct behavior. The contract asks only that the field is
+        reported non-negative; the direct backend's exact zero and the
+        scheduler backend's real waits are backend-suite facts."""
+        outcome = self.build_executor().run(
+            _command(
+                "contract.queue-wait",
+                (sys.executable, "-c", "pass"),
+                tmp_path,
+                self.completion_timeout_seconds,
+            ),
+            self.resources(),
+        )
+        assert type(outcome) is LaneCompleted
+        assert outcome.queue_wait_seconds >= 0.0
+
 
     def test_output_streams_before_the_lane_completes(
         self, tmp_path: Path, capfd: "pytest.CaptureFixture[str]"

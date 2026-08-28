@@ -21,6 +21,14 @@ from issue_orchestrator.domain.lane_execution import (
     LaneWorkKey,
 )
 from issue_orchestrator.entrypoints.cli_tools import lane_run as lane_run_module
+from issue_orchestrator.infra.lane_declarations import (
+    LaneDeclaration,
+    LaneDeclarationError,
+)
+from issue_orchestrator.ports.lane_dispatch_journal import (
+    LaneDispatchJournalError,
+    LaneDispatchRecord,
+)
 from issue_orchestrator.entrypoints.cli_tools.lane_run import (
     BACKEND_ENVIRONMENT_VARIABLE,
     main,
@@ -44,13 +52,46 @@ def isolated_history(
     return history
 
 
+@pytest.fixture(autouse=True)
+def declared_lane(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test resolves a default declaration for cli.test.
+
+    Without this, main() would read the repository's real lanes.yaml,
+    where the test's work key is (correctly) not declared."""
+    monkeypatch.setattr(
+        lane_run_module,
+        "_load_declaration",
+        lambda work_key: LaneDeclaration(
+            request_cpus=1, memory_mb=1024, suspendable=False
+        ),
+    )
+
+
+class _FakeJournal:
+    """Captures records; the CLI is tested against the PORT, never the
+    storage transport (A1, #7122 review)."""
+
+    def __init__(self) -> None:
+        self.records: list[LaneDispatchRecord] = []
+
+    def record(self, record: LaneDispatchRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.fixture(autouse=True)
+def fake_journal(monkeypatch: pytest.MonkeyPatch) -> _FakeJournal:
+    """Every test gets a faked journal, for the same reason the
+    history store is isolated: tests run inside the real repository."""
+    journal = _FakeJournal()
+    monkeypatch.setattr(lane_run_module, "_build_journal", lambda: journal)
+    return journal
+
+
 def _run(*command: str, flags: tuple[str, ...] = (), timeout: str = "60") -> int:
     return main(
         [
             "--work-key",
             "cli.test",
-            "--request-cpus",
-            "1",
             "--timeout-seconds",
             timeout,
             *flags,
@@ -97,8 +138,6 @@ def test_missing_separator_is_a_usage_error() -> None:
             [
                 "--work-key",
                 "cli.test",
-                "--request-cpus",
-                "1",
                 "--timeout-seconds",
                 "60",
                 "/usr/bin/true",
@@ -133,17 +172,29 @@ def test_environment_variable_selects_the_backend(
     assert _run("/usr/bin/true") == 78
 
 
-def test_memory_budget_crosses_the_port_boundary(
+def test_declared_facts_cross_the_port_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The direct adapter ignores scheduling hints, so a run-and-check
-    test is vacuous: main() could drop the flag and still exit 0. A
-    capturing executor at the composition seam proves the value the
-    port actually receives."""
-    executor = _capture(monkeypatch, LaneCompleted(0, 1.0))
-    assert _run("/usr/bin/true", flags=("--request-memory-mb", "2048")) == 0
+    """The lanes.yaml declaration — not any flag — is what reaches the
+    port. A capturing executor at the composition seam proves the
+    values the port actually receives."""
+    monkeypatch.setattr(
+        lane_run_module,
+        "_load_declaration",
+        lambda work_key: LaneDeclaration(
+            request_cpus=7,
+            memory_mb=2048,
+            suspendable=True,
+            exclusive=("codex",),
+        ),
+    )
+    executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
+    assert _run("/usr/bin/true") == 0
     assert len(executor.resources) == 1
+    assert executor.resources[0].request_cpus == 7
     assert executor.resources[0].request_memory_mb == 2048
+    assert executor.resources[0].suspendable is True
+    assert executor.resources[0].exclusive == ("codex",)
 
 
 def test_priority_cannot_be_declared_by_the_client() -> None:
@@ -157,7 +208,7 @@ def test_empty_history_is_the_naive_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Zero history means priority 0 — exactly today's behavior."""
-    executor = _capture(monkeypatch, LaneCompleted(0, 1.0))
+    executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
     assert _run("/usr/bin/true") == 0
     assert executor.resources[0].priority == 0
 
@@ -170,7 +221,7 @@ def test_learned_priority_crosses_the_port_boundary(
     key = LaneWorkKey("cli.test")
     for runtime in (30.0, 90.0, 60.0):
         isolated_history.record_success(key, runtime)
-    executor = _capture(monkeypatch, LaneCompleted(0, 1.0))
+    executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
     assert _run("/usr/bin/true") == 0
     assert executor.resources[0].priority == 60
 
@@ -178,7 +229,7 @@ def test_learned_priority_crosses_the_port_boundary(
 def test_successful_lane_seeds_the_next_run(
     monkeypatch: pytest.MonkeyPatch, isolated_history: JsonLaneRuntimeHistory
 ) -> None:
-    _capture(monkeypatch, LaneCompleted(0, 42.0))
+    _capture(monkeypatch, LaneCompleted(0, 42.0, 0.0))
     assert _run("/usr/bin/true") == 0
     assert isolated_history.learned_priority(LaneWorkKey("cli.test")) == 42
 
@@ -188,9 +239,66 @@ def test_failed_lane_teaches_nothing(
 ) -> None:
     """A failed run's duration is the failure's, not the lane's — a
     482s provider stall must never become a lane's learned weight."""
-    _capture(monkeypatch, LaneCompleted(1, 482.0))
+    _capture(monkeypatch, LaneCompleted(1, 482.0, 0.0))
     assert _run("/usr/bin/true") == 1
     assert isolated_history.learned_priority(LaneWorkKey("cli.test")) == 0
+
+
+def test_completed_lane_journals_one_dispatch_record(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_history: JsonLaneRuntimeHistory,
+    fake_journal: _FakeJournal,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Priority used, queue wait, runtime, and exit reach the journal
+    port as a typed record AND the gate log as a stderr line —
+    dispatch quality must be readable in place and queryable across
+    runs without pool archaeology."""
+    key = LaneWorkKey("cli.test")
+    for runtime in (30.0, 90.0, 60.0):
+        isolated_history.record_success(key, runtime)
+    _capture(monkeypatch, LaneCompleted(0, 45.0, 12.0))
+    assert _run("/usr/bin/true") == 0
+    (record,) = fake_journal.records
+    assert record.work_key == LaneWorkKey("cli.test")
+    assert record.priority == 60
+    assert record.queue_wait_seconds == 12.0
+    assert record.observed_runtime_seconds == 45.0
+    assert record.exit_code == 0
+    stderr = capsys.readouterr().err
+    assert (
+        "[lane-dispatch] cli.test backend=direct priority=60 "
+        "queue_wait=12.0s runtime=45.0s exit=0" in stderr
+    )
+
+
+def test_failed_lane_still_journals_its_dispatch_facts(
+    monkeypatch: pytest.MonkeyPatch, fake_journal: _FakeJournal
+) -> None:
+    """Failures teach the learning loop nothing, but their dispatch
+    facts are diagnosis — the record is journaled either way."""
+    _capture(monkeypatch, LaneCompleted(1, 482.0, 3.0))
+    assert _run("/usr/bin/true") == 1
+    (record,) = fake_journal.records
+    assert record.exit_code == 1
+    assert record.observed_runtime_seconds == 482.0
+
+
+def test_journal_failure_is_a_backend_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistence failure has one explicit owner: the journal raises
+    its typed error and the CLI reports a backend fault (70)."""
+
+    class _BrokenJournal:
+        def record(self, record: LaneDispatchRecord) -> None:
+            raise LaneDispatchJournalError("disk gone")
+
+    monkeypatch.setattr(
+        lane_run_module, "_build_journal", lambda: _BrokenJournal()
+    )
+    _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
+    assert _run("/usr/bin/true") == 70
 
 
 def test_corrupt_history_fails_loudly_not_naively(
@@ -223,33 +331,40 @@ def test_memory_budget_domain_validation_rejects_nonsense() -> None:
 def test_observed_runtime_domain_validation_rejects_nonsense() -> None:
     for bad in (float("nan"), float("inf"), -1.0):
         with pytest.raises(ValueError):
-            LaneCompleted(0, bad)
+            LaneCompleted(0, bad, 0.0)
     with pytest.raises(ValueError):
         # The annotation's numeric tower accepts an int; the runtime
         # guard does not — observed runtimes are always measured floats.
-        LaneCompleted(0, 5)
-    assert LaneCompleted(0, 0.0).observed_runtime_seconds == 0.0
+        LaneCompleted(0, 5, 0.0)
+    assert LaneCompleted(0, 0.0, 0.0).observed_runtime_seconds == 0.0
 
 
-def test_suspendability_crosses_the_port_boundary(
+def test_scheduling_facts_cannot_be_declared_as_flags() -> None:
+    """One configuration home: cpus, memory, suspendability, and
+    exclusives are lanes.yaml rows, and the flags must not exist — a
+    second declaration surface would drift from the first."""
+    for flag in (
+        ("--request-cpus", "4"),
+        ("--request-memory-mb", "2048"),
+        ("--suspendable",),
+        ("--not-suspendable",),
+        ("--exclusive", "codex"),
+    ):
+        with pytest.raises(SystemExit):
+            _run("/usr/bin/true", flags=flag)
+
+
+def test_undeclared_lane_fails_as_configuration_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Freezing requires an explicit declaration: the unclassified
-    default is NON-suspendable (fail-safe — a lane nobody classified
-    is never frozen), and both explicit classifications cross the
-    port."""
-    executor = _capture(monkeypatch, LaneCompleted(0, 1.0))
-    assert _run("/usr/bin/true") == 0
-    assert executor.resources[0].suspendable is False
-    assert _run("/usr/bin/true", flags=("--suspendable",)) == 0
-    assert executor.resources[1].suspendable is True
-    assert _run("/usr/bin/true", flags=("--not-suspendable",)) == 0
-    assert executor.resources[2].suspendable is False
+    """No policy-by-absence: a lane missing from lanes.yaml must not
+    run with invented resources."""
 
+    def refuse(work_key: str) -> LaneDeclaration:
+        raise LaneDeclarationError(f"lane {work_key!r} is not declared")
 
-def test_suspendability_flags_are_mutually_exclusive() -> None:
-    with pytest.raises(SystemExit):
-        _run("/usr/bin/true", flags=("--suspendable", "--not-suspendable"))
+    monkeypatch.setattr(lane_run_module, "_load_declaration", refuse)
+    assert _run("/usr/bin/true") == 78
 
 
 def test_suspendable_domain_validation_rejects_non_bool() -> None:
