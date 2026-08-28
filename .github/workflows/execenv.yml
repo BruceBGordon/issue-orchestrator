@@ -1,0 +1,47 @@
+# Containerized execution environment proofs (issue #7115, ADR-0012):
+# build the image and run the in-container selftest — pool readiness,
+# the lane executor contract inside cgroup containment (including the
+# boundary test's Linux-containment branch), and the hard memory
+# ceiling. Path-scoped: this is opt-in infrastructure, not the gate.
+name: execenv
+
+on:
+  push:
+    paths:
+      - "docker/execenv/**"
+      - "scripts/condor-execenv.sh"
+      - ".github/workflows/execenv.yml"
+      - "src/issue_orchestrator/adapters/condor/**"
+      - "src/issue_orchestrator/domain/lane_execution.py"
+      - "tests/integration/test_condor_lane_executor.py"
+  pull_request:
+    paths:
+      - "docker/execenv/**"
+      - "scripts/condor-execenv.sh"
+      - ".github/workflows/execenv.yml"
+
+jobs:
+  execenv-selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the execution environment image
+        run: scripts/condor-execenv.sh build
+
+      - name: Start the pool container
+        run: scripts/condor-execenv.sh up
+
+      - name: Run the in-container proofs
+        run: scripts/condor-execenv.sh selftest
+
+      - name: Pool diagnostics on failure
+        if: failure()
+        run: |
+          docker logs io-execenv || true
+          docker exec io-execenv sh -c 'tail -n 50 /var/log/condor/*Log' || true
+
+      - name: Tear down
+        if: always()
+        run: scripts/condor-execenv.sh down

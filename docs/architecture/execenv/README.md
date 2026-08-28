@@ -72,12 +72,22 @@ Deliberate placeholders, all in the Dockerfile (ADR-0007):
 
 ## Running it
 
+**What exists today (the #7115 validation-lane increment):** the image,
+entrypoint, pool config, and in-container proofs live at
+`docker/execenv/`, driven by `scripts/condor-execenv.sh
+build|up|selftest|down`. It runs the lane contract suite (including the
+Linux escape-*containment* branch of the boundary test) and proves the
+hard `request_memory` ceiling inside cgroup v2. io itself does not run
+in-container yet — that half gates on ADR-0016 (credential
+provisioning), and the recipe below is its target shape:
+
 ```bash
 docker volume create io-work
 docker volume create io-spool
 
 docker run -d --name io \
   -p 8080:8080 \
+  --stop-timeout 60 \
   --add-host=host.docker.internal:host-gateway \
   -v io-work:/work \
   -v io-spool:/var/lib/condor \
