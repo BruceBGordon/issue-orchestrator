@@ -19,6 +19,7 @@ from .domain.event_taxonomy import (
     is_session_event_name,
     is_validation_event_name,
 )
+from .events import EventName
 from .events.spec import spec_for
 from .ports.timeline_store import TimelineRecord
 
@@ -221,7 +222,7 @@ def _record_to_event(issue_number: int, record: TimelineRecord) -> TimelineEvent
     parent_key = _parent_key(issue_number, data)
     run_id = _run_id_from_data(data)
     run_dir = _run_dir_from_data(data)
-    artifacts = _artifacts_from_data(data)
+    artifacts = _artifacts_from_data(data, event_name=canonical_name)
     agent = data.get("agent") if isinstance(data.get("agent"), str) else None
     task = data.get("task") if isinstance(data.get("task"), str) else None
     rework_cycle = (
@@ -794,7 +795,9 @@ def _truncate_summary(text: str) -> str:
     return text[: _MAX_SUMMARY - 1].rstrip() + "\u2026"
 
 
-def _artifacts_from_data(data: dict[str, Any]) -> list[TimelineArtifact]:
+def _artifacts_from_data(
+    data: dict[str, Any], *, event_name: str
+) -> list[TimelineArtifact]:
     artifacts: list[TimelineArtifact] = []
     seen: dict[tuple[str, str], TimelineArtifact] = {}
 
@@ -811,7 +814,11 @@ def _artifacts_from_data(data: dict[str, Any]) -> list[TimelineArtifact]:
             artifacts, seen, "review_comment", "Review Comment", comment_url
         )
     completion_path = data.get("completion_path_absolute")
-    if isinstance(completion_path, str) and completion_path:
+    if (
+        isinstance(completion_path, str)
+        and completion_path
+        and _event_owns_completion_record(event_name, data)
+    ):
         _append_artifact(
             artifacts, seen, "completion_record", "Completion", completion_path
         )
@@ -825,6 +832,19 @@ def _artifacts_from_data(data: dict[str, Any]) -> list[TimelineArtifact]:
     if isinstance(run_dir, str) and run_dir:
         _append_artifact(artifacts, seen, "run_dir", "Run Dir", run_dir)
     return artifacts
+
+
+def _event_owns_completion_record(event_name: str, data: Mapping[str, Any]) -> bool:
+    """Return whether this event asserts that its completion output exists."""
+    if event_name in {
+        EventName.SESSION_COMPLETED,
+        EventName.SESSION_INVALID_COMPLETION_RECORD,
+    }:
+        return True
+    return (
+        event_name == EventName.SESSION_FAILED
+        and data.get("failure_kind") == "invalid_completion_record"
+    )
 
 
 def _explicit_artifacts_from_data(

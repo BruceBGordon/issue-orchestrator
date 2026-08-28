@@ -49,6 +49,8 @@ function loadTimelineSlice(overrides = {}) {
     ].join('\n');
     const context = {
         openReviewArtifact: (...args) => calls.push(['openReviewArtifact', ...args]),
+        openModal: (...args) => calls.push(['openModal', ...args]),
+        escapeHtml: _escapeHtml,
         showToast: (...args) => calls.push(['showToast', ...args]),
         ...overrides,
     };
@@ -56,6 +58,22 @@ function loadTimelineSlice(overrides = {}) {
     vm.runInContext(slice, context, { filename: 'timeline.js review artifact slice' });
     return { context, calls };
 }
+
+test('unavailable exact-run evidence opens escaped row-scoped diagnostics', () => {
+    const { context, calls } = loadTimelineSlice();
+
+    context.runTimelineEventAction({
+        type: 'show_actions_error',
+        issue_number: 194,
+        error_messages: ['Manifest missing <started_at>'],
+    });
+
+    assert.deepEqual(calls, [[
+        'openModal',
+        'What is missing #194',
+        '<ul class="diag-actions-list"><li>Manifest missing &lt;started_at&gt;</li></ul>',
+    ]]);
+});
 
 function loadReviewDialogSlice(overrides = {}) {
     const calls = [];

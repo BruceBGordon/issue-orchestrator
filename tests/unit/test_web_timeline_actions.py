@@ -35,6 +35,7 @@ class TestTimelineActionWiring:
         "open_orchestrator_log": "/api/session/orchestrator-log/{issue_number}",
         "open_session_diagnostics": "/api/dialog/session-diagnostics/{issue_number}",
         "show_event_details": None,  # client-side modal for row payload inspection
+        "show_actions_error": None,  # client-side modal for row-scoped evidence errors
     }
     _REQUIRED_FIELDS_BY_ACTION: dict[str, tuple[str, ...]] = {
         "open_validation_failure": ("issue_number", "run_dir"),
@@ -209,6 +210,109 @@ class TestTimelineActionWiring:
             # Every step should have at least the default diagnostics actions
             assert "open_agent_log" in step_action_types
             assert "open_session_diagnostics" in step_action_types
+        finally:
+            set_orchestrator(None)
+
+    def test_live_start_expected_completion_path_keeps_timeline_available(
+        self, tmp_path: Path
+    ) -> None:
+        from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+        from issue_orchestrator.ports.timeline_store import TimelineRecord
+
+        mock_orch = create_mock_orchestrator()
+        mock_orch.state.cached_queue_issues = [create_issue(158, "Live Coding")]
+        worktree = tmp_path / "porchpin-158"
+        worktree.mkdir(parents=True)
+        run = FileSystemSessionOutput().start_run(worktree, "coding-1", issue_number=158)
+        (run.run_dir / "ui-session.log").write_text("agent output\n", encoding="utf-8")
+        expected_completion = run.run_dir / "completion-agent.json"
+        mock_orch.deps.timeline_reader.read.return_value = TimelineStream.from_records(
+            158,
+            [
+                TimelineRecord(
+                    event_id="start-158",
+                    timestamp="2026-08-28T12:00:00Z",
+                    event="agent.coding_started",
+                    source_event="session.started",
+                    data={
+                        "issue_number": 158,
+                        "run_dir": str(run.run_dir),
+                        "worktree_path": str(worktree),
+                        "completion_path_absolute": str(expected_completion),
+                        "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
+                        "logical_run": 1,
+                        "logical_cycle": 1,
+                        "logical_phase": "coding",
+                        "event_intent": "coding",
+                    },
+                )
+            ],
+        )
+
+        set_orchestrator(mock_orch)
+        try:
+            response = TestClient(app).get("/api/issue-detail/158")
+            assert response.status_code == 200
+            row = response.json()["events"][0]
+            assert any(action["type"] == "open_agent_log" for action in row["actions"])
+            assert all(
+                artifact["type"] != "completion_record" for artifact in row["artifacts"]
+            )
+            assert str(expected_completion) not in str(row)
+        finally:
+            set_orchestrator(None)
+
+    def test_legacy_unreadable_manifest_is_scoped_to_its_timeline_row(
+        self, tmp_path: Path
+    ) -> None:
+        import json
+
+        from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+        from issue_orchestrator.ports.timeline_store import TimelineRecord
+
+        mock_orch = create_mock_orchestrator()
+        mock_orch.state.cached_queue_issues = [create_issue(194, "Legacy Session")]
+        worktree = tmp_path / "porchpin-tech-lead-194"
+        worktree.mkdir(parents=True)
+        run = FileSystemSessionOutput().start_run(worktree, "coding-1", issue_number=194)
+        manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
+        manifest.pop("started_at")
+        run.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        mock_orch.deps.timeline_reader.read.return_value = TimelineStream.from_records(
+            194,
+            [
+                TimelineRecord(
+                    event_id="legacy-194",
+                    timestamp="2026-08-17T09:24:18Z",
+                    event="agent.coding_started",
+                    source_event="session.started",
+                    data={
+                        "issue_number": 194,
+                        "run_dir": str(run.run_dir),
+                        "worktree_path": str(worktree),
+                        "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
+                        "logical_run": 1,
+                        "logical_cycle": 1,
+                        "logical_phase": "coding",
+                        "event_intent": "coding",
+                    },
+                )
+            ],
+        )
+
+        set_orchestrator(mock_orch)
+        try:
+            response = TestClient(app).get("/api/issue-detail/194")
+            assert response.status_code == 200
+            actions = response.json()["events"][0]["actions"]
+            unavailable = next(
+                action for action in actions if action["type"] == "show_actions_error"
+            )
+            assert unavailable["label"] == "Session evidence unavailable"
+            assert unavailable["primary"] is True
+            assert "started_at" in unavailable["error_message"]
+            assert all(action["type"] != "open_agent_log" for action in actions)
+            assert "run_dir" not in unavailable
         finally:
             set_orchestrator(None)
 

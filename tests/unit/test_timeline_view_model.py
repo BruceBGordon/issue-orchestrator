@@ -56,6 +56,29 @@ def test_build_issue_timeline_maps_phase_and_step():
     assert grouped["in_progress"][0].step == "started"
 
 
+def test_session_start_expected_completion_path_is_not_an_available_artifact():
+    event = build_issue_timeline(
+        158,
+        [
+            TimelineRecord(
+                event_id="start-158",
+                timestamp="2026-08-28T12:00:00Z",
+                event="agent.coding_started",
+                source_event="session.started",
+                data={
+                    "issue_number": 158,
+                    "completion_path_absolute": "/tmp/run/completion-record.json",
+                    "run_dir": "/tmp/run",
+                },
+            )
+        ],
+    )["events"][0]
+
+    assert all(
+        artifact["type"] != "completion_record" for artifact in event["artifacts"]
+    )
+
+
 def test_build_issue_timeline_maps_validation_and_review_queue_to_orchestrator_phase():
     records = [
         TimelineRecord(
