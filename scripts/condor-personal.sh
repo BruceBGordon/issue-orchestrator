@@ -86,6 +86,27 @@ CONTINUE = (\$(OwnerLoadAvg) < ${IO_CONDOR_CONTINUE_LOAD:-2.0})
 EOF
 }
 
+# Files this helper manages whose ABSENCE from staging is meaningful:
+# copying staged files over a destination cannot delete anything, so a
+# previously-installed opt-in policy would survive every later plain
+# `up`. The install boundary owns that reconciliation (B2, #7118
+# review): a managed file not present in staging is removed from the
+# destination.
+MANAGED_OPTIONAL_CONFIGS="91-io-load-backoff.conf"
+
+install_staged_configs() {
+  local staging="$1" destination="$2" runner=""
+  if [ ! -w "$destination" ]; then
+    runner="sudo"
+  fi
+  $runner cp "$staging"/*.conf "$destination/"
+  for managed in $MANAGED_OPTIONAL_CONFIGS; do
+    if [ ! -f "$staging/$managed" ] && [ -f "$destination/$managed" ]; then
+      $runner rm -f "$destination/$managed"
+    fi
+  done
+}
+
 # The plain Linux htcondor package boots DAEMON_LIST = MASTER and
 # nothing else - it is a component install, not a personal pool. This
 # overlay defines the personal role explicitly: all five daemons on
@@ -294,11 +315,7 @@ linux_configure() {
   if ambient_needs_personal_role "$ambient_daemons"; then
     write_personal_role_config "$staging"
   fi
-  if [ -w "$config_dir" ]; then
-    cp "$staging"/*.conf "$config_dir/"
-  else
-    sudo cp "$staging"/*.conf "$config_dir/"
-  fi
+  install_staged_configs "$staging" "$config_dir"
   rm -rf "$staging"
   if command -v systemctl >/dev/null 2>&1; then
     sudo systemctl restart condor

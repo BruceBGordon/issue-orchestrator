@@ -344,6 +344,18 @@ def _pool_tool(name: str) -> tuple[Path, dict[str, str]]:
     return binary, environment
 
 
+def _unique_lane_key(prefix: str) -> str:
+    """A per-submission unique work key for tests that address their
+    own job through the queue. The stable logical work keys are shared
+    by concurrent gates of the same repo (B4, #7118 review): targeting
+    one would let this test freeze or remove ANOTHER worktree's run of
+    the same lane. Uniqueness makes the batch constraint an execution
+    identity."""
+    import uuid
+
+    return f"{prefix}-{uuid.uuid4().hex[:10]}"
+
+
 def _batch_constraint(work_key: str) -> str:
     return f'JobBatchName == "{work_key}"'
 
@@ -398,7 +410,7 @@ def test_suspension_charges_neither_deadline_nor_observed_runtime(
     charging frozen time would remove it. The suspended state is
     asserted as observed scheduler fact, not assumed from the command's
     exit code."""
-    work_key = "contract.suspension"
+    work_key = _unique_lane_key("contract.suspension")
     marker = tmp_path / "running"
     script = (
         "import sys, time, pathlib\n"
@@ -462,7 +474,7 @@ def test_true_overrun_is_still_enforced_across_a_suspension(
     """The suspension subtraction must not disable the deadline: a lane
     genuinely exceeding its executing-time budget is still removed —
     across a targeted freeze/thaw of exactly this lane's job."""
-    work_key = "contract.overrun"
+    work_key = _unique_lane_key("contract.overrun")
     marker = tmp_path / "running-overrun"
     script = (
         "import sys, time, pathlib\n"
@@ -525,14 +537,23 @@ def test_owner_load_spike_freezes_only_suspendable_lanes(tmp_path: Path) -> None
     the frozen lane to completion when the load clears."""
     import os
 
+    # condor_config_val returns the EXPANDED expression — macro names
+    # like OwnerLoadAvg do not survive expansion (B6, #7118 review).
+    # Assert the effective policy: the machine-wide owner-load pair and
+    # the per-lane eligibility guard.
     policy = _run_pool_tool("condor_config_val", "SUSPEND").stdout
-    assert "OwnerLoadAvg" in policy, (
-        "this test requires a pool started with IO_CONDOR_LOAD_BACKOFF=1; "
-        f"the running pool's SUSPEND is: {policy!r}"
+    assert "TotalLoadAvg - TotalCondorLoadAvg" in policy, (
+        "this test requires a pool started with IO_CONDOR_LOAD_BACKOFF=1 "
+        "and the machine-wide owner-load policy; the running pool's "
+        f"effective SUSPEND is: {policy!r}"
+    )
+    assert "SuspendableLane" in policy, (
+        "the effective SUSPEND lacks the per-lane eligibility guard: "
+        f"{policy!r}"
     )
 
-    freezable_key = "backoff.freezable"
-    exempt_key = "backoff.exempt"
+    freezable_key = _unique_lane_key("backoff.freezable")
+    exempt_key = _unique_lane_key("backoff.exempt")
     script = "import time; time.sleep(90)"
     outcomes: dict[str, object] = {}
 

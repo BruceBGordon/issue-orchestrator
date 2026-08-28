@@ -284,3 +284,57 @@ def test_load_backoff_thresholds_are_overridable(tmp_path: Path) -> None:
     generated = (tmp_path / "91-io-load-backoff.conf").read_text()
     assert "> 8.5" in generated
     assert "< 3.0" in generated
+
+
+def test_install_boundary_reconciles_managed_files(tmp_path: Path) -> None:
+    """B2 round two (#7118 review): the Linux path stages fresh and
+    COPIES staged .conf files over the persistent destination — copying
+    cannot delete, so a stale opt-in policy in the destination survived
+    a disabled re-run. The install boundary must reconcile: a managed
+    file absent from staging is removed from the destination."""
+    staging = tmp_path / "staging"
+    destination = tmp_path / "config.d"
+    staging.mkdir()
+    destination.mkdir()
+    (destination / "91-io-load-backoff.conf").write_text("SUSPEND = stale\n")
+    (staging / "90-issue-orchestrator-lanes.conf").write_text("x = 1\n")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{SCRIPT}" && install_staged_configs "$1" "$2"',
+            "_",
+            str(staging),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not (destination / "91-io-load-backoff.conf").exists(), (
+        "a disabled install left the stale opt-in policy in the destination"
+    )
+    assert (destination / "90-issue-orchestrator-lanes.conf").exists()
+
+
+def test_install_boundary_installs_staged_managed_files(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    destination = tmp_path / "config.d"
+    staging.mkdir()
+    destination.mkdir()
+    (staging / "91-io-load-backoff.conf").write_text("SUSPEND = fresh\n")
+    (staging / "90-issue-orchestrator-lanes.conf").write_text("x = 1\n")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{SCRIPT}" && install_staged_configs "$1" "$2"',
+            "_",
+            str(staging),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (destination / "91-io-load-backoff.conf").read_text() == "SUSPEND = fresh\n"
