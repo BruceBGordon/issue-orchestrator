@@ -27,13 +27,18 @@ environment runs on Linux in a container, with IO alongside it, and
 
 ## Contents
 
+As shipped by #7119 (the design-artifact paths this section previously
+listed were placeholders and never existed in-repo):
+
 ```
-Dockerfile                      the image
-docker/condor/00-io-execenv.config
-docker/entrypoint.sh
-ci/test-execenv.sh              the detached-grandchild kill test
-.github/workflows/ci.yml
-adr/                       every decision and why
+docker/execenv/Dockerfile              the image (pins: base digest, condor LTS, uv digest)
+docker/execenv/condor/00-io-execenv.config
+docker/execenv/entrypoint.sh           fail-hard cgroup-v2 delegation + PID 1
+docker/execenv/selftest.sh             in-container proofs (incl. the
+                                       detached-grandchild containment case)
+scripts/condor-execenv.sh              host driver: build|up|preflight|selftest|diagnose|down
+.github/workflows/execenv.yml          path-scoped CI running the proofs natively
+adr/                                   every decision and why
 ```
 
 ## Decisions

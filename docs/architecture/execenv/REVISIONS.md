@@ -72,3 +72,16 @@ determined essentially everything else.
 Two items opened rather than resolved: ADR-0013 (the job privilege boundary is not
 a security boundary once the Docker socket is mounted) and ADR-0014 (bind-mount
 path mismatch).
+
+---
+
+## rev 3 (2026-08-28, with #7119)
+
+The validation-lane increment shipped and CI runs the proofs natively.
+Amendments forced by evidence: ADR-0007's aarch64 confirmation resolved
+negatively (htcondor.org is amd64-only; the distro's arm64 23.4 silently
+declines cgroup-v2 family tracking) — the image is linux/amd64
+everywhere; ADR-0012's release-tag arm64 leg is removed for the same
+reason. The README contents inventory now lists the shipped paths.
+Still open, unchanged: ADR-0013, ADR-0014, and ADR-0016 (agent
+credential provisioning — designed in discussion, not yet recorded).

@@ -101,26 +101,34 @@ diagnose)
     exit 0
     ;;
 down)
-    # --type container is load-bearing: a bare inspect resolves the
-    # IMAGE io-execenv:latest when no such container exists (observed
-    # on the CI runner: teardown succeeded, the postcondition matched
-    # the image forever and reported failure).
-    if ! docker inspect --type container "$CONTAINER" >/dev/null 2>&1; then
+    # Existence via `docker ps -aq`: container-scoped by definition (a
+    # bare inspect resolves the IMAGE io-execenv:latest - observed on
+    # the CI runner), and its command failure is DISTINCT from an
+    # empty result, so daemon-unavailable and not-found cannot be
+    # conflated (B4 round two: a missing docker binary must not report
+    # "already absent" and exit 0).
+    ids=$(docker ps -aq --filter "name=^${CONTAINER}\$") || {
+        echo "execenv: cannot query docker for $CONTAINER (daemon unavailable?)" >&2
+        exit 70
+    }
+    if [ -z "$ids" ]; then
         echo "execenv: container $CONTAINER already absent"
         exit 0
     fi
     docker stop "$CONTAINER" >/dev/null
     docker rm "$CONTAINER" >/dev/null
-    # Postcondition, verified: a false "removed" would hide daemon or
-    # authorization failures behind a comforting message (B4, #7119
-    # review). The daemon acknowledges rm slightly asynchronously on
-    # some hosts (observed on a GitHub runner: rm succeeded, an
-    # immediate inspect still resolved) - poll briefly before
-    # declaring failure; the honesty is in the bounded verification,
-    # not in racing the daemon.
+    # Postcondition, verified: a false "removed" would hide failures
+    # behind a comforting message. The daemon acknowledges rm slightly
+    # asynchronously on some hosts - poll briefly (bounded), and a
+    # query failure during verification is its own loud error, never
+    # proof of removal.
     removed=""
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        if ! docker inspect --type container "$CONTAINER" >/dev/null 2>&1; then
+        ids=$(docker ps -aq --filter "name=^${CONTAINER}\$") || {
+            echo "execenv: cannot verify removal of $CONTAINER (docker query failed)" >&2
+            exit 70
+        }
+        if [ -z "$ids" ]; then
             removed="yes"
             break
         fi

@@ -23,7 +23,11 @@ and it is the exact case that fails under the old macOS user install.
 - Poll `condor_status` until a slot appears, with a timeout. Never a fixed `sleep`.
 - Dump `StarterLog` and `ProcLog` on failure — condor failures are opaque without them
   and there is no debugger on a CI run.
-- Build `amd64` on every push. Add the `arm64` leg only on release tags.
+- Build `amd64` on every push. ~~Add the `arm64` leg only on release tags.~~
+  **Amended by #7119 (rev 3):** there is no `arm64` leg to add — htcondor.org
+  ships amd64 only, and the distro's arm64 package lacks working cgroup-v2
+  family tracking (ADR-0007 amendment). The image is `linux/amd64` on every
+  platform; Apple Silicon runs it emulated.
 
 ## Consequences
 
