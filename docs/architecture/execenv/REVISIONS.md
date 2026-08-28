@@ -83,5 +83,17 @@ negatively (htcondor.org is amd64-only; the distro's arm64 23.4 silently
 declines cgroup-v2 family tracking) — the image is linux/amd64
 everywhere; ADR-0012's release-tag arm64 leg is removed for the same
 reason. The README contents inventory now lists the shipped paths.
-Still open, unchanged: ADR-0013, ADR-0014, and ADR-0016 (agent
-credential provisioning — designed in discussion, not yet recorded).
+Still open, unchanged: ADR-0013 and ADR-0014. ADR-0016 was recorded
+and accepted in rev 4.
+
+## Rev 4 — 2026-08-29
+
+ADR-0016 recorded and **Accepted** on the strength of a live spike
+(2026-08-28/29): claude authenticates in-container via a read-only
+volume-mounted setup token (non-root, root refused
+`--dangerously-skip-permissions`); codex authenticates via a device-auth
+master whose jobs receive per-job copies — mandatory, because the spike
+demonstrated that a directly-mounted master is destroyed by first-touch
+working-state churn and failed use. Host sessions proven untouched by
+both new token families. Agent jobs' credential prerequisite (#7112) is
+closed; the admission probe becomes the provider-outage sentinel.
