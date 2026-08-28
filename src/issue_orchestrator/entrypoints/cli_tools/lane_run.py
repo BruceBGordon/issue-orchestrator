@@ -40,6 +40,11 @@ from ...domain.lane_execution import (
     LaneTimedOut,
     LaneWorkKey,
 )
+from ...infra.lane_declarations import (
+    LaneDeclaration,
+    LaneDeclarationError,
+    load_lane_declaration,
+)
 from ...infra.validation_timings import append_jsonl, resolve_git_common_dir
 from ...ports.lane_executor import LaneExecutor
 from ...ports.lane_runtime_history import LaneRuntimeHistory
@@ -71,6 +76,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         executor = _build_executor(arguments.backend)
         history = _build_history()
         work_key = LaneWorkKey(str(arguments.work_key))
+        # Scheduling facts are declared in ONE place —
+        # .issue-orchestrator/lanes.yaml — resolved here by the
+        # lane's logical work key. The Makefile carries commands and
+        # work keys only.
+        declaration = _load_declaration(work_key.value)
         # Dispatch order is learned, never declared: the rolling
         # median of this lane's past runtimes (LPT — longer
         # lanes first). Zero history means priority 0, exactly
@@ -79,13 +89,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         outcome = executor.run(
             _build_command(arguments),
             LaneResources(
-                request_cpus=arguments.request_cpus,
-                exclusive=tuple(arguments.exclusive),
+                request_cpus=declaration.request_cpus,
+                exclusive=declaration.exclusive,
                 priority=priority,
-                request_memory_mb=arguments.request_memory_mb,
-                suspendable=arguments.suspendable,
+                request_memory_mb=declaration.memory_mb,
+                suspendable=declaration.suspendable,
             ),
         )
+    except LaneDeclarationError as error:
+        print(f"lane-run: {error}", file=sys.stderr)
+        return _UNAVAILABLE_EXIT_CODE
     except LaneExecutorUnavailableError as error:
         print(f"lane-run: {error}", file=sys.stderr)
         return _UNAVAILABLE_EXIT_CODE
@@ -143,41 +156,11 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         description="Run one validation lane through the configured backend.",
     )
     parser.add_argument("--work-key", required=True)
-    parser.add_argument("--request-cpus", type=int, required=True)
-    parser.add_argument(
-        "--request-memory-mb",
-        type=int,
-        default=1024,
-        help="Memory budget for the lane's whole tree; sizes the scheduler slot.",
-    )
-    parser.add_argument(
-        "--exclusive",
-        action="append",
-        default=[],
-        help="Machine-wide mutual-exclusion token (repeatable).",
-    )
     parser.add_argument("--timeout-seconds", type=float, required=True)
-    suspendability = parser.add_mutually_exclusive_group()
-    suspendability.add_argument(
-        "--suspendable",
-        dest="suspendable",
-        action="store_true",
-        help=(
-            "The lane tolerates being frozen mid-run by machine-load "
-            "backoff (declare for hermetic lanes)."
-        ),
-    )
-    suspendability.add_argument(
-        "--not-suspendable",
-        dest="suspendable",
-        action="store_false",
-        help=(
-            "The lane must never be frozen mid-run (lanes holding live "
-            "provider exchanges). This is also the unclassified default: "
-            "freezing requires an explicit declaration."
-        ),
-    )
-    parser.set_defaults(suspendable=False)
+    # Scheduling facts (cpus, memory, suspendability, exclusives) are
+    # NOT flags: they are declared once per work key in
+    # .issue-orchestrator/lanes.yaml and resolved by name, so
+    # no second configuration surface can drift from the first.
     parser.add_argument(
         "--backend",
         choices=(_DIRECT_BACKEND, _CONDOR_BACKEND),
@@ -224,6 +207,11 @@ def _record_dispatch(
             "exit_code": outcome.exit_code,
         },
     )
+
+
+def _load_declaration(work_key: str) -> LaneDeclaration:
+    """The declared scheduling facts for this work key (test seam)."""
+    return load_lane_declaration(Path.cwd(), work_key)
 
 
 def _dispatch_log_path() -> Path | None:

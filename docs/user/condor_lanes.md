@@ -97,17 +97,22 @@ belongs to exactly one, and its name says which:
 
 | Parameter family | What it is | Consumed by |
 |---|---|---|
-| `LANE_REQUEST_CPUS_*`, `LANE_MEMORY_MB_*` (Makefile lane table) | **Measured** per-lane demand — busy cores from `/usr/bin/time -l`, not worker counts | Scheduling backend admission only; the direct backend accepts-and-ignores |
-| `LANE_WORKERS_*`, `*_PARALLEL` | How parallel the suite itself runs (xdist `-n`) | The suite, in every mode |
-| `VALIDATE_*_JOBS` phase widths | Host protection: keeps xdist-heavy suites from trampling each other | Direct mode only — the flat fan + pool admission replaces this structure |
+| `.issue-orchestrator/lanes.yaml` rows | **Measured** per-lane demand (request_cpus, memory_mb), suspendability, exclusives — one schema-validated home, resolved by `lane-run` per work key | Scheduling backend admission only; the direct backend accepts-and-ignores |
+| `LANE_WORKERS_*`, `*_PARALLEL` (Makefile) | How parallel the suite itself runs (xdist `-n`) — part of the command text | The suite, in every mode |
+| `VALIDATE_*_JOBS` phase widths (Makefile) | Host protection: keeps xdist-heavy suites from trampling each other | Direct mode only — the flat fan + pool admission replaces this structure |
 | `IO_POOL_CAPACITY_PERCENT` | The one throughput dial (below) | The pool |
+
+The Makefile speaks only logical work names and commands; everything
+scheduling-shaped is a `lanes.yaml` row, and a drift test holds the
+two together bidirectionally (an undeclared lane cannot run, a
+declared lane no target submits is a dead row).
 
 Workers and requests are different numbers on purpose: most lanes are
 I/O-bound (an integration slice keeps 4 workers busy on 0.85 cores),
 so requesting worker-count cores rations capacity that is mostly
 phantom. Measure with
 `/usr/bin/time -l gmake <lane-target> LANE_EXECUTOR=direct` — busy
-cores = (user+sys)/wall — and record the result in the lane table.
+cores = (user+sys)/wall — and record the result in `lanes.yaml`.
 
 ## Pool capacity dial (opt-in)
 
@@ -143,13 +148,13 @@ Three rules are built in, each load-bearing:
 - **Owner load, never total load.** The policy subtracts the load
   condor's own jobs cause; suspending on total load would trip on the
   gate's own lane fan and oscillate against its own reflection.
-- **Only lanes that declared it safe.** Hermetic lanes carry
-  `--suspendable`; lanes holding live provider exchanges carry
-  `--not-suspendable` (frozen mid-turn, their response window expires
-  and the thaw manufactures a provider-outage failure). The
-  unclassified default is **non-suspendable** — freezing requires an
-  explicit declaration, never an author's memory — and a guard test
-  forces every lane declaration to say which side it is on.
+- **Only lanes that declared it safe.** Hermetic lanes declare
+  `suspendable: true` in `.issue-orchestrator/lanes.yaml`; lanes
+  holding live provider exchanges declare `suspendable: false`
+  (frozen mid-turn, their response window expires and the thaw
+  manufactures a provider-outage failure). The field is
+  schema-required — a lane nobody classified fails validation
+  loudly instead of defaulting either way.
 - **Frozen time is charged to nothing.** The compiled lane deadline
   subtracts suspension time (a freeze must not manufacture a timeout),
   and observed runtime excludes it (a freeze must not teach the

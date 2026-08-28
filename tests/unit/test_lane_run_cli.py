@@ -21,6 +21,10 @@ from issue_orchestrator.domain.lane_execution import (
     LaneWorkKey,
 )
 from issue_orchestrator.entrypoints.cli_tools import lane_run as lane_run_module
+from issue_orchestrator.infra.lane_declarations import (
+    LaneDeclaration,
+    LaneDeclarationError,
+)
 from issue_orchestrator.entrypoints.cli_tools.lane_run import (
     BACKEND_ENVIRONMENT_VARIABLE,
     main,
@@ -45,6 +49,21 @@ def isolated_history(
 
 
 @pytest.fixture(autouse=True)
+def declared_lane(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test resolves a default declaration for cli.test.
+
+    Without this, main() would read the repository's real lanes.yaml,
+    where the test's work key is (correctly) not declared."""
+    monkeypatch.setattr(
+        lane_run_module,
+        "_load_declaration",
+        lambda work_key: LaneDeclaration(
+            request_cpus=1, memory_mb=1024, suspendable=False
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
 def isolated_dispatch_log(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> Path:
@@ -62,8 +81,6 @@ def _run(*command: str, flags: tuple[str, ...] = (), timeout: str = "60") -> int
         [
             "--work-key",
             "cli.test",
-            "--request-cpus",
-            "1",
             "--timeout-seconds",
             timeout,
             *flags,
@@ -110,8 +127,6 @@ def test_missing_separator_is_a_usage_error() -> None:
             [
                 "--work-key",
                 "cli.test",
-                "--request-cpus",
-                "1",
                 "--timeout-seconds",
                 "60",
                 "/usr/bin/true",
@@ -146,17 +161,29 @@ def test_environment_variable_selects_the_backend(
     assert _run("/usr/bin/true") == 78
 
 
-def test_memory_budget_crosses_the_port_boundary(
+def test_declared_facts_cross_the_port_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The direct adapter ignores scheduling hints, so a run-and-check
-    test is vacuous: main() could drop the flag and still exit 0. A
-    capturing executor at the composition seam proves the value the
-    port actually receives."""
+    """The lanes.yaml declaration — not any flag — is what reaches the
+    port. A capturing executor at the composition seam proves the
+    values the port actually receives."""
+    monkeypatch.setattr(
+        lane_run_module,
+        "_load_declaration",
+        lambda work_key: LaneDeclaration(
+            request_cpus=7,
+            memory_mb=2048,
+            suspendable=True,
+            exclusive=("codex",),
+        ),
+    )
     executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
-    assert _run("/usr/bin/true", flags=("--request-memory-mb", "2048")) == 0
+    assert _run("/usr/bin/true") == 0
     assert len(executor.resources) == 1
+    assert executor.resources[0].request_cpus == 7
     assert executor.resources[0].request_memory_mb == 2048
+    assert executor.resources[0].suspendable is True
+    assert executor.resources[0].exclusive == ("codex",)
 
 
 def test_priority_cannot_be_declared_by_the_client() -> None:
@@ -295,25 +322,32 @@ def test_observed_runtime_domain_validation_rejects_nonsense() -> None:
     assert LaneCompleted(0, 0.0, 0.0).observed_runtime_seconds == 0.0
 
 
-def test_suspendability_crosses_the_port_boundary(
+def test_scheduling_facts_cannot_be_declared_as_flags() -> None:
+    """One configuration home: cpus, memory, suspendability, and
+    exclusives are lanes.yaml rows, and the flags must not exist — a
+    second declaration surface would drift from the first."""
+    for flag in (
+        ("--request-cpus", "4"),
+        ("--request-memory-mb", "2048"),
+        ("--suspendable",),
+        ("--not-suspendable",),
+        ("--exclusive", "codex"),
+    ):
+        with pytest.raises(SystemExit):
+            _run("/usr/bin/true", flags=flag)
+
+
+def test_undeclared_lane_fails_as_configuration_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Freezing requires an explicit declaration: the unclassified
-    default is NON-suspendable (fail-safe — a lane nobody classified
-    is never frozen), and both explicit classifications cross the
-    port."""
-    executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
-    assert _run("/usr/bin/true") == 0
-    assert executor.resources[0].suspendable is False
-    assert _run("/usr/bin/true", flags=("--suspendable",)) == 0
-    assert executor.resources[1].suspendable is True
-    assert _run("/usr/bin/true", flags=("--not-suspendable",)) == 0
-    assert executor.resources[2].suspendable is False
+    """No policy-by-absence: a lane missing from lanes.yaml must not
+    run with invented resources."""
 
+    def refuse(work_key: str) -> LaneDeclaration:
+        raise LaneDeclarationError(f"lane {work_key!r} is not declared")
 
-def test_suspendability_flags_are_mutually_exclusive() -> None:
-    with pytest.raises(SystemExit):
-        _run("/usr/bin/true", flags=("--suspendable", "--not-suspendable"))
+    monkeypatch.setattr(lane_run_module, "_load_declaration", refuse)
+    assert _run("/usr/bin/true") == 78
 
 
 def test_suspendable_domain_validation_rejects_non_bool() -> None:
