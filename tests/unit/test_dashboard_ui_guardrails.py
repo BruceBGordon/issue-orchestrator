@@ -1394,8 +1394,12 @@ def test_timeline_unavailable_artifact_actions_keep_backend_label_and_can_be_pri
     js = _read(DASHBOARD_JS)
     render_body = _function_body(js, "renderTimelineEventActions")
     label_body = _function_body(js, "_timelineActionShortLabel")
+    action_body = _function_body(js, "runTimelineEventAction")
     assert "item.action.primary !== true" in render_body
     assert "type === 'show_actions_error') return label || 'What is missing?'" in label_body
+    assert "action.type === 'show_actions_error'" in action_body
+    assert "escapeHtml(msg)" in action_body
+    assert "openModal(`What is missing${issueSuffix}`" in action_body
 
 
 def test_cycle_artifact_popover_does_not_invent_run_level_session_transcript() -> None:

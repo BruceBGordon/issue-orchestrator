@@ -31,6 +31,7 @@ from ..execution.timeline_action_capabilities import (
     review_feedback_event_name,
     timeline_local_artifact_kind,
     timeline_url_artifact_kind,
+    unavailable_run_artifacts_detail,
 )
 from ..execution.timeline_artifact_expectations import event_requires_run_dir
 from ..timeline import MIN_SUPPORTED_TIMELINE_SCHEMA_VERSION, TIMELINE_SCHEMA_VERSION
@@ -515,6 +516,29 @@ def _timeline_event_default_actions(
     )
 
 
+def _timeline_event_unavailable_run_action(
+    *,
+    run_artifacts: TimelineRunArtifacts,
+    issue_number: int,
+    add_action: Callable[[dict[str, Any], str], None],
+) -> None:
+    """Expose an exact-row diagnostic without inventing replacement artifacts."""
+    unavailable_detail = unavailable_run_artifacts_detail(run_artifacts)
+    if unavailable_detail is None:
+        return
+    add_action(
+        {
+            "type": "show_actions_error",
+            "label": "Session evidence unavailable",
+            "issue_number": issue_number,
+            "error_message": unavailable_detail,
+            "error_messages": [unavailable_detail],
+            "primary": True,
+        },
+        "run-artifacts-unavailable",
+    )
+
+
 def _agent_log_is_usable(log_path: Path) -> bool:
     """Return True when run-scoped agent log should be exposed in timeline actions."""
     return log_path.exists()
@@ -682,6 +706,11 @@ def _timeline_event_actions(event: dict[str, Any], issue_number: int) -> list[di
         run_artifacts=run_artifacts,
         agent_log_label=agent_log_label,
         include_run_scoped=available_run is not None and is_agent_event,
+        add_action=_add_action,
+    )
+    _timeline_event_unavailable_run_action(
+        run_artifacts=run_artifacts,
+        issue_number=issue_number,
         add_action=_add_action,
     )
     return actions

@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
+
+from issue_orchestrator.events.artifact_semantics import (
+    CompletionPathSemantics,
+    completion_path_semantics,
+)
 
 
 class TimelineFixturePathField(StrEnum):
@@ -20,8 +26,10 @@ def rewrite_timeline_fixture_path(
     field: TimelineFixturePathField,
     run_dir: Path,
     original_value: str,
+    event_name: str,
+    event_data: Mapping[str, object],
 ) -> Path:
-    """Rewrite and materialize one captured local-artifact path."""
+    """Rewrite a captured path and materialize only asserted artifacts."""
     if not original_value.strip():
         raise ValueError(f"captured Timeline field {field.value} is empty")
 
@@ -32,6 +40,15 @@ def rewrite_timeline_fixture_path(
 
     rewritten_path = run_dir / Path(original_value).name
     rewritten_path.parent.mkdir(parents=True, exist_ok=True)
+    if field is TimelineFixturePathField.COMPLETION_PATH_ABSOLUTE:
+        semantics = completion_path_semantics(event_name, event_data)
+        if semantics is CompletionPathSemantics.EXPECTED_DESTINATION:
+            return rewritten_path
+        if semantics is CompletionPathSemantics.NONE:
+            raise ValueError(
+                "captured Timeline completion path has no event semantics: "
+                f"event={event_name}"
+            )
     content = (
         "{}\n"
         if field is TimelineFixturePathField.COMPLETION_PATH_ABSOLUTE

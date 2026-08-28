@@ -11,6 +11,7 @@ from ..execution.recorded_session_runs import (
     InvalidRecordedRunReference,
     RecordedRunIssueMismatch,
     RecordedRunNotFound,
+    RecordedRunUntrusted,
     RecordedRunUnreadable,
     resolve_exact_recorded_run,
 )
@@ -45,6 +46,8 @@ def exact_recorded_run_response(
                 {"error": f"Requested run does not belong to issue #{expected}"},
                 status_code=404,
             )
+        case RecordedRunUntrusted(detail=detail):
+            return JSONResponse({"error": detail}, status_code=400)
         case RecordedRunUnreadable(detail=detail):
             return JSONResponse({"error": detail}, status_code=500)
         case _:

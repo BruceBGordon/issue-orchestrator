@@ -16,6 +16,7 @@ from .recorded_session_runs import (
     InvalidRecordedRunReference,
     RecordedRunIssueMismatch,
     RecordedRunNotFound,
+    RecordedRunUntrusted,
     RecordedRunUnreadable,
     resolve_exact_recorded_run,
 )
@@ -41,12 +42,23 @@ class MissingRunArtifacts:
 
 
 @dataclass(frozen=True, slots=True)
+class UnavailableRunArtifacts:
+    """The run exists, but its manifest cannot prove exact-run ownership."""
+
+    run_dir: Path
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
 class UnscopedTimelineEvent:
     """This event never required a run directory."""
 
 
 TimelineRunArtifacts: TypeAlias = (
-    AvailableRunArtifacts | MissingRunArtifacts | UnscopedTimelineEvent
+    AvailableRunArtifacts
+    | MissingRunArtifacts
+    | UnavailableRunArtifacts
+    | UnscopedTimelineEvent
 )
 
 
@@ -141,8 +153,8 @@ def _validated_available_run(
     run_dir: Path,
     issue_number: int,
     event_name: str,
-) -> AvailableRunArtifacts:
-    """Convert exact-run lookup results into the Timeline fail-fast policy."""
+) -> AvailableRunArtifacts | UnavailableRunArtifacts:
+    """Convert exact-run lookup results into a closed capability state."""
     exact_run = resolve_exact_recorded_run(
         str(run_dir),
         issue_number=issue_number,
@@ -151,9 +163,12 @@ def _validated_available_run(
         case ExactRecordedRun():
             return AvailableRunArtifacts(recorded_run=exact_run)
         case RecordedRunNotFound(detail=detail):
-            raise RuntimeError(
-                "timeline event references an existing run without a readable manifest: "
-                f"issue={issue_number} event={event_name} run_dir={run_dir}; {detail}"
+            return UnavailableRunArtifacts(
+                run_dir=run_dir,
+                detail=(
+                    "Recorded session evidence has no readable manifest: "
+                    f"issue={issue_number} event={event_name}; {detail}"
+                ),
             )
         case RecordedRunIssueMismatch(actual_issue_number=actual):
             raise RuntimeError(
@@ -161,10 +176,23 @@ def _validated_available_run(
                 f"issue={issue_number} actual_issue={actual} "
                 f"event={event_name} run_dir={run_dir}"
             )
-        case InvalidRecordedRunReference(detail=detail) | RecordedRunUnreadable(detail=detail):
+        case InvalidRecordedRunReference(detail=detail):
             raise RuntimeError(
                 "timeline event has an untrusted run_dir: "
                 f"issue={issue_number} event={event_name} run_dir={run_dir}; {detail}"
+            )
+        case RecordedRunUntrusted(detail=detail):
+            raise RuntimeError(
+                "timeline event has an untrusted run_dir: "
+                f"issue={issue_number} event={event_name} run_dir={run_dir}; {detail}"
+            )
+        case RecordedRunUnreadable(detail=detail):
+            return UnavailableRunArtifacts(
+                run_dir=run_dir,
+                detail=(
+                    "Recorded session evidence is unreadable: "
+                    f"issue={issue_number} event={event_name}; {detail}"
+                ),
             )
         case _:
             assert_never(exact_run)
@@ -176,7 +204,22 @@ def available_run_artifacts(
     match run_artifacts:
         case AvailableRunArtifacts():
             return run_artifacts
-        case MissingRunArtifacts() | UnscopedTimelineEvent():
+        case (
+            MissingRunArtifacts() | UnavailableRunArtifacts() | UnscopedTimelineEvent()
+        ):
+            return None
+        case _:
+            assert_never(run_artifacts)
+
+
+def unavailable_run_artifacts_detail(
+    run_artifacts: TimelineRunArtifacts,
+) -> str | None:
+    """Return the explicit inspection failure for an existing unusable run."""
+    match run_artifacts:
+        case UnavailableRunArtifacts(detail=detail):
+            return detail
+        case AvailableRunArtifacts() | MissingRunArtifacts() | UnscopedTimelineEvent():
             return None
         case _:
             assert_never(run_artifacts)

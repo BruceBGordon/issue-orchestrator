@@ -263,6 +263,94 @@ def test_issue_detail_reads_from_sqlite_store(sample_config, mock_repository_hos
         web.set_orchestrator(None)
 
 
+def test_issue_detail_survives_future_and_legacy_run_evidence_from_sqlite(
+    sample_config,
+    mock_repository_host,
+):
+    """One unavailable row must not make a persisted issue timeline unavailable."""
+    orch, timeline_writer = _build_orchestrator_with_sqlite_timeline(
+        sample_config,
+        mock_repository_host,
+    )
+    issue_number = 4194
+    live_run_dir = Path(
+        _start_run_with_artifacts(
+            sample_config.repo_root,
+            issue_number=issue_number,
+            session_name="issue-4194-live",
+        )
+    )
+    legacy_run_dir = Path(
+        _start_run_with_artifacts(
+            sample_config.repo_root,
+            issue_number=issue_number,
+            session_name="issue-4194-legacy",
+        )
+    )
+    future_completion = live_run_dir / "completion-future.json"
+    assert not future_completion.exists()
+    orch.state.cached_queue_issues = [
+        Issue(
+            number=issue_number,
+            title="Persisted timeline evidence compatibility",
+            labels=["agent:backend"],
+        ),
+    ]
+
+    timeline_writer.record(TraceEvent(EventName.SESSION_STARTED, {
+        "issue_number": issue_number,
+        "run_id": "run-4194-live",
+        "run_dir": str(live_run_dir),
+        "completion_path_absolute": str(future_completion),
+        "task": "code",
+        "agent": "agent:backend",
+        "rework_cycle": 0,
+    }))
+    timeline_writer.record(TraceEvent(EventName.SESSION_STARTED, {
+        "issue_number": issue_number,
+        "run_id": "run-4194-legacy",
+        "run_dir": str(legacy_run_dir),
+        "task": "code",
+        "agent": "agent:backend",
+        "rework_cycle": 0,
+    }))
+
+    legacy_manifest_path = legacy_run_dir / "manifest.json"
+    legacy_manifest = json.loads(legacy_manifest_path.read_text(encoding="utf-8"))
+    legacy_manifest.pop("started_at")
+    legacy_manifest_path.write_text(json.dumps(legacy_manifest), encoding="utf-8")
+
+    web.set_orchestrator(orch)
+    try:
+        response = TestClient(web.app).get(
+            f"/api/issue-detail/{issue_number}?view=debug"
+        )
+
+        assert response.status_code == 200
+        events = response.json()["events"]
+        live_row = next(event for event in events if event.get("run_id") == "run-4194-live")
+        legacy_row = next(
+            event for event in events if event.get("run_id") == "run-4194-legacy"
+        )
+        assert all(
+            artifact["type"] != "completion_record"
+            for artifact in live_row["artifacts"]
+        )
+        assert str(future_completion) not in str(live_row)
+        unavailable_action = _single_action(
+            legacy_row["actions"],
+            type="show_actions_error",
+            primary=True,
+        )
+        assert unavailable_action["label"] == "Session evidence unavailable"
+        assert "started_at" in str(unavailable_action["error_message"])
+        assert all(
+            action["type"] != "open_agent_log" for action in legacy_row["actions"]
+        )
+    finally:
+        web.set_orchestrator(None)
+
+
 def test_issue_detail_uses_mocked_pipeline_artifact_refs_from_sqlite(
     sample_config,
     mock_repository_host,

@@ -1651,6 +1651,52 @@ class TestIssueLogEndpointsUseLatestHistory:
         finally:
             set_orchestrator(None)
 
+    def test_terminal_recording_route_rejects_untrusted_run_topology(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A readable manifest cannot legitimize a lookalike run directory."""
+        from issue_orchestrator.execution.session_output_adapter import (
+            FileSystemSessionOutput,
+        )
+
+        mock_orch = create_mock_orchestrator()
+        worktree = tmp_path / "wt-untrusted-run"
+        worktree.mkdir()
+        run = FileSystemSessionOutput().start_run(
+            worktree,
+            "issue-123",
+            issue_number=123,
+        )
+        lookalike = (
+            worktree
+            / ".issue-orchestrator"
+            / "not-sessions"
+            / run.run_dir.name
+        )
+        lookalike.mkdir(parents=True)
+        self._write_terminal_recording(lookalike, "private terminal marker\n")
+        manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
+        manifest["run_dir"] = str(lookalike)
+        manifest["log_path"] = str(lookalike / "terminal-recording.jsonl")
+        (lookalike / "manifest.json").write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+
+        set_orchestrator(mock_orch)
+        try:
+            response = TestClient(app).get(
+                "/api/session/terminal-recording/123",
+                params={"run_dir": str(lookalike)},
+            )
+
+            assert response.status_code == 400
+            assert "ownership constraints" in response.json()["error"]
+            assert "private terminal marker" not in response.text
+        finally:
+            set_orchestrator(None)
+
     def test_exact_historical_diagnostics_does_not_rebind_missing_claude_log(
         self,
         tmp_path: Path,
