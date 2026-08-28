@@ -90,6 +90,41 @@ runs a probe job in a fresh submitter-owned directory — readiness means
 identity configuration and hold reason instead of leaving you nine
 held lanes later.
 
+## Which parameters belong to which mode
+
+The concurrency controls are three separate layers; each parameter
+belongs to exactly one, and its name says which:
+
+| Parameter family | What it is | Consumed by |
+|---|---|---|
+| `LANE_REQUEST_CPUS_*`, `LANE_MEMORY_MB_*` (Makefile lane table) | **Measured** per-lane demand — busy cores from `/usr/bin/time -l`, not worker counts | Scheduling backend admission only; the direct backend accepts-and-ignores |
+| `LANE_WORKERS_*`, `*_PARALLEL` | How parallel the suite itself runs (xdist `-n`) | The suite, in every mode |
+| `VALIDATE_*_JOBS` phase widths | Host protection: keeps xdist-heavy suites from trampling each other | Direct mode only — the flat fan + pool admission replaces this structure |
+| `IO_POOL_CAPACITY_PERCENT` | The one throughput dial (below) | The pool |
+
+Workers and requests are different numbers on purpose: most lanes are
+I/O-bound (an integration slice keeps 4 workers busy on 0.85 cores),
+so requesting worker-count cores rations capacity that is mostly
+phantom. Measure with
+`/usr/bin/time -l gmake <lane-target> LANE_EXECUTOR=direct` — busy
+cores = (user+sys)/wall — and record the result in the lane table.
+
+## Pool capacity dial (opt-in)
+
+One number scales the whole pool's admission capacity as a percentage
+of physical cores:
+
+```bash
+IO_POOL_CAPACITY_PERCENT=150 scripts/condor-personal.sh up   # oversubscribe
+IO_POOL_CAPACITY_PERCENT=60 scripts/condor-personal.sh up    # throttle
+scripts/condor-personal.sh up                                # unset: physical cores
+```
+
+Raising it admits more concurrent lanes — sound when requests are
+honest and the mix is I/O-bound; lowering it throttles everything
+uniformly. This is the static half of load control; the reactive half
+is the machine-load backoff below.
+
 ## Machine-load backoff (opt-in)
 
 The pool can defer to the machine's real owner: when load that condor's
@@ -143,6 +178,15 @@ not yet submitted. The properties to know:
   directory to reset everything.
 - History is shared across all worktrees of a repository (it lives in
   the git common dir, like the validation timings).
+
+Every completed lane also reports its dispatch facts — the priority it
+ran with, how long it queued, how long it executed — as a
+`[lane-dispatch]` line in the gate log and a row in
+`<git-common-dir>/issue-orchestrator/lane-dispatch.jsonl`, so dispatch
+quality is checkable without pool archaeology. Jobs additionally carry
+their submitting worktree (`LaneSubmitter` in the queue), since the
+pool is shared and concurrent gates from different worktrees are
+normal.
 
 ## Architecture
 

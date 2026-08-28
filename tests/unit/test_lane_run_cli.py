@@ -44,6 +44,19 @@ def isolated_history(
     return history
 
 
+@pytest.fixture(autouse=True)
+def isolated_dispatch_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Path:
+    """Every test gets its own dispatch log, for the same reason the
+    history store is isolated: tests run inside the real repository."""
+    log_path = tmp_path / "lane-dispatch.jsonl"
+    monkeypatch.setattr(
+        lane_run_module, "_dispatch_log_path", lambda: log_path
+    )
+    return log_path
+
+
 def _run(*command: str, flags: tuple[str, ...] = (), timeout: str = "60") -> int:
     return main(
         [
@@ -140,7 +153,7 @@ def test_memory_budget_crosses_the_port_boundary(
     test is vacuous: main() could drop the flag and still exit 0. A
     capturing executor at the composition seam proves the value the
     port actually receives."""
-    executor = _capture(monkeypatch, LaneCompleted(0, 1.0))
+    executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
     assert _run("/usr/bin/true", flags=("--request-memory-mb", "2048")) == 0
     assert len(executor.resources) == 1
     assert executor.resources[0].request_memory_mb == 2048
@@ -157,7 +170,7 @@ def test_empty_history_is_the_naive_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Zero history means priority 0 — exactly today's behavior."""
-    executor = _capture(monkeypatch, LaneCompleted(0, 1.0))
+    executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
     assert _run("/usr/bin/true") == 0
     assert executor.resources[0].priority == 0
 
@@ -170,7 +183,7 @@ def test_learned_priority_crosses_the_port_boundary(
     key = LaneWorkKey("cli.test")
     for runtime in (30.0, 90.0, 60.0):
         isolated_history.record_success(key, runtime)
-    executor = _capture(monkeypatch, LaneCompleted(0, 1.0))
+    executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
     assert _run("/usr/bin/true") == 0
     assert executor.resources[0].priority == 60
 
@@ -178,7 +191,7 @@ def test_learned_priority_crosses_the_port_boundary(
 def test_successful_lane_seeds_the_next_run(
     monkeypatch: pytest.MonkeyPatch, isolated_history: JsonLaneRuntimeHistory
 ) -> None:
-    _capture(monkeypatch, LaneCompleted(0, 42.0))
+    _capture(monkeypatch, LaneCompleted(0, 42.0, 0.0))
     assert _run("/usr/bin/true") == 0
     assert isolated_history.learned_priority(LaneWorkKey("cli.test")) == 42
 
@@ -188,9 +201,60 @@ def test_failed_lane_teaches_nothing(
 ) -> None:
     """A failed run's duration is the failure's, not the lane's — a
     482s provider stall must never become a lane's learned weight."""
-    _capture(monkeypatch, LaneCompleted(1, 482.0))
+    _capture(monkeypatch, LaneCompleted(1, 482.0, 0.0))
     assert _run("/usr/bin/true") == 1
     assert isolated_history.learned_priority(LaneWorkKey("cli.test")) == 0
+
+
+def test_completed_lane_writes_one_dispatch_record(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_history: JsonLaneRuntimeHistory,
+    isolated_dispatch_log: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Priority used, queue wait, runtime, and exit land in the shared
+    dispatch log AND on stderr — dispatch quality must be readable in
+    the gate log and queryable across runs without pool archaeology."""
+    import json
+
+    key = LaneWorkKey("cli.test")
+    for runtime in (30.0, 90.0, 60.0):
+        isolated_history.record_success(key, runtime)
+    _capture(monkeypatch, LaneCompleted(0, 45.0, 12.0))
+    assert _run("/usr/bin/true") == 0
+    records = [
+        json.loads(line)
+        for line in isolated_dispatch_log.read_text().splitlines()
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record["work_key"] == "cli.test"
+    assert record["priority"] == 60
+    assert record["queue_wait_seconds"] == 12.0
+    assert record["observed_runtime_seconds"] == 45.0
+    assert record["exit_code"] == 0
+    stderr = capsys.readouterr().err
+    assert (
+        "[lane-dispatch] cli.test backend=direct priority=60 "
+        "queue_wait=12.0s runtime=45.0s exit=0" in stderr
+    )
+
+
+def test_failed_lane_still_records_its_dispatch_facts(
+    monkeypatch: pytest.MonkeyPatch, isolated_dispatch_log: Path
+) -> None:
+    """Failures teach the learning loop nothing, but their dispatch
+    facts are diagnosis — the record is written either way."""
+    import json
+
+    _capture(monkeypatch, LaneCompleted(1, 482.0, 3.0))
+    assert _run("/usr/bin/true") == 1
+    (record,) = [
+        json.loads(line)
+        for line in isolated_dispatch_log.read_text().splitlines()
+    ]
+    assert record["exit_code"] == 1
+    assert record["observed_runtime_seconds"] == 482.0
 
 
 def test_corrupt_history_fails_loudly_not_naively(
@@ -223,12 +287,12 @@ def test_memory_budget_domain_validation_rejects_nonsense() -> None:
 def test_observed_runtime_domain_validation_rejects_nonsense() -> None:
     for bad in (float("nan"), float("inf"), -1.0):
         with pytest.raises(ValueError):
-            LaneCompleted(0, bad)
+            LaneCompleted(0, bad, 0.0)
     with pytest.raises(ValueError):
         # The annotation's numeric tower accepts an int; the runtime
         # guard does not — observed runtimes are always measured floats.
-        LaneCompleted(0, 5)
-    assert LaneCompleted(0, 0.0).observed_runtime_seconds == 0.0
+        LaneCompleted(0, 5, 0.0)
+    assert LaneCompleted(0, 0.0, 0.0).observed_runtime_seconds == 0.0
 
 
 def test_suspendability_crosses_the_port_boundary(
@@ -238,7 +302,7 @@ def test_suspendability_crosses_the_port_boundary(
     default is NON-suspendable (fail-safe — a lane nobody classified
     is never frozen), and both explicit classifications cross the
     port."""
-    executor = _capture(monkeypatch, LaneCompleted(0, 1.0))
+    executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
     assert _run("/usr/bin/true") == 0
     assert executor.resources[0].suspendable is False
     assert _run("/usr/bin/true", flags=("--suspendable",)) == 0

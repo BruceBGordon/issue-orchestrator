@@ -225,6 +225,14 @@ def test_queue_wait_is_never_billed_to_the_lane_deadline(tmp_path: Path) -> None
         "observed runtime includes queue wait: "
         f"{queued.observed_runtime_seconds:.1f}s for a 1s lane"
     )
+    # The excluded wait is not discarded — it is reported separately.
+    # This lane provably queued behind the holder's ~11s token, so a
+    # real (multi-second) wait must appear in queue_wait_seconds: the
+    # dispatch-quality signal the gate log surfaces per lane.
+    assert queued.queue_wait_seconds > 2.0, (
+        "a lane that queued behind an 11s token reported "
+        f"queue_wait={queued.queue_wait_seconds:.1f}s"
+    )
 
 
 def test_higher_priority_lane_dispatches_first_from_a_contended_queue(

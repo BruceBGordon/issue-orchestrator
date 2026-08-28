@@ -18,6 +18,7 @@ import argparse
 import os
 import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -39,7 +40,7 @@ from ...domain.lane_execution import (
     LaneTimedOut,
     LaneWorkKey,
 )
-from ...infra.validation_timings import resolve_git_common_dir
+from ...infra.validation_timings import append_jsonl, resolve_git_common_dir
 from ...ports.lane_executor import LaneExecutor
 from ...ports.lane_runtime_history import LaneRuntimeHistory
 
@@ -70,16 +71,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         executor = _build_executor(arguments.backend)
         history = _build_history()
         work_key = LaneWorkKey(str(arguments.work_key))
+        # Dispatch order is learned, never declared: the rolling
+        # median of this lane's past runtimes (LPT — longer
+        # lanes first). Zero history means priority 0, exactly
+        # the naive first run.
+        priority = history.learned_priority(work_key)
         outcome = executor.run(
             _build_command(arguments),
             LaneResources(
                 request_cpus=arguments.request_cpus,
                 exclusive=tuple(arguments.exclusive),
-                # Dispatch order is learned, never declared: the rolling
-                # median of this lane's past runtimes (LPT — longer
-                # lanes first). Zero history means priority 0, exactly
-                # the naive first run.
-                priority=history.learned_priority(work_key),
+                priority=priority,
                 request_memory_mb=arguments.request_memory_mb,
                 suspendable=arguments.suspendable,
             ),
@@ -97,6 +99,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"lane-run: {error}", file=sys.stderr)
         return _BACKEND_FAULT_EXIT_CODE
     if type(outcome) is LaneCompleted:
+        try:
+            _record_dispatch(arguments, priority, outcome)
+        except OSError as error:
+            print(f"lane-run: dispatch record failed: {error}", file=sys.stderr)
+            return _BACKEND_FAULT_EXIT_CODE
         if outcome.exit_code == 0:
             # Only successes teach: a failed run's duration is the
             # failure's, not the lane's.
@@ -168,6 +175,51 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         ),
     )
     return parser.parse_args(argv)
+
+
+def _record_dispatch(
+    arguments: argparse.Namespace, priority: int, outcome: LaneCompleted
+) -> None:
+    """One dispatch-quality record per completed lane, said and stored.
+
+    The stderr line puts priority, queue wait, and runtime in the gate
+    log where a reader already is; the JSONL row (shared across
+    worktrees like the runtime history) makes dispatch quality
+    queryable across runs without pool archaeology. Failed lanes are
+    recorded too — a kill's dispatch facts are diagnosis, even though
+    only successes feed the learning loop.
+    """
+    print(
+        f"[lane-dispatch] {arguments.work_key} backend={arguments.backend} "
+        f"priority={priority} queue_wait={outcome.queue_wait_seconds:.1f}s "
+        f"runtime={outcome.observed_runtime_seconds:.1f}s "
+        f"exit={outcome.exit_code}",
+        file=sys.stderr,
+    )
+    append_jsonl(
+        _dispatch_log_path(),
+        {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "worktree": Path.cwd().name,
+            "backend": str(arguments.backend),
+            "work_key": str(arguments.work_key),
+            "priority": priority,
+            "queue_wait_seconds": round(outcome.queue_wait_seconds, 1),
+            "observed_runtime_seconds": round(
+                outcome.observed_runtime_seconds, 1
+            ),
+            "exit_code": outcome.exit_code,
+        },
+    )
+
+
+def _dispatch_log_path() -> Path | None:
+    """Repo-shared dispatch log beside the runtime history; None (a
+    no-op append) outside a repository, like the history's inertness."""
+    common_dir = resolve_git_common_dir(Path.cwd())
+    if common_dir is None:
+        return None
+    return common_dir / "issue-orchestrator" / "lane-dispatch.jsonl"
 
 
 def _build_history() -> LaneRuntimeHistory:

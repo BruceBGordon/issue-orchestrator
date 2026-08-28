@@ -334,7 +334,7 @@ endef
 typecheck:
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,typecheck,\
-		$(LANE_RUN) --backend condor --work-key typecheck --suspendable --request-memory-mb 4096 --request-cpus $(LANE_CPUS_TYPECHECK) \
+		$(LANE_RUN) --backend condor --work-key typecheck --suspendable --request-memory-mb $(LANE_MEMORY_MB_TYPECHECK) --request-cpus $(LANE_REQUEST_CPUS_TYPECHECK) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) typecheck LANE_EXECUTOR=direct)
 else
@@ -381,10 +381,47 @@ PARALLEL ?= auto
 # both modes, and a configured-but-missing pool fails loudly (exit 78).
 LANE_EXECUTOR := $(or $(LANE_EXECUTOR),$(ISSUE_ORCHESTRATOR_LANE_EXECUTOR),direct)
 LANE_RUN = $(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_run
-LANE_CPUS_TYPECHECK ?= 4
-LANE_CPUS_UNIT ?= 12
-LANE_CPUS_SIMULATED ?= 4
-LANE_CPUS_INTEGRATION ?= 4
+# ---------------------------------------------------------------------------
+# Lane declarations — every scheduling fact about every validation lane, in
+# one place. Recipes below carry no numbers.
+#
+#   *_WORKERS       how parallel the suite itself runs (xdist -n). A fact
+#                   about the suite; applies in every mode.
+#   *_REQUEST_CPUS  cores of MEASURED demand, consumed ONLY by the
+#                   scheduling backend's admission (the direct backend's
+#                   protection is the VALIDATE_*_JOBS phase structure).
+#                   Workers and requests are different numbers on purpose:
+#                   an I/O-bound suite keeps many workers busy on few cores.
+#                   Measured 2026-08-28 via `/usr/bin/time -l` on the lane's
+#                   direct-mode target: busy cores = (user+sys)/wall.
+#   *_MEMORY_MB     budget for the lane's whole tree; sizes the slot (and
+#                   the container's kernel ceiling, where enforced).
+#
+# test-unit measured 8.0 busy cores at 12 workers; typecheck 1.8; the
+# integration slices 0.85 at 4 workers (subprocess-wait dominated); the
+# live agent lanes wait on provider turns and need ~1. Measurement cuts
+# both ways: test-simulated-core measured 6.6 busy cores against its old
+# request of 4 — its scenarios spawn orchestrator subprocesses beyond its
+# xdist workers, so it was under-requesting. Unmeasured lanes keep their
+# historical requests until measured — do not guess.
+# ---------------------------------------------------------------------------
+LANE_WORKERS_UNIT ?= 12
+LANE_REQUEST_CPUS_UNIT ?= 8
+LANE_MEMORY_MB_UNIT ?= 6144
+LANE_REQUEST_CPUS_TYPECHECK ?= 2
+LANE_MEMORY_MB_TYPECHECK ?= 4096
+LANE_REQUEST_CPUS_SIMULATED_CORE ?= 7
+LANE_MEMORY_MB_SIMULATED_CORE ?= 2048
+LANE_REQUEST_CPUS_SIMULATED_AGENT ?= 2
+LANE_MEMORY_MB_SIMULATED_AGENT ?= 1024
+LANE_REQUEST_CPUS_INTEGRATION_SLICE ?= 2
+LANE_MEMORY_MB_INTEGRATION_SLICE ?= 2048
+LANE_REQUEST_CPUS_INTEGRATION_LOCAL ?= 4
+LANE_MEMORY_MB_INTEGRATION_LOCAL ?= 3072
+LANE_REQUEST_CPUS_AGENT_SLICE ?= 1
+LANE_MEMORY_MB_AGENT_SLICE ?= 1024
+LANE_REQUEST_CPUS_AGENT_FULL ?= 4
+LANE_MEMORY_MB_AGENT_FULL ?= 2048
 LANE_TIMEOUT_SECONDS ?= 1800
 
 # Suite slices (condor mode): the fat integration suites split into
@@ -434,9 +471,9 @@ sync-deps:
 test-unit: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-unit,\
-		$(LANE_RUN) --backend condor --work-key test-unit --suspendable --request-memory-mb 6144 --request-cpus $(LANE_CPUS_UNIT) \
+		$(LANE_RUN) --backend condor --work-key test-unit --suspendable --request-memory-mb $(LANE_MEMORY_MB_UNIT) --request-cpus $(LANE_REQUEST_CPUS_UNIT) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
-			$(GMAKE) test-unit LANE_EXECUTOR=direct UNIT_PARALLEL=$(LANE_CPUS_UNIT))
+			$(GMAKE) test-unit LANE_EXECUTOR=direct UNIT_PARALLEL=$(LANE_WORKERS_UNIT))
 else ifeq ($(UNIT_PARALLEL),0)
 	$(call TIMED_RUN,test-unit,\
 		$(PYTEST) tests/unit packages/agent_runner/tests -x -q --tb=short $(PYTEST_TIMINGS))
@@ -455,7 +492,7 @@ endif
 test-simulated-core: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-simulated-core,\
-		$(LANE_RUN) --backend condor --work-key test-simulated-core --suspendable --request-memory-mb 2048 --request-cpus $(LANE_CPUS_SIMULATED) \
+		$(LANE_RUN) --backend condor --work-key test-simulated-core --suspendable --request-memory-mb $(LANE_MEMORY_MB_SIMULATED_CORE) --request-cpus $(LANE_REQUEST_CPUS_SIMULATED_CORE) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-simulated-core LANE_EXECUTOR=direct)
 else ifeq ($(SIMULATED_PARALLEL),0)
@@ -479,7 +516,7 @@ endif
 test-simulated-agent: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-simulated-agent,\
-		$(LANE_RUN) --backend condor --work-key test-simulated-agent --suspendable --request-memory-mb 1024 --request-cpus 2 \
+		$(LANE_RUN) --backend condor --work-key test-simulated-agent --suspendable --request-memory-mb $(LANE_MEMORY_MB_SIMULATED_AGENT) --request-cpus $(LANE_REQUEST_CPUS_SIMULATED_AGENT) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-simulated-agent LANE_EXECUTOR=direct)
 else ifeq ($(SIMULATED_PARALLEL),0)
@@ -507,7 +544,7 @@ test-integration-core: test-integration-core-local test-integration-core-live-co
 test-integration-core-local: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-core-local,\
-		$(LANE_RUN) --backend condor --work-key test-integration-core-local --suspendable --request-memory-mb 3072 --request-cpus $(LANE_CPUS_INTEGRATION) \
+		$(LANE_RUN) --backend condor --work-key test-integration-core-local --suspendable --request-memory-mb $(LANE_MEMORY_MB_INTEGRATION_LOCAL) --request-cpus $(LANE_REQUEST_CPUS_INTEGRATION_LOCAL) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-integration-core-local LANE_EXECUTOR=direct)
 else ifeq ($(INTEGRATION_PARALLEL),0)
@@ -540,7 +577,7 @@ test-integration-no-infra: test-integration-core
 test-integration-agent: sync-deps
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-agent,\
-		$(LANE_RUN) --backend condor --work-key test-integration-agent --not-suspendable --request-memory-mb 2048 --request-cpus 4 \
+		$(LANE_RUN) --backend condor --work-key test-integration-agent --not-suspendable --request-memory-mb $(LANE_MEMORY_MB_AGENT_FULL) --request-cpus $(LANE_REQUEST_CPUS_AGENT_FULL) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-integration-agent LANE_EXECUTOR=direct)
 else ifeq ($(INTEGRATION_AGENT_PARALLEL),0)
@@ -556,8 +593,8 @@ endif
 test-integration-core-slice-%: sync-deps FORCE
 ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-core-slice-$*,\
-		$(LANE_RUN) --backend condor --work-key test-integration-core-slice-$* --suspendable --request-memory-mb 2048 \
-			--request-cpus 4 \
+		$(LANE_RUN) --backend condor --work-key test-integration-core-slice-$* --suspendable --request-memory-mb $(LANE_MEMORY_MB_INTEGRATION_SLICE) \
+			--request-cpus $(LANE_REQUEST_CPUS_INTEGRATION_SLICE) \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
 			$(GMAKE) test-integration-core-slice-$* LANE_EXECUTOR=direct)
 else
@@ -573,8 +610,8 @@ define AGENT_SLICE_RULE
 test-integration-agent-$(1): sync-deps
 ifeq ($$(LANE_EXECUTOR),condor)
 	$$(call TIMED_RUN,test-integration-agent-$(1),\
-		$$(LANE_RUN) --backend condor --work-key test-integration-agent-$(1) --not-suspendable --request-memory-mb 1024 \
-			--request-cpus 2 \
+		$$(LANE_RUN) --backend condor --work-key test-integration-agent-$(1) --not-suspendable --request-memory-mb $$(LANE_MEMORY_MB_AGENT_SLICE) \
+			--request-cpus $$(LANE_REQUEST_CPUS_AGENT_SLICE) \
 			--timeout-seconds $$(LANE_TIMEOUT_SECONDS) -- \
 			$$(GMAKE) test-integration-agent-$(1) LANE_EXECUTOR=direct)
 else
@@ -714,6 +751,11 @@ validate-pr:
 
 # Raw validation - direct execution without output capture wrapper
 # Use this as a fallback if the Python wrapper fails
+# Direct-mode host protection ONLY: these phase fan-out widths keep
+# xdist-heavy suites from trampling each other when lanes run straight
+# on the host. In scheduling mode the flat fan replaces this structure
+# and the pool's admission (the LANE_REQUEST_CPUS_* declarations) is
+# the concurrency authority.
 VALIDATE_JOBS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 5)
 VALIDATE_STATIC_JOBS ?= $(VALIDATE_JOBS)
 VALIDATE_TEST_JOBS ?= 1
@@ -768,8 +810,12 @@ _validate-core-tests-impl: test-unit test-simulated-core test-integration-core-l
 
 _validate-pr-impl:
 ifeq ($(LANE_EXECUTOR),condor)
+# -j must cover EVERY flat target: a lane waiting for a make slot is
+# invisible to the scheduler, so the learned dispatch order cannot
+# reach it and make's arbitrary ordering decides instead. Submission
+# must never be the bottleneck — admission is the pool's job.
 	$(call TIMED_RUN,validate-pr-flat-phase,\
-		$(GMAKE) -j12 --output-sync=target _validate-pr-flat-impl)
+		$(GMAKE) -j$(words $(_VALIDATE_PR_FLAT_TARGETS)) --output-sync=target _validate-pr-flat-impl)
 else
 	$(call TIMED_RUN,validate-main-phase,\
 		$(GMAKE) --output-sync=target _validate-impl)
@@ -781,11 +827,13 @@ endif
 # policy — every lane must pass either way, and the pool's admission
 # (request_cpus, exclusives) replaces the sequential phase structure
 # that protected the direct path from oversubscription.
-_validate-pr-flat-impl: typecheck lint-arch lint-complexity test-unit \
+_VALIDATE_PR_FLAT_TARGETS := typecheck lint-arch lint-complexity test-unit \
 	test-simulated-core test-simulated-agent \
 	test-integration-core-slice-1 test-integration-core-slice-2 test-integration-core-slice-3 \
 	test-integration-agent-claude test-integration-agent-codex test-integration-agent-chain \
 	test-integration-core-live-codex test-web test-vscode
+
+_validate-pr-flat-impl: $(_VALIDATE_PR_FLAT_TARGETS)
 
 _validate-agent-impl: test-simulated-agent test-integration-agent
 

@@ -167,10 +167,18 @@ class LaneCompleted:
     loop, which is why neither may leak into it: queue-inflated numbers
     would chase their own scheduling delays, and frozen time would
     teach the loop that a lane got slower when the machine got busier.
+
+    ``queue_wait_seconds`` is the excluded scheduling wait, reported
+    separately: the span from asking a backend to run the lane until
+    execution first began. It is the dispatch-quality signal — a long
+    pole waiting here is exactly the waste the learned-priority loop
+    exists to remove — so it must be observable without pool
+    archaeology. The direct backend starts immediately and reports 0.
     """
 
     exit_code: int
     observed_runtime_seconds: float
+    queue_wait_seconds: float
 
     def __post_init__(self) -> None:
         if type(self.exit_code) is not int:
@@ -182,6 +190,15 @@ class LaneCompleted:
         ):
             raise ValueError(
                 "LaneCompleted.observed_runtime_seconds must be finite and "
+                "non-negative"
+            )
+        if (
+            type(self.queue_wait_seconds) is not float
+            or not math.isfinite(self.queue_wait_seconds)
+            or self.queue_wait_seconds < 0
+        ):
+            raise ValueError(
+                "LaneCompleted.queue_wait_seconds must be finite and "
                 "non-negative"
             )
 

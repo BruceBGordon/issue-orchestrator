@@ -64,10 +64,16 @@ class LaneJobExited:
     the (last) execute event to the terminal event, read from the
     event-log timestamps — never from when this process happened to
     poll. Observation lag must not masquerade as execution time.
+
+    ``queue_wait_seconds`` is the scheduling wait the runtime excludes:
+    submit event to the FIRST execute event. Restart churn is charged
+    to neither number — the wait ends when execution first began, the
+    runtime is the final execution's span.
     """
 
     exit_code: int
     runtime_seconds: float
+    queue_wait_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +82,7 @@ class LaneJobKilledBySignal:
 
     signal_number: int
     runtime_seconds: float
+    queue_wait_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +136,11 @@ def classify_event_log(log_text: str) -> LaneJobState:
     state: LaneJobState = LaneJobPending()
     span = _ExecutionSpan()
     for code, occurred_at, body in events:
-        if code == _EXECUTING:
+        if code == _SUBMITTED:
+            # Not a state change, but the anchor of the queue-wait
+            # clock the terminal states report.
+            span.submitted(occurred_at)
+        elif code == _EXECUTING:
             span.executing(occurred_at)
             state = LaneJobRunning()
         elif code == _SUSPENDED:
@@ -139,7 +150,9 @@ def classify_event_log(log_text: str) -> LaneJobState:
             span.resume(occurred_at)
             state = LaneJobRunning()
         elif code == _TERMINATED:
-            state = _classify_termination(body, span.runtime_at(occurred_at))
+            state = _classify_termination(
+                body, span.runtime_at(occurred_at), span.queue_wait()
+            )
         elif code == _ABORTED:
             if _DEADLINE_REMOVAL_MARKER in body:
                 state = LaneJobDeadlineRemoved(span.runtime_at(occurred_at))
@@ -147,8 +160,8 @@ def classify_event_log(log_text: str) -> LaneJobState:
                 state = LaneJobRemoved(_first_body_line(body))
         elif code == _HELD:
             state = LaneJobFaulted(_first_body_line(body))
-        # Submission and every other event code (image size, usage
-        # updates, …) are informational and do not change the state.
+        # Every other event code (image size, usage updates, …) is
+        # informational and does not change the state.
     return state
 
 
@@ -162,16 +175,34 @@ class _ExecutionSpan:
     """
 
     def __init__(self) -> None:
+        self._submitted_at: datetime | None = None
+        self._first_execute_at: datetime | None = None
         self._execute_at: datetime | None = None
         self._suspended_at: datetime | None = None
         self._suspended_seconds = 0.0
 
+    def submitted(self, occurred_at: datetime) -> None:
+        if self._submitted_at is None:
+            self._submitted_at = occurred_at
+
     def executing(self, occurred_at: datetime) -> None:
         # The LAST execute anchors the span: a restarted job's final
-        # execution is the runtime signal, not its false starts.
+        # execution is the runtime signal, not its false starts. The
+        # FIRST execute ends the queue wait — restart churn is charged
+        # to neither clock.
+        if self._first_execute_at is None:
+            self._first_execute_at = occurred_at
         self._execute_at = occurred_at
         self._suspended_at = None
         self._suspended_seconds = 0.0
+
+    def queue_wait(self) -> float:
+        if self._submitted_at is None or self._first_execute_at is None:
+            raise ValueError(
+                "job event log reached execution with no submit event "
+                "before it"
+            )
+        return self._interval(self._submitted_at, self._first_execute_at)
 
     def suspend(self, occurred_at: datetime) -> None:
         self._suspended_at = occurred_at
@@ -239,13 +270,19 @@ def _split_complete_events(log_text: str) -> list[tuple[str, datetime, str]]:
     return events
 
 
-def _classify_termination(body: str, runtime_seconds: float) -> LaneJobState:
+def _classify_termination(
+    body: str, runtime_seconds: float, queue_wait_seconds: float
+) -> LaneJobState:
     returned = _RETURN_VALUE.search(body)
     if returned is not None:
-        return LaneJobExited(int(returned.group(1)), runtime_seconds)
+        return LaneJobExited(
+            int(returned.group(1)), runtime_seconds, queue_wait_seconds
+        )
     signaled = _TERMINATION_SIGNAL.search(body)
     if signaled is not None:
-        return LaneJobKilledBySignal(int(signaled.group(1)), runtime_seconds)
+        return LaneJobKilledBySignal(
+            int(signaled.group(1)), runtime_seconds, queue_wait_seconds
+        )
     raise ValueError(
         "job termination event carried neither a return value nor a signal: "
         f"{_first_body_line(body)!r}"

@@ -146,6 +146,26 @@ class LaneExecutorContract:
             self.completion_timeout_seconds
         )
 
+    def test_queue_wait_is_reported_and_plausible(self, tmp_path: Path) -> None:
+        """Completed lanes price their scheduling wait separately.
+
+        The contract asks only for plausibility — non-negative, inside
+        the machinery allowance. The direct backend's exact zero and
+        the scheduler backend's real waits are backend-suite facts."""
+        outcome = self.build_executor().run(
+            _command(
+                "contract.queue-wait",
+                (sys.executable, "-c", "pass"),
+                tmp_path,
+                self.completion_timeout_seconds,
+            ),
+            self.resources(),
+        )
+        assert type(outcome) is LaneCompleted
+        assert 0.0 <= outcome.queue_wait_seconds <= (
+            self.completion_timeout_seconds
+        )
+
 
     def test_output_streams_before_the_lane_completes(
         self, tmp_path: Path, capfd: "pytest.CaptureFixture[str]"

@@ -77,10 +77,12 @@ class DirectLaneExecutor:
             self._contain_group(process)
             raise
         observed_runtime = time.monotonic() - started_at
+        # No scheduler, no queue: the lane started the moment it was
+        # asked to, so the queue wait is identically zero.
         if exit_code < 0:
             # Signal death reports as 128+N in every backend.
-            return LaneCompleted(128 - exit_code, observed_runtime)
-        return LaneCompleted(exit_code, observed_runtime)
+            return LaneCompleted(128 - exit_code, observed_runtime, 0.0)
+        return LaneCompleted(exit_code, observed_runtime, 0.0)
 
     def _contain_group(self, process: subprocess.Popen[bytes]) -> None:
         try:

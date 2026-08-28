@@ -92,13 +92,13 @@ def test_executing_is_running_and_updates_are_informational() -> None:
 def test_normal_termination_carries_the_exact_exit_code() -> None:
     zero = classify_event_log(_SUBMITTED + _EXECUTING + _TERMINATED_ZERO)
     seventeen = classify_event_log(_SUBMITTED + _EXECUTING + _TERMINATED_SEVENTEEN)
-    assert zero == LaneJobExited(0, 0.0)
-    assert seventeen == LaneJobExited(17, 0.0)
+    assert zero == LaneJobExited(0, 0.0, 3.0)
+    assert seventeen == LaneJobExited(17, 0.0, 3.0)
 
 
 def test_signal_termination_carries_the_signal() -> None:
     state = classify_event_log(_SUBMITTED + _EXECUTING + _TERMINATED_SIGNAL)
-    assert state == LaneJobKilledBySignal(9, 0.0)
+    assert state == LaneJobKilledBySignal(9, 0.0, 3.0)
 
 
 def test_deadline_removal_is_distinguished_from_operator_removal() -> None:
@@ -205,19 +205,28 @@ def test_runtime_is_the_event_log_span_not_an_observation_clock() -> None:
     report 33s even when the whole log is only read AFTER the job is
     long dead — the case where a poll clock collapses toward zero."""
     state = classify_event_log(_SUBMITTED + _EXECUTING + _TERMINATED_AT_0905)
-    assert state == LaneJobExited(0, 33.0)
+    assert state == LaneJobExited(0, 33.0, 3.0)
 
 
 def test_restarted_job_reports_the_final_execution_span() -> None:
+    # Runtime anchors on the LAST execute (25s); the queue wait ends at
+    # the FIRST (3s). Restart churn between them is charged to neither.
     state = classify_event_log(
         _SUBMITTED + _EXECUTING + _EXECUTING_LATER + _TERMINATED_AT_0905
     )
-    assert state == LaneJobExited(0, 25.0)
+    assert state == LaneJobExited(0, 25.0, 3.0)
 
 
 def test_terminal_without_execute_fails_loudly() -> None:
     with pytest.raises(ValueError, match="no execute event"):
         classify_event_log(_SUBMITTED + _TERMINATED_ZERO)
+
+
+def test_terminal_without_submit_fails_loudly() -> None:
+    """A log that reaches execution with no submit record cannot
+    price its queue wait — refuse rather than fabricate a zero."""
+    with pytest.raises(ValueError, match="no submit event"):
+        classify_event_log(_EXECUTING + _TERMINATED_ZERO)
 
 
 def test_backwards_timestamps_fail_loudly() -> None:
@@ -246,7 +255,7 @@ def test_suspended_intervals_are_subtracted_from_the_runtime() -> None:
         + _UNSUSPENDED_EVENT
         + _TERMINATED_AT_0905
     )
-    assert state == LaneJobExited(0, 21.0)
+    assert state == LaneJobExited(0, 21.0, 3.0)
 
 
 def test_terminal_while_frozen_closes_the_open_suspension() -> None:
@@ -255,7 +264,7 @@ def test_terminal_while_frozen_closes_the_open_suspension() -> None:
     )
     # execute 14:08:32 → terminate 14:09:05 is 33s; frozen from
     # 14:08:40 to the terminal event is 25s; executed 8s.
-    assert state == LaneJobExited(0, 8.0)
+    assert state == LaneJobExited(0, 8.0, 3.0)
 
 
 def test_unsuspend_without_suspension_fails_loudly() -> None:

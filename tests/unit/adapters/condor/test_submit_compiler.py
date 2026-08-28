@@ -209,3 +209,28 @@ def test_work_key_is_the_batch_name(tmp_path: Path) -> None:
         tmp_path,
     )
     assert "batch_name = test-unit" in compiled.text
+
+
+def test_submitter_worktree_is_tagged_on_the_job(tmp_path: Path) -> None:
+    """The pool is shared by every worktree on the machine and
+    concurrent gates are normal; each job names its submitting
+    worktree so attribution never requires Iwd archaeology."""
+    compiled = compile_submit_description(
+        _command(("/bin/true",)),
+        LaneResources(request_cpus=1),
+        tmp_path,
+    )
+    assert '+LaneSubmitter = "worktree"' in compiled.text
+
+
+def test_unquotable_submitter_name_is_rejected(tmp_path: Path) -> None:
+    command = LaneCommand(
+        work_key=LaneWorkKey("test-unit"),
+        arguments=("/bin/true",),
+        working_directory=Path('/repo/bad"name'),
+        deadline=LaneDeadline(300.0),
+    )
+    with pytest.raises(ValueError, match="unusable as submitter tag"):
+        compile_submit_description(
+            command, LaneResources(request_cpus=1), tmp_path
+        )

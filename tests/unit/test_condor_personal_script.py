@@ -286,6 +286,65 @@ def test_load_backoff_thresholds_are_overridable(tmp_path: Path) -> None:
     assert "< 3.0" in generated
 
 
+def _physical_cores() -> int:
+    import os
+
+    cores = os.cpu_count()
+    assert cores
+    return cores
+
+
+def test_capacity_dial_is_unset_by_default(tmp_path: Path) -> None:
+    """Without the dial, condor's own physical detection rules — no
+    capacity file is written at all."""
+    _write_lane_config(tmp_path)
+    assert not (tmp_path / "92-io-pool-capacity.conf").exists()
+
+
+def test_capacity_dial_scales_physical_cores(tmp_path: Path) -> None:
+    """One throughput dial: NUM_CPUS = percent x physical cores. 150%
+    is deliberate oversubscription for I/O-bound lane mixes; 50%
+    throttles the whole pool uniformly."""
+    _write_lane_config(tmp_path, IO_POOL_CAPACITY_PERCENT="150")
+    generated = (tmp_path / "92-io-pool-capacity.conf").read_text()
+    assert f"NUM_CPUS = {_physical_cores() * 150 // 100}" in generated
+
+    _write_lane_config(tmp_path, IO_POOL_CAPACITY_PERCENT="50")
+    generated = (tmp_path / "92-io-pool-capacity.conf").read_text()
+    assert f"NUM_CPUS = {_physical_cores() * 50 // 100}" in generated
+
+
+def test_capacity_dial_unset_removes_the_previous_setting(
+    tmp_path: Path,
+) -> None:
+    """Symmetric lifecycle, same invariant as the backoff policy: a
+    plain re-run must not leave a stale capacity override behind."""
+    _write_lane_config(tmp_path, IO_POOL_CAPACITY_PERCENT="150")
+    assert (tmp_path / "92-io-pool-capacity.conf").exists()
+    _write_lane_config(tmp_path)
+    assert not (tmp_path / "92-io-pool-capacity.conf").exists()
+
+
+def test_capacity_dial_rejects_nonsense_loudly(tmp_path: Path) -> None:
+    import os
+
+    for bad in ("abc", "0", "-20", "1.5"):
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'source "{SCRIPT}" && write_lane_config "$1"',
+                "_",
+                str(tmp_path),
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "IO_POOL_CAPACITY_PERCENT": bad},
+        )
+        assert result.returncode != 0, bad
+        assert "IO_POOL_CAPACITY_PERCENT" in result.stderr
+
+
 def test_install_boundary_reconciles_managed_files(tmp_path: Path) -> None:
     """B2 round two (#7118 review): the Linux path stages fresh and
     COPIES staged .conf files over the persistent destination — copying

@@ -47,6 +47,11 @@ def test_lane_outcome_surfaces_are_pinned() -> None:
     assert _field_names(lane_execution.LaneCompleted) == (
         "exit_code",
         "observed_runtime_seconds",
+        # Deliberate widening (dispatch observability): the scheduling
+        # wait the runtime excludes, reported so dispatch quality is
+        # visible per lane without pool archaeology. Backend-agnostic:
+        # the direct backend reports 0.0.
+        "queue_wait_seconds",
     )
     assert _field_names(lane_execution.LaneTimedOut) == ("elapsed_seconds",)
 
