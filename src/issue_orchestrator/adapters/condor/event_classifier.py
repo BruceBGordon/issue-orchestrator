@@ -12,8 +12,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 
-_EVENT_BANNER = re.compile(r"^(\d{3}) \(\d+\.\d+\.\d+\) ", re.MULTILINE)
+_EVENT_BANNER = re.compile(
+    r"^(?P<code>\d{3}) \(\d+\.\d+\.\d+\) "
+    r"(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ",
+    re.MULTILINE,
+)
+_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 _RETURN_VALUE = re.compile(r"Normal termination \(return value (-?\d+)\)")
 _TERMINATION_SIGNAL = re.compile(r"Abnormal termination \(signal (\d+)\)")
 
@@ -40,9 +46,16 @@ class LaneJobRunning:
 
 @dataclass(frozen=True, slots=True)
 class LaneJobExited:
-    """The job ran to its own exit."""
+    """The job ran to its own exit.
+
+    ``runtime_seconds`` is the scheduler's own record: the span from
+    the (last) execute event to the terminal event, read from the
+    event-log timestamps — never from when this process happened to
+    poll. Observation lag must not masquerade as execution time.
+    """
 
     exit_code: int
+    runtime_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,11 +63,14 @@ class LaneJobKilledBySignal:
     """The job died to a signal while running."""
 
     signal_number: int
+    runtime_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
 class LaneJobDeadlineRemoved:
     """The compiled runtime deadline removed the job."""
+
+    runtime_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,14 +114,22 @@ def classify_event_log(log_text: str) -> LaneJobState:
         raise ValueError("classify_event_log requires the log text")
     events = _split_complete_events(log_text)
     state: LaneJobState = LaneJobPending()
-    for code, body in events:
+    execute_at: datetime | None = None
+    for code, occurred_at, body in events:
         if code == _EXECUTING:
+            # The LAST execute event anchors the span: a restarted job's
+            # final execution is the runtime signal, not its false starts.
+            execute_at = occurred_at
             state = LaneJobRunning()
         elif code == _TERMINATED:
-            state = _classify_termination(body)
+            state = _classify_termination(
+                body, _runtime_seconds(execute_at, occurred_at)
+            )
         elif code == _ABORTED:
             if _DEADLINE_REMOVAL_MARKER in body:
-                state = LaneJobDeadlineRemoved()
+                state = LaneJobDeadlineRemoved(
+                    _runtime_seconds(execute_at, occurred_at)
+                )
             else:
                 state = LaneJobRemoved(_first_body_line(body))
         elif code == _HELD:
@@ -117,17 +141,38 @@ def classify_event_log(log_text: str) -> LaneJobState:
     return state
 
 
+def _runtime_seconds(execute_at: datetime | None, terminal_at: datetime) -> float:
+    """The scheduler's own execution span, execute → terminal.
+
+    Second-granular (the log's timestamp resolution) — plenty for a
+    dispatch-ordering rank, and honest in a way a poll clock can never
+    be: a job first observed already-terminal still reports its true
+    span instead of collapsing toward zero.
+    """
+    if execute_at is None:
+        raise ValueError(
+            "job reached a terminal event with no execute event before it"
+        )
+    span = (terminal_at - execute_at).total_seconds()
+    if span < 0:
+        raise ValueError(
+            "job event log timestamps run backwards: execute "
+            f"{execute_at} after terminal {terminal_at}"
+        )
+    return span
+
+
 _RECORD_DELIMITER = re.compile(r"^\.\.\.\s*$", re.MULTILINE)
 
 
-def _split_complete_events(log_text: str) -> list[tuple[str, str]]:
+def _split_complete_events(log_text: str) -> list[tuple[str, datetime, str]]:
     """Yield only records the scheduler has finished writing.
 
     A record is complete when its terminating ``...`` line exists. The
     region after the last delimiter is a record in progress and is
     deliberately ignored.
     """
-    events: list[tuple[str, str]] = []
+    events: list[tuple[str, datetime, str]] = []
     position = 0
     for delimiter in _RECORD_DELIMITER.finditer(log_text):
         record = log_text[position : delimiter.start()]
@@ -135,17 +180,22 @@ def _split_complete_events(log_text: str) -> list[tuple[str, str]]:
         banner = _EVENT_BANNER.search(record)
         if banner is None:
             continue
-        events.append((banner.group(1), record[banner.start() :]))
+        occurred_at = datetime.strptime(
+            banner.group("timestamp"), _TIMESTAMP_FORMAT
+        )
+        events.append(
+            (banner.group("code"), occurred_at, record[banner.start() :])
+        )
     return events
 
 
-def _classify_termination(body: str) -> LaneJobState:
+def _classify_termination(body: str, runtime_seconds: float) -> LaneJobState:
     returned = _RETURN_VALUE.search(body)
     if returned is not None:
-        return LaneJobExited(int(returned.group(1)))
+        return LaneJobExited(int(returned.group(1)), runtime_seconds)
     signaled = _TERMINATION_SIGNAL.search(body)
     if signaled is not None:
-        return LaneJobKilledBySignal(int(signaled.group(1)))
+        return LaneJobKilledBySignal(int(signaled.group(1)), runtime_seconds)
     raise ValueError(
         "job termination event carried neither a return value nor a signal: "
         f"{_first_body_line(body)!r}"

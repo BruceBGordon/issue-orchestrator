@@ -228,12 +228,7 @@ class CondorLaneExecutor:
             state = self._observe(compiled)
             if execute_observed_at is None and type(state) is not LaneJobPending:
                 execute_observed_at = time.monotonic()
-            terminal = self._map_terminal(
-                state,
-                execute_observed_at
-                if execute_observed_at is not None
-                else time.monotonic(),
-            )
+            terminal = self._map_terminal(state)
             if terminal is not None:
                 streams.pump()
                 return terminal
@@ -268,21 +263,23 @@ class CondorLaneExecutor:
                 f"job={job_id}"
             )
 
-    def _map_terminal(
-        self, state: LaneJobState, execute_observed_at: float
-    ) -> LaneOutcome | None:
+    def _map_terminal(self, state: LaneJobState) -> LaneOutcome | None:
         if type(state) is LaneJobPending or type(state) is LaneJobRunning:
             return None
-        # Runtime anchors at first observed execution: queue wait is
-        # never billed to the lane's deadline nor fed to the learning
-        # loop as if it were work.
-        observed_runtime = time.monotonic() - execute_observed_at
+        # Runtime is the scheduler's own execute→terminal span from the
+        # event-log timestamps — never this process's poll clock, whose
+        # observation lag would masquerade as execution time (and whose
+        # first observation of a short job can already be terminal,
+        # collapsing the span toward zero). Queue wait is excluded by
+        # the same arithmetic.
         if type(state) is LaneJobExited:
-            return LaneCompleted(state.exit_code, observed_runtime)
+            return LaneCompleted(state.exit_code, state.runtime_seconds)
         if type(state) is LaneJobKilledBySignal:
-            return LaneCompleted(128 + state.signal_number, observed_runtime)
+            return LaneCompleted(
+                128 + state.signal_number, state.runtime_seconds
+            )
         if type(state) is LaneJobDeadlineRemoved:
-            return LaneTimedOut(observed_runtime)
+            return LaneTimedOut(state.runtime_seconds)
         if type(state) is LaneJobRemoved:
             raise LaneExecutorError(
                 f"the lane's job was removed outside its deadline: {state.detail}"

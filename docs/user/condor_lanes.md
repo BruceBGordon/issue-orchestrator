@@ -97,8 +97,11 @@ successful run's observed execution time (queue wait excluded) is
 recorded per work key under
 `<git-common-dir>/issue-orchestrator/lane-runtime-history/`, and the
 next submission's dispatch priority is the rolling median of the last
-five — longest lanes first (the LPT makespan heuristic), so a long lane
-can never be stranded behind short ones. The properties to know:
+five — longest lanes first (the LPT makespan heuristic). Priority
+decides which of the *simultaneously eligible queued* lanes matches
+first; a large lane can still wait on slot shape (its cpu/memory
+request needs a big enough hole) or on lanes that arrived while it was
+not yet submitted. The properties to know:
 
 - **The first run is naive by design.** No history means no priority —
   identical to pre-learning behavior. One gate run seeds everything.
