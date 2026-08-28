@@ -220,3 +220,56 @@ def test_every_condor_lane_resolves_declared_scheduling_facts(
         declaration = load_lane_declaration(REPO_ROOT, work_key)
         assert declaration.memory_mb >= 1
         assert isinstance(declaration.suspendable, bool)
+
+
+def test_slice_recipe_captures_durations_and_guards_an_empty_selection(
+    tmp_path: Path,
+) -> None:
+    """The consume/capture pair, checked on the recipe that wires it.
+
+    The empty guard is not cosmetic: the previous shape spliced the
+    slicer's stdout straight into the pytest argument list, so a slicer
+    that exited non-zero (a corrupt weight store now makes it do
+    exactly that) left pytest with no arguments — which collects the
+    WHOLE repository instead of failing the lane.
+    """
+    _plant_collisions(tmp_path)
+    recipe = _dry_run(
+        tmp_path, "test-integration-core-slice-2", "LANE_EXECUTOR=direct"
+    )
+    assert "-p issue_orchestrator.infra.pytest_file_durations" in recipe
+    assert "--epoch " in recipe
+    assert "targets=$(" in recipe
+    assert '-z "$targets"' in recipe
+
+
+def test_the_duration_capture_point_is_backend_neutral(tmp_path: Path) -> None:
+    """A scheduler backend submits a wrapper that re-invokes the very
+    same direct recipe inside its job, so the durations are captured
+    identically in both modes. Nothing about capture lives in the
+    backend branch."""
+    _plant_collisions(tmp_path)
+    condor = _dry_run(
+        tmp_path, "test-integration-core-slice-2", "LANE_EXECUTOR=condor"
+    )
+    assert "test-integration-core-slice-2 LANE_EXECUTOR=direct" in condor
+    assert "issue_orchestrator.infra.pytest_file_durations" not in condor
+
+
+def test_every_slice_of_one_gate_shares_one_weight_epoch(tmp_path: Path) -> None:
+    """Coverage across processes. The slice lanes read the learned
+    weights minutes apart and each teaches the store as it finishes, so
+    two slicers reading live would balance on different numbers — and
+    two different partitions of one file list can leave a file unrun in
+    a gate that still goes green. One stamp per gate is what makes the
+    three partitions the same partition."""
+    import re
+
+    _plant_collisions(tmp_path)
+    fan = _dry_run(tmp_path, "_validate-pr-flat-impl", "LANE_EXECUTOR=condor")
+    stamps = re.findall(r"SLICE_WEIGHTS_EPOCH=(\S+)", fan)
+    slice_lanes = [lane for lane in FLAT_FAN_LANES if "core-slice-" in lane]
+    assert len(stamps) == len(slice_lanes), (
+        f"every slice lane must carry the gate stamp: {stamps}"
+    )
+    assert len(set(stamps)) == 1, f"slices of one gate disagree on weights: {stamps}"
