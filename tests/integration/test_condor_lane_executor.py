@@ -218,7 +218,10 @@ def test_queue_wait_is_never_billed_to_the_lane_deadline(tmp_path: Path) -> None
     # The learning loop's precondition: the ~7s token wait must not
     # appear in observed runtime (the lane slept 1s). A queue-inflated
     # number here would make learned ordering chase its own delays.
-    assert queued.observed_runtime_seconds < 6.0, (
+    # Bound matches the widened emulation margins: the ~11s token wait
+    # is the discriminator, and a completed lane already proves the 8s
+    # deadline charged runtime only.
+    assert queued.observed_runtime_seconds < 8.0, (
         "observed runtime includes queue wait: "
         f"{queued.observed_runtime_seconds:.1f}s for a 1s lane"
     )

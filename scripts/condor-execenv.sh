@@ -109,8 +109,20 @@ down)
     docker rm "$CONTAINER" >/dev/null
     # Postcondition, verified: a false "removed" would hide daemon or
     # authorization failures behind a comforting message (B4, #7119
-    # review).
-    if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+    # review). The daemon acknowledges rm slightly asynchronously on
+    # some hosts (observed on a GitHub runner: rm succeeded, an
+    # immediate inspect still resolved) - poll briefly before
+    # declaring failure; the honesty is in the bounded verification,
+    # not in racing the daemon.
+    removed=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
+            removed="yes"
+            break
+        fi
+        sleep 1
+    done
+    if [ -z "$removed" ]; then
         echo "execenv: FAILED to remove container $CONTAINER" >&2
         exit 70
     fi

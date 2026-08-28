@@ -58,8 +58,12 @@ PYTHON=/work/venv/bin/python
 
 say "lane executor contract suite against the container pool"
 cd /work
+# requires_backoff_pool excluded: that acceptance test needs a pool
+# started with the load-backoff policy; this container's pool
+# deliberately runs without one, and the test fails its own preflight
+# here by design (same exclusion as the condor-lanes CI job).
 "$PYTHON" -m pytest /repo/tests/integration/test_condor_lane_executor.py \
-    -q -m requires_infra -p no:cacheprovider \
+    -q -m "requires_infra and not requires_backoff_pool" -p no:cacheprovider \
     --rootdir=/repo -o addopts=
 
 # The allocation waits 10s before asking for memory: the starter
