@@ -51,12 +51,14 @@ def test_keys_do_not_interfere(tmp_path: Path) -> None:
 
 
 def test_no_temporary_files_survive_a_record(tmp_path: Path) -> None:
+    """Atomic-replace temporaries must not accumulate; the per-key
+    .lock sibling is the one deliberate persistent artifact."""
     store = _store(tmp_path)
     store.record_success(KEY, 30.0)
     survivors = [
         path.name
         for path in (tmp_path / "history").iterdir()
-        if path.name != f"{KEY.value}.json"
+        if path.name not in (f"{KEY.value}.json", f"{KEY.value}.lock")
     ]
     assert not survivors, survivors
 
@@ -94,4 +96,56 @@ def test_record_rejects_nonsense_runtimes(tmp_path: Path) -> None:
         with pytest.raises(ValueError):
             store.record_success(KEY, bad)
     with pytest.raises(ValueError):
-        store.record_success(KEY, 5)  # type: ignore[arg-type]
+        # The annotation's numeric tower accepts an int; the runtime
+        # guard does not — recorded runtimes are always measured floats.
+        store.record_success(KEY, 5)
+
+
+def test_concurrent_records_both_persist(tmp_path: Path) -> None:
+    """B2 (#7117 review): the store is shared across worktrees, so two
+    gates can record the same lane simultaneously. An unlocked
+    read-modify-replace loses one observation; the per-key lock must
+    keep both."""
+    import threading
+
+    store = _store(tmp_path)
+    barrier = threading.Barrier(2)
+
+    def record(value: float) -> None:
+        barrier.wait()
+        store.record_success(KEY, value)
+
+    threads = [
+        threading.Thread(target=record, args=(value,))
+        for value in (10.0, 20.0)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    import json
+
+    persisted = json.loads(
+        (tmp_path / "history" / f"{KEY.value}.json").read_text()
+    )["runtimes"]
+    assert sorted(persisted) == [10.0, 20.0], persisted
+
+
+def test_negative_integer_entry_is_corrupt(tmp_path: Path) -> None:
+    """B3 (#7117 review): a negative int is as corrupt as a NaN — the
+    fail-loud contract covers both representations."""
+    store = _store(tmp_path)
+    path = tmp_path / "history" / f"{KEY.value}.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"runtimes": [-1]}', encoding="utf-8")
+    with pytest.raises(LaneRuntimeHistoryError, match="non-runtime"):
+        store.learned_priority(KEY)
+
+
+def test_boolean_entry_is_corrupt(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    path = tmp_path / "history" / f"{KEY.value}.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"runtimes": [true]}', encoding="utf-8")
+    with pytest.raises(LaneRuntimeHistoryError, match="non-runtime"):
+        store.learned_priority(KEY)

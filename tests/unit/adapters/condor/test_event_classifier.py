@@ -92,13 +92,13 @@ def test_executing_is_running_and_updates_are_informational() -> None:
 def test_normal_termination_carries_the_exact_exit_code() -> None:
     zero = classify_event_log(_SUBMITTED + _EXECUTING + _TERMINATED_ZERO)
     seventeen = classify_event_log(_SUBMITTED + _EXECUTING + _TERMINATED_SEVENTEEN)
-    assert zero == LaneJobExited(0)
-    assert seventeen == LaneJobExited(17)
+    assert zero == LaneJobExited(0, 0.0)
+    assert seventeen == LaneJobExited(17, 0.0)
 
 
 def test_signal_termination_carries_the_signal() -> None:
     state = classify_event_log(_SUBMITTED + _EXECUTING + _TERMINATED_SIGNAL)
-    assert state == LaneJobKilledBySignal(9)
+    assert state == LaneJobKilledBySignal(9, 0.0)
 
 
 def test_deadline_removal_is_distinguished_from_operator_removal() -> None:
@@ -153,6 +153,7 @@ def test_every_prefix_of_a_full_log_classifies_without_error() -> None:
             assert type(state) in (LaneJobPending, LaneJobRunning)
 
 
+
 _SUSPENDED_EVENT = (
     "010 (002.000.000) 2026-08-26 14:08:40 Job was suspended.\n"
     "\tNumber of processes actually suspended: 1\n"
@@ -181,12 +182,83 @@ def test_unsuspension_resumes_running() -> None:
 
 
 def test_suspended_then_terminated_classifies_the_exit() -> None:
+    # Terminated at 14:08:32? The fixture's terminal precedes the
+    # suspension timestamps - use the later terminal for coherence.
     state = classify_event_log(
         _SUBMITTED
         + _EXECUTING
         + _SUSPENDED_EVENT
         + _UNSUSPENDED_EVENT
-        + _TERMINATED_ZERO
+        + _TERMINATED_ZERO.replace("14:08:32", "14:08:55")
     )
     assert type(state) is LaneJobExited
     assert state.exit_code == 0
+
+
+
+_EXECUTING_LATER = _EXECUTING.replace("14:08:32", "14:08:40")
+_TERMINATED_AT_0905 = _TERMINATED_ZERO.replace("14:08:32", "14:09:05")
+
+
+def test_runtime_is_the_event_log_span_not_an_observation_clock() -> None:
+    """B1 (#7117 review): execute 14:08:32 → terminate 14:09:05 must
+    report 33s even when the whole log is only read AFTER the job is
+    long dead — the case where a poll clock collapses toward zero."""
+    state = classify_event_log(_SUBMITTED + _EXECUTING + _TERMINATED_AT_0905)
+    assert state == LaneJobExited(0, 33.0)
+
+
+def test_restarted_job_reports_the_final_execution_span() -> None:
+    state = classify_event_log(
+        _SUBMITTED + _EXECUTING + _EXECUTING_LATER + _TERMINATED_AT_0905
+    )
+    assert state == LaneJobExited(0, 25.0)
+
+
+def test_terminal_without_execute_fails_loudly() -> None:
+    with pytest.raises(ValueError, match="no execute event"):
+        classify_event_log(_SUBMITTED + _TERMINATED_ZERO)
+
+
+def test_backwards_timestamps_fail_loudly() -> None:
+    backwards = _TERMINATED_ZERO.replace("14:08:32", "14:07:00")
+    with pytest.raises(ValueError, match="backwards"):
+        classify_event_log(_SUBMITTED + _EXECUTING + backwards)
+
+
+def test_deadline_removal_carries_the_span() -> None:
+    aborted_later = _ABORTED_BY_DEADLINE.replace("14:09:32", "14:09:32")
+    state = classify_event_log(_SUBMITTED + _EXECUTING + aborted_later)
+    assert type(state) is LaneJobDeadlineRemoved
+    assert state.runtime_seconds == 60.0
+
+
+def test_suspended_intervals_are_subtracted_from_the_runtime() -> None:
+    """The merged truth of 7117-B1 and the suspension exclusion: the
+    scheduler's record is execute 14:08:32 → terminate 14:09:05 (33s)
+    with a 12s frozen interval (14:08:40 → 14:08:52) inside it, so the
+    lane executed for 21s — all from event-log arithmetic, no poll
+    clock anywhere."""
+    state = classify_event_log(
+        _SUBMITTED
+        + _EXECUTING
+        + _SUSPENDED_EVENT
+        + _UNSUSPENDED_EVENT
+        + _TERMINATED_AT_0905
+    )
+    assert state == LaneJobExited(0, 21.0)
+
+
+def test_terminal_while_frozen_closes_the_open_suspension() -> None:
+    state = classify_event_log(
+        _SUBMITTED + _EXECUTING + _SUSPENDED_EVENT + _TERMINATED_AT_0905
+    )
+    # execute 14:08:32 → terminate 14:09:05 is 33s; frozen from
+    # 14:08:40 to the terminal event is 25s; executed 8s.
+    assert state == LaneJobExited(0, 8.0)
+
+
+def test_unsuspend_without_suspension_fails_loudly() -> None:
+    with pytest.raises(ValueError, match="no suspension open"):
+        classify_event_log(_SUBMITTED + _EXECUTING + _UNSUSPENDED_EVENT)
+

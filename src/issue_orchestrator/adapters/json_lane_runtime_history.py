@@ -4,7 +4,9 @@
 Per-key files keep concurrent lanes from contending: the fifteen-odd
 lanes of one gate finish near-simultaneously, and each rewrites only
 its own file via an atomic replace. Two gates racing the *same* lane
-resolve last-writer-wins, which is acceptable for a rolling statistic.
+serialize on a per-key lock file (a stable sibling, never replaced —
+locking the data file itself would race across os.replace inodes), so
+every successful observation is persisted.
 
 The store keeps only the last ``window`` runtimes per lane, so history
 re-converges by itself when a lane's cost drifts or the hardware
@@ -14,6 +16,7 @@ is baked.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
@@ -66,9 +69,23 @@ class JsonLaneRuntimeHistory:
             raise ValueError(
                 "record_success runtime_seconds must be finite and non-negative"
             )
-        runtimes = self._read(work_key)
-        runtimes.append(round(runtime_seconds, 3))
-        self._write(work_key, runtimes[-self._window :])
+        # The store is shared across worktrees by design, so two gates
+        # can finish the same lane near-simultaneously. An unlocked
+        # read-modify-replace loses whichever record lands first; the
+        # per-key lock serializes the update so every success is
+        # persisted (B2, #7117 review).
+        lock_path = self._path(work_key).with_suffix(".lock")
+        try:
+            self._directory.mkdir(parents=True, exist_ok=True)
+            with open(lock_path, "w") as lock_handle:
+                fcntl.flock(lock_handle, fcntl.LOCK_EX)
+                runtimes = self._read(work_key)
+                runtimes.append(round(runtime_seconds, 3))
+                self._write(work_key, runtimes[-self._window :])
+        except OSError as error:
+            raise LaneRuntimeHistoryError(
+                f"cannot lock lane runtime history at {lock_path}: {error}"
+            ) from error
 
     def learned_priority(self, work_key: LaneWorkKey) -> int:
         if type(work_key) is not LaneWorkKey:
@@ -118,7 +135,10 @@ class JsonLaneRuntimeHistory:
             )
         runtimes: list[float] = []
         for entry in cast(list[object], entries):
-            if type(entry) is int:
+            # Both representations must satisfy the same invariant:
+            # a finite, non-negative number. A negative integer is as
+            # corrupt as a NaN (B3, #7117 review).
+            if type(entry) is int and entry >= 0:
                 runtimes.append(float(entry))
             elif type(entry) is float and math.isfinite(entry) and entry >= 0:
                 runtimes.append(entry)
