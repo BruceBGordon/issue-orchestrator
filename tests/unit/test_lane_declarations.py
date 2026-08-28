@@ -185,6 +185,12 @@ def _submitted_work_keys(tmp_path: Path) -> set[str]:
             env=_scrubbed_environment(),
         )
         keys.update(re.findall(r"--work-key (\S+)", completed.stdout))
+    # The Makefile is not the only submitter: the execenv container
+    # selftest drives lane-run for its kernel-ceiling proofs. Its
+    # work keys are part of the same drift boundary — missing them
+    # broke the execenv CI job exactly once (round three, #7122).
+    selftest = (REPO_ROOT / "docker/execenv/selftest.sh").read_text()
+    keys.update(re.findall(r"--work-key (\S+)", selftest))
     return keys
 
 

@@ -74,3 +74,16 @@ lanes:
     request_cpus: 1
     memory_mb: 1024
     suspendable: false
+  # Kernel-ceiling proof lanes, submitted by docker/execenv/selftest.sh
+  # (not the Makefile): the same 400MB allocation must SUCCEED under
+  # the first budget and be kernel-killed under the second — the
+  # deliberately insufficient memory_mb below is the proof's subject,
+  # not a sizing mistake.
+  execenv.memory-ok:
+    request_cpus: 1
+    memory_mb: 1024
+    suspendable: false
+  execenv.memory-oom:
+    request_cpus: 1
+    memory_mb: 128
+    suspendable: false
