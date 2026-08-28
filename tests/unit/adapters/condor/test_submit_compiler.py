@@ -141,3 +141,23 @@ def test_memory_budget_sizes_the_slot(tmp_path: Path) -> None:
         tmp_path,
     )
     assert "request_memory = 4096" in compiled.text
+
+
+def test_learned_priority_is_emitted_when_known(tmp_path: Path) -> None:
+    compiled = compile_submit_description(
+        _command(("/bin/true",)),
+        LaneResources(request_cpus=1, priority=60),
+        tmp_path,
+    )
+    assert "priority = 60" in compiled.text
+
+
+def test_naive_run_emits_no_priority_line(tmp_path: Path) -> None:
+    """Zero history compiles to a submit file with no priority at all -
+    the naive first run is byte-for-byte the pre-learning behavior."""
+    compiled = compile_submit_description(
+        _command(("/bin/true",)),
+        LaneResources(request_cpus=1),
+        tmp_path,
+    )
+    assert "priority" not in compiled.text

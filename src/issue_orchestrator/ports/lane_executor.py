@@ -21,6 +21,8 @@ class LaneExecutor(Protocol):
       lane runs (streamed, not buffered until completion).
     - A lane exceeding ``command.deadline`` has its entire process tree
       terminated and reports :class:`LaneTimedOut` (exit code 124).
+    - A completed lane reports ``observed_runtime_seconds`` — the time
+      it actually executed, excluding any scheduler queue wait.
     - Backend faults raise :class:`LaneExecutorError` subclasses; they
       are never encoded as lane exit codes.
     """

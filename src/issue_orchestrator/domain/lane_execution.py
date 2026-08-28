@@ -141,13 +141,30 @@ class LaneCommand:
 
 @dataclass(frozen=True, slots=True)
 class LaneCompleted:
-    """The lane's process tree ran to its own exit."""
+    """The lane's process tree ran to its own exit.
+
+    ``observed_runtime_seconds`` is the time the lane actually executed,
+    excluding any scheduler queue wait. It feeds the runtime-history
+    learning loop, which is why queue wait must never leak into it: a
+    learned ordering derived from queue-inflated numbers would chase its
+    own scheduling delays.
+    """
 
     exit_code: int
+    observed_runtime_seconds: float
 
     def __post_init__(self) -> None:
         if type(self.exit_code) is not int:
             raise ValueError("LaneCompleted.exit_code must be an integer")
+        if (
+            type(self.observed_runtime_seconds) is not float
+            or not math.isfinite(self.observed_runtime_seconds)
+            or self.observed_runtime_seconds < 0
+        ):
+            raise ValueError(
+                "LaneCompleted.observed_runtime_seconds must be finite and "
+                "non-negative"
+            )
 
 
 @dataclass(frozen=True, slots=True)

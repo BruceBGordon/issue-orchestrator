@@ -90,11 +90,39 @@ runs a probe job in a fresh submitter-owned directory — readiness means
 identity configuration and hold reason instead of leaving you nine
 held lanes later.
 
+## Learned dispatch order
+
+Lanes carry no tuning knobs: the system orders its own queue. Every
+successful run's observed execution time (queue wait excluded) is
+recorded per work key under
+`<git-common-dir>/issue-orchestrator/lane-runtime-history/`, and the
+next submission's dispatch priority is the rolling median of the last
+five — longest lanes first (the LPT makespan heuristic). Priority
+decides which of the *simultaneously eligible queued* lanes matches
+first; a large lane can still wait on slot shape (its cpu/memory
+request needs a big enough hole) or on lanes that arrived while it was
+not yet submitted. The properties to know:
+
+- **The first run is naive by design.** No history means no priority —
+  identical to pre-learning behavior. One gate run seeds everything.
+- **Only successes teach.** A failed run's duration is the failure's,
+  not the lane's, so provider stalls never poison the ordering.
+- **Nothing to invalidate.** The rolling window re-converges by itself
+  when a lane's cost drifts or the hardware changes. To reset one lane
+  anyway, delete its file from the history directory; delete the
+  directory to reset everything.
+- History is shared across all worktrees of a repository (it lives in
+  the git common dir, like the validation timings).
+
 ## Architecture
 
 - `domain/lane_execution.py` — the typed contracts (the only vocabulary
   that crosses the port).
 - `ports/lane_executor.py` — the port.
+- `ports/lane_runtime_history.py` +
+  `adapters/json_lane_runtime_history.py` — the learning loop
+  (backend-neutral: every backend reports runtime, every backend's
+  submissions may consume the ordering).
 - `adapters/direct_lane_executor.py` — default backend.
 - `adapters/condor/` — the anti-corruption layer: `submit_compiler.py`
   translates lane specs outbound into job descriptions;

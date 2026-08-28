@@ -25,6 +25,10 @@ from ...adapters.direct_lane_executor import (
     DirectLaneExecutor,
     DirectLaneTerminationPolicy,
 )
+from ...adapters.json_lane_runtime_history import (
+    JsonLaneRuntimeHistory,
+    LaneRuntimeHistoryError,
+)
 from ...domain.lane_execution import (
     LaneCommand,
     LaneCompleted,
@@ -35,7 +39,9 @@ from ...domain.lane_execution import (
     LaneTimedOut,
     LaneWorkKey,
 )
+from ...infra.validation_timings import resolve_git_common_dir
 from ...ports.lane_executor import LaneExecutor
+from ...ports.lane_runtime_history import LaneRuntimeHistory
 
 BACKEND_ENVIRONMENT_VARIABLE = "ISSUE_ORCHESTRATOR_LANE_EXECUTOR"
 _DIRECT_BACKEND = "direct"
@@ -62,12 +68,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments.command = command
     try:
         executor = _build_executor(arguments.backend)
+        history = _build_history()
+        work_key = LaneWorkKey(str(arguments.work_key))
         outcome = executor.run(
             _build_command(arguments),
             LaneResources(
                 request_cpus=arguments.request_cpus,
                 exclusive=tuple(arguments.exclusive),
-                priority=arguments.priority,
+                # Dispatch order is learned, never declared: the rolling
+                # median of this lane's past runtimes (LPT — longer
+                # lanes first). Zero history means priority 0, exactly
+                # the naive first run.
+                priority=history.learned_priority(work_key),
                 request_memory_mb=arguments.request_memory_mb,
             ),
         )
@@ -77,7 +89,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     except LaneExecutorError as error:
         print(f"lane-run: backend fault: {error}", file=sys.stderr)
         return _BACKEND_FAULT_EXIT_CODE
+    except LaneRuntimeHistoryError as error:
+        # Corrupt history is a bug in whatever wrote it — fail loudly
+        # (the message names the file to delete); never guess a
+        # priority from garbage.
+        print(f"lane-run: {error}", file=sys.stderr)
+        return _BACKEND_FAULT_EXIT_CODE
     if type(outcome) is LaneCompleted:
+        if outcome.exit_code == 0:
+            # Only successes teach: a failed run's duration is the
+            # failure's, not the lane's.
+            try:
+                history.record_success(work_key, outcome.observed_runtime_seconds)
+            except LaneRuntimeHistoryError as error:
+                print(f"lane-run: {error}", file=sys.stderr)
+                return _BACKEND_FAULT_EXIT_CODE
         return outcome.exit_code
     if type(outcome) is LaneTimedOut:
         print(
@@ -111,12 +137,6 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--timeout-seconds", type=float, required=True)
     parser.add_argument(
-        "--priority",
-        type=int,
-        default=0,
-        help="Expected duration in seconds; scheduling backends start longer lanes first.",
-    )
-    parser.add_argument(
         "--backend",
         choices=(_DIRECT_BACKEND, _CONDOR_BACKEND),
         default=os.environ.get(BACKEND_ENVIRONMENT_VARIABLE, _DIRECT_BACKEND),
@@ -126,6 +146,34 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         ),
     )
     return parser.parse_args(argv)
+
+
+def _build_history() -> LaneRuntimeHistory:
+    """The repo-shared runtime history, or an inert one outside a repo.
+
+    History lives with the repository (the git common dir), like the
+    validation timings, so every worktree of one repo learns from the
+    same runs. Outside a repository there is nothing to share and
+    nothing worth learning across invocations, so the loop is inert:
+    priority 0, record nowhere.
+    """
+    common_dir = resolve_git_common_dir(Path.cwd())
+    if common_dir is None:
+        return _InertLaneRuntimeHistory()
+    return JsonLaneRuntimeHistory(
+        common_dir / "issue-orchestrator" / "lane-runtime-history"
+    )
+
+
+class _InertLaneRuntimeHistory:
+    """No-repo stand-in: always naive, never persists."""
+
+    def record_success(self, work_key: LaneWorkKey, runtime_seconds: float) -> None:
+        del work_key, runtime_seconds
+
+    def learned_priority(self, work_key: LaneWorkKey) -> int:
+        del work_key
+        return 0
 
 
 def _build_executor(backend: str) -> LaneExecutor:

@@ -202,9 +202,84 @@ def test_queue_wait_is_never_billed_to_the_lane_deadline(tmp_path: Path) -> None
     holder.join(timeout=120)
 
     assert type(results["holder"]) is LaneCompleted
-    assert type(results["queued"]) is LaneCompleted, (
+    queued = results["queued"]
+    assert type(queued) is LaneCompleted, (
         "queue wait was billed to the lane deadline: "
-        f"{results['queued']!r}"
+        f"{queued!r}"
+    )
+    # The learning loop's precondition: the ~7s token wait must not
+    # appear in observed runtime (the lane slept 1s). A queue-inflated
+    # number here would make learned ordering chase its own delays.
+    assert queued.observed_runtime_seconds < 6.0, (
+        "observed runtime includes queue wait: "
+        f"{queued.observed_runtime_seconds:.1f}s for a 1s lane"
+    )
+
+
+def test_higher_priority_lane_dispatches_first_from_a_contended_queue(
+    tmp_path: Path,
+) -> None:
+    """The scheduler must honor the priority hint when choosing among
+    idle lanes: with two lanes queued behind a token holder, the
+    higher-priority one runs first regardless of submission order.
+    This is the dispatch half of the learning loop — the submit half
+    (history median becomes the hint) is proven at the CLI boundary."""
+    journal = tmp_path / "journal.txt"
+    journal.write_text("")
+    script = (
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "with Path(sys.argv[1]).open('a') as handle:\n"
+        "    handle.write(f'start:{sys.argv[2]}\\n')\n"
+        "time.sleep(float(sys.argv[3]))\n"
+    )
+
+    def run_lane(name: str, sleep_seconds: float, priority: int) -> None:
+        outcome = CondorLaneExecutor(CondorTools.resolve()).run(
+            LaneCommand(
+                work_key=LaneWorkKey(f"contract.dispatch-{name}"),
+                arguments=(
+                    sys.executable,
+                    "-c",
+                    script,
+                    str(journal),
+                    name,
+                    str(sleep_seconds),
+                ),
+                working_directory=tmp_path,
+                deadline=LaneDeadline(300.0),
+            ),
+            LaneResources(
+                request_cpus=1,
+                exclusive=("dispatchordertoken",),
+                priority=priority,
+            ),
+        )
+        assert type(outcome) is LaneCompleted and outcome.exit_code == 0
+
+    threads = [threading.Thread(target=run_lane, args=("blocker", 6.0, 0))]
+    threads[0].start()
+    time.sleep(1.5)
+    # Deliberately submit the LOW-priority lane first: only the
+    # priority hint, not arrival order, may decide who runs next.
+    threads.append(threading.Thread(target=run_lane, args=("low", 2.0, 1)))
+    threads[1].start()
+    time.sleep(1.0)
+    threads.append(threading.Thread(target=run_lane, args=("high", 2.0, 100)))
+    threads[2].start()
+    for thread in threads:
+        thread.join(timeout=180)
+        assert not thread.is_alive(), "a dispatch-order lane never concluded"
+
+    started = [
+        line.split(":", 1)[1]
+        for line in journal.read_text().splitlines()
+        if line.startswith("start:")
+    ]
+    assert started[0] == "blocker", started
+    assert started[1:] == ["high", "low"], (
+        "the scheduler ignored the priority hint under contention: "
+        f"{started}"
     )
 
 
