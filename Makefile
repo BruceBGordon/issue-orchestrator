@@ -783,6 +783,15 @@ _validate-static-impl: typecheck lint-arch lint-complexity
 _validate-core-tests-impl: test-unit test-simulated-core test-integration-core-local
 
 _validate-pr-impl:
+# Gate-entry host sanity check (#7142). Stray load from an earlier run is
+# invisible to the gate it poisons: on 2026-08-29 twenty orphaned burners cost
+# seven flaked gates across four branches and a day of misattribution before
+# anyone ran ps. Runs for every backend on purpose — the flake victim was the
+# host-side browser lane, which both modes run on this machine — and before
+# any phase, so the fact is in validation-stderr.log ahead of what it explains.
+# Diagnosis only: the tool never kills and always exits 0, and `-` keeps a
+# broken interpreter from failing the gate this check exists to protect.
+	-@$(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.host_load_preflight
 ifeq ($(LANE_EXECUTOR),condor)
 # -j must cover EVERY flat target: a lane waiting for a make slot is
 # invisible to the scheduler, so the learned dispatch order cannot

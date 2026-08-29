@@ -99,12 +99,15 @@ def supports_process_groups() -> bool:
     return hasattr(os, "killpg") and hasattr(os, "waitid")
 
 
-def _signal_group(pgid: int, sig: signal.Signals) -> None:
+def signal_group(pgid: int, sig: signal.Signals) -> None:
     """Signal every live member of ``pgid``.
 
     ``ESRCH`` means the group is gone; ``EPERM`` means no live member could be
     signalled, which on macOS is what a group holding only the zombie leader
     reports. Neither leaves anything for us to do.
+
+    Public because ``tests/load_fixture`` runs the same escalation over groups
+    it spawned itself: the ESRCH/EPERM reading is one policy, not two.
     """
     try:
         os.killpg(pgid, sig)
@@ -112,20 +115,22 @@ def _signal_group(pgid: int, sig: signal.Signals) -> None:
         return
 
 
-def _await_leader_exit(process: subprocess.Popen[str], *, grace_seconds: float) -> None:
-    """Wait up to ``grace_seconds`` for the leader to exit, without reaping it.
+def await_exit_without_reaping(pid: int, *, grace_seconds: float) -> None:
+    """Wait up to ``grace_seconds`` for ``pid`` to exit, without reaping it.
 
     ``WNOWAIT`` leaves the child in a waitable state, so the leader stays a
     zombie and its pid — and with it the pgid — stays reserved for the SIGKILL
     that follows. Returning early is only an optimisation: the caller signals
     unconditionally either way.
+
+    Reaping here instead (``poll``/``wait``) would free the pid for reuse
+    between the grace window and the kill, and the kill would then name a
+    stranger's group.
     """
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
         try:
-            info = os.waitid(
-                os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG
-            )
+            info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
         except ChildProcessError:
             return
         if info is not None and info.si_pid != 0:
@@ -145,13 +150,13 @@ def _terminate_group(
     # leader, so its pid is the pgid.
     pgid = process.pid
 
-    _signal_group(pgid, signal.SIGTERM)
-    _await_leader_exit(process, grace_seconds=terminate_grace_seconds)
+    signal_group(pgid, signal.SIGTERM)
+    await_exit_without_reaping(pgid, grace_seconds=terminate_grace_seconds)
 
     # Unconditional, and before any reap. This is the whole guarantee: it does
     # not matter whether the pipes went quiet, whether the leader cooperated, or
     # whether a descendant is ignoring signals.
-    _signal_group(pgid, signal.SIGKILL)
+    signal_group(pgid, signal.SIGKILL)
 
     try:
         return process.communicate(timeout=kill_grace_seconds)

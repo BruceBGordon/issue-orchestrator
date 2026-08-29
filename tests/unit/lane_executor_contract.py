@@ -25,6 +25,7 @@ from issue_orchestrator.domain.lane_execution import (
     LaneWorkKey,
 )
 from issue_orchestrator.ports.lane_executor import LaneExecutor
+from tests.load_fixture import reap_marked_processes
 
 _TREE_SCRIPT = """
 import os, signal, sys, time
@@ -249,19 +250,28 @@ class LaneExecutorContract:
         self, tmp_path: Path
     ) -> None:
         grandchild_pid_path = tmp_path / "grandchild.pid"
-        outcome = self.build_executor().run(
-            _command(
-                "contract.deadline",
-                (sys.executable, "-c", _TREE_SCRIPT, str(grandchild_pid_path)),
-                tmp_path,
-                5.0,
-            ),
-            self.resources(),
-        )
-        assert type(outcome) is LaneTimedOut
-        assert outcome.exit_code == LANE_TIMEOUT_EXIT_CODE
-        grandchild_pid = int(grandchild_pid_path.read_text())
-        assert _await_pid_gone(grandchild_pid, 30.0), (
-            "a TERM-immune grandchild survived the lane deadline: "
-            f"pid={grandchild_pid}"
-        )
+        try:
+            outcome = self.build_executor().run(
+                _command(
+                    "contract.deadline",
+                    (sys.executable, "-c", _TREE_SCRIPT, str(grandchild_pid_path)),
+                    tmp_path,
+                    5.0,
+                ),
+                self.resources(),
+            )
+            assert type(outcome) is LaneTimedOut
+            assert outcome.exit_code == LANE_TIMEOUT_EXIT_CODE
+            grandchild_pid = int(grandchild_pid_path.read_text())
+            assert _await_pid_gone(grandchild_pid, 30.0), (
+                "a TERM-immune grandchild survived the lane deadline: "
+                f"pid={grandchild_pid}"
+            )
+        finally:
+            # #7142: ``_TREE_SCRIPT`` ignores SIGTERM and never exits on its
+            # own, so exactly when the assertions above are doing their job —
+            # a backend regressed, or the pid file was never written — this
+            # test is the thing leaving immortal processes on the machine.
+            # Five of them, up to twelve hours old, were found here. The pgid
+            # belongs to the backend, so identity comes from the argv instead.
+            reap_marked_processes(str(grandchild_pid_path))
