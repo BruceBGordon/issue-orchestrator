@@ -69,6 +69,7 @@ from pathlib import Path
 from typing import Callable
 
 from ..domain.exchange_kill_evidence import (
+    ComposerState,
     ComposerStateVerdict,
     RoundIdleTrace,
     undetermined_composer_state,
@@ -420,13 +421,7 @@ class ExchangeKillEvidenceRecorder:
         both steps below degrade into a recorded error rather than aborting.
         Anything else raises and the staging directory is discarded whole.
         """
-        composer = (
-            undetermined_composer_state(
-                "capture budget exhausted before the recording could be replayed"
-            )
-            if budget.expired()
-            else self._classify(facts.identity)
-        )
+        composer = self._composer_verdict(facts.identity, budget=budget)
         copy = self._copy_recording_or_note_why_not(
             facts.identity.recording_path,
             staging / RECORDING_COPY_FILENAME,
@@ -495,12 +490,38 @@ class ExchangeKillEvidenceRecorder:
             self._staging_seq += 1
             return self._staging_seq
 
-    def _classify(self, identity: RoundIdentity) -> ComposerStateVerdict:
+    def _composer_verdict(
+        self, identity: RoundIdentity, *, budget: CaptureBudget
+    ) -> ComposerStateVerdict:
+        """Classify under the budget, and refuse to trust an overrun result.
+
+        Three gates, because a stage can blow the budget three ways: before it
+        starts, while it runs, and by the time it returns. The replay itself
+        takes the budget so it can stop between events; the check afterwards is
+        what stops a stage that overran anyway from having its answer believed
+        (#7141 round 3 finding 3).
+        """
+        if budget.expired():
+            return undetermined_composer_state(
+                "capture budget exhausted before the recording could be replayed"
+            )
+        verdict = self._classify(identity, budget=budget)
+        if budget.expired() and verdict.state is not ComposerState.UNDETERMINED:
+            return undetermined_composer_state(
+                "capture budget exhausted during the replay; the reconstruction "
+                "is not trusted"
+            )
+        return verdict
+
+    def _classify(
+        self, identity: RoundIdentity, *, budget: CaptureBudget
+    ) -> ComposerStateVerdict:
         try:
             return classify_composer_state(
                 identity.recording_path,
                 prompt_marker=identity.prompt_marker,
                 replay_bytes=self._replay_bytes,
+                abort=budget.expired,
             )
         except Exception as exc:
             logger.exception(

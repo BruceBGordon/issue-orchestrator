@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from ..domain.exchange_kill_evidence import (
     ComposerState,
@@ -103,6 +104,7 @@ def classify_composer_state(
     *,
     prompt_marker: str = "",
     replay_bytes: int = DEFAULT_REPLAY_BYTES,
+    abort: Callable[[], bool] | None = None,
 ) -> ComposerStateVerdict:
     """Classify whether the injected prompt is still stranded in the composer.
 
@@ -115,6 +117,10 @@ def classify_composer_state(
     structurally incomplete (still being appended to, or holding an unparseable
     row), renders no written rows, or shows no marker at all.
 
+    ``abort`` lets a caller on a deadline stop the replay between events; an
+    abandoned replay yields ``UNDETERMINED`` rather than a verdict read off a
+    half-applied stream.
+
     ``prompt_marker`` is a short per-turn token (the round/attempt tag).
     Whether it is visible is recorded as supporting evidence only, never as the
     decision: a submitted prompt is also rendered into the transcript, and long
@@ -122,7 +128,14 @@ def classify_composer_state(
     """
     if not recording_path.exists():
         return undetermined_composer_state(f"recording is missing at {recording_path}")
-    replay = replay_terminal_recording(recording_path, max_bytes=replay_bytes)
+    replay = replay_terminal_recording(
+        recording_path, max_bytes=replay_bytes, abort=abort
+    )
+    if replay.abandoned:
+        return undetermined_composer_state(
+            "the replay was abandoned before the recording was fully applied; "
+            "refusing to classify a half-reconstructed screen"
+        )
     if not replay.structurally_complete:
         return undetermined_composer_state(
             "recording is incomplete (still being appended to, or holding an "

@@ -406,3 +406,138 @@ class TestDegenerateGeometry:
         view.feed("東亜".encode("utf-8"))
 
         assert view.render().rows[0] in ("東", "亜")
+
+
+class TestMalformedResizeRows:
+    """#7141 round 3 finding 1: geometry fields must be real, plausible ints."""
+
+    def _recording_with_resize(self, tmp_path: Path, rows: object, cols: object) -> Path:
+        path = _recording(tmp_path / "resized.jsonl", (b"\x1b[1;1Htab to queue message",))
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "event_type": "resize",
+                        "offset_ms": 50,
+                        "rows": rows,
+                        "cols": cols,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        return path
+
+    def test_zero_rows_is_not_trusted(self, tmp_path: Path) -> None:
+        path = self._recording_with_resize(tmp_path, 0, 40)
+
+        assert replay_terminal_recording(path).structurally_complete is False
+
+    def test_negative_dimensions_are_not_trusted(self, tmp_path: Path) -> None:
+        path = self._recording_with_resize(tmp_path, 40, -5)
+
+        assert replay_terminal_recording(path).structurally_complete is False
+
+    def test_boolean_dimensions_are_not_trusted(self, tmp_path: Path) -> None:
+        """``bool`` is an ``int`` subclass, so isinstance let ``true`` through as 1."""
+        path = self._recording_with_resize(tmp_path, True, 40)
+
+        assert replay_terminal_recording(path).structurally_complete is False
+
+    def test_absurd_dimensions_are_not_trusted(self, tmp_path: Path) -> None:
+        path = self._recording_with_resize(tmp_path, 40, 10_000_000)
+
+        assert replay_terminal_recording(path).structurally_complete is False
+
+    def test_a_missing_dimension_is_not_trusted(self, tmp_path: Path) -> None:
+        path = _recording(tmp_path / "r.jsonl", (b"x",))
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                '{"schema_version": 1, "event_type": "resize", "offset_ms": 5, '
+                '"rows": 40}\n'
+            )
+
+        assert replay_terminal_recording(path).structurally_complete is False
+
+    def test_a_real_resize_is_still_applied(self, tmp_path: Path) -> None:
+        path = self._recording_with_resize(tmp_path, 10, 20)
+
+        replay = replay_terminal_recording(path)
+
+        assert replay.structurally_complete is True
+
+
+class TestGraphemeClusters:
+    """#7141 round 3 finding 2: match the bundled terminal's grapheme model."""
+
+    def test_a_zwj_family_emoji_is_one_grapheme_of_two_cells(self) -> None:
+        view = _viewport(rows=3, cols=30)
+
+        view.feed("abc".encode("utf-8"))
+        view.feed("\U0001F468‍\U0001F469‍\U0001F467‍\U0001F466".encode())
+        view.feed(b"|")
+
+        # 3 ASCII + 2 for the whole family cluster, so the bar sits at column 5.
+        assert view.render().cursor_col == 6
+        assert view.render().rows[0].endswith("|")
+
+    def test_the_reviewer_probe_lands_the_cursor_at_column_25(self) -> None:
+        view = _viewport(rows=3, cols=30)
+
+        view.feed(b"x" * 23)
+        view.feed("\U0001F468‍\U0001F469‍\U0001F467‍\U0001F466".encode())
+
+        assert view.render().cursor_col == 25
+
+    def test_a_zwj_cluster_does_not_wrap_a_following_footer(self) -> None:
+        """Naive per-codepoint widths made the family 11 cells and split the row."""
+        view = _viewport(rows=4, cols=30)
+
+        view.feed(b"ab ")
+        view.feed("\U0001F468‍\U0001F469‍\U0001F467‍\U0001F466".encode())
+        view.feed(b"tab to queue message")
+
+        assert "tab to queue message" in view.render().rows[0]
+
+    def test_a_variation_selector_does_not_advance(self) -> None:
+        view = _viewport(rows=3, cols=10)
+
+        view.feed("⚠️!".encode("utf-8"))
+
+        assert view.render().rows[0].endswith("!")
+        assert view.render().cursor_col == 2
+
+
+class TestReplayAbort:
+    """#7141 round 3 finding 3: the replay stage runs under the caller's budget."""
+
+    def test_an_aborted_replay_is_reported_abandoned(self, tmp_path: Path) -> None:
+        path = _recording(tmp_path / "r.jsonl", (b"one", b"two", b"three"))
+
+        replay = replay_terminal_recording(path, abort=lambda: True)
+
+        assert replay.abandoned is True
+        assert replay.structurally_complete is False
+
+    def test_a_replay_that_is_never_aborted_completes(self, tmp_path: Path) -> None:
+        path = _recording(tmp_path / "r.jsonl", (b"one", b"two"))
+
+        replay = replay_terminal_recording(path, abort=lambda: False)
+
+        assert replay.abandoned is False
+        assert replay.structurally_complete is True
+        assert replay.events_applied == 2
+
+    def test_an_abort_partway_stops_applying_events(self, tmp_path: Path) -> None:
+        path = _recording(tmp_path / "r.jsonl", tuple(b"row %d\r\n" % i for i in range(50)))
+        calls = {"n": 0}
+
+        def _abort() -> bool:
+            calls["n"] += 1
+            return calls["n"] > 5
+
+        replay = replay_terminal_recording(path, abort=_abort)
+
+        assert replay.abandoned is True
+        assert replay.events_applied < 50

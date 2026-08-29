@@ -320,14 +320,40 @@ def iter_terminal_recording(path: Path) -> Iterator[dict[str, Any]]:
             yield json.loads(raw_line)
 
 
+#: Nothing real reports a terminal larger than this; a recording that claims
+#: more is malformed rather than unusual.
+MAX_TERMINAL_ROWS = 500
+MAX_TERMINAL_COLS = 1000
+
+
+def screen_dimension(value: Any, *, limit: int) -> int | None:
+    """Return a usable geometry value, or ``None`` when it cannot be trusted.
+
+    The one place that decides what a valid ``resize`` row carries, shared by
+    the viewer's geometry lookup and the viewport replay so the two cannot
+    disagree about which recordings are well-formed.
+
+    ``isinstance(value, int)`` is not enough: ``bool`` is a subclass of ``int``
+    in Python, so ``"rows": true`` sailed through as a one-row screen (#7141
+    round 3). Exact-type matching rejects that, and the range bound rejects the
+    zero, negative and absurd dimensions that equally mean the row is not what
+    the writer emitted.
+    """
+    if type(value) is not int:
+        return None
+    if value < 1 or value > limit:
+        return None
+    return value
+
+
 def first_terminal_geometry(path: Path) -> tuple[int, int] | None:
-    """Return the first recorded terminal geometry as (rows, cols)."""
+    """Return the first *trustworthy* recorded geometry as (rows, cols)."""
     for event in iter_terminal_recording(path):
         if event.get("event_type") != "resize":
             continue
-        rows = event.get("rows")
-        cols = event.get("cols")
-        if isinstance(rows, int) and isinstance(cols, int):
+        rows = screen_dimension(event.get("rows"), limit=MAX_TERMINAL_ROWS)
+        cols = screen_dimension(event.get("cols"), limit=MAX_TERMINAL_COLS)
+        if rows is not None and cols is not None:
             return rows, cols
     return None
 

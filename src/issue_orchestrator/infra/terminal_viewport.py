@@ -46,12 +46,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, ClassVar
 
+from .terminal_recording import (
+    MAX_TERMINAL_COLS,
+    MAX_TERMINAL_ROWS,
+    screen_dimension,
+)
+
 DEFAULT_ROWS = 40
 DEFAULT_COLS = 120
-_MAX_ROWS = 500
-_MAX_COLS = 1000
+_MAX_ROWS = MAX_TERMINAL_ROWS
+_MAX_COLS = MAX_TERMINAL_COLS
 _BLANK = " "
 _REPLACEMENT = "\ufffd"
+_ZWJ = "\u200d"
+# Marks, format characters and variation selectors never claim a cell.
+_ZERO_WIDTH_CATEGORIES = frozenset({"Mn", "Me", "Cf"})
 _TAB_WIDTH = 8
 
 _ESC = 0x1B
@@ -92,6 +101,7 @@ class TerminalViewport:
         self._row = 0
         self._col = 0
         self._saved: tuple[int, int] = (0, 0)
+        self._join_pending = False
         self._scroll_top = 0
         self._scroll_bottom = self._rows - 1
         self._fed = 0
@@ -189,9 +199,17 @@ class TerminalViewport:
         self._print(chr(byte))
 
     def _print(self, char: str) -> None:
+        # A ZWJ binds what follows into the grapheme already on screen, so the
+        # joined character claims no cells of its own. The bundled xterm the
+        # session viewer runs draws 👨‍👩‍👧‍👦 as ONE glyph; counting its parts
+        # separately pushed everything after it along the row and wrapped a
+        # footer mid-word, costing a real stranded-composer catch
+        # (#7141 round 3).
+        joined = self._join_pending
+        self._join_pending = char == _ZWJ
         # A grid narrower than the glyph cannot represent it; clamping keeps
         # the write in bounds instead of running off the end of the row.
-        cells = min(_char_cells(char), self._cols)
+        cells = 0 if joined else min(_char_cells(char), self._cols)
         if cells == 0:
             self._attach_combining(char)
             return
@@ -211,7 +229,10 @@ class TerminalViewport:
         column = max(0, self._col - 1)
         while column > 0 and self._grid[self._row][column] == "":
             column -= 1
-        self._grid[self._row][column] += char
+        cell = self._grid[self._row][column]
+        # Nothing to decorate yet: replace the blank rather than trailing the
+        # mark behind a space that was never printed.
+        self._grid[self._row][column] = char if cell == _BLANK else cell + char
         self._written[self._row] = True
 
     def _line_feed(self) -> None:
@@ -282,6 +303,7 @@ class TerminalViewport:
         self._grid = self._blank_grid()
         self._written = [True] * self._rows
         self._row = self._col = 0
+        self._join_pending = False
         self._scroll_top, self._scroll_bottom = 0, self._rows - 1
 
     # -- CSI operations ----------------------------------------------------
@@ -439,14 +461,19 @@ def _utf8_width(lead: int) -> int:
 
 
 def _char_cells(char: str) -> int:
-    """Screen cells this character occupies.
+    """Screen cells this character occupies, ignoring cluster joining.
 
     wcwidth semantics, narrowed to what a grid needs: East Asian Wide and
-    Fullwidth forms take two cells, combining marks take none and decorate the
-    cell already written. Getting this wrong desynchronises every subsequent
-    cursor address on the row, so a later erase clears the wrong columns and
-    leaves a footer behind (#7141 round 2).
+    Fullwidth forms take two cells; combining marks, variation selectors and
+    format characters (including ZWJ) take none and decorate the cell already
+    written. Getting this wrong desynchronises every subsequent cursor address
+    on the row, so a later erase clears the wrong columns and leaves a footer
+    behind (#7141 round 2).
+
+    Cluster joining is the caller's job — see ``TerminalViewport._print``.
     """
+    if char == _ZWJ or unicodedata.category(char) in _ZERO_WIDTH_CATEGORIES:
+        return 0
     if unicodedata.combining(char):
         return 0
     return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
@@ -492,6 +519,7 @@ class RecordingReplay:
     rows_scanned: int
     replayed_from_start: bool
     structurally_complete: bool
+    abandoned: bool = False
 
 
 def replay_terminal_recording(
@@ -499,6 +527,7 @@ def replay_terminal_recording(
     *,
     max_bytes: int = DEFAULT_REPLAY_MAX_BYTES,
     max_events: int = DEFAULT_REPLAY_MAX_EVENTS,
+    abort: Callable[[], bool] | None = None,
 ) -> RecordingReplay:
     """Reconstruct the final viewport of a ``terminal-recording.jsonl``.
 
@@ -511,6 +540,11 @@ def replay_terminal_recording(
     still open for append), when any scanned row fails to parse, or when a row
     carries an undecodable payload — all of which mean the replay saw something
     other than the exact byte stream the agent emitted.
+
+    ``abort`` lets a caller working to a deadline stop the replay between
+    events. An abandoned replay sets both ``abandoned`` and (because a
+    half-applied stream is exactly the kind of hole a screen clear hides)
+    ``structurally_complete=False``, so no verdict can rest on it.
     """
     blob, replayed_from_start = _read_window(path, max_bytes=max_bytes)
     complete = blob.endswith(b"\n") or not blob
@@ -522,9 +556,14 @@ def replay_terminal_recording(
     viewport = TerminalViewport()
     applied = 0
     scanned = 0
+    abandoned = False
     for raw_row in rows:
         if not raw_row.strip():
             continue
+        if abort is not None and abort():
+            abandoned = True
+            complete = False
+            break
         scanned += 1
         if scanned > max_events:
             complete = False
@@ -543,6 +582,7 @@ def replay_terminal_recording(
         rows_scanned=scanned,
         replayed_from_start=replayed_from_start,
         structurally_complete=complete,
+        abandoned=abandoned,
     )
 
 
@@ -583,8 +623,9 @@ _SOUND_NO_OP = _EventOutcome(applied=0, sound=True)
 def _apply_event(viewport: TerminalViewport, event: dict[str, Any]) -> _EventOutcome:
     kind = event.get("event_type")
     if kind == "resize":
-        rows, cols = event.get("rows"), event.get("cols")
-        if not isinstance(rows, int) or not isinstance(cols, int):
+        rows = screen_dimension(event.get("rows"), limit=_MAX_ROWS)
+        cols = screen_dimension(event.get("cols"), limit=_MAX_COLS)
+        if rows is None or cols is None:
             return _EventOutcome(applied=0, sound=False)
         viewport.resize(rows=rows, cols=cols)
         return _SOUND_NO_OP

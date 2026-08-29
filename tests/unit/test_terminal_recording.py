@@ -346,3 +346,28 @@ def test_remove_mirror_recording_stops_fan_out(tmp_path) -> None:
             writer.remove_mirror_recording(recording_path)
     finally:
         writer.close()
+
+
+def test_first_terminal_geometry_rejects_untrustworthy_dimensions(tmp_path) -> None:
+    """``bool`` is an ``int`` subclass, so ``rows: true`` sized the viewer to 1."""
+    import json
+
+    recording_path = tmp_path / "terminal-recording.jsonl"
+    rows = [
+        {"schema_version": 1, "event_type": "resize", "offset_ms": 0,
+         "rows": True, "cols": 120},
+        {"schema_version": 1, "event_type": "resize", "offset_ms": 1,
+         "rows": 0, "cols": 120},
+        {"schema_version": 1, "event_type": "resize", "offset_ms": 2,
+         "rows": 40, "cols": -3},
+        {"schema_version": 1, "event_type": "resize", "offset_ms": 3,
+         "rows": 40, "cols": 10_000_000},
+        {"schema_version": 1, "event_type": "resize", "offset_ms": 4,
+         "rows": 40, "cols": 120},
+    ]
+    recording_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    assert first_terminal_geometry(recording_path) == (40, 120)

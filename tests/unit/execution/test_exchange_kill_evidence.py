@@ -1285,3 +1285,119 @@ class TestCaptureBudget:
         )
         assert identity["recording_present"] is True
         assert identity["recording_copy_error"] is None
+
+
+class _StepClock:
+    """Monotonic stand-in that jumps only when the test says so."""
+
+    def __init__(self, *, jump_after_calls: int | None = None) -> None:
+        self._value = 0.0
+        self._jump_after = jump_after_calls
+        self.calls = 0
+
+    def __call__(self) -> float:
+        self.calls += 1
+        if self._jump_after is not None and self.calls > self._jump_after:
+            self._value = 1_000.0
+        return self._value
+
+    def expire(self) -> None:
+        self._value = 1_000.0
+
+
+class TestReplayRunsUnderTheBudget:
+    """#7141 round 3 finding 3: no stage escapes the one budget."""
+
+    def test_a_replay_that_overruns_the_budget_is_not_trusted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from issue_orchestrator.execution import exchange_kill_evidence as module
+
+        root = tmp_path / "retained"
+        clock = _StepClock()
+        recorder = ExchangeKillEvidenceRecorder(
+            resolve_root=lambda _worktree: root,
+            clock=lambda: _FROZEN_AT,
+            monotonic=clock,
+            capture_budget_seconds=10.0,
+        )
+        real = module.classify_composer_state
+
+        def _stalling(*args: object, **kwargs: object) -> object:
+            verdict = real(*args, **kwargs)  # type: ignore[arg-type]
+            clock.expire()  # the stage took longer than the budget allowed
+            return verdict
+
+        monkeypatch.setattr(module, "classify_composer_state", _stalling)
+        recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        captured = recorder.capture_abandoned_rounds(7128, reason="deadline")
+
+        assert len(captured) == 1
+        identity = json.loads(
+            (captured[0] / RUN_IDENTITY_FILENAME).read_text(encoding="utf-8")
+        )
+        assert identity["composer_state"]["state"] == "undetermined"
+        assert "not trusted" in identity["composer_state"]["evidence_snippet"]
+
+    def test_a_replay_abandoned_mid_way_says_so(self, tmp_path: Path) -> None:
+        """The reported hole: the replay ran on regardless and was believed."""
+        root = tmp_path / "retained"
+        # Survive entry, the per-round check and the pre-replay gate, then
+        # expire once the replay is consuming events.
+        clock = _StepClock(jump_after_calls=3)
+        recorder = ExchangeKillEvidenceRecorder(
+            resolve_root=lambda _worktree: root,
+            clock=lambda: _FROZEN_AT,
+            monotonic=clock,
+            capture_budget_seconds=10.0,
+        )
+        chunks = [_STRANDED_FOOTER]
+        chunks.extend(b"filler %d\r\n" % index for index in range(200))
+        recording = _recording(tmp_path / "long.jsonl", chunks)
+        recorder.round_started(_identity(tmp_path, recording=recording))
+
+        captured = recorder.capture_abandoned_rounds(7128, reason="deadline")
+
+        assert len(captured) == 1
+        identity = json.loads(
+            (captured[0] / RUN_IDENTITY_FILENAME).read_text(encoding="utf-8")
+        )
+        assert identity["composer_state"]["state"] == "undetermined"
+        assert "abandoned" in identity["composer_state"]["evidence_snippet"]
+
+    def test_the_replay_receives_the_budget_as_its_abort(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from issue_orchestrator.execution import exchange_kill_evidence as module
+
+        seen: dict[str, object] = {}
+
+        def _spy(path: Path, **kwargs: object) -> object:
+            seen.update(kwargs)
+            return module.undetermined_composer_state("spied")
+
+        monkeypatch.setattr(module, "classify_composer_state", _spy)
+        recorder = _recorder(tmp_path / "retained")
+        recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        recorder.capture_abandoned_rounds(7128, reason="deadline")
+
+        assert callable(seen["abort"])
+
+    def test_a_healthy_capture_still_gets_its_verdict(self, tmp_path: Path) -> None:
+        recorder = _recorder(tmp_path / "retained", capture_budget_seconds=600.0)
+        recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        captured = recorder.capture_abandoned_rounds(7128, reason="deadline")
+
+        identity = json.loads(
+            (captured[0] / RUN_IDENTITY_FILENAME).read_text(encoding="utf-8")
+        )
+        assert identity["composer_state"]["state"] == "composer_stranded"

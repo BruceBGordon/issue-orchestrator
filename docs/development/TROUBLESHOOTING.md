@@ -196,7 +196,8 @@ you are looking at the PR #6484 injection/settle family, not a provider stall.
 `composer_state` is read off the **rendered final viewport**, not the raw byte
 history, so an erased footer cannot support a verdict. Anything that makes the
 reconstruction untrustworthy — a half-written recording, an unparseable row, an
-undecodable payload — yields `undetermined` rather than a guess. `matched_marker` names
+undecodable payload, an implausible `resize`, or a replay the capture budget cut
+short — yields `undetermined` rather than a guess. `matched_marker` names
 the affordance that decided it and `evidence_snippet` is the screen row it came
 from — check them before acting on the classification. `replayed_from_start:
 false` means only a trailing window of the recording was replayed; the verdict
