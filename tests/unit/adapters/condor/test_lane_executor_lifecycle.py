@@ -465,6 +465,107 @@ def _interrupted_lane(
     )
 
 
+class _ClockThatFaultsAfterTheInterrupt:
+    """Stands in for the executor module's ``time``.
+
+    Raises ``interrupt`` from the poll loop's sleep to start the
+    cancellation, then raises ``at_first_clock_read`` from the very next
+    ``monotonic()`` — which is the wind-down's first instruction,
+    building its budget. Nothing between the two reads the clock (the
+    interrupt unwinds straight from the sleep into the handler), so this
+    targets that one window and no other.
+    """
+
+    def __init__(
+        self, interrupt: BaseException, at_first_clock_read: BaseException
+    ) -> None:
+        self._interrupt: BaseException | None = interrupt
+        self._pending: BaseException | None = at_first_clock_read
+
+    def sleep(self, seconds: float) -> None:
+        pending = self._interrupt
+        if pending is not None:
+            self._interrupt = None
+            raise pending
+        time.sleep(seconds)
+
+    def monotonic(self) -> float:
+        if self._interrupt is None and self._pending is not None:
+            pending = self._pending
+            self._pending = None
+            raise pending
+        return time.monotonic()
+
+
+def test_a_second_interrupt_building_the_budget_still_chains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 4: the budget was built on the line BEFORE the try, so the
+    wind-down's own first instruction sat outside the policy it exists
+    to apply. An interrupt there escaped unchained — __cause__ None —
+    the same contract break round 3 fixed one statement later."""
+    history = tmp_path / "per-job-history"
+    history.mkdir()
+    tools = _cancellable_tools(
+        tmp_path, history=history, removal_writes_classad=False
+    )
+    executor = CondorLaneExecutor(tools)
+    first = KeyboardInterrupt("first")
+    second = KeyboardInterrupt("second")
+    monkeypatch.setattr(
+        lane_executor_module,
+        "time",
+        _ClockThatFaultsAfterTheInterrupt(first, second),
+    )
+
+    work_key = "lifecycle.budgetinterrupt"
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _interrupted_lane(tools, tmp_path, work_key)
+
+    assert caught.value is second, "the second interrupt did not win"
+    assert caught.value.__cause__ is first, (
+        "the original ending vanished: the boundary did not cover the "
+        "budget construction"
+    )
+    for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_a_system_exit_building_the_budget_is_contained_and_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The same window, the other half of the policy: a SystemExit at
+    the wind-down's first instruction must not replace the real ending,
+    and must not vanish unrecorded."""
+    history = tmp_path / "per-job-history"
+    history.mkdir()
+    tools = _cancellable_tools(
+        tmp_path, history=history, removal_writes_classad=False
+    )
+    executor = CondorLaneExecutor(tools)
+    original = KeyboardInterrupt("the real ending")
+    monkeypatch.setattr(
+        lane_executor_module,
+        "time",
+        _ClockThatFaultsAfterTheInterrupt(original, SystemExit(17)),
+    )
+
+    work_key = "lifecycle.budgetexit"
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _interrupted_lane(tools, tmp_path, work_key)
+
+    assert caught.value is original, (
+        "a SystemExit building the budget rewrote why the lane ended"
+    )
+    stderr = capsys.readouterr().err
+    assert "cancellation cleanup gave up after" in stderr, stderr
+    assert "SystemExit" in stderr, stderr
+    for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 def test_the_cancellation_budget_also_bounds_the_removal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

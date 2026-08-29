@@ -539,8 +539,17 @@ class CondorLaneExecutor:
         never substituted in silence, so the original ending stays
         readable as ``__cause__`` even when both are interrupts.
         """
-        budget = _CollectionBudget.lasting(_CANCELLED_ACCOUNTING_WAIT_SECONDS)
         try:
+            # Inside the boundary, not before it: NOTHING in this body
+            # may precede the policy, and "the budget" was the last
+            # instruction still doing so (round 4). Reading the clock is
+            # about the least likely thing here to fail, which is
+            # exactly why it was easy to leave outside and exactly why
+            # leaving it there was wrong — the guarantee is structural,
+            # not a bet on which statements can throw.
+            budget = _CollectionBudget.lasting(
+                _CANCELLED_ACCOUNTING_WAIT_SECONDS
+            )
             self._remove(job_id, budget.remaining_seconds())
             if not budget.exhausted():
                 streams.pump()
