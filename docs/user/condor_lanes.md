@@ -252,8 +252,16 @@ normal.
   `event_classifier.py` translates job event logs inbound into typed
   lifecycle states. Scheduler vocabulary is forbidden outside this
   package by the `semgrep_condor_vocabulary` guardrail.
-- `entrypoints/cli_tools/lane_run.py` — the composition root the
-  Makefile invokes; selects the backend.
+- `execution/lane_backends.py` — the backend registry: one entry per
+  backend carrying BOTH factories (executor and policy check), with the
+  selectable names derived from it. A backend cannot be runnable
+  without also being checkable.
+- `ports/lane_policy_check.py` + `adapters/condor/pool_policy.py` —
+  the pool-policy self-check (above).
+- `entrypoints/cli_tools/lane_run.py` — the per-lane entrypoint the
+  Makefile invokes; `entrypoints/cli_tools/lane_preflight.py` — the
+  once-per-gate policy preflight. Both resolve their backend through
+  the registry.
 
 Interactive agent sessions (PTY) are out of scope for this backend —
 see issue #7112. Multi-machine pools are a follow-on; everything here

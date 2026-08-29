@@ -24,6 +24,7 @@ on:
       - 'scripts/lane_slices.py'
       - 'tests/unit/test_lane_slices.py'
       - 'tests/unit/test_condor_personal_script.py'
+      - 'tests/unit/test_lane_backends_registry.py'
       - 'tests/unit/test_validate_gate_lane_coverage.py'
       - 'Makefile'
       - '.issue-orchestrator/config/modes/**'
