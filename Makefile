@@ -353,7 +353,7 @@ define TIMED_RUN
 		echo "[lane-verdict] ignoring LANE_VERDICT_* for $$target - non-environment transport on: $(LANE_VERDICT_OVERRIDDEN) - the environment is the only sanctioned transport; lane runs uncached" >&2; \
 	fi; \
 	if [ $$verdict_on -eq 1 ]; then \
-		$(LANE_VERDICT) check --worktree "$(CURDIR)" --target "$$target"; vrc=$$?; \
+		$(LANE_VERDICT) check --worktree "$(LANE_VERDICT_WORKTREE)" --target "$$target"; vrc=$$?; \
 	else \
 		vrc=3; \
 	fi; \
@@ -366,7 +366,7 @@ define TIMED_RUN
 		status=$$?; \
 		if [ $$verdict_on -eq 0 ] || [ $$status -ne 0 ]; then \
 			:; \
-		elif ! $(LANE_VERDICT) record --worktree "$(CURDIR)" --target "$$target" --exit-status $$status; then \
+		elif ! $(LANE_VERDICT) record --worktree "$(LANE_VERDICT_WORKTREE)" --target "$$target" --exit-status $$status; then \
 			echo "[lane-verdict] warning: could not record green for $$target (store at $(CURDIR)) - no verdict left, lane outcome preserved" >&2; \
 		fi; \
 	fi; \
@@ -383,8 +383,26 @@ endef
 # lane's status on the first live gate). Correct by construction: the
 # interpreter is absolutized when it is a path, and the worktree is
 # passed explicitly as $(CURDIR) - never inferred from the shell's cwd.
-LANE_VERDICT_PYTHON = $(if $(findstring /,$(PYTHON)),$(abspath $(PYTHON)),$(PYTHON))
-LANE_VERDICT = $(LANE_VERDICT_PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_verdict
+# Every variable in the verdict layer's enforcement chain carries the
+# `override` directive: round 4 proved the policy helpers are
+# themselves ordinary make variables, and a command-line assignment
+# (LANE_VERDICT_VARIABLES=... to narrow the declared set,
+# LANE_VERDICT_OVERRIDDEN= to blank the collection) bypassed the whole
+# origin check. `override` is GNU make's documented mechanism for
+# winning against command-line assignments at every make level. The
+# chain: the CLI invocation (a replaced LANE_VERDICT could answer
+# 'cached' for every lane), its interpreter, the declared variable
+# set, the override collection, and the worktree (snapshotted from
+# CURDIR at parse so a redirected CURDIR cannot re-aim the store).
+# Deliberately NOT overridden: $(PYTHON) is the whole build's
+# interpreter knob with legitimate overrides (tests, worktrees) far
+# beyond this layer; replacing it cannot selectively forge verdicts
+# without visibly breaking every other lane invocation, and the
+# absolutized copy below is pinned. Shell-level state (verdict_on,
+# vrc, status, target) is untouchable by make assignments.
+override LANE_VERDICT_PYTHON = $(if $(findstring /,$(PYTHON)),$(abspath $(PYTHON)),$(PYTHON))
+override LANE_VERDICT = $(LANE_VERDICT_PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_verdict
+override LANE_VERDICT_WORKTREE := $(CURDIR)
 # The layer's COMPLETE variable set. Engagement requires EVERY one of
 # these to be environment-origin (undefined is fine - absence is
 # handled separately); one override-origin variable anywhere refuses
@@ -393,8 +411,8 @@ LANE_VERDICT = $(LANE_VERDICT_PYTHON) -m issue_orchestrator.entrypoints.cli_tool
 # the lane set under an environment SHA). The origin check ITERATES
 # this list, so a future LANE_VERDICT_* variable is covered by
 # construction - add it here and the transport check owns it.
-LANE_VERDICT_VARIABLES := LANE_VERDICT_SHA LANE_VERDICT_LANES
-LANE_VERDICT_OVERRIDDEN = $(strip $(foreach v,$(LANE_VERDICT_VARIABLES),$(if $(filter environment undefined,$(origin $(v))),,$(v))))
+override LANE_VERDICT_VARIABLES := LANE_VERDICT_SHA LANE_VERDICT_LANES
+override LANE_VERDICT_OVERRIDDEN = $(strip $(foreach v,$(LANE_VERDICT_VARIABLES),$(if $(filter environment undefined,$(origin $(v))),,$(v))))
 
 # Two-pass typecheck: strict for core (domain/ports/control), standard for rest
 # --warnings ensures 0 warnings required (exit code 1 if warnings reported)
@@ -877,7 +895,10 @@ endif
 # policy — every lane must pass either way, and the pool's admission
 # (request_cpus, exclusives) replaces the sequential phase structure
 # that protected the direct path from oversubscription.
-_VALIDATE_PR_FLAT_TARGETS := typecheck lint-arch lint-complexity test-unit \
+# `override`: this list feeds the fan's prerequisites, the -j width,
+# AND the exported LANE_VERDICT_LANES - a command-line assignment
+# would narrow all three (a shrunken fan is a vacuous suite green).
+override _VALIDATE_PR_FLAT_TARGETS := typecheck lint-arch lint-complexity test-unit \
 	test-simulated-core test-simulated-agent \
 	test-integration-core-slice-1 test-integration-core-slice-2 test-integration-core-slice-3 \
 	test-integration-agent-claude test-integration-agent-codex test-integration-agent-chain \

@@ -554,11 +554,26 @@ def _assert_layer_refused(
     first: "subprocess.CompletedProcess[str]",
     second: "subprocess.CompletedProcess[str]",
     repo: Path,
+    *,
+    naming: str,
+    not_named: str = "",
 ) -> None:
     assert first.returncode == 0
     assert "RAN-OK" in first.stdout
     assert "recorded-green" not in first.stdout, first.stdout
-    assert "ignoring LANE_VERDICT_" in first.stderr, first.stderr
+    # The refusal names the EXACT offending variable(s), so an operator
+    # sees which transport misfired, not a generic shrug.
+    assert f"non-environment transport on: {naming} " in first.stderr, (
+        first.stderr
+    )
+    if not_named:
+        refusal = [
+            line
+            for line in first.stderr.splitlines()
+            if "non-environment transport" in line
+        ][0]
+        named_section = refusal.split("transport on:")[1].split(" - ")[0]
+        assert not_named not in named_section, refusal
     lanes_root = repo / ".issue-orchestrator" / "validation" / "lanes"
     assert not list(lanes_root.glob("*/*.json"))
     assert "cached-green" not in second.stdout
@@ -581,7 +596,13 @@ def test_mixed_origin_env_sha_cli_lanes_refuses_the_whole_layer(
     sha = _commit_all(repo)
     first = _mixed_origin_run(repo, sha, sha_via="env", lanes_via="cli")
     second = _mixed_origin_run(repo, sha, sha_via="env", lanes_via="cli")
-    _assert_layer_refused(first, second, repo)
+    _assert_layer_refused(
+        first,
+        second,
+        repo,
+        naming="LANE_VERDICT_LANES",
+        not_named="LANE_VERDICT_SHA",
+    )
 
 
 def test_mixed_origin_cli_sha_env_lanes_refuses_the_whole_layer(
@@ -596,7 +617,96 @@ def test_mixed_origin_cli_sha_env_lanes_refuses_the_whole_layer(
     sha = _commit_all(repo)
     first = _mixed_origin_run(repo, sha, sha_via="cli", lanes_via="env")
     second = _mixed_origin_run(repo, sha, sha_via="cli", lanes_via="env")
-    _assert_layer_refused(first, second, repo)
+    _assert_layer_refused(
+        first,
+        second,
+        repo,
+        naming="LANE_VERDICT_SHA",
+        not_named="LANE_VERDICT_LANES",
+    )
+
+
+def test_both_cli_refusal_names_both_variables(tmp_path: Path) -> None:
+    repo, _ = _fake_repo(tmp_path)
+    (repo / "extra.mk").write_text(
+        "ok-lane:\n\t$(call TIMED_RUN,ok-lane,echo RAN-OK)\n"
+    )
+    sha = _commit_all(repo)
+    first = _mixed_origin_run(repo, sha, sha_via="cli", lanes_via="cli")
+    second = _mixed_origin_run(repo, sha, sha_via="cli", lanes_via="cli")
+    _assert_layer_refused(
+        first, second, repo, naming="LANE_VERDICT_SHA LANE_VERDICT_LANES"
+    )
+
+
+def _helper_override_run(
+    repo: Path, sha: str, helper_assignment: str
+) -> subprocess.CompletedProcess[str]:
+    """Mixed-origin delivery PLUS a command-line assignment attacking
+    a policy helper itself (round 4)."""
+    make = shutil.which("gmake") or "make"
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"LANE_VERDICT_SHA", "LANE_VERDICT_LANES"}
+    }
+    environment["PYTHONPATH"] = str(REPO_ROOT / "src")
+    environment["LANE_VERDICT_SHA"] = sha
+    return subprocess.run(
+        [
+            make,
+            "-f",
+            str(REPO_ROOT / "Makefile"),
+            "-f",
+            "extra.mk",
+            f"PYTHON={REPO_ROOT / '.venv' / 'bin' / 'python'}",
+            "ok-lane",
+            "LANE_VERDICT_LANES=ok-lane",
+            helper_assignment,
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+
+def test_narrowing_the_declared_variable_set_cannot_bypass(
+    tmp_path: Path,
+) -> None:
+    """Round-4 finding: the policy helpers are themselves make
+    variables. LANE_VERDICT_VARIABLES=LANE_VERDICT_SHA narrowed the
+    declared set so the origin check never inspected LANES, and the
+    override-supplied lane set engaged silently. The `override`
+    directive pins the policy definitions against command-line
+    assignment at every make level."""
+    repo, _ = _fake_repo(tmp_path)
+    (repo / "extra.mk").write_text(
+        "ok-lane:\n\t$(call TIMED_RUN,ok-lane,echo RAN-OK)\n"
+    )
+    sha = _commit_all(repo)
+    first = _helper_override_run(
+        repo, sha, "LANE_VERDICT_VARIABLES=LANE_VERDICT_SHA"
+    )
+    second = _helper_override_run(
+        repo, sha, "LANE_VERDICT_VARIABLES=LANE_VERDICT_SHA"
+    )
+    _assert_layer_refused(first, second, repo, naming="LANE_VERDICT_LANES")
+
+
+def test_blanking_the_override_collection_cannot_bypass(
+    tmp_path: Path,
+) -> None:
+    """The sibling attack: LANE_VERDICT_OVERRIDDEN= blanked the
+    collection wholesale, unconditionally engaging the layer."""
+    repo, _ = _fake_repo(tmp_path)
+    (repo / "extra.mk").write_text(
+        "ok-lane:\n\t$(call TIMED_RUN,ok-lane,echo RAN-OK)\n"
+    )
+    sha = _commit_all(repo)
+    first = _helper_override_run(repo, sha, "LANE_VERDICT_OVERRIDDEN=")
+    second = _helper_override_run(repo, sha, "LANE_VERDICT_OVERRIDDEN=")
+    _assert_layer_refused(first, second, repo, naming="LANE_VERDICT_LANES")
 
 
 def test_untracked_state_disengages_the_cache_both_ways(
