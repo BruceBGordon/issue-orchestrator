@@ -20,7 +20,6 @@ from issue_orchestrator.infra.machine_state import (
     CpuTicks,
     HostMachineStateSampler,
     default_machine_state_sampler,
-    describe_exception,
     idle_percent_between,
     machine_state_fields,
     parse_proc_stat_idle_percent,
@@ -328,19 +327,6 @@ class TestSamplingFailureNeverPropagates:
 
         with pytest.raises(KeyboardInterrupt):
             sample_machine_state_from(acquire)
-
-    def test_the_renderer_never_raises_whatever_it_is_handed(self) -> None:
-        """The rendering helper is the boundary's last line, so it is
-        pinned directly: normal errors keep their message, hostile ones
-        degrade to a name, and nothing escapes."""
-
-        class _Hostile(Exception):
-            def __repr__(self) -> str:
-                raise ValueError("no repr")
-
-        assert "boom" in describe_exception(ValueError("boom"))
-        assert describe_exception(_Hostile()) == "_Hostile"
-        assert describe_exception(KeyboardInterrupt()) == "KeyboardInterrupt()"
 
     def test_a_sampler_answering_with_the_wrong_type_is_contained(self) -> None:
         class _Wrong:

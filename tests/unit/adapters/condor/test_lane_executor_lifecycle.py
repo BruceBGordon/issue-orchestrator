@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -262,6 +263,20 @@ _CANCELLED_CLASSAD = 'ExitCode = undefined\nRemoveReason = "via condor_rm"\n'
 _SLOW_LOOKUP_SECONDS = 20.0
 
 
+def _unhurried_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take the cancellation clock out of a test that is not about it.
+
+    The real budget is two seconds, which on a loaded parallel suite is
+    a genuine race against the two subprocess spawns the wind-down makes
+    before it reaches the accounting stage — so a test asserting what
+    happens AT that stage would be measuring machine load. The three
+    duration tests own the budget; these own the behaviour.
+    """
+    monkeypatch.setattr(
+        lane_executor_module, "_CANCELLED_ACCOUNTING_WAIT_SECONDS", 30.0
+    )
+
+
 def _cancellable_tools(
     tmp_path: Path,
     *,
@@ -320,6 +335,7 @@ def test_a_cancelled_lane_also_collects_its_per_job_accounting(
     """
     history = tmp_path / "per-job-history"
     history.mkdir()
+    _unhurried_cancellation(monkeypatch)
     tools = _cancellable_tools(
         tmp_path, history=history, removal_writes_classad=True
     )
@@ -407,6 +423,164 @@ def test_the_cancellation_budget_bounds_the_whole_collection(
         shutil.rmtree(directory, ignore_errors=True)
 
 
+class _ToolThatRaises:
+    """Stands in for the executor module's ``subprocess``.
+
+    An interrupt can arrive while the executor is blocked on a scheduler
+    TOOL, not only while it is sleeping — and the removal is the first
+    and likeliest such window on the cancellation path. Keying on the
+    tool's name rather than a call count says which window the test is
+    about, and survives any reordering of the calls around it.
+    """
+
+    def __init__(self, tool_name: str, error: BaseException) -> None:
+        self._tool_name = tool_name
+        self._pending: BaseException | None = error
+
+    def run(
+        self, arguments: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        pending = self._pending
+        if pending is not None and Path(arguments[0]).name == self._tool_name:
+            self._pending = None
+            raise pending
+        return subprocess.run(arguments, **kwargs)  # type: ignore[arg-type]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(subprocess, name)
+
+
+def _interrupted_lane(
+    tools: CondorTools, tmp_path: Path, work_key: str
+) -> None:
+    """Drive one lane whose poll loop is interrupted; never returns."""
+    CondorLaneExecutor(tools).run(
+        LaneCommand(
+            work_key=LaneWorkKey(work_key),
+            arguments=(sys.executable, "-c", "pass"),
+            working_directory=tmp_path,
+            deadline=LaneDeadline(300.0),
+        ),
+        LaneResources(request_cpus=1),
+    )
+
+
+def test_the_cancellation_budget_also_bounds_the_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3 finding 1: the budget was created inside the accounting
+    step, so the two stages before it were outside the clock entirely —
+    a slow condor_rm spent the general 30s tool timeout and only THEN
+    did a 2s "budget" begin. The wind-down owns the whole operation, so
+    the removal draws from the same allowance as everything else."""
+    history = tmp_path / "per-job-history"
+    history.mkdir()
+    tools = _cancellable_tools(
+        tmp_path, history=history, removal_writes_classad=False
+    )
+    tools.remove.write_text(f"#!/bin/sh\nexec sleep {_SLOW_LOOKUP_SECONDS:.0f}\n")
+    tools.remove.chmod(0o755)
+    work_key = "lifecycle.slowremoval"
+    executor = CondorLaneExecutor(tools)
+    monkeypatch.setattr(
+        lane_executor_module, "time", _WaitsThatRaise(KeyboardInterrupt())
+    )
+
+    started = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        executor.run(
+            LaneCommand(
+                work_key=LaneWorkKey(work_key),
+                arguments=(sys.executable, "-c", "pass"),
+                working_directory=tmp_path,
+                deadline=LaneDeadline(300.0),
+            ),
+            LaneResources(request_cpus=1),
+        )
+    elapsed = time.monotonic() - started
+
+    budget = lane_executor_module._CANCELLED_ACCOUNTING_WAIT_SECONDS
+    assert elapsed < budget * 4, (
+        "the cancellation budget did not span the job removal: "
+        f"{elapsed:.2f}s for a {budget:.0f}s budget"
+    )
+    for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_a_second_interrupt_during_the_removal_still_chains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3 finding 2: the exception boundary began AFTER the
+    removal, so an interrupt during that subprocess wait — the earliest
+    and likeliest window — escaped as the newest exception with no
+    __cause__, silently breaking the chaining contract round 2 added."""
+    history = tmp_path / "per-job-history"
+    history.mkdir()
+    tools = _cancellable_tools(
+        tmp_path, history=history, removal_writes_classad=False
+    )
+    executor = CondorLaneExecutor(tools)
+    first = KeyboardInterrupt("first")
+    second = KeyboardInterrupt("second")
+    monkeypatch.setattr(lane_executor_module, "time", _WaitsThatRaise(first))
+    monkeypatch.setattr(
+        lane_executor_module,
+        "subprocess",
+        _ToolThatRaises("condor_rm", second),
+    )
+
+    work_key = "lifecycle.interruptedremoval"
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _interrupted_lane(tools, tmp_path, work_key)
+
+    assert caught.value is second, "the second interrupt did not win"
+    assert caught.value.__cause__ is first, (
+        "the original ending vanished: the boundary did not cover the removal"
+    )
+    for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_a_system_exit_during_the_removal_is_contained_and_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round 3 finding 3: SystemExit behaved differently in the two
+    windows — it propagated during the removal (replacing the real
+    ending, the exact harm the policy names) and was swallowed in
+    silence during the accounting by a leftover bare containment.
+
+    One policy across the whole wind-down: contained, so it cannot
+    rewrite why the lane ended, and RECORDED, because a containment that
+    reports nothing is indistinguishable from a bug."""
+    history = tmp_path / "per-job-history"
+    history.mkdir()
+    tools = _cancellable_tools(
+        tmp_path, history=history, removal_writes_classad=False
+    )
+    executor = CondorLaneExecutor(tools)
+    original = KeyboardInterrupt("the real ending")
+    monkeypatch.setattr(lane_executor_module, "time", _WaitsThatRaise(original))
+    monkeypatch.setattr(
+        lane_executor_module,
+        "subprocess",
+        _ToolThatRaises("condor_rm", SystemExit("cleanup exit")),
+    )
+
+    work_key = "lifecycle.exitduringremoval"
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _interrupted_lane(tools, tmp_path, work_key)
+
+    assert caught.value is original, (
+        "a SystemExit during cleanup rewrote why the lane ended"
+    )
+    stderr = capsys.readouterr().err
+    assert "cancellation cleanup gave up after" in stderr, stderr
+    assert "SystemExit" in stderr, stderr
+    for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 @pytest.mark.parametrize(
     "original",
     [KeyboardInterrupt("first"), asyncio.CancelledError("cancelled")],
@@ -425,6 +599,7 @@ def test_a_second_interrupt_during_cleanup_wins(
     """
     history = tmp_path / "per-job-history"
     history.mkdir()
+    _unhurried_cancellation(monkeypatch)
     # No ClassAd is ever written, so the collection reaches its own
     # file-wait - exactly where the second interrupt lands.
     tools = _cancellable_tools(

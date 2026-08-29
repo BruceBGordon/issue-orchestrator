@@ -23,7 +23,7 @@ from ...domain.lane_execution import (
     LaneResources,
     LaneTimedOut,
 )
-from ...infra.teardown_signals import TEARDOWN_SIGNALS
+from ...infra.containment import TEARDOWN_SIGNALS, describe_exception
 from .event_classifier import (
     LaneJobDeadlineRemoved,
     LaneJobExited,
@@ -130,6 +130,16 @@ class _CollectionBudget:
 
     def exhausted(self) -> bool:
         return self.remaining_seconds() <= 0.0
+
+
+def _job_accounting_budget() -> _CollectionBudget:
+    """The allowance for collecting a concluded lane's accounting.
+
+    Not a cancellation: nobody is waiting on a keystroke, so this is the
+    generous bound. The cancellation path builds its own, much tighter
+    one and spends it across the whole wind-down.
+    """
+    return _CollectionBudget.lasting(_JOB_ACCOUNTING_WAIT_SECONDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,13 +372,17 @@ class CondorLaneExecutor:
                 # Retention and accounting collection are ONE decision:
                 # whatever is worth keeping the directory for is worth
                 # the scheduler's own final word on the job.
-                self._collect_job_accounting(job_id, run_directory)
+                self._collect_job_accounting(
+                    job_id, run_directory, _job_accounting_budget()
+                )
             return terminal
         except LaneExecutorError as error:
             if job_id is not None and streams is not None:
-                self._remove(job_id)
+                self._remove(job_id, _TOOL_TIMEOUT_SECONDS)
                 streams.pump()
-                self._collect_job_accounting(job_id, run_directory)
+                self._collect_job_accounting(
+                    job_id, run_directory, _job_accounting_budget()
+                )
             raise LaneExecutorError(
                 f"{error} (lane diagnostics retained at {run_directory})"
             ) from error
@@ -506,33 +520,45 @@ class CondorLaneExecutor:
         retained directory, and so does its accounting — the removal
         here is exactly what makes the ClassAd appear.
 
+        ONE clock and ONE policy, both from the first instruction (round
+        3). Round 2 put the budget and the exception boundary around the
+        accounting only, which left the two stages before it — the
+        removal and the stream drain — outside both: a slow ``condor_rm``
+        spent the general tool timeout on top of the budget, a second
+        interrupt during it propagated with no ``__cause__``, and a
+        ``SystemExit`` during it replaced the original ending outright.
+        A method that owns an operation owns all of it, so the budget is
+        created here and every stage below draws from it.
+
         Nothing this does may rewrite why the lane ended, so ordinary
-        collection failures (and ``SystemExit``) are contained. The one
-        exception is the whole point of the teardown policy (round 2
-        finding 2): a SECOND interrupt arriving during cleanup means the
-        operator is no longer willing to wait for the cleanup, so it
-        wins over the first — chained, never substituted in silence, so
-        the original ending stays readable as ``__cause__`` even when
-        both are interrupts.
+        failures and ``SystemExit`` are contained — and RECORDED, because
+        a containment that reports nothing is indistinguishable from a
+        bug. The single exception is the teardown policy: a second
+        interrupt arriving during cleanup means the operator is no longer
+        willing to wait for it, so it wins over the first — chained,
+        never substituted in silence, so the original ending stays
+        readable as ``__cause__`` even when both are interrupts.
         """
-        self._remove(job_id)
-        streams.pump()
+        budget = _CollectionBudget.lasting(_CANCELLED_ACCOUNTING_WAIT_SECONDS)
         try:
-            self._collect_job_accounting(
-                job_id,
-                run_directory,
-                wait_seconds=_CANCELLED_ACCOUNTING_WAIT_SECONDS,
-            )
+            self._remove(job_id, budget.remaining_seconds())
+            if not budget.exhausted():
+                streams.pump()
+            self._collect_job_accounting(job_id, run_directory, budget)
         except TEARDOWN_SIGNALS as interrupt:
             raise interrupt from unwinding
-        except BaseException:
-            pass
+        except BaseException as contained:
+            print(
+                "condor lane: cancellation cleanup gave up after "
+                f"{describe_exception(contained)}",
+                file=sys.stderr,
+            )
 
     def _collect_job_accounting(
         self,
         job_id: str,
         run_directory: Path,
-        wait_seconds: float = _JOB_ACCOUNTING_WAIT_SECONDS,
+        budget: _CollectionBudget,
     ) -> None:
         """Copy this job's final ClassAd into the retained diagnostics.
 
@@ -548,10 +574,12 @@ class CondorLaneExecutor:
         that stopped writing per-job accounting is visible rather than
         quietly unhelpful.
 
-        ``wait_seconds`` bounds the WHOLE attempt, lookup included, not
-        one stage of it (round 2 finding 1).
+        The ``budget`` belongs to the caller's whole operation, not to
+        this collection: on the cancellation path the removal has
+        already drawn from it. Every stage below asks what is left
+        before it starts, so nothing new begins after expiry (round 2
+        finding 1, round 3 finding 1).
         """
-        budget = _CollectionBudget.lasting(wait_seconds)
         if _JOB_IDENTIFIER_RE.fullmatch(job_id) is None:
             # The ClassAd file is named history.<cluster>.<proc>, so the
             # identifier is also a path component: never build a read
@@ -588,9 +616,18 @@ class CondorLaneExecutor:
             return
         source = directory / f"history.{job_id}"
         # The SAME budget the lookup drew from: whatever it spent is
-        # gone, and never sleeps past the end of it.
-        while not source.is_file() and not budget.exhausted():
+        # gone. Exhaustion is checked BEFORE the stat, not after it, so
+        # a stuck filesystem cannot start one more probe past the
+        # deadline, and the sleep never runs past the end of it.
+        while not budget.exhausted() and not source.is_file():
             time.sleep(min(_POLL_INTERVAL_SECONDS, budget.remaining_seconds()))
+        if budget.exhausted():
+            print(
+                "condor lane: the per-job accounting budget ran out before "
+                f"{source} could be collected",
+                file=sys.stderr,
+            )
+            return
         try:
             shutil.copyfile(source, run_directory / _JOB_ACCOUNTING_FILE_NAME)
         except OSError as error:
@@ -657,9 +694,20 @@ class CondorLaneExecutor:
             )
         return first_token[0]
 
-    def _remove(self, job_id: str) -> None:
+    def _remove(self, job_id: str, timeout_seconds: float) -> None:
+        """Remove the job, within the CALLER'S allowance.
+
+        The timeout is required rather than defaulted: a removal during
+        a cancellation draws from the same budget as everything else
+        that cleanup does, and one that quietly took the general tool
+        timeout instead is what made a 2s cancellation budget measure
+        5.35s (round 3 finding 1).
+        """
         try:
-            self._tools.invoke((str(self._tools.remove), job_id))
+            self._tools.invoke(
+                (str(self._tools.remove), job_id),
+                timeout_seconds=timeout_seconds,
+            )
         except LaneExecutorError:
             # Best-effort during unwinding; the primary error wins.
             return

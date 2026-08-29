@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Callable
 
 from ..ports.machine_state import MachineState, MachineStateSampler
-from .teardown_signals import TEARDOWN_SIGNALS
+from .containment import TEARDOWN_SIGNALS, describe_exception, safe_type_name
 
 logger = logging.getLogger(__name__)
 
@@ -102,40 +102,6 @@ class _HostCpuLoadInfo(ctypes.Structure):
     _fields_ = [("cpu_ticks", ctypes.c_uint * 4)]
 
 
-_UNRENDERABLE = "<unrenderable exception>"
-# A hostile or merely enormous exception must not bloat every JSONL row.
-_MAX_PROBE_ERROR_CHARS = 500
-
-
-def _safe_type_name(value: object) -> str:
-    """The type's name, without trusting a hostile metaclass for it."""
-    try:
-        name = type(value).__name__
-    except BaseException:
-        return _UNRENDERABLE
-    if type(name) is not str or not name:
-        return _UNRENDERABLE
-    return name
-
-
-def describe_exception(error: BaseException) -> str:
-    """Render an exception for the record WITHOUT trusting the exception.
-
-    An exception is user code: ``__str__`` and ``__repr__`` can raise,
-    return a non-string, or return megabytes. Rendering one inside a
-    containment boundary and letting that rendering raise is how the
-    boundary leaks (round 1 finding A) — so every attempt is itself
-    contained and the last resort is a constant.
-    """
-    try:
-        rendered = repr(error)
-    except BaseException:
-        rendered = ""
-    if type(rendered) is not str or not rendered:
-        rendered = _safe_type_name(error)
-    return rendered[:_MAX_PROBE_ERROR_CHARS]
-
-
 def sample_machine_state(sampler: MachineStateSampler) -> MachineState:
     """Read host contention, containing any sampling failure here."""
     return sample_machine_state_from(lambda: sampler)
@@ -161,7 +127,7 @@ def sample_machine_state_from(
     handler raising one during the sampling window, sailed straight
     through and replaced an ALREADY-DECIDED lane outcome before it could
     be journaled. So this catches ``BaseException`` and re-raises only
-    ``TEARDOWN_SIGNALS`` (``infra/teardown_signals.py``, shared with the
+    ``TEARDOWN_SIGNALS`` (``infra/containment.py``, shared with the
     lane executor's cancellation path so the two cannot drift) — the
     signals whose whole meaning is "stop, the caller is going away".
 
@@ -184,7 +150,7 @@ def sample_machine_state_from(
     if type(state) is not MachineState:
         # A sampler answering with the wrong type is a bug, but not one
         # worth failing a gate over: record it like any failed probe.
-        name = _safe_type_name(state)
+        name = safe_type_name(state)
         logger.warning("machine-state sampler returned %s", name)
         return unmeasured_machine_state(
             f"sampler returned {name}, not MachineState",

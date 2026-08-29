@@ -391,7 +391,7 @@ open. So every row of both
   contained and recorded, because the alternative is a probe replacing
   the gate's own exit code. Only teardown signals get out
   (`KeyboardInterrupt`, `GeneratorExit`, `CancelledError`, listed once
-  in `infra/teardown_signals.py` and shared with the lane executor's
+  in `infra/containment.py` and shared with the lane executor's
   cancellation path): the operator's Ctrl-C must win. Rendering the
   failure is itself contained, so an exception whose `__str__` or
   `__repr__` raises degrades to its type name instead of escaping.
@@ -414,19 +414,30 @@ appear. It is best-effort by construction: it runs while a lane is
 already ending badly, so a pool without the knob costs the ClassAd and a
 stderr line, never the lane's own result.
 
-Two properties make that safe to do while a lane is being cancelled:
+Two properties make that safe to do while a lane is being cancelled.
+Both start at the first instruction of the wind-down and cover all of
+it — job removal, stream draining, configuration lookup, the wait for
+the file, and the copy:
 
-- **One budget spans the whole attempt** (a couple of seconds there
-  rather than the usual ten), configuration lookup included — not a
-  per-stage timeout. A pool whose tools have gone slow cannot spend an
-  interrupted lane's allowance on the lookup and then start waiting;
-  whatever the lookup spends is gone, and a stage with nothing left is
-  skipped. Spending the budget costs the ClassAd, and says so.
-- **A second Ctrl-C wins.** Ordinary collection failures (and
-  `SystemExit`) stay contained so a diagnostic cannot rewrite why the
-  lane ended, but a teardown signal arriving *during* cleanup means the
-  operator is no longer willing to wait for it — it propagates, with the
-  original ending chained as `__cause__` rather than discarded.
+- **One budget spans the whole wind-down** (a couple of seconds there
+  rather than the usual ten), not a per-stage timeout. A pool whose
+  tools have gone slow cannot spend an interrupted lane's allowance on
+  the removal or the lookup and then start waiting: whatever a stage
+  spends is gone, and a stage with nothing left is skipped rather than
+  started — including the `stat` and the copy. Spending the budget costs
+  the ClassAd, and says so.
+- **A second Ctrl-C wins, from the first instruction.** Ordinary
+  failures and `SystemExit` stay contained so a diagnostic cannot
+  rewrite why the lane ended — and are *recorded*, since a containment
+  that reports nothing is indistinguishable from a bug. A teardown
+  signal arriving *during* cleanup means the operator is no longer
+  willing to wait for it: it propagates, with the original ending
+  chained as `__cause__` rather than discarded.
+
+The primitives both boundaries share — which exceptions are teardown
+signals, and how to render a contained one without trusting it — live in
+`infra/containment.py`, so the sampler and the wind-down cannot drift
+apart.
 
 **That knob is a loaded gun, and the pool helper treats it as one.** A
 *missing* per-job history directory is safe — condor logs `must point to
