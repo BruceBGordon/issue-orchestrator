@@ -15,9 +15,14 @@ import pytest
 
 from tests.sandbox_probe_retry import (
     TIMEOUT_RETURNCODE,
+    AbsentContent,
+    AbsentPath,
     AllEvidence,
     CreatedPaths,
+    PresentContent,
+    ProbeBreach,
     ProbeTimeout,
+    UnchangedBytes,
     run_until_evidence,
 )
 
@@ -410,3 +415,141 @@ def test_timed_out_attempt_never_counts_even_with_its_evidence_present() -> None
     )
     assert probe.completed_attempt is not None
     assert probe.completed_attempt.number == 2
+
+
+def test_a_breach_is_reported_ahead_of_the_timeout_that_followed_it(
+    tmp_path: Path,
+) -> None:
+    """Breach-first ordering, owned here so no call site can reverse it.
+
+    Two probes had ``require_completed()`` before their snapshot assertions,
+    and a run that escaped the worktree on its final attempt and then timed out
+    reported the timeout — burying the breach. ``require_intact`` evaluates
+    every attempt's snapshot first, so the finding that surfaces is the leak.
+    """
+    escaped = tmp_path / "escaped.txt"
+    completed = tmp_path / "completed.txt"
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        escaped.write_text("ESCAPED", encoding="utf-8")
+        raise _timeout()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(AbsentPath(escaped, "a write escaped the worktree"),),
+    )
+
+    assert probe.timed_out, "the run really did end on a timeout..."
+    with pytest.raises(ProbeBreach) as excinfo:
+        probe.require_intact()
+    assert "a write escaped the worktree" in str(excinfo.value)
+
+    # ...and the timeout is still there for a run with nothing to report.
+    with pytest.raises(ProbeTimeout):
+        probe.require_completed()
+
+
+def test_declaring_a_breach_check_is_what_captures_its_path(tmp_path: Path) -> None:
+    """A breach path cannot be omitted from the capture set.
+
+    The other half of the same review finding: the leak-bearing sinks were
+    breach-relevant but absent from ``observed_paths``, so nothing was captured
+    to check. Naming a path in a check is now the only declaration needed.
+    """
+    leaky = tmp_path / "secret-read.txt"
+    completed = tmp_path / "completed.txt"
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        leaky.write_text("TOPSECRET", encoding="utf-8")
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(AbsentContent(leaky, b"TOPSECRET", "the secret was read"),),
+        # Deliberately NOT listed here.
+        observed_paths=(),
+    )
+
+    assert probe.snapshots[0][leaky] == b"TOPSECRET"
+    with pytest.raises(ProbeBreach):
+        probe.require_intact()
+
+
+def test_a_reset_sink_that_recorded_a_breach_is_still_reported(tmp_path: Path) -> None:
+    """The retry's reset cannot erase what an earlier attempt recorded.
+
+    A path can be both the probe's result sink and its breach record. Clearing
+    it for the retry is correct — the retry must redo the work — but only
+    because the capture already happened.
+    """
+    sink = tmp_path / "secret-read.txt"
+    attempts = 0
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        nonlocal attempts
+        attempts += 1
+        sink.write_text("TOPSECRET" if attempts == 1 else "", encoding="utf-8")
+        if attempts == 1:
+            raise _timeout()
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((sink,)),
+        breach_checks=(AbsentContent(sink, b"TOPSECRET", "the secret was read"),),
+    )
+
+    assert attempts == 2
+    assert sink.read_text(encoding="utf-8") == "", "final disk state looks clean"
+    with pytest.raises(ProbeBreach) as excinfo:
+        probe.require_intact()
+    assert "on attempt 1" in str(excinfo.value)
+
+
+def test_present_and_unchanged_checks_detect_deletion_and_append(
+    tmp_path: Path,
+) -> None:
+    """Planted fixtures: a marker must survive, and a ref must not grow."""
+    planted = tmp_path / "settings.json"
+    ref = tmp_path / "ref"
+
+    deleted: dict[Path, bytes | None] = {planted: None, ref: b"abc\n"}
+    appended: dict[Path, bytes | None] = {planted: b"MARKER", ref: b"abc\nextra"}
+    intact: dict[Path, bytes | None] = {planted: b"MARKER", ref: b"abc\n"}
+
+    marker_check = PresentContent(planted, b"MARKER", "the policy file was replaced")
+    ref_check = UnchangedBytes(ref, b"abc\n", "the base ref was modified")
+
+    assert marker_check.violated_by(deleted) is not None, "a deleted file has no marker"
+    assert marker_check.violated_by(intact) is None
+    assert ref_check.violated_by(appended) is not None, "appending is modifying"
+    assert ref_check.violated_by(intact) is None
+
+
+def test_no_breach_checks_still_requires_completion(tmp_path: Path) -> None:
+    """A probe with no breach surface declares that, and still must complete."""
+    completed = tmp_path / "completed.txt"
+
+    probe = run_until_evidence(
+        lambda: (_ for _ in ()).throw(_timeout()),
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(),
+    )
+
+    with pytest.raises(ProbeTimeout):
+        probe.require_intact()
+
+
+def test_created_paths_rejects_an_empty_requirement() -> None:
+    """Zero required paths is satisfied by an attempt that did nothing."""
+    with pytest.raises(ValueError, match="at least one path"):
+        CreatedPaths(())
+
+
+def test_all_evidence_rejects_no_parts() -> None:
+    """A conjunction of nothing is true — the same vacuity, one layer up."""
+    with pytest.raises(ValueError, match="at least one part"):
+        AllEvidence(())
