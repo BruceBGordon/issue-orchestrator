@@ -202,19 +202,36 @@ def _compile_exec_script(arguments: tuple[str, ...], rusage_path: Path) -> str:
     - **The subshell ``exec``s the lane**, so it costs a fork but no
       resident process: the running tree is the shim plus the lane,
       exactly one process more than before.
+    - **The whole preamble shares line 2 with the lane's ``exec``.**
+      When ``execve`` itself fails — a lane binary that is missing or
+      not executable — the shell's diagnostic quotes the script's LINE
+      NUMBER (``lane.exec: line 2: ...: Permission denied``, and the
+      dash and zsh spellings of the same). Written as separate lines
+      the preamble pushed the ``exec`` to line 4 and changed that text,
+      which is a difference in the lane's error file however cosmetic
+      it looks (B round 2, #7136 review). Semicolons put the redirect,
+      the trap, and the ``exec`` on one physical line, so the ``exec``
+      sits on line 2 exactly where the pre-measurement shim's did.
+      Anything inserted ahead of it re-breaks this, which is why the
+      equivalence is pinned by comparing against that earlier shim
+      rather than against a copied string.
 
-    Verified empirically on ``bash`` 3.2 (macOS ``/bin/sh``),
-    ``bash`` 5, ``dash`` (Linux ``/bin/sh``), and ``zsh``: identical
-    stdout, stderr, and exit status for clean exits, non-zero exits,
-    and signal deaths; the lane's signal dispositions left at their
-    defaults; and the shim surviving a soft kill to report its lane's
-    real status.
+    The contract this holds, in full: for any lane, the shim's exit
+    status, stdout, and stderr are byte-identical to the pre-measurement
+    shim's — clean exits, non-zero exits, signal deaths, and lane
+    binaries that cannot be executed alike. Verified empirically on
+    ``bash`` 3.2 (macOS ``/bin/sh``), ``bash`` 5, ``dash`` (Linux
+    ``/bin/sh``), and ``zsh``, along with the lane's signal
+    dispositions left at their defaults and the shim surviving a soft
+    kill to report its lane's real status.
     """
     quoted = " ".join(shlex.quote(argument) for argument in arguments)
     return (
         "#!/bin/sh\n"
-        "exec 3>&2 2>/dev/null\n"
-        f"trap '' {_SOFT_KILL_SIGNALS}\n"
+        # One line, by construction — see the docstring. The lane's
+        # exec must stay on line 2.
+        "exec 3>&2 2>/dev/null; "
+        f"trap '' {_SOFT_KILL_SIGNALS}; "
         f"( trap - {_SOFT_KILL_SIGNALS}; exec {quoted} 2>&3 3>&- ) 2>/dev/null\n"
         "__lane_status=$?\n"
         f"{compile_rusage_capture(rusage_path)}"

@@ -44,8 +44,7 @@ def test_compiles_complete_description_with_runtime_deadline(
     assert compiled.exec_script_path == tmp_path / "lane.exec"
     assert compiled.exec_script_text == (
         "#!/bin/sh\n"
-        "exec 3>&2 2>/dev/null\n"
-        "trap '' TERM HUP INT\n"
+        "exec 3>&2 2>/dev/null; trap '' TERM HUP INT; "
         "( trap - TERM HUP INT; exec /usr/bin/gmake test-unit PARALLEL=8"
         " 2>&3 3>&- ) 2>/dev/null\n"
         "__lane_status=$?\n"
@@ -414,19 +413,84 @@ def test_shim_output_is_byte_identical_to_running_the_lane_directly(
     assert _shim_result(tmp_path, argv, shell, mode) == _direct_result(argv)
 
 
+def _pre_measurement_shim(arguments: tuple[str, ...]) -> str:
+    """The shim as it was before CPU measurement existed.
+
+    Mirrors ``_compile_exec_script`` at c94da53 (#7122) — a shebang and
+    an ``exec``, nothing else. This is the right baseline for a lane
+    binary that cannot be executed, where the shell's own diagnostic
+    names the SCRIPT (and its line number) rather than the lane: there
+    is no shim-free way to run that case, so "unchanged" has to mean
+    "what the previous shim printed".
+    """
+    import shlex as _shlex
+
+    return "#!/bin/sh\nexec " + " ".join(
+        _shlex.quote(argument) for argument in arguments
+    ) + "\n"
+
+
 @pytest.mark.parametrize("shell", _SHELLS)
-def test_a_lane_that_cannot_be_executed_still_reports_why(
+@pytest.mark.parametrize("state", ("missing", "not_executable"))
+def test_an_unexecutable_lane_binary_reports_exactly_as_it_used_to(
+    tmp_path: Path, shell: str, state: str
+) -> None:
+    """B round 2 (#7136 review): the case the old version of this test
+    only pretended to cover.
+
+    It used to run `/bin/sh -c 'exec /nonexistent'` — an argv whose
+    argv[0] IS executable, so the shim's own exec succeeded and an
+    INNER shell produced the error identically either way. A false
+    positive. The real case is an outer argv that cannot be exec-ed at
+    all, where the failure is diagnosed by the shell running the shim
+    and the message quotes the shim's own line number: adding lines
+    ahead of the exec silently rewrote 'line 2' to 'line 4'.
+
+    Both scripts are run from the SAME path, because the path is part
+    of the message being compared.
+    """
+    import subprocess
+
+    run_directory = tmp_path / f"execfail-{shell.replace('/', '_')}-{state}"
+    run_directory.mkdir()
+    target = run_directory / "lane-binary"
+    if state == "not_executable":
+        target.write_text("#!/bin/sh\nexit 0\n")
+        target.chmod(0o644)
+    argv = (str(target),)
+    compiled = compile_submit_description(
+        _command(argv), LaneResources(request_cpus=1), run_directory
+    )
+
+    def run(script_text: str) -> tuple[int, str, str]:
+        compiled.exec_script_path.write_text(script_text)
+        compiled.exec_script_path.chmod(0o755)
+        produced = subprocess.run(
+            [shell, str(compiled.exec_script_path)],
+            capture_output=True,
+            text=True,
+        )
+        return produced.returncode, produced.stdout, produced.stderr
+
+    baseline = run(_pre_measurement_shim(argv))
+    assert baseline[0] != 0 and str(target) in baseline[2], baseline
+    assert run(compiled.exec_script_text) == baseline
+
+
+@pytest.mark.parametrize("shell", _SHELLS)
+def test_the_lane_exec_stays_on_the_line_the_baseline_used(
     tmp_path: Path, shell: str
 ) -> None:
-    """The other half of the stderr split: silencing the parent must
-    not silence the CHILD. A failed execve is diagnosed by the
-    already-redirected child process, so the reason still reaches the
-    lane's error file — losing it would turn a broken lane command
-    into a bare 127."""
-    argv = ("/bin/sh", "-c", "exec /nonexistent/lane/binary")
-    shimmed = _shim_result(tmp_path, argv, shell, "notfound")
-    assert shimmed == _direct_result(argv)
-    assert "/nonexistent/lane/binary" in shimmed[2]
+    """Why the preamble is one dense line, stated as an executable
+    fact rather than a comment: the shell quotes a line number when
+    exec fails, so the lane's exec has to sit where it always sat."""
+    del shell
+    compiled = compile_submit_description(
+        _command(("/bin/true",)), LaneResources(request_cpus=1), tmp_path
+    )
+    lines = compiled.exec_script_text.splitlines()
+    assert lines[0] == "#!/bin/sh"
+    assert "exec /bin/true" in lines[1], lines
 
 
 @pytest.mark.parametrize("shell", _SHELLS)
