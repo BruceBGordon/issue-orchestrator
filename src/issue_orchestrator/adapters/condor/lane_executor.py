@@ -58,8 +58,10 @@ _ADMISSION_TIMEOUT_SECONDS = 600.0
 PERSONAL_POOL_HOME_ENVIRONMENT_VARIABLE = "ISSUE_ORCHESTRATOR_CONDOR_HOME"
 _DEFAULT_PERSONAL_POOL_HOME = Path.home() / ".local/share/issue-orchestrator/condor"
 # The scheduler's per-process macro override prefix: `_CONDOR_<KNOB>`
-# in the environment overrides <KNOB> for that process only. Never for
-# the daemons, which is why this package refuses to read through one.
+# in the environment overrides <KNOB> for that process only, never for
+# the daemons. Scrubbed on the configuration-READ path (an answer about
+# the pool must come from the pool) and deliberately preserved on the
+# submit path (`getenv = true` carries it to the lane).
 _MACRO_OVERRIDE_PREFIX = "_CONDOR_"
 _TOOL_EXECUTABLES = (
     ("submit", "condor_submit"),
@@ -168,27 +170,53 @@ class CondorTools:
     ) -> subprocess.CompletedProcess[str]:
         """Run one scheduler tool against this pool, bounded in time.
 
+        The caller's environment is passed through, deliberately. The
+        submit description sets ``getenv = true``, so the environment
+        this process hands to ``condor_submit`` is the environment the
+        LANE ITSELF inherits — carrying it faithfully is the contract,
+        not an oversight, and quietly deleting a category of variables
+        from it would surprise whoever set them.
+
         A non-zero return code is the caller's to interpret — tools use
         it for ordinary answers as well as failures. Only an
         invocation that never produced one (missing binary, hung tool)
         is a backend fault.
-
-        Per-process macro overrides are scrubbed from the environment.
-        ``_CONDOR_<KNOB>`` makes one process see a different value for
-        <KNOB> than the pool's configuration holds — and the DAEMONS
-        never see it at all. Letting it through would let an ambient
-        export decide what the policy check believes the pool carries
-        (masking real drift, or manufacturing fake drift) while the
-        pool ran something else entirely; on the submit path it would
-        let the same export quietly change how lanes are submitted.
-        Every tool this package runs reads the POOL, not the caller
-        (residual on N1, #7132 review).
         """
-        environment = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith(_MACRO_OVERRIDE_PREFIX)
-        }
+        return self._run(arguments, scrub_macro_overrides=False)
+
+    def read_configuration(
+        self, *query: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Ask the pool what its own configuration says.
+
+        Deliberately asymmetric with :meth:`invoke`, and the asymmetry
+        is the point. ``_CONDOR_<KNOB>`` overrides <KNOB> for one
+        process and is invisible to the DAEMONS, so an answer read
+        through one describes the caller's environment rather than the
+        pool — an ambient export could mask real drift (verified: the
+        tool answers "Not defined" for a knob the pool genuinely sets
+        wrong) or manufacture fake drift. A question asked ABOUT the
+        pool must be answered BY the pool, so overrides are scrubbed
+        here and only here (residual on N1, #7132 review).
+
+        Taking the query rather than a full argv is part of the same
+        guarantee: this path always runs the configuration tool, and
+        no submission can be routed through it by mistake.
+        """
+        return self._run(
+            (str(self.config_query), *query), scrub_macro_overrides=True
+        )
+
+    def _run(
+        self, arguments: tuple[str, ...], *, scrub_macro_overrides: bool
+    ) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        if scrub_macro_overrides:
+            environment = {
+                key: value
+                for key, value in environment.items()
+                if not key.startswith(_MACRO_OVERRIDE_PREFIX)
+            }
         if self.pool_config is not None:
             environment["CONDOR_CONFIG"] = str(self.pool_config)
         try:

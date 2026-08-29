@@ -207,7 +207,7 @@ class CondorPoolPolicyCheck:
         backend fault and is raised — a pool that cannot be read must
         never be reported as satisfying its policy.
         """
-        completed = self._tools.invoke((str(self._tools.config_query), knob))
+        completed = self._tools.read_configuration(knob)
         if completed.returncode == 0:
             # ONLY the line terminator comes off. The tool ends its
             # answer with a newline and that newline is transport;
@@ -233,7 +233,7 @@ class CondorPoolPolicyCheck:
         the pool parses, not what happens to sit in a directory: a file
         the pool never reads is not policy.
         """
-        completed = self._tools.invoke((str(self._tools.config_query), "-config"))
+        completed = self._tools.read_configuration("-config")
         if completed.returncode != 0:
             diagnostic = (
                 completed.stderr.strip() or completed.stdout.strip()

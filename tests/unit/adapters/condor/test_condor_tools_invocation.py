@@ -1,10 +1,19 @@
-"""The tool boundary's contract: every invocation reads the POOL.
+"""The tool boundary's contract, and its deliberate asymmetry.
 
-``CondorTools.invoke`` is the single place this package runs a
-scheduler tool, which makes it the single place that decides what
-environment those tools see. The rule it enforces is that the answer a
-tool gives describes the pool's own configuration — not whatever the
-calling shell happened to export.
+``CondorTools`` is the single place this package runs a scheduler
+tool, which makes it the single place that decides what environment
+those tools see. It answers two different questions and the
+environment rule differs by question:
+
+- ``read_configuration`` asks ABOUT the pool, so the pool must be what
+  answers: per-process macro overrides are scrubbed, or an ambient
+  export could decide what the policy check believes.
+- ``invoke`` runs the submit/remove/query tools, and the submit
+  description sets ``getenv = true`` — the environment handed to
+  ``condor_submit`` is the environment the LANE inherits. Carrying it
+  faithfully is the contract, so nothing is scrubbed there.
+
+Both halves are pinned here; the asymmetry is the design, not drift.
 """
 
 from __future__ import annotations
@@ -35,15 +44,33 @@ def _dumping_tools(tmp_path: Path, *, pool_config: Path | None = None) -> Condor
     )
 
 
-def _environment_seen(tools: CondorTools) -> dict[str, str]:
-    completed = tools.invoke((str(tools.config_query),))
-    assert completed.returncode == 0, completed.stderr
+def _parse(completed: object) -> dict[str, str]:
+    stdout = getattr(completed, "stdout", "")
     seen: dict[str, str] = {}
-    for line in completed.stdout.splitlines():
+    for line in str(stdout).splitlines():
         key, separator, value = line.partition("=")
         if separator:
             seen[key] = value
     return seen
+
+
+def _read_environment(tools: CondorTools) -> dict[str, str]:
+    """What the configuration-READ path lets a tool see."""
+    completed = tools.read_configuration()
+    assert completed.returncode == 0, completed.stderr
+    return _parse(completed)
+
+
+def _submit_environment(tools: CondorTools) -> dict[str, str]:
+    """What the SUBMIT path lets a tool see - and, via getenv = true,
+    what the lane itself inherits."""
+    completed = tools.invoke((str(tools.submit),))
+    assert completed.returncode == 0, completed.stderr
+    return _parse(completed)
+
+
+def _environment_seen(tools: CondorTools) -> dict[str, str]:
+    return _read_environment(tools)
 
 
 def test_per_process_macro_overrides_never_reach_the_tools(
@@ -58,10 +85,30 @@ def test_per_process_macro_overrides_never_reach_the_tools(
     monkeypatch.setenv("_CONDOR_MOUNT_UNDER_SCRATCH", "")
     monkeypatch.setenv("_CONDOR_CONCURRENCY_LIMIT_DEFAULT", "1")
 
-    seen = _environment_seen(_dumping_tools(tmp_path))
+    seen = _read_environment(_dumping_tools(tmp_path))
 
     leaked = [key for key in seen if key.startswith("_CONDOR_")]
-    assert not leaked, f"macro overrides reached a scheduler tool: {leaked}"
+    assert not leaked, f"macro overrides reached a configuration read: {leaked}"
+
+
+def test_the_submit_path_carries_the_caller_environment_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other half of the asymmetry, and it is load-bearing: the
+    submit description sets `getenv = true`, so what this process hands
+    to condor_submit is what the LANE inherits. Scrubbing there would
+    silently delete variables from the job's environment — a mutation
+    nobody asked for, and not what the read-path property requires."""
+    monkeypatch.setenv("_CONDOR_IO_INTENT_LOAD_BACKOFF", "False")
+    monkeypatch.setenv("IO_SENTINEL_FOR_TEST", "kept")
+
+    seen = _submit_environment(_dumping_tools(tmp_path))
+
+    assert seen["_CONDOR_IO_INTENT_LOAD_BACKOFF"] == "False", (
+        "the submit path must pass the caller's environment through "
+        "unchanged - getenv = true carries it into the lane"
+    )
+    assert seen["IO_SENTINEL_FOR_TEST"] == "kept"
 
 
 def test_the_rest_of_the_environment_is_preserved(
@@ -72,7 +119,7 @@ def test_the_rest_of_the_environment_is_preserved(
     monkeypatch.setenv("IO_SENTINEL_FOR_TEST", "kept")
     monkeypatch.setenv("_CONDOR_ANYTHING", "dropped")
 
-    seen = _environment_seen(_dumping_tools(tmp_path))
+    seen = _read_environment(_dumping_tools(tmp_path))
 
     assert seen["IO_SENTINEL_FOR_TEST"] == "kept"
     assert "PATH" in seen
