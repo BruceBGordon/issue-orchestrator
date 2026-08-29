@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from typing import Callable, ClassVar
 
 from .xterm_widths import EMPTY_CLUSTER, cluster_advance
+from .pending_wrap import ColumnOperation, resolve_parked_column
 from .terminal_recording import MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS
 
 DEFAULT_ROWS = 40
@@ -259,18 +260,22 @@ class TerminalViewport:
     def _apply_control(self, byte: int) -> None:
         """Apply one single-byte ASCII control character."""
         if byte == 0x0D:  # CR
+            self._resolve(ColumnOperation.CARRIAGE_RETURN)
             self._col = 0
             return
         if byte in (0x0A, 0x0B, 0x0C):  # LF, VT, FF all index a line
+            self._resolve(ColumnOperation.LINE_FEED)
             self._line_feed()
             return
         if byte == 0x08:  # BS
-            # Measured: a cursor parked past the right edge is pulled back onto
-            # the last column first, so one backspace from there lands two
-            # visual columns left of where it was written.
-            self._col = max(0, min(self._col, self._cols - 1) - 1)
+            self._resolve(ColumnOperation.BACKSPACE)
+            self._col = max(0, self._col - 1)
             return
         if byte == 0x09:  # HT
+            self._resolve(ColumnOperation.HORIZONTAL_TAB)
+            if self._col >= self._cols:
+                # Measured: a parked cursor is left alone by a tab.
+                return
             self._col = min(self._cols - 1, (self._col // _TAB_WIDTH + 1) * _TAB_WIDTH)
             return
 
@@ -285,6 +290,11 @@ class TerminalViewport:
             self._attach_combining(char)
             return
         if self._col + cells > self._cols:
+            self._resolve(
+                ColumnOperation.PRINT_WRAPPING
+                if self._autowrap
+                else ColumnOperation.PRINT_WITHOUT_WRAP
+            )
             if not self._autowrap:
                 # Measured with DECAWM off: a wide glyph that will not fit is
                 # skipped entirely, and a narrow one overwrites the last cell
@@ -342,10 +352,11 @@ class TerminalViewport:
         self._written[self._row] = True
         self._extent[self._row] = max(self._extent[self._row], column + 1)
 
+    def _resolve(self, operation: ColumnOperation) -> None:
+        """Apply this operation's parked-column resolution from the table."""
+        self._col = resolve_parked_column(self._col, self._cols, operation)
+
     def _line_feed(self) -> None:
-        # Measured: indexing a line pulls a cursor parked past the right edge
-        # (the pending-wrap position) back onto the last column.
-        self._col = min(self._col, self._cols - 1)
         if self._row == self._scroll_bottom:
             self._scroll_up(1)
             return
@@ -378,9 +389,11 @@ class TerminalViewport:
         NEL keep a footer on one row that xterm splits across two (#7141 r5).
         """
         if codepoint == _C1_IND:
+            self._resolve(ColumnOperation.LINE_FEED)
             self._line_feed()
             return payload
         if codepoint == _C1_NEL:
+            self._resolve(ColumnOperation.NEXT_LINE)
             self._col = 0
             self._line_feed()
             return payload
@@ -432,6 +445,9 @@ class TerminalViewport:
         return index + 1
 
     def _dispatch_csi(self, final: str, params_raw: str) -> None:
+        if final == "p" and params_raw == "!":
+            self._soft_reset()
+            return
         if params_raw.startswith("?"):
             self._dispatch_private_mode(final, params_raw[1:])
             return
@@ -472,13 +488,32 @@ class TerminalViewport:
                 continue
             mode = int(stripped)
             if mode == _DECAWM:
+                self._resolve(ColumnOperation.SET_AUTOWRAP)
                 self._autowrap = enable
                 continue
             if mode in _IGNORED_PRIVATE_MODES:
                 continue
             self.unmodelled_modes.append(f"?{mode}{final}")
 
+    def _soft_reset(self) -> None:
+        """DECSTR. Measured: restores autowrap and the scroll region only.
+
+        It leaves the screen, the cursor and a parked column exactly where they
+        were — which is what separates it from RIS.
+        """
+        self._resolve(ColumnOperation.SOFT_RESET)
+        self._autowrap = True
+        self._scroll_top, self._scroll_bottom = 0, self._rows - 1
+
     def _reset(self) -> None:
+        """RIS. Measured: everything back to defaults, autowrap included.
+
+        Leaving autowrap off across a reset rendered a screen the terminal does
+        not draw, with no refusal to flag it (#7141 round 7).
+        """
+        self._resolve(ColumnOperation.FULL_RESET)
+        self._autowrap = True
+        self._run_start = True
         self._grid = self._blank_grid()
         self._widths = [[1] * self._cols for _ in range(self._rows)]
         self._written = [True] * self._rows
@@ -490,30 +525,38 @@ class TerminalViewport:
     # -- CSI operations ----------------------------------------------------
 
     def _cup(self, params: list[int]) -> None:
+        self._resolve(ColumnOperation.CURSOR_POSITION)
         row = (params[0] if params else 1) or 1
         col = (params[1] if len(params) > 1 else 1) or 1
         self._row = max(0, min(self._rows - 1, row - 1))
         self._col = max(0, min(self._cols - 1, col - 1))
 
     def _cursor_up(self, params: list[int]) -> None:
+        self._resolve(ColumnOperation.CURSOR_RELATIVE)
         self._row = max(0, self._row - _amount(params))
 
     def _cursor_down(self, params: list[int]) -> None:
+        self._resolve(ColumnOperation.CURSOR_RELATIVE)
         self._row = min(self._rows - 1, self._row + _amount(params))
 
     def _cursor_forward(self, params: list[int]) -> None:
+        self._resolve(ColumnOperation.CURSOR_RELATIVE)
         self._col = min(self._cols - 1, self._col + _amount(params))
 
     def _cursor_back(self, params: list[int]) -> None:
+        self._resolve(ColumnOperation.CURSOR_RELATIVE)
         self._col = max(0, self._col - _amount(params))
 
     def _column_absolute(self, params: list[int]) -> None:
+        self._resolve(ColumnOperation.CURSOR_COLUMN_ABSOLUTE)
         self._col = max(0, min(self._cols - 1, _amount(params) - 1))
 
     def _row_absolute(self, params: list[int]) -> None:
+        self._resolve(ColumnOperation.CURSOR_ROW_ABSOLUTE)
         self._row = max(0, min(self._rows - 1, _amount(params) - 1))
 
     def _erase_in_line(self, params: list[int]) -> None:
+        self._resolve(ColumnOperation.ERASE)
         mode = params[0] if params else 0
         start, stop = self._erase_span(mode)
         for column in range(start, stop):
@@ -532,6 +575,7 @@ class TerminalViewport:
         return self._col, self._cols
 
     def _erase_in_display(self, params: list[int]) -> None:
+        self._resolve(ColumnOperation.ERASE)
         mode = params[0] if params else 0
         if mode in (2, 3):
             self._blank_rows(range(self._rows))
@@ -551,6 +595,7 @@ class TerminalViewport:
             self._extent[index] = 0
 
     def _set_scroll_region(self, params: list[int]) -> None:
+        self._resolve(ColumnOperation.SET_SCROLL_REGION)
         top = (params[0] if params else 1) or 1
         bottom = (params[1] if len(params) > 1 else self._rows) or self._rows
         top_index = max(0, min(self._rows - 1, top - 1))
@@ -562,9 +607,11 @@ class TerminalViewport:
         self._row, self._col = 0, 0
 
     def _scroll_up_csi(self, params: list[int]) -> None:
+        self._resolve(ColumnOperation.SCROLL)
         self._scroll_up(_amount(params))
 
     def _scroll_down_csi(self, params: list[int]) -> None:
+        self._resolve(ColumnOperation.SCROLL)
         top, bottom = self._scroll_top, self._scroll_bottom
         for _ in range(_amount(params)):
             del self._grid[bottom]

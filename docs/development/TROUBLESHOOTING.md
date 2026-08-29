@@ -203,7 +203,10 @@ reconstruction untrustworthy — a half-written recording, an unparseable row, a
 undecodable payload, an implausible `resize`, a replay the capture budget cut
 short, or a grid-affecting terminal mode the viewport does not model — yields
 `undetermined` rather than a guess. Autowrap (DECAWM) *is* modelled, because
-TUIs toggle it constantly and a footer's row depends on it. `matched_marker` names
+TUIs toggle it constantly and a footer's row depends on it — as do the resets
+that restore it (`ESC c`, `CSI !p`). A reset restores the terminal but never
+clears a refusal: whatever the unmodelled mode already did to the reconstructed
+rows cannot be undone. `matched_marker` names
 the affordance that decided it and `evidence_snippet` is the screen row it came
 from — check them before acting on the classification. `replayed_from_start:
 false` means only a trailing window of the recording was replayed; the verdict

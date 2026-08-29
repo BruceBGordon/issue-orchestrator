@@ -9,6 +9,7 @@
 //   node tools/measure_xterm_widths.js screens     # cursor + rows per probe
 //   node tools/measure_xterm_widths.js controls    # C1 (U+0080-U+009F) behaviour
 //   node tools/measure_xterm_widths.js autowrap    # DECAWM on/off + pending wrap
+//   node tools/measure_xterm_widths.js pending     # parked-cursor resolution table
 //
 // Emit-only: it prints JSON for a human (or a test author) to read. Nothing
 // imports it at runtime.
@@ -225,12 +226,88 @@ async function measureAutowrap() {
     console.log(JSON.stringify(out, null, 2));
 }
 
+// Every operation that can resolve, preserve or clamp a cursor parked past
+// the right edge. Each probe fills the row (parking the cursor), applies one
+// operation, then prints Z — so the resulting cursor and rows say exactly what
+// that operation did to the parked state. One probe per row of the resolution
+// table in ``infra.pending_wrap``.
+function pendingWrapProbes() {
+    const ESC = '\u001b';
+    const FILL = 'abcdefghij'; // exactly 10 columns
+    const operations = {
+        baseline_no_operation: '',
+        carriage_return: '\r',
+        line_feed: '\n',
+        vertical_tab: '\u000b',
+        form_feed: '\u000c',
+        index_c1: '\u0084',
+        next_line_c1: '\u0085',
+        backspace: '\b',
+        horizontal_tab: '\t',
+        cursor_forward: `${ESC}[C`,
+        cursor_back: `${ESC}[D`,
+        cursor_up: `${ESC}[A`,
+        cursor_down: `${ESC}[B`,
+        cursor_position: `${ESC}[1;1H`,
+        column_absolute: `${ESC}[5G`,
+        row_absolute: `${ESC}[2d`,
+        erase_in_line_to_end: `${ESC}[K`,
+        erase_in_line_to_start: `${ESC}[1K`,
+        erase_in_line_all: `${ESC}[2K`,
+        erase_in_display_below: `${ESC}[J`,
+        erase_in_display_above: `${ESC}[1J`,
+        erase_in_display_all: `${ESC}[2J`,
+        scroll_up: `${ESC}[S`,
+        scroll_down: `${ESC}[T`,
+        set_scroll_region: `${ESC}[2;3r`,
+        autowrap_off: `${ESC}[?7l`,
+        autowrap_on: `${ESC}[?7h`,
+        select_graphic_rendition: `${ESC}[0m`,
+        operating_system_command: `${ESC}]0;title\u0007`,
+        full_reset: `${ESC}c`,
+        soft_reset: `${ESC}[!p`,
+    };
+    const encoder = new TextEncoder();
+    const probes = {};
+    for (const [name, operation] of Object.entries(operations)) {
+        probes[`pending_${name}`] = {
+            cols: 10, rows: 4,
+            bytes: Array.from(encoder.encode(FILL + operation + 'Z')),
+        };
+        // The same operation with autowrap already off, so a resolution that
+        // depends on the mode is visible rather than masked by wrapping.
+        probes[`pending_nowrap_${name}`] = {
+            cols: 10, rows: 4,
+            bytes: Array.from(encoder.encode(`${ESC}[?7l` + FILL + operation + 'Z')),
+        };
+    }
+    return probes;
+}
+
+async function measurePendingWrap() {
+    const out = {};
+    for (const [name, probe] of Object.entries(pendingWrapProbes())) {
+        const term = new Terminal({ cols: probe.cols, rows: probe.rows, allowProposedApi: true });
+        await write(term, new Uint8Array(probe.bytes));
+        const buffer = term.buffer.active;
+        out[name] = {
+            cols: probe.cols,
+            bytes: probe.bytes,
+            cursorX: buffer.cursorX,
+            cursorY: buffer.cursorY,
+            rows: readViewport(buffer, probe.rows),
+        };
+    }
+    console.log(JSON.stringify(out, null, 2));
+}
+
 const mode = process.argv[2] || 'screens';
 const MODES = {
     widths: measureWidths,
     screens: measureScreens,
     controls: measureControls,
     autowrap: measureAutowrap,
+    pending: measurePendingWrap,
 };
 (MODES[mode] || measureScreens)().catch((error) => {
     console.error(error);

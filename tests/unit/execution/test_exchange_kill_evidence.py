@@ -1484,3 +1484,37 @@ class TestTerminalModesCannotForgeAMarker:
         path = _recording(tmp_path / "common.jsonl", (footer.encode("utf-8"),))
 
         assert classify_composer_state(path).state is ComposerState.COMPOSER_STRANDED
+
+
+class TestResetRestoresTerminalDefaults:
+    """#7141 round 7: a reset the viewport ignored diverged silently."""
+
+    def test_a_full_reset_restores_wrapping_so_the_footer_gets_its_row(
+        self, tmp_path: Path
+    ) -> None:
+        """RIS puts autowrap back, so the marker lands on a row of its own.
+
+        Keeping autowrap off across the reset drew a screen the terminal never
+        shows — and, in this direction, silently missed a real stranded footer.
+        """
+        stream = "\u001b[?7l\u001bc" + "X" * 120 + "tab to queue message"
+        path = _recording(tmp_path / "ris.jsonl", (stream.encode("utf-8"),), cols=120)
+
+        assert classify_composer_state(path).state is ComposerState.COMPOSER_STRANDED
+
+    def test_without_the_reset_the_footer_is_still_swallowed(
+        self, tmp_path: Path
+    ) -> None:
+        """Control: the reset is what changes the answer, not the marker."""
+        stream = "\u001b[?7l" + "X" * 120 + "tab to queue message"
+        path = _recording(tmp_path / "nors.jsonl", (stream.encode("utf-8"),), cols=120)
+
+        assert (
+            classify_composer_state(path).state is not ComposerState.COMPOSER_STRANDED
+        )
+
+    def test_a_soft_reset_also_restores_wrapping(self, tmp_path: Path) -> None:
+        stream = "\u001b[?7l\u001b[!p" + "X" * 120 + "tab to queue message"
+        path = _recording(tmp_path / "decstr.jsonl", (stream.encode("utf-8"),), cols=120)
+
+        assert classify_composer_state(path).state is ComposerState.COMPOSER_STRANDED
