@@ -476,11 +476,87 @@ immediately re-EXCEPTs on the same queued job, forever. So:
 - The execenv image makes the same guarantee at build time, and the
   build fails if the directory is not world-writable.
 
+## Seeing what the pool is doing: `executor-status`
+
+```bash
+issue-orchestrator executor-status              # summarize the last 400 records
+issue-orchestrator executor-status --scan 20    # only the most recent 20
+issue-orchestrator executor-status --backend condor   # report on a named backend
+```
+
+Read-only, from any directory in the repository. It answers one
+question — *why is validation work running or waiting?* — by joining
+three things that are otherwise checked separately:
+
+```
+Executor pool — backend condor (from repository validation command), captured …
+
+POOL: online — 1 machine, 18 cpus, 2 in use; 1 running, 1 queued
+  STATE      FOR  CPUS  PRI  LANE       SUBMITTED BY             EXCLUSIVE
+  running  27.0s     2   71  test-unit  issue-orchestrator-wt-a  codexlogin
+  queued   24.0s     2   72  test-web   issue-orchestrator-wt-b  codexlogin
+
+LANES: /repo/.issue-orchestrator/lanes.yaml
+  dispatch journal: …/lane-dispatch.jsonl (30 record(s) scanned), highest first
+  LANE          CPUS  MEM MB  FREEZE  EXCLUSIVE  RUNS  LAST RUNTIME  …  BACKEND  WHEN
+  test-unit        8    6144  ok      -             3         1m21s  …  condor   …
+  execenv.memory-oom  1   128  never  -             0             —  …  —        never
+```
+
+The mental model, top to bottom:
+
+- **The header** names the backend *and what established it*: an
+  explicit `--backend`, `$ISSUE_ORCHESTRATOR_LANE_EXECUTOR`, or this
+  repository's own gate command (which is where `LANE_EXECUTOR=condor`
+  lives). If nothing establishes it, the header says
+  `backend UNKNOWN` and the command exits `78` — it will not assume one,
+  because a status tool confidently naming the wrong backend is worse
+  than one that admits it cannot tell.
+- **POOL** is *now*. `online` is a claim that the pool can run work:
+  it has execute resources and the collector heard from each of them
+  recently. Anything else reads `health UNKNOWN` with the reason —
+  no execute resources, records the collector is still serving from
+  cache after a daemon died, or liveness it could not establish. The
+  numbers it did report are still shown, labelled as its claim.
+  Every job row names the lane, the **worktree that submitted it** (the
+  pool is machine-wide), how long it has been **in that state**, and any
+  exclusive token it holds.
+- **LANES** is every lane that exists, from the declarations, joined to
+  what the journal says each one last cost. A declared lane that has
+  never run still gets a row (`never`), and a lane in the journal that
+  the declarations no longer describe is marked `undeclared` — it cannot
+  run again until it is declared. `PRI` is the learned dispatch priority
+  the **next** run will carry, so the table is printed in the order the
+  next gate will dispatch. `BACKEND` is the backend each lane actually
+  last ran on, so history that contradicts the header is visible.
+- **IDLE** is how idle the host was when that runtime was measured, from
+  the `machine_state` envelope above — a duration read without its
+  contention is the ambiguity that envelope exists to end. Rows written
+  before the envelope existed (and rows a worktree on older code is
+  still appending to the shared journal) cannot be read back, so they
+  are skipped and the count is printed beside the scan total: the
+  history is thinner than the window, and saying so is the point.
+- **FAULTS**, when present, means an input is broken rather than empty.
+
+Nothing is ever silently omitted. A machine with no pool prints
+`POOL: unavailable` and the reason, and still prints the lane table. A
+repository with no journal prints the path records will appear at.
+Absence exits `0`; a *broken* input (a corrupt journal row, an
+untranslatable answer from the pool, a missing or malformed
+`lanes.yaml`) is printed under `FAULTS` and exits `70`; a backend that
+nothing establishes exits `78`.
+
+The command never prints command lines, arguments, environments, or
+output paths: the pool query does not even ask for those attributes, so
+a prompt or a token cannot reach the terminal through it.
 ## Architecture
 
 - `domain/lane_execution.py` — the typed contracts (the only vocabulary
   that crosses the port).
-- `ports/lane_executor.py` — the port.
+- `ports/lane_executor.py` — the execution port;
+  `ports/lane_policy_check.py` — the backend's policy self-check;
+  `ports/executor_pool.py` — the read-only pool-inspection port. All
+  three speak the same backend-neutral vocabulary.
 - `ports/lane_runtime_history.py` +
   `adapters/json_lane_runtime_history.py` — the dispatch-order learning
   loop (backend-neutral: every backend reports runtime, every backend's
@@ -490,25 +566,39 @@ immediately re-EXCEPTs on the same queued job, forever. So:
   loop, with `infra/file_duration_store.py` resolving its one shared
   home, `infra/pytest_file_durations.py` capturing, and
   `scripts/lane_slices.py` consuming.
-- `adapters/direct_lane_executor.py` — default backend.
+- `observation/executor_status.py` — joins the pool, the dispatch
+  journal, and the learning loop into one snapshot, and owns what
+  happens when a source is absent or broken.
+- `adapters/direct_lane_executor.py` — default backend, including the
+  policy check whose honest answer is an empty invariant set and the
+  inspector that states precisely why it has no pool.
 - `ports/machine_state.py` + `infra/machine_state.py` — the forensics
   envelope every timing and dispatch record carries (backend-neutral,
-  and the single owner of probe-failure semantics).
+  and the single owner of probe-failure semantics, in both directions:
+  it writes the envelope and reads it back).
 - `adapters/condor/` — the anti-corruption layer: `submit_compiler.py`
   translates lane specs outbound into job descriptions;
   `event_classifier.py` translates job event logs inbound into typed
-  lifecycle states. Scheduler vocabulary is forbidden outside this
+  lifecycle states; `pool_policy.py` reads the pool's effective
+  configuration into a typed policy report; `pool_inspector.py`
+  translates queue and slot answers inbound into pool contracts;
+  `lane_executor.py` holds `CondorTools`, which locates the scheduler's
+  command-line tools and is the single boundary through which this
+  package invokes them. Scheduler vocabulary is forbidden outside this
   package by the `semgrep_condor_vocabulary` guardrail.
 - `execution/lane_backends.py` — the backend registry: one entry per
-  backend carrying BOTH factories (executor and policy check), with the
-  selectable names derived from it. A backend cannot be runnable
-  without also being checkable.
+  backend carrying EVERY factory (executor, policy check, pool
+  inspector), with the selectable names derived from it. A backend
+  cannot be runnable without also being checkable and inspectable. It
+  is the guardrail's only exemption outside `adapters/condor`.
 - `ports/lane_policy_check.py` + `adapters/condor/pool_policy.py` —
   the pool-policy self-check (above).
 - `entrypoints/cli_tools/lane_run.py` — the per-lane entrypoint the
-  Makefile invokes; `entrypoints/cli_tools/lane_preflight.py` — the
-  once-per-gate policy preflight. Both resolve their backend through
-  the registry.
+  Makefile invokes (it also wires the lane runner's own persistence
+  adapters); `lane_preflight.py` — the once-per-gate policy preflight;
+  `executor_status.py` — renders the operator snapshot for
+  `issue-orchestrator executor-status`. All three resolve their backend
+  through the registry.
 
 Interactive agent sessions (PTY) are out of scope for this backend —
 see issue #7112. Multi-machine pools are a follow-on; everything here

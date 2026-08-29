@@ -52,7 +52,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, cast
 
 from ..ports.machine_state import MachineState, MachineStateSampler
 from .containment import TEARDOWN_SIGNALS, describe_exception, safe_type_name
@@ -193,6 +193,104 @@ def machine_state_fields(state: MachineState) -> dict[str, object]:
         "probe_error": state.probe_error,
     }
     return {MACHINE_STATE_RECORD_KEY: envelope}
+
+
+class MachineStateEnvelopeError(ValueError):
+    """A stored envelope cannot be read back as the reading it recorded."""
+
+
+class MachineStateEnvelopeMissing(MachineStateEnvelopeError):
+    """The record carries no envelope at all.
+
+    Distinct from a malformed one, and the distinction is load-bearing:
+    the envelope was added to records that already existed (#7135), and
+    the journals it was added to are append-only and shared by every
+    worktree on the machine. A worktree still running older code keeps
+    appending envelope-less rows TODAY, interleaved with new ones. Such
+    a row was valid when written — it is a schema-version fact, not
+    something a writer got wrong — so a reader may skip and count it.
+    A malformed envelope stays an error: that IS a writer getting it
+    wrong.
+    """
+
+
+def machine_state_from_fields(record: dict[str, object]) -> MachineState:
+    """Read back the envelope :func:`machine_state_fields` wrote.
+
+    Lives beside the writer because the envelope's shape is ONE
+    decision; a reader that lived with its first consumer would drift
+    from the writer the moment either changed. Strict on the way in for
+    the same reason the writer always emits every key: a null is a
+    recorded fact and an absent key is an ambiguity, so a missing key is
+    an error rather than a quietly-invented ``None``.
+    """
+    if type(record) is not dict:
+        raise MachineStateEnvelopeError("a record must be a mapping")
+    if MACHINE_STATE_RECORD_KEY not in record:
+        raise MachineStateEnvelopeMissing(
+            f"record carries no {MACHINE_STATE_RECORD_KEY!r} envelope"
+        )
+    envelope = record[MACHINE_STATE_RECORD_KEY]
+    if not isinstance(envelope, dict):
+        raise MachineStateEnvelopeError(
+            f"{MACHINE_STATE_RECORD_KEY!r} is not an envelope"
+        )
+    fields = cast("dict[str, object]", envelope)
+    expected = {
+        "sampled_at",
+        "loadavg_1m",
+        "loadavg_5m",
+        "loadavg_15m",
+        "cpu_idle_percent",
+        "cpu_idle_source",
+        "physical_cores",
+        "probe_error",
+    }
+    missing = expected - set(fields)
+    if missing:
+        raise MachineStateEnvelopeError(
+            f"envelope is missing {sorted(missing)}"
+        )
+    sampled_at = fields["sampled_at"]
+    if type(sampled_at) is not str:
+        raise MachineStateEnvelopeError("envelope 'sampled_at' is not a string")
+    try:
+        moment = datetime.fromisoformat(sampled_at)
+    except ValueError as error:
+        raise MachineStateEnvelopeError(
+            f"envelope 'sampled_at' is not a timestamp: {sampled_at!r}"
+        ) from error
+    try:
+        # MachineState owns every field invariant; reuse them rather
+        # than restating them here.
+        return MachineState(
+            sampled_at=moment,
+            loadavg_1m=_optional_float(fields, "loadavg_1m"),
+            loadavg_5m=_optional_float(fields, "loadavg_5m"),
+            loadavg_15m=_optional_float(fields, "loadavg_15m"),
+            cpu_idle_percent=_optional_float(fields, "cpu_idle_percent"),
+            cpu_idle_source=cast(str, fields["cpu_idle_source"]),
+            physical_cores=cast("int | None", fields["physical_cores"]),
+            probe_error=cast("str | None", fields["probe_error"]),
+        )
+    except ValueError as error:
+        raise MachineStateEnvelopeError(f"envelope is not a reading: {error}") from error
+
+
+def _optional_float(fields: dict[str, object], name: str) -> float | None:
+    """A recorded number, or a recorded absence — never a guess.
+
+    JSON renders 2.0 as 2, so an integer here is the same measurement as
+    a float one; anything else is not a measurement at all.
+    """
+    value = fields[name]
+    if value is None:
+        return None
+    if type(value) is int:
+        return float(value)
+    if type(value) is float:
+        return value
+    raise MachineStateEnvelopeError(f"envelope {name!r} is not a number")
 
 
 def stamp_machine_state(sampler: MachineStateSampler) -> dict[str, object]:

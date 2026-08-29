@@ -21,10 +21,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from ...adapters.json_lane_runtime_history import (
-    JsonLaneRuntimeHistory,
-    LaneRuntimeHistoryError,
-)
+from ...adapters.json_lane_runtime_history import JsonLaneRuntimeHistory
 from ...adapters.jsonl_lane_dispatch_journal import (
     InertLaneDispatchJournal,
     JsonlLaneDispatchJournal,
@@ -59,9 +56,13 @@ from ...infra.validation_timings import resolve_git_common_dir
 from ...ports.lane_dispatch_journal import (
     LaneDispatchJournal,
     LaneDispatchJournalError,
+    LaneDispatchJournalReader,
     LaneDispatchRecord,
 )
-from ...ports.lane_runtime_history import LaneRuntimeHistory
+from ...ports.lane_runtime_history import (
+    LaneRuntimeHistory,
+    LaneRuntimeHistoryError,
+)
 from ...ports.machine_state import MachineStateSampler
 
 _UNAVAILABLE_EXIT_CODE = 78
@@ -85,7 +86,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments.command = command
     try:
         executor = build_lane_executor(str(arguments.backend))
-        history = _build_history()
+        history = build_runtime_history()
         journal = _build_journal()
         work_key = LaneWorkKey(str(arguments.work_key))
         # Scheduling facts are declared in ONE place —
@@ -227,16 +228,28 @@ def _build_machine_state_sampler() -> MachineStateSampler:
     return default_machine_state_sampler()
 
 
-def _build_journal() -> LaneDispatchJournal:
+def _build_journal_adapter() -> JsonlLaneDispatchJournal | InertLaneDispatchJournal:
     """The repo-shared dispatch journal, or an inert one outside a repo
-    (mirroring the runtime history's inertness)."""
+    (mirroring the runtime history's inertness).
+
+    One constructor for both directions of the journal: the writer and
+    the reader must never disagree about which file they mean."""
     common_dir = resolve_git_common_dir(Path.cwd())
     if common_dir is None:
         return InertLaneDispatchJournal()
     return JsonlLaneDispatchJournal(common_dir / "issue-orchestrator")
 
 
-def _build_history() -> LaneRuntimeHistory:
+def _build_journal() -> LaneDispatchJournal:
+    return _build_journal_adapter()
+
+
+def build_dispatch_journal_reader() -> LaneDispatchJournalReader:
+    """Read-only view of the same journal `lane-run` writes."""
+    return _build_journal_adapter()
+
+
+def build_runtime_history() -> LaneRuntimeHistory:
     """The repo-shared runtime history, or an inert one outside a repo.
 
     History lives with the repository (the git common dir), like the

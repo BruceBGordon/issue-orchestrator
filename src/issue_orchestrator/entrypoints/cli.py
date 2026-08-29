@@ -699,6 +699,26 @@ def cmd_e2e_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_executor_status(args: argparse.Namespace) -> int:
+    """Show the validation-lane executor pool and recent lane dispatch.
+
+    Tolerates a missing configuration — the pool is machine-wide, shared
+    by every worktree of every repository on the host, so this must
+    answer even where no config would load. It does NOT ignore one that
+    is present: the repository's gate command is what selects the
+    backend, and reporting on a different one is worse than reporting
+    that the backend is unknown (finding 1, #7138).
+    """
+    from .cli_tools.executor_status import main as executor_status_main
+
+    forwarded: list[str] = []
+    for flag in ("backend", "scan"):
+        value = getattr(args, flag, None)
+        if value is not None:
+            forwarded.extend([f"--{flag}", str(value)])
+    return executor_status_main(forwarded)
+
+
 def cmd_default(args: argparse.Namespace) -> int:  # noqa: ARG001 - args unused but required for command signature
     """Default command when no subcommand is given - open unified dashboard."""
     import webbrowser
@@ -829,6 +849,7 @@ def main() -> int:
             doctor=cmd_doctor,
             demo=cmd_demo,
             trace=cmd_trace,
+            executor_status=cmd_executor_status,
         )
     )
 

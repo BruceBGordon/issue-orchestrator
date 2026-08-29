@@ -99,6 +99,7 @@ and this table is the same set with the tier each command carries:
 | `audit` | Diagnostics | Supported |
 | `trace` | Diagnostics | Supported |
 | `demo` | Diagnostics | Supported |
+| `executor-status` | Diagnostics | Supported |
 | `test-reset` | Development | Internal |
 | `e2e-reset` | Development | Internal |
 

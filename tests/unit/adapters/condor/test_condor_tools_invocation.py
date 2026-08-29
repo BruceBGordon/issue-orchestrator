@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from issue_orchestrator.adapters.condor.lane_executor import CondorTools
+from issue_orchestrator.adapters.condor.tools import CondorTools
 
 _DUMP = "#!/bin/sh\nenv\n"
 
@@ -31,7 +31,13 @@ _DUMP = "#!/bin/sh\nenv\n"
 def _dumping_tools(tmp_path: Path, *, pool_config: Path | None = None) -> CondorTools:
     binaries = tmp_path / "bin"
     binaries.mkdir(exist_ok=True)
-    for name in ("condor_submit", "condor_rm", "condor_q", "condor_config_val"):
+    for name in (
+        "condor_submit",
+        "condor_rm",
+        "condor_q",
+        "condor_config_val",
+        "condor_status",
+    ):
         tool = binaries / name
         tool.write_text(_DUMP)
         tool.chmod(0o755)
@@ -40,6 +46,7 @@ def _dumping_tools(tmp_path: Path, *, pool_config: Path | None = None) -> Condor
         remove=binaries / "condor_rm",
         query=binaries / "condor_q",
         config_query=binaries / "condor_config_val",
+        pool_query=binaries / "condor_status",
         pool_config=pool_config,
     )
 

@@ -23,6 +23,14 @@ from ..domain.lane_execution import (
     LaneResources,
     LaneTimedOut,
 )
+from ..ports.executor_pool import PoolOffline, PoolState
+
+_NO_POOL_REASON = (
+    "the direct backend runs each lane as a child process of the gate "
+    "that asked for it; there is no machine-wide pool, no queue, and no "
+    "admission control to inspect (see docs/user/condor_lanes.md to opt "
+    "into a scheduling backend that has one)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,3 +134,16 @@ class DirectLanePolicyCheck:
             remedy="not applicable: this backend has no external policy",
             invariants=(),
         )
+
+
+class DirectLanePoolInspector:
+    """The direct backend's answer to "show me the pool": there isn't one.
+
+    A real adapter rather than a ``None`` the caller must remember to
+    handle: the absence of a pool is a fact this backend can state
+    precisely, and stating it is more useful than an empty listing that
+    looks like an idle pool.
+    """
+
+    def inspect(self) -> PoolState:
+        return PoolOffline(_NO_POOL_REASON)

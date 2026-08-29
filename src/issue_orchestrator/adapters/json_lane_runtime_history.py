@@ -27,20 +27,13 @@ from pathlib import Path
 from typing import cast
 
 from ..domain.lane_execution import LaneWorkKey
+from ..ports.lane_runtime_history import LaneRuntimeHistoryError
 
 _ROLLING_WINDOW = 5
 _FILE_SUFFIX = ".json"
 _SAFE_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
-
-class LaneRuntimeHistoryError(RuntimeError):
-    """The history store itself is broken — corrupt state, not absence.
-
-    Raised loudly instead of degrading to naive behavior: a corrupt
-    store means something wrote garbage, and hiding that behind a
-    silent reset would hide the writer's bug. Absence is never an
-    error — an empty store is the naive first run.
-    """
+__all__ = ["JsonLaneRuntimeHistory", "LaneRuntimeHistoryError"]
 
 
 class JsonLaneRuntimeHistory:

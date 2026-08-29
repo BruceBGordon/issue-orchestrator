@@ -47,7 +47,7 @@ from ...domain.lane_execution import (
     LanePolicyInvariant,
     LanePolicyReport,
 )
-from .lane_executor import CondorTools
+from .tools import CondorTools
 
 # The three hard invariants, asserted unconditionally. Values are
 # compared as the config tool prints them, after the normalization in

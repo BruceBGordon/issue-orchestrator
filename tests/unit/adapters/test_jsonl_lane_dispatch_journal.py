@@ -126,6 +126,143 @@ def test_inert_journal_records_nowhere(tmp_path: Path) -> None:
     assert not list(probe.iterdir())
 
 
+def test_written_records_read_back_with_their_observation_facts(
+    tmp_path: Path,
+) -> None:
+    """Round trip: what the writer stored is what the reader returns."""
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    journal.record(_record(exit_code=0))
+    journal.record(_record(exit_code=124))
+
+    history = journal.read_recent(10)
+
+    assert history.location == str(tmp_path / "lane-dispatch.jsonl")
+    assert [entry.record.exit_code for entry in history.entries] == [0, 124]
+    first = history.entries[0]
+    assert first.record.work_key == LaneWorkKey("test-unit")
+    assert first.record.backend == "condor"
+    assert first.record.priority == 45
+    assert first.record.queue_wait_seconds == 12.0
+    assert first.record.observed_runtime_seconds == 45.0
+    # The worktree that submitted is an observation of the write, not
+    # part of what the lane reported, so it lives on the entry.
+    assert first.worktree == Path.cwd().name
+    assert first.recorded_at.tzinfo is not None
+
+
+def test_absent_journal_is_an_empty_history_not_an_error(tmp_path: Path) -> None:
+    """A repository that has never run a lane is the first run, not a fault."""
+    history = JsonlLaneDispatchJournal(tmp_path).read_recent(10)
+    assert history.entries == ()
+    assert "lane-dispatch.jsonl" in history.location
+
+
+def test_only_the_most_recent_window_is_returned(tmp_path: Path) -> None:
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    for exit_code in range(5):
+        journal.record(_record(exit_code=exit_code))
+
+    history = journal.read_recent(2)
+
+    assert [entry.record.exit_code for entry in history.entries] == [3, 4]
+
+
+def test_corruption_outside_the_window_does_not_block_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Only what is actually read is parsed.
+
+    Ancient garbage must not permanently break a status command that is
+    reporting on today's runs — but see the next test: garbage inside
+    the window is never skipped past.
+    """
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    path.write_text("not json at all\n")
+    journal.record(_record(exit_code=7))
+
+    history = journal.read_recent(1)
+
+    assert [entry.record.exit_code for entry in history.entries] == [7]
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("{not json", "not JSON"),
+        ('["a list"]', "not a JSON object"),
+        ('{"recorded_at": 5}', "not a string"),
+        ('{"recorded_at": "yesterday"}', "not a timestamp"),
+        ('{"recorded_at": "2026-08-28T10:00:00"}', "no timezone"),
+        ('{"recorded_at": "2026-08-28T10:00:00+00:00"}', "worktree"),
+    ],
+)
+def test_corrupt_records_fail_loudly_naming_the_line(
+    tmp_path: Path, line: str, expected: str
+) -> None:
+    """A journal that cannot be read back means something wrote garbage.
+
+    Guessing past it would hide the writer's bug behind numbers that
+    look plausible, so every malformed line raises and says where.
+    """
+    (tmp_path / "lane-dispatch.jsonl").write_text(f"{line}\n")
+    with pytest.raises(LaneDispatchJournalError) as caught:
+        JsonlLaneDispatchJournal(tmp_path).read_recent(10)
+    assert "line 1" in str(caught.value)
+    assert expected in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ({"work_key": "Not A Work Key"}, "LaneWorkKey"),
+        ({"work_key": None}, "LaneWorkKey"),
+        ({"backend": ""}, "backend"),
+        ({"priority": -3}, "priority"),
+        ({"priority": "high"}, "priority"),
+        ({"exit_code": "zero"}, "exit_code"),
+        ({"queue_wait_seconds": "soon"}, "not a number"),
+        ({"observed_runtime_seconds": None}, "not a number"),
+    ],
+)
+def test_field_invariants_are_enforced_by_the_record_itself(
+    tmp_path: Path, mutation: dict[str, object], expected: str
+) -> None:
+    """The stored row must satisfy the same contract a live record does."""
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    journal.record(_record())
+    path = tmp_path / "lane-dispatch.jsonl"
+    row = json.loads(path.read_text().splitlines()[0])
+    row.update(mutation)
+    path.write_text(json.dumps(row) + "\n")
+
+    with pytest.raises(LaneDispatchJournalError) as caught:
+        journal.read_recent(10)
+    assert expected in str(caught.value)
+
+
+def test_blank_lines_are_not_records(tmp_path: Path) -> None:
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    journal.record(_record())
+    path = tmp_path / "lane-dispatch.jsonl"
+    path.write_text(f"\n{path.read_text()}\n\n")
+
+    assert len(journal.read_recent(10).entries) == 1
+
+
+def test_reader_rejects_a_meaningless_window(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        JsonlLaneDispatchJournal(tmp_path).read_recent(0)
+    with pytest.raises(ValueError, match="positive"):
+        InertLaneDispatchJournal().read_recent(0)
+
+
+def test_inert_journal_reads_back_nothing_and_says_why() -> None:
+    history = InertLaneDispatchJournal().read_recent(10)
+    assert history.entries == ()
+    assert "not a repository" in history.location
+
+
 def test_record_validation_rejects_nonsense() -> None:
     with pytest.raises(ValueError, match="priority"):
         LaneDispatchRecord(
@@ -157,3 +294,115 @@ def test_record_validation_rejects_nonsense() -> None:
             exit_code=0,
             machine_state=_MACHINE_STATE,
         )
+
+
+def test_reading_never_blocks_a_concurrent_writer_and_never_tears(
+    tmp_path: Path,
+) -> None:
+    """A gate must not stall because someone ran executor-status.
+
+    The reader takes no lock, and the writer's single O_APPEND write is
+    what keeps a concurrently-read line whole: every record the reader
+    sees parses, and the writer is never made to wait.
+    """
+    import threading
+
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    writes = 200
+    done = threading.Event()
+
+    def write_many() -> None:
+        try:
+            for exit_code in range(writes):
+                journal.record(_record(exit_code=exit_code))
+        finally:
+            done.set()
+
+    writer = threading.Thread(target=write_many)
+    writer.start()
+    # Read repeatedly *while* the writer runs: a torn line would raise
+    # the journal's corruption error, and a lock would deadlock or
+    # serialize the writer behind us.
+    reads = 0
+    while not done.is_set():
+        journal.read_recent(50)
+        reads += 1
+    writer.join(timeout=30)
+    assert not writer.is_alive(), "reading must not block the writer"
+    assert reads > 0, "probe never actually read during the writes"
+
+    final = journal.read_recent(writes)
+    assert [entry.record.exit_code for entry in final.entries] == list(range(writes))
+
+
+# --- rows older than the machine-state envelope (#7135) --------------
+
+
+def test_rows_written_before_the_envelope_are_skipped_and_counted(
+    tmp_path: Path,
+) -> None:
+    """They were valid when written, so they are not corruption.
+
+    The journal is append-only and shared by every worktree on the
+    machine, so rows predating the envelope are interleaved with new
+    ones and a worktree on older code keeps adding them. Refusing the
+    whole window would make the reader useless on any real journal;
+    hiding them would overstate the sample behind every runtime read
+    from it. So: skipped, and counted.
+    """
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    journal.record(_record(exit_code=0))
+    path = tmp_path / "lane-dispatch.jsonl"
+    modern = json.loads(path.read_text().splitlines()[0])
+    legacy = {key: value for key, value in modern.items() if key != "machine_state"}
+    path.write_text(
+        json.dumps(legacy) + "\n" + json.dumps(modern) + "\n"
+        + json.dumps(legacy) + "\n"
+    )
+
+    history = journal.read_recent(10)
+
+    assert len(history.entries) == 1, "the readable row must survive"
+    assert history.predating_envelope == 2
+    assert history.entries[0].record.machine_state == _MACHINE_STATE
+
+
+def test_a_malformed_envelope_is_still_corruption(tmp_path: Path) -> None:
+    """The distinction is the point: absent is a schema version, but
+    present-and-wrong is a writer getting it wrong, and that stays
+    loud."""
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    journal.record(_record())
+    path = tmp_path / "lane-dispatch.jsonl"
+    row = json.loads(path.read_text().splitlines()[0])
+    row["machine_state"] = {"sampled_at": "2026-08-29T00:00:00+00:00"}
+    path.write_text(json.dumps(row) + "\n")
+
+    with pytest.raises(LaneDispatchJournalError, match="missing"):
+        journal.read_recent(10)
+
+
+def test_an_envelope_that_is_not_a_mapping_is_corruption(tmp_path: Path) -> None:
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    journal.record(_record())
+    path = tmp_path / "lane-dispatch.jsonl"
+    row = json.loads(path.read_text().splitlines()[0])
+    row["machine_state"] = "not an envelope"
+    path.write_text(json.dumps(row) + "\n")
+
+    with pytest.raises(LaneDispatchJournalError, match="not an envelope"):
+        journal.read_recent(10)
+
+
+def test_a_window_of_only_legacy_rows_is_empty_not_broken(tmp_path: Path) -> None:
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    journal.record(_record())
+    path = tmp_path / "lane-dispatch.jsonl"
+    modern = json.loads(path.read_text().splitlines()[0])
+    legacy = {key: value for key, value in modern.items() if key != "machine_state"}
+    path.write_text("".join(json.dumps(legacy) + "\n" for _ in range(3)))
+
+    history = journal.read_recent(10)
+
+    assert history.entries == ()
+    assert history.predating_envelope == 3
