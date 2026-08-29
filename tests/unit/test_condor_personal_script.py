@@ -208,6 +208,79 @@ def test_lane_config_always_disables_scratch_over_tmp(tmp_path: Path) -> None:
     assert "CONCURRENCY_LIMIT_DEFAULT = 1" in generated
 
 
+def test_lane_config_always_enables_per_job_accounting(tmp_path: Path) -> None:
+    """#7127: per-job accounting is CONFIGURATION, and it rides the
+    always-applied lane config so every pool this helper manages drops
+    each finished job's final ClassAd where the lane runner collects
+    it. The path is expressed as $(SPOOL)/... so condor expands it to
+    the schedd's own spool wherever the pool lives."""
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{SCRIPT}" && write_lane_config "$1"',
+            "_",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    generated = (tmp_path / "90-issue-orchestrator-lanes.conf").read_text()
+    assert "PER_JOB_HISTORY_DIR = $(SPOOL)/per-job-history" in generated
+
+
+def _ensure_history_dir(
+    tmp_path: Path, spool_value: str
+) -> subprocess.CompletedProcess[str]:
+    """Run ensure_per_job_history_dir against a stubbed config reader."""
+    import os
+
+    stubs = tmp_path / "stub-bin"
+    stubs.mkdir(exist_ok=True)
+    reader = stubs / "condor_config_val"
+    reader.write_text(f"#!/bin/bash\necho '{spool_value}'\n")
+    reader.chmod(0o755)
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'export PATH="{stubs}:$PATH"; '
+            f'source "{SCRIPT}" && ensure_per_job_history_dir',
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ},
+    )
+
+
+def test_per_job_history_dir_is_created_because_condor_never_creates_it(
+    tmp_path: Path,
+) -> None:
+    """A missing directory disables per-job accounting SILENTLY, so the
+    helper creates it at every `up` rather than assuming it exists."""
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    result = _ensure_history_dir(tmp_path, str(spool))
+    assert result.returncode == 0, result.stderr
+    assert (spool / "per-job-history").is_dir()
+
+
+def test_creating_the_history_dir_is_idempotent(tmp_path: Path) -> None:
+    spool = tmp_path / "spool"
+    (spool / "per-job-history").mkdir(parents=True)
+    assert _ensure_history_dir(tmp_path, str(spool)).returncode == 0
+    assert (spool / "per-job-history").is_dir()
+
+
+def test_unset_spool_says_so_instead_of_failing_the_pool(tmp_path: Path) -> None:
+    """Accounting is a diagnostic aid, not a precondition for running
+    lanes: an exotic pool with no SPOOL loses the ClassAds, not `up`."""
+    result = _ensure_history_dir(tmp_path, "")
+    assert result.returncode == 0, result.stderr
+    assert "per-job accounting is off" in result.stderr
+
+
 def _write_lane_config(tmp_path: Path, **env: str) -> None:
     import os
 

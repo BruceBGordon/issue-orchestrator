@@ -346,6 +346,62 @@ their submitting worktree (`LaneSubmitter` in the queue), since the
 pool is shared and concurrent gates from different worktrees are
 normal.
 
+## Forensics: what every record carries
+
+A duration on its own cannot be read. Two overlapping gates produce
+contention-inflated samples that look exactly like regressions, and the
+covariate that separates them is gone the moment nobody had a terminal
+open. So every row of both
+`<git-common-dir>/issue-orchestrator/validate-timings.jsonl` and
+`lane-dispatch.jsonl` carries a `machine_state` envelope:
+
+```json
+"machine_state": {
+  "sampled_at": "2026-08-29T12:00:00+00:00",
+  "loadavg_1m": 7.91, "loadavg_5m": 12.51, "loadavg_15m": 9.0,
+  "cpu_idle_percent": 85.68,
+  "cpu_idle_source": "host_statistics(HOST_CPU_LOAD_INFO) over 0.1s",
+  "physical_cores": 18, "probe_error": null
+}
+```
+
+- **CPU idle is not derivable from load average**, especially on macOS
+  where load counts parked threads: a host reading 12.5 can be 85%
+  idle. Both platforms expose cumulative CPU tick counters, so both are
+  read the same way — two reads a window apart, idle share of the
+  delta. Linux reads `/proc/stat`; darwin reads the kernel counters
+  `top` itself prints, without paying for `top` (measured at ~1-1.5s of
+  CPU per probe, rising with load). `cpu_idle_source` always names
+  which probe answered, or why none did.
+- **The window is a floor, not a fixed wait.** Darwin's aggregate
+  refreshes on a cadence that coarsens under load, so the probe
+  re-reads until the counters move (bounded at 2s). A "no measurement"
+  answer exactly when the host is pegged would be the worst possible
+  failure for this envelope.
+- **The host is probed on a bounded cadence**, not once per record: one
+  sampler per process holds its reading for a few seconds, and
+  `sampled_at` makes the reuse visible.
+- **A failed probe never fails the work.** The envelope keeps its shape
+  with nulls and a `probe_error`; an observability probe that could turn
+  a green lane red would manufacture the failures this exists to
+  explain. This is the one deliberate exception to the repository's
+  fail-fast stance, owned in `infra/machine_state.py`.
+- **Concurrency is derivable, not sampled.** A running-job count would
+  cost a scheduler subprocess per record; instead, each dispatch row's
+  end instant, runtime and queue wait let overlap be reconstructed from
+  the journal itself.
+
+The pool is also configured with `PER_JOB_HISTORY_DIR`
+(`$(SPOOL)/per-job-history`), so the scheduler writes every finished
+job's complete final ClassAd to `history.<cluster>.<proc>`. When a lane
+does **not** end cleanly, its retained run directory collects that file
+as `lane.classad` beside `lane.sub`, `lane.events`, `lane.out` and
+`lane.err` — memory and CPU usage, slot, hold reason and every
+timestamp travel with the diagnostics instead of staying in a rotating
+global history. Collection is best-effort by construction: it runs while
+a lane is already failing, so a pool without the knob costs the ClassAd
+and a stderr line, never the lane's own result.
+
 ## Architecture
 
 - `domain/lane_execution.py` — the typed contracts (the only vocabulary
@@ -361,6 +417,9 @@ normal.
   home, `infra/pytest_file_durations.py` capturing, and
   `scripts/lane_slices.py` consuming.
 - `adapters/direct_lane_executor.py` — default backend.
+- `ports/machine_state.py` + `infra/machine_state.py` — the forensics
+  envelope every timing and dispatch record carries (backend-neutral,
+  and the single owner of probe-failure semantics).
 - `adapters/condor/` — the anti-corruption layer: `submit_compiler.py`
   translates lane specs outbound into job descriptions;
   `event_classifier.py` translates job event logs inbound into typed

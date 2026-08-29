@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
+from ..infra.machine_state import machine_state_fields
 from ..infra.validation_timings import append_jsonl
 from ..ports.lane_dispatch_journal import (
     LaneDispatchJournalError,
@@ -52,6 +53,10 @@ class JsonlLaneDispatchJournal:
                         record.observed_runtime_seconds, 1
                     ),
                     "exit_code": record.exit_code,
+                    # Same envelope shape and same owner as the
+                    # validation timings beside it, so one query reads
+                    # host contention across both files (#7127).
+                    **machine_state_fields(record.machine_state),
                 },
             )
         except OSError as error:

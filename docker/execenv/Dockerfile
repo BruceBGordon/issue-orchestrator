@@ -56,6 +56,15 @@ COPY selftest.sh /usr/local/bin/execenv-selftest
 RUN chmod 0755 /usr/local/bin/execenv-entrypoint /usr/local/bin/execenv-selftest \
     && mkdir -p /work && chown io:io /work
 
+# PER_JOB_HISTORY_DIR is written by the schedd, which runs as the condor
+# user here; condor never creates the directory and disables per-job
+# accounting silently when it is missing (#7127). The path is derived
+# from the installed configuration, not guessed.
+RUN set -eu; \
+    spool="$(condor_config_val SPOOL)"; \
+    install -d -m 0755 "$spool/per-job-history"; \
+    chown --reference="$spool" "$spool/per-job-history"
+
 # condor_master is PID 1 (ADR-0003): it is already a supervisor, and
 # docker stop's SIGTERM drains the pool cleanly — provided the run
 # recipe passes --stop-timeout 60 (default 10s defeats the drain).

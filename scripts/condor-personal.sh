@@ -40,6 +40,15 @@ JOB_START_COUNT = 100
 CLAIM_WORKLIFE = 3600
 PERIODIC_EXPR_INTERVAL = 5
 CONCURRENCY_LIMIT_DEFAULT = 1
+# Per-job accounting (#7127). When a job leaves the queue the schedd
+# writes its COMPLETE final ClassAd to <dir>/history.<cluster>.<proc>.
+# The lane runner collects that file into a failed lane's retained
+# diagnostics, so the full accounting - exit status, peak memory, CPU
+# usage, slot, hold reason, every timestamp - survives WITH the run
+# directory instead of only inside a rotating global history file that
+# nothing correlates back to the lane. Configuration and collection
+# only: no new accounting code anywhere.
+PER_JOB_HISTORY_DIR = $(SPOOL)/per-job-history
 # Lane compatibility, required on EVERY pool this helper manages (not
 # just ones it builds the role for): condor bind-mounts job scratch
 # over /tmp by default on Linux, so a lane whose working directory
@@ -174,6 +183,38 @@ WANT_SUSPEND = (TARGET.SuspendableLane =?= True)
 SUSPEND = (\$(OwnerLoadAvg) > ${IO_CONDOR_SUSPEND_LOAD:-5.0}) && (TARGET.SuspendableLane =?= True)
 CONTINUE = (\$(OwnerLoadAvg) < ${IO_CONDOR_CONTINUE_LOAD:-2.0})
 EOF
+}
+
+# The schedd writes the per-job ClassAds itself, so the directory must
+# exist and be writable by whoever runs it - the submitting user on the
+# tarball pools, the condor user on a system install. Condor does not
+# create it, and a missing directory disables per-job accounting
+# silently, so this runs at every `up` and is never assumed.
+ensure_per_job_history_dir() {
+  local spool history owner
+  spool=$(condor_config_val SPOOL 2>/dev/null || echo "")
+  if [ -z "$spool" ]; then
+    echo "condor-personal: SPOOL is unset; per-job accounting is off" >&2
+    return 0
+  fi
+  history="$spool/per-job-history"
+  if [ -d "$history" ]; then
+    return 0
+  fi
+  if mkdir -p "$history" 2>/dev/null; then
+    return 0
+  fi
+  # Accounting is a diagnostic aid, not a precondition for running
+  # lanes: a pool whose spool we cannot write loses the ClassAds, not
+  # `up`.
+  owner=$(stat -f '%Su' "$spool" 2>/dev/null || stat -c '%U' "$spool" 2>/dev/null || echo "")
+  if ! sudo mkdir -p "$history" 2>/dev/null; then
+    echo "condor-personal: could not create $history; per-job accounting is off" >&2
+    return 0
+  fi
+  if [ -n "$owner" ]; then
+    sudo chown "$owner" "$history" || true
+  fi
 }
 
 # Files this helper manages whose ABSENCE from staging is meaningful:
@@ -454,6 +495,7 @@ case "${1:-}" in
     else
       linux_configure
     fi
+    ensure_per_job_history_dir
     if condor_status -total >/dev/null 2>&1; then
       echo "condor-personal: pool already running; applying configuration"
       condor_reconfig >/dev/null 2>&1 || true

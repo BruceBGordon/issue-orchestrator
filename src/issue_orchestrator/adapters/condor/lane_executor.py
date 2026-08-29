@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -49,6 +50,21 @@ _SCHEDULER_SLACK_SECONDS = 120.0
 # bound only catches a structurally dead pool that accepts submissions
 # and never matches them.
 _ADMISSION_TIMEOUT_SECONDS = 600.0
+
+# Per-job accounting (#7127). The pool is configured (by
+# scripts/condor-personal.sh and the execenv image) to drop every
+# finished job's complete final ClassAd at
+# <PER_JOB_HISTORY_DIR>/history.<cluster>.<proc>. A retained run
+# directory collects its own job's file, so a failed lane's full
+# accounting travels with its diagnostics instead of living in a
+# rotating global history nothing correlates back to the lane.
+_PER_JOB_HISTORY_CONFIGURATION_KNOB = "PER_JOB_HISTORY_DIR"
+_JOB_ACCOUNTING_FILE_NAME = "lane.classad"
+# The schedd writes the ClassAd when the job leaves the QUEUE, which is
+# shortly after its terminal event reaches the log. Bounded so a pool
+# that never writes it costs seconds, never the gate.
+_JOB_ACCOUNTING_WAIT_SECONDS = 10.0
+_JOB_IDENTIFIER_RE = re.compile(r"\d+\.\d+")
 
 
 # Where scripts/condor-personal.sh installs the personal pool. Resolving
@@ -283,11 +299,17 @@ class CondorLaneExecutor:
             terminal = self._follow_job(command, compiled, job_id, streams)
             if type(terminal) is LaneCompleted and terminal.exit_code == 0:
                 retain_run_directory = False
+            else:
+                # Retention and accounting collection are ONE decision:
+                # whatever is worth keeping the directory for is worth
+                # the scheduler's own final word on the job.
+                self._collect_job_accounting(job_id, run_directory)
             return terminal
         except LaneExecutorError as error:
             if job_id is not None and streams is not None:
                 self._remove(job_id)
                 streams.pump()
+                self._collect_job_accounting(job_id, run_directory)
             raise LaneExecutorError(
                 f"{error} (lane diagnostics retained at {run_directory})"
             ) from error
@@ -410,6 +432,77 @@ class CondorLaneExecutor:
                 f"the scheduler held the lane's job: {state.detail}"
             )
         raise AssertionError("lane job state is a closed union")
+
+    def _collect_job_accounting(self, job_id: str, run_directory: Path) -> None:
+        """Copy this job's final ClassAd into the retained diagnostics.
+
+        Best-effort by construction, and deliberately so: this runs while
+        a lane is ALREADY ending badly, so a diagnostic that could raise
+        would replace the real failure with its own. Every giving-up
+        path says why on stderr, beside the retention line, so a pool
+        that stopped writing per-job accounting is visible rather than
+        quietly unhelpful.
+        """
+        if _JOB_IDENTIFIER_RE.fullmatch(job_id) is None:
+            # The ClassAd file is named history.<cluster>.<proc>, so the
+            # identifier is also a path component: never build a read
+            # path out of a token that is not that shape.
+            print(
+                f"condor lane: unexpected job identifier {job_id!r}; no "
+                "per-job accounting was collected",
+                file=sys.stderr,
+            )
+            return
+        try:
+            directory = self._per_job_history_directory()
+        except LaneExecutorError as error:
+            print(
+                f"condor lane: per-job accounting lookup failed: {error}",
+                file=sys.stderr,
+            )
+            return
+        if directory is None:
+            print(
+                "condor lane: this pool sets no "
+                f"{_PER_JOB_HISTORY_CONFIGURATION_KNOB}, so no per-job "
+                "accounting was collected (scripts/condor-personal.sh up "
+                "configures it)",
+                file=sys.stderr,
+            )
+            return
+        source = directory / f"history.{job_id}"
+        deadline = time.monotonic() + _JOB_ACCOUNTING_WAIT_SECONDS
+        while not source.is_file() and time.monotonic() < deadline:
+            time.sleep(_POLL_INTERVAL_SECONDS)
+        try:
+            shutil.copyfile(source, run_directory / _JOB_ACCOUNTING_FILE_NAME)
+        except OSError as error:
+            print(
+                f"condor lane: could not collect per-job accounting from "
+                f"{source}: {error}",
+                file=sys.stderr,
+            )
+
+    def _per_job_history_directory(self) -> Path | None:
+        """Where this pool drops each job's final ClassAd, or None.
+
+        Read from the pool's own effective configuration rather than
+        recomputed here, so the helpers that WRITE the knob remain its
+        only authors — and read through ``read_configuration``, the
+        scrubbed channel (#7132), because this is a question ABOUT the
+        pool: a ``_CONDOR_PER_JOB_HISTORY_DIR`` exported into this
+        process would otherwise answer for the caller's environment and
+        send the collector looking somewhere the daemons never write.
+        """
+        completed = self._tools.read_configuration(
+            _PER_JOB_HISTORY_CONFIGURATION_KNOB
+        )
+        if completed.returncode != 0:
+            return None
+        value = completed.stdout.strip()
+        if not value or value.lower() == "undefined":
+            return None
+        return Path(value)
 
     def _observe(self, compiled: CompiledSubmitDescription) -> LaneJobState:
         try:

@@ -10,6 +10,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..ports.machine_state import MachineStateSampler
+from .machine_state import default_machine_state_sampler, stamp_machine_state
+
 _CONFIG_KEY_PATTERN = r"[A-Za-z_][A-Za-z0-9_]*"
 _CONFIG_FIELD_PATTERN = rf"{_CONFIG_KEY_PATTERN}=\S+"
 _CONFIG_RE = re.compile(
@@ -173,14 +176,27 @@ def build_timing_envelope(
     }
 
 
-def append_validation_timing(worktree: Path, record: dict[str, object]) -> None:
-    """Append one validation timing record with shared worktree context."""
+def append_validation_timing(
+    worktree: Path,
+    record: dict[str, object],
+    machine_state: MachineStateSampler | None = None,
+) -> None:
+    """Append one validation timing record with shared worktree context.
+
+    ``machine_state`` defaults to the process-wide host sampler; tests
+    (and any caller wanting a different probe) inject their own.
+    """
     payload: dict[str, object] = {
         "worktree": str(worktree),
         "branch": current_branch_name(worktree),
         "recorded_at": datetime.now(timezone.utc).isoformat(),
     }
     payload.update(record)
+    # Stamped last so a caller's own keys can never displace the
+    # envelope: "how long" is worthless without "under what".
+    payload.update(
+        stamp_machine_state(machine_state or default_machine_state_sampler())
+    )
     append_jsonl(get_shared_timings_file(worktree), payload)
 
 
@@ -207,6 +223,12 @@ class ValidateTimingRecorder:
     command: str
     run_id: str = field(
         default_factory=lambda: datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    )
+    # Injectable so tests can fake the probe; defaults to the shared
+    # per-process host sampler so one gate probes the host on a bounded
+    # cadence no matter how many records it writes.
+    machine_state: MachineStateSampler = field(
+        default_factory=default_machine_state_sampler
     )
     branch: str | None = field(init=False)
     output_path: Path | None = field(init=False)
@@ -253,9 +275,7 @@ class ValidateTimingRecorder:
             "started_at": self.starts.pop(target, None),
             "ended_at": end_match.group("at"),
         }
-        for key, value in self.config.items():
-            record[key] = value
-        append_jsonl(self.output_path, record)
+        self._append(record)
 
     def finalize(
         self,
@@ -286,13 +306,11 @@ class ValidateTimingRecorder:
                     monotonic_ended_at=monotonic_ended_at,
                 )
             )
-        for key, value in self.config.items():
-            record[key] = value
-        append_jsonl(self.output_path, record)
+        self._append(record)
 
     def append_resource_sample(self, sample: dict[str, object]) -> None:
         """Persist one periodic host resource sample."""
-        record = {
+        record: dict[str, object] = {
             "kind": "resource_sample",
             "run_id": self.run_id,
             "command": self.command,
@@ -300,6 +318,16 @@ class ValidateTimingRecorder:
             "branch": self.branch,
             **sample,
         }
+        self._append(record)
+
+    def _append(self, record: dict[str, object]) -> None:
+        """The one exit every record this recorder writes goes through.
+
+        Config context first, then the machine-state envelope — stamped
+        last so neither a record's own fields nor a config key can
+        displace the covariate that explains the timing (#7127).
+        """
         for key, value in self.config.items():
             record[key] = value
+        record.update(stamp_machine_state(self.machine_state))
         append_jsonl(self.output_path, record)

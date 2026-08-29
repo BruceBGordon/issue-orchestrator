@@ -348,6 +348,63 @@ def test_run_directory_lifecycle_deletes_on_success_retains_on_failure(
         _shutil.rmtree(directory, ignore_errors=True)
 
 
+def test_failed_lane_retains_the_pools_own_per_job_accounting(
+    tmp_path: Path,
+) -> None:
+    """Acceptance for #7127's collection half, on the live pool.
+
+    ``scripts/condor-personal.sh`` configures PER_JOB_HISTORY_DIR, so
+    when a lane exits nonzero its retained run directory must also hold
+    ``lane.classad`` — the scheduler's COMPLETE final ClassAd for that
+    exact job (exit status, memory, CPU, slot, every timestamp) — beside
+    the event log, instead of only inside a rotating global history that
+    nothing correlates back to the lane.
+
+    Against a pool started without the knob this FAILS rather than
+    skips: silently absent accounting is precisely what this exists to
+    prevent.
+    """
+    import glob as _glob
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    configured = _run_pool_tool("condor_config_val", "PER_JOB_HISTORY_DIR")
+    assert configured.returncode == 0 and configured.stdout.strip(), (
+        "this pool sets no PER_JOB_HISTORY_DIR; restart it with "
+        "scripts/condor-personal.sh up so per-job accounting is written "
+        f"(condor_config_val said: {configured.stdout.strip()!r} "
+        f"{configured.stderr.strip()!r})"
+    )
+
+    pattern = str(Path(_tempfile.gettempdir()) / "lane-contract.accounting*")
+    before = set(_glob.glob(pattern))
+    outcome = CondorLaneExecutor(CondorTools.resolve()).run(
+        LaneCommand(
+            work_key=LaneWorkKey("contract.accounting"),
+            arguments=(sys.executable, "-c", "raise SystemExit(3)"),
+            working_directory=tmp_path,
+            deadline=LaneDeadline(60.0),
+        ),
+        LaneResources(request_cpus=1),
+    )
+    assert type(outcome) is LaneCompleted and outcome.exit_code == 3
+    retained = set(_glob.glob(pattern)) - before
+    assert retained, "the failed lane did not retain its diagnostics"
+    try:
+        for directory in retained:
+            classad = Path(directory) / "lane.classad"
+            assert classad.is_file(), (
+                "the failed lane retained no per-job accounting; the pool "
+                f"writes it to {configured.stdout.strip()}"
+            )
+            text = classad.read_text(encoding="utf-8")
+            assert "ClusterId" in text, text[:400]
+            assert "ExitCode = 3" in text, text[:400]
+    finally:
+        for directory in retained:
+            _shutil.rmtree(directory, ignore_errors=True)
+
+
 def _pool_tool(name: str) -> tuple[Path, dict[str, str]]:
     """Locate a scheduler tool beside the resolved submit binary, with
     the environment its pool configuration requires."""
