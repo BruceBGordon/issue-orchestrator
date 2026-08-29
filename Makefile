@@ -347,10 +347,10 @@ define TIMED_RUN
 	verdict_on=0; \
 	if [ -z "$$LANE_VERDICT_SHA" ]; then \
 		:; \
-	elif [ "$(origin LANE_VERDICT_SHA)" = "environment" ]; then \
+	elif [ -z "$(LANE_VERDICT_OVERRIDDEN)" ]; then \
 		verdict_on=1; \
 	else \
-		echo "[lane-verdict] ignoring LANE_VERDICT_* delivered as make overrides for $$target - the environment is the only sanctioned transport; lane runs uncached" >&2; \
+		echo "[lane-verdict] ignoring LANE_VERDICT_* for $$target - non-environment transport on: $(LANE_VERDICT_OVERRIDDEN) - the environment is the only sanctioned transport; lane runs uncached" >&2; \
 	fi; \
 	if [ $$verdict_on -eq 1 ]; then \
 		$(LANE_VERDICT) check --worktree "$(CURDIR)" --target "$$target"; vrc=$$?; \
@@ -385,6 +385,16 @@ endef
 # passed explicitly as $(CURDIR) - never inferred from the shell's cwd.
 LANE_VERDICT_PYTHON = $(if $(findstring /,$(PYTHON)),$(abspath $(PYTHON)),$(PYTHON))
 LANE_VERDICT = $(LANE_VERDICT_PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_verdict
+# The layer's COMPLETE variable set. Engagement requires EVERY one of
+# these to be environment-origin (undefined is fine - absence is
+# handled separately); one override-origin variable anywhere refuses
+# the whole layer, because a mixed delivery lets an override replace
+# a gate-owned input (round 3: command-line LANES silently swapped
+# the lane set under an environment SHA). The origin check ITERATES
+# this list, so a future LANE_VERDICT_* variable is covered by
+# construction - add it here and the transport check owns it.
+LANE_VERDICT_VARIABLES := LANE_VERDICT_SHA LANE_VERDICT_LANES
+LANE_VERDICT_OVERRIDDEN = $(strip $(foreach v,$(LANE_VERDICT_VARIABLES),$(if $(filter environment undefined,$(origin $(v))),,$(v))))
 
 # Two-pass typecheck: strict for core (domain/ports/control), standard for rest
 # --warnings ensures 0 warnings required (exit code 1 if warnings reported)

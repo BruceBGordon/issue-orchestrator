@@ -508,6 +508,97 @@ def test_command_line_overrides_cannot_reach_a_nested_make(
     assert "INNER-RAN" in second.stdout
 
 
+def _mixed_origin_run(
+    repo: Path,
+    sha: str,
+    *,
+    sha_via: str,
+    lanes_via: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run ok-lane with each verdict variable delivered independently
+    via 'env' or 'cli' transport (MAKEFLAGS deliberately not scrubbed)."""
+    make = shutil.which("gmake") or "make"
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"LANE_VERDICT_SHA", "LANE_VERDICT_LANES"}
+    }
+    environment["PYTHONPATH"] = str(REPO_ROOT / "src")
+    arguments = [
+        make,
+        "-f",
+        str(REPO_ROOT / "Makefile"),
+        "-f",
+        "extra.mk",
+        f"PYTHON={REPO_ROOT / '.venv' / 'bin' / 'python'}",
+        "ok-lane",
+    ]
+    if sha_via == "env":
+        environment["LANE_VERDICT_SHA"] = sha
+    else:
+        arguments.append(f"LANE_VERDICT_SHA={sha}")
+    if lanes_via == "env":
+        environment["LANE_VERDICT_LANES"] = "ok-lane"
+    else:
+        arguments.append("LANE_VERDICT_LANES=ok-lane")
+    return subprocess.run(
+        arguments,
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+
+def _assert_layer_refused(
+    first: "subprocess.CompletedProcess[str]",
+    second: "subprocess.CompletedProcess[str]",
+    repo: Path,
+) -> None:
+    assert first.returncode == 0
+    assert "RAN-OK" in first.stdout
+    assert "recorded-green" not in first.stdout, first.stdout
+    assert "ignoring LANE_VERDICT_" in first.stderr, first.stderr
+    lanes_root = repo / ".issue-orchestrator" / "validation" / "lanes"
+    assert not list(lanes_root.glob("*/*.json"))
+    assert "cached-green" not in second.stdout
+    assert "RAN-OK" in second.stdout
+
+
+def test_mixed_origin_env_sha_cli_lanes_refuses_the_whole_layer(
+    tmp_path: Path,
+) -> None:
+    """Round-3 finding: with environment-origin SHA but command-line
+    LANES, the layer stayed fully engaged while the OVERRIDE supplied
+    the gate-owned lane set (recorded, then cached-skipped, no refusal
+    line). Engagement must require EVERY LANE_VERDICT_* variable to be
+    environment-origin; one override-origin variable anywhere refuses
+    the whole layer loudly."""
+    repo, _ = _fake_repo(tmp_path)
+    (repo / "extra.mk").write_text(
+        "ok-lane:\n\t$(call TIMED_RUN,ok-lane,echo RAN-OK)\n"
+    )
+    sha = _commit_all(repo)
+    first = _mixed_origin_run(repo, sha, sha_via="env", lanes_via="cli")
+    second = _mixed_origin_run(repo, sha, sha_via="env", lanes_via="cli")
+    _assert_layer_refused(first, second, repo)
+
+
+def test_mixed_origin_cli_sha_env_lanes_refuses_the_whole_layer(
+    tmp_path: Path,
+) -> None:
+    """The symmetric direction: command-line SHA with environment
+    LANES must refuse identically."""
+    repo, _ = _fake_repo(tmp_path)
+    (repo / "extra.mk").write_text(
+        "ok-lane:\n\t$(call TIMED_RUN,ok-lane,echo RAN-OK)\n"
+    )
+    sha = _commit_all(repo)
+    first = _mixed_origin_run(repo, sha, sha_via="cli", lanes_via="env")
+    second = _mixed_origin_run(repo, sha, sha_via="cli", lanes_via="env")
+    _assert_layer_refused(first, second, repo)
+
+
 def test_untracked_state_disengages_the_cache_both_ways(
     tmp_path: Path,
 ) -> None:
