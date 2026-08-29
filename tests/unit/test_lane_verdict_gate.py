@@ -441,6 +441,73 @@ def test_nested_direct_make_never_consults_or_records(tmp_path: Path) -> None:
     assert "INNER-RAN" in second.stdout, "the failed lane must re-run fully"
 
 
+def test_command_line_overrides_cannot_reach_a_nested_make(
+    tmp_path: Path,
+) -> None:
+    """Round-2 finding B1: make forwards COMMAND-LINE variable
+    assignments to sub-makes through MAKEFLAGS, bypassing the env
+    unset entirely — the nested make re-instated the verdict vars as
+    command-line definitions and recorded a green the failing outer
+    lane never earned. The class fix is transport-based: the layer
+    engages only when the variables arrive as ENVIRONMENT (the gate
+    phase's sanctioned channel); override-origin delivery — argv here,
+    or a hand-exported MAKEFLAGS, which a child also sees as
+    command-line origin — is refused loudly at every make level, so
+    the inner make is inert regardless of how the assignments travel.
+    This runner deliberately does NOT scrub MAKEFLAGS."""
+    repo, _ = _fake_repo(tmp_path)
+    extra = repo / "extra.mk"
+    extra.write_text(
+        "outer-lane:\n"
+        "\t$(call TIMED_RUN,outer-lane,"
+        f"$(GMAKE) -f {REPO_ROOT / 'Makefile'} -f extra.mk "
+        "PYTHON=$(PYTHON) inner-step && exit 7)\n"
+        "inner-step:\n"
+        "\t$(call TIMED_RUN,inner-step,echo INNER-RAN)\n"
+    )
+    sha = _commit_all(repo)
+    make = shutil.which("gmake") or "make"
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"LANE_VERDICT_SHA", "LANE_VERDICT_LANES"}
+    }
+    environment["PYTHONPATH"] = str(REPO_ROOT / "src")
+
+    def run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                make,
+                "-f",
+                str(REPO_ROOT / "Makefile"),
+                "-f",
+                "extra.mk",
+                f"PYTHON={REPO_ROOT / '.venv' / 'bin' / 'python'}",
+                "outer-lane",
+                f"LANE_VERDICT_SHA={sha}",
+                "LANE_VERDICT_LANES=outer-lane inner-step",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+    first = run()
+    assert first.returncode != 0
+    assert "INNER-RAN" in first.stdout
+    assert "recorded-green" not in first.stdout, (
+        "override-transported verdict vars reached a nested make:\n"
+        + first.stdout
+    )
+    assert "ignoring LANE_VERDICT_" in first.stderr
+    lanes_root = repo / ".issue-orchestrator" / "validation" / "lanes"
+    assert not list(lanes_root.glob("*/*.json"))
+    second = run()
+    assert "cached-green" not in second.stdout
+    assert "INNER-RAN" in second.stdout
+
+
 def test_untracked_state_disengages_the_cache_both_ways(
     tmp_path: Path,
 ) -> None:

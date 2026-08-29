@@ -329,7 +329,13 @@ PYTEST_TIMINGS ?= --durations=$(PYTEST_DURATIONS) --durations-min=$(PYTEST_DURAT
 # UNSET: only this outer wrapper owns consulting and recording - a
 # nested make (the scheduler lane's inner direct invocation) must
 # never mint a green the outer lane's postconditions haven't earned.
-# The guard uses
+# Engagement is TRANSPORT-CHECKED with $(origin): only ENVIRONMENT
+# delivery (the gate phase's channel) engages the layer. Command-line
+# assignments are refused loudly - make forwards those to sub-makes
+# through MAKEFLAGS past any env unset, and a child sees a
+# hand-exported MAKEFLAGS override the same way, so origin-checking
+# closes every override transport by definition (MFLAGS carries no
+# variable definitions at all). The guard uses
 # -z (not -n) so recipe text stays free of " -n ", which the phase
 # tests read as an xdist width marker.
 define TIMED_RUN
@@ -338,10 +344,18 @@ define TIMED_RUN
 	start=$$(date +%s); \
 	start_hr=$$(date '+%Y-%m-%dT%H:%M:%S%z'); \
 	echo "[validate-timing] START target=$$target at=$$start_hr"; \
+	verdict_on=0; \
 	if [ -z "$$LANE_VERDICT_SHA" ]; then \
-		vrc=3; \
+		:; \
+	elif [ "$(origin LANE_VERDICT_SHA)" = "environment" ]; then \
+		verdict_on=1; \
 	else \
+		echo "[lane-verdict] ignoring LANE_VERDICT_* delivered as make overrides for $$target - the environment is the only sanctioned transport; lane runs uncached" >&2; \
+	fi; \
+	if [ $$verdict_on -eq 1 ]; then \
 		$(LANE_VERDICT) check --worktree "$(CURDIR)" --target "$$target"; vrc=$$?; \
+	else \
+		vrc=3; \
 	fi; \
 	if [ $$vrc -eq 0 ]; then \
 		status=0; \
@@ -350,7 +364,7 @@ define TIMED_RUN
 	else \
 		( unset LANE_VERDICT_SHA LANE_VERDICT_LANES; $(2) ); \
 		status=$$?; \
-		if [ -z "$$LANE_VERDICT_SHA" ] || [ $$status -ne 0 ]; then \
+		if [ $$verdict_on -eq 0 ] || [ $$status -ne 0 ]; then \
 			:; \
 		elif ! $(LANE_VERDICT) record --worktree "$(CURDIR)" --target "$$target" --exit-status $$status; then \
 			echo "[lane-verdict] warning: could not record green for $$target (store at $(CURDIR)) - no verdict left, lane outcome preserved" >&2; \
