@@ -199,6 +199,21 @@ class MachineStateEnvelopeError(ValueError):
     """A stored envelope cannot be read back as the reading it recorded."""
 
 
+class MachineStateEnvelopeMissing(MachineStateEnvelopeError):
+    """The record carries no envelope at all.
+
+    Distinct from a malformed one, and the distinction is load-bearing:
+    the envelope was added to records that already existed (#7135), and
+    the journals it was added to are append-only and shared by every
+    worktree on the machine. A worktree still running older code keeps
+    appending envelope-less rows TODAY, interleaved with new ones. Such
+    a row was valid when written — it is a schema-version fact, not
+    something a writer got wrong — so a reader may skip and count it.
+    A malformed envelope stays an error: that IS a writer getting it
+    wrong.
+    """
+
+
 def machine_state_from_fields(record: dict[str, object]) -> MachineState:
     """Read back the envelope :func:`machine_state_fields` wrote.
 
@@ -211,10 +226,14 @@ def machine_state_from_fields(record: dict[str, object]) -> MachineState:
     """
     if type(record) is not dict:
         raise MachineStateEnvelopeError("a record must be a mapping")
-    envelope = record.get(MACHINE_STATE_RECORD_KEY)
+    if MACHINE_STATE_RECORD_KEY not in record:
+        raise MachineStateEnvelopeMissing(
+            f"record carries no {MACHINE_STATE_RECORD_KEY!r} envelope"
+        )
+    envelope = record[MACHINE_STATE_RECORD_KEY]
     if not isinstance(envelope, dict):
         raise MachineStateEnvelopeError(
-            f"record carries no {MACHINE_STATE_RECORD_KEY!r} envelope"
+            f"{MACHINE_STATE_RECORD_KEY!r} is not an envelope"
         )
     fields = cast("dict[str, object]", envelope)
     expected = {

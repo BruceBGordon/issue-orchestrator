@@ -479,51 +479,72 @@ immediately re-EXCEPTs on the same queued job, forever. So:
 ## Seeing what the pool is doing: `executor-status`
 
 ```bash
-issue-orchestrator executor-status            # summarize the last 400 records
-issue-orchestrator executor-status --scan 20  # only the most recent 20
+issue-orchestrator executor-status              # summarize the last 400 records
+issue-orchestrator executor-status --scan 20    # only the most recent 20
+issue-orchestrator executor-status --backend condor   # report on a named backend
 ```
 
 Read-only, from any directory in the repository. It answers one
-question — *why is validation work running or waiting?* — by joining two
-things that are otherwise checked separately:
+question — *why is validation work running or waiting?* — by joining
+three things that are otherwise checked separately:
 
 ```
-Executor pool — backend condor, captured 2026-08-28 23:37:14Z
+Executor pool — backend condor (from repository validation command), captured …
 
 POOL: online — 1 machine, 18 cpus, 2 in use; 1 running, 1 queued
-  STATE      FOR  CPUS  PRI  LANE          SUBMITTED BY             EXCLUSIVE
-  running  27.0s     2   71  test-unit     issue-orchestrator-wt-a  codexlogin
-  queued   24.0s     2   72  test-web      issue-orchestrator-wt-b  codexlogin
+  STATE      FOR  CPUS  PRI  LANE       SUBMITTED BY             EXCLUSIVE
+  running  27.0s     2   71  test-unit  issue-orchestrator-wt-a  codexlogin
+  queued   24.0s     2   72  test-web   issue-orchestrator-wt-b  codexlogin
 
-RECENT DISPATCH: /repo/.git/issue-orchestrator/lane-dispatch.jsonl (…)
-  LANE       RUNS  LAST RUNTIME  LAST QUEUE WAIT  PRI  EXIT  WHEN
-  test-unit     9         1m04s             0.0s   59     0  2026-08-28 23:12:15Z
+LANES: /repo/.issue-orchestrator/lanes.yaml
+  dispatch journal: …/lane-dispatch.jsonl (30 record(s) scanned), highest first
+  LANE          CPUS  MEM MB  FREEZE  EXCLUSIVE  RUNS  LAST RUNTIME  …  BACKEND  WHEN
+  test-unit        8    6144  ok      -             3         1m21s  …  condor   …
+  execenv.memory-oom  1   128  never  -             0             —  …  —        never
 ```
 
 The mental model, top to bottom:
 
-- **POOL** is *now*. Capacity is the machine's real cpus; "in use" is
-  totalled from the jobs listed underneath, so the header can never
-  disagree with the rows. Every row names the lane, the **worktree that
-  submitted it** (the pool is machine-wide — concurrent gates from
-  different worktrees are normal), how long it has been in that state,
-  and any exclusive token it holds. A queued row sitting behind a
-  running row that holds the same token is the answer to "why is my
-  lane waiting".
-- **RECENT DISPATCH** is *history*, one row per lane, read from the
-  journal every completed lane writes. `PRI` is the learned dispatch
-  priority the **next** run will carry, so the table is printed in the
-  order the next gate will dispatch in.
+- **The header** names the backend *and what established it*: an
+  explicit `--backend`, `$ISSUE_ORCHESTRATOR_LANE_EXECUTOR`, or this
+  repository's own gate command (which is where `LANE_EXECUTOR=condor`
+  lives). If nothing establishes it, the header says
+  `backend UNKNOWN` and the command exits `78` — it will not assume one,
+  because a status tool confidently naming the wrong backend is worse
+  than one that admits it cannot tell.
+- **POOL** is *now*. `online` is a claim that the pool can run work:
+  it has execute resources and the collector heard from each of them
+  recently. Anything else reads `health UNKNOWN` with the reason —
+  no execute resources, records the collector is still serving from
+  cache after a daemon died, or liveness it could not establish. The
+  numbers it did report are still shown, labelled as its claim.
+  Every job row names the lane, the **worktree that submitted it** (the
+  pool is machine-wide), how long it has been **in that state**, and any
+  exclusive token it holds.
+- **LANES** is every lane that exists, from the declarations, joined to
+  what the journal says each one last cost. A declared lane that has
+  never run still gets a row (`never`), and a lane in the journal that
+  the declarations no longer describe is marked `undeclared` — it cannot
+  run again until it is declared. `PRI` is the learned dispatch priority
+  the **next** run will carry, so the table is printed in the order the
+  next gate will dispatch. `BACKEND` is the backend each lane actually
+  last ran on, so history that contradicts the header is visible.
+- **IDLE** is how idle the host was when that runtime was measured, from
+  the `machine_state` envelope above — a duration read without its
+  contention is the ambiguity that envelope exists to end. Rows written
+  before the envelope existed (and rows a worktree on older code is
+  still appending to the shared journal) cannot be read back, so they
+  are skipped and the count is printed beside the scan total: the
+  history is thinner than the window, and saying so is the point.
 - **FAULTS**, when present, means an input is broken rather than empty.
 
 Nothing is ever silently omitted. A machine with no pool prints
-`POOL: unavailable` and the reason (the direct backend has no pool at
-all; an opted-in pool may simply not be running), and still prints the
-dispatch history. A repository that has never run a lane prints the
-journal path it will appear at. Absence exits `0` — it is the ordinary
-state of an opt-in backend — while a *broken* input (a corrupt journal
-row, an untranslatable answer from the pool) is printed under `FAULTS`
-and exits `70`, so a script cannot mistake damage for quiet.
+`POOL: unavailable` and the reason, and still prints the lane table. A
+repository with no journal prints the path records will appear at.
+Absence exits `0`; a *broken* input (a corrupt journal row, an
+untranslatable answer from the pool, a missing or malformed
+`lanes.yaml`) is printed under `FAULTS` and exits `70`; a backend that
+nothing establishes exits `78`.
 
 The command never prints command lines, arguments, environments, or
 output paths: the pool query does not even ask for those attributes, so

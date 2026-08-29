@@ -8,6 +8,7 @@ not HTCondor.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -30,19 +31,28 @@ from issue_orchestrator.ports.executor_pool import (
     PoolOffline,
     PoolOnline,
     PoolState,
+    PoolUnknownHealth,
 )
 
 _SERVER_TIME = 1_787_959_500
+# Slot heartbeats are judged against the reader's clock, so fixtures
+# stamp them relative to now rather than to the scheduler's fake clock.
+_NOW = int(time.time())
+_UPDATE_INTERVAL_SECONDS = 300
 
 _IDLE_SLOT = {
+    "Name": "slot1@host.local",
     "Machine": "host.local",
     "TotalSlotCpus": 18,
     "PartitionableSlot": True,
+    "LastHeardFrom": _NOW - 5,
 }
 _DYNAMIC_SLOT = {
+    "Name": "slot1_1@host.local",
     "Machine": "host.local",
     "TotalSlotCpus": 3,
     "DynamicSlot": True,
+    "LastHeardFrom": _NOW - 5,
 }
 _RUNNING_LANE_JOB = {
     "JobStatus": 2,
@@ -50,8 +60,7 @@ _RUNNING_LANE_JOB = {
     "LaneSubmitter": "issue-orchestrator-wt-alpha",
     "Owner": "operator",
     "JobPrio": 59,
-    "QDate": _SERVER_TIME - 90,
-    "JobCurrentStartDate": _SERVER_TIME - 60,
+    "EnteredCurrentStatus": _SERVER_TIME - 60,
     "RequestCpus": 3,
     "ServerTime": _SERVER_TIME,
 }
@@ -61,7 +70,7 @@ _QUEUED_LANE_JOB = {
     "LaneSubmitter": "issue-orchestrator-wt-beta",
     "Owner": "operator",
     "JobPrio": 82,
-    "QDate": _SERVER_TIME - 30,
+    "EnteredCurrentStatus": _SERVER_TIME - 30,
     "ConcurrencyLimits": "codexlogin, claudelogin",
     "RequestCpus": 2,
     "ServerTime": _SERVER_TIME,
@@ -70,8 +79,7 @@ _FOREIGN_JOB = {
     "JobStatus": 2,
     "Owner": "someone-else",
     "JobPrio": 0,
-    "QDate": _SERVER_TIME - 500,
-    "JobCurrentStartDate": _SERVER_TIME - 400,
+    "EnteredCurrentStatus": _SERVER_TIME - 400,
     "RequestCpus": 4,
     "ServerTime": _SERVER_TIME,
 }
@@ -84,6 +92,7 @@ def _stub_tools(
     jobs: str = "[]",
     slots_exit: int = 0,
     jobs_exit: int = 0,
+    interval_exit: int = 0,
 ) -> CondorTools:
     binaries = tmp_path / "bin"
     binaries.mkdir(exist_ok=True)
@@ -91,7 +100,9 @@ def _stub_tools(
         "condor_submit": "#!/bin/sh\nexit 0\n",
         "condor_rm": "#!/bin/sh\nexit 0\n",
         "condor_q": f"#!/bin/sh\ncat <<'JSON'\n{jobs}\nJSON\nexit {jobs_exit}\n",
-        "condor_config_val": "#!/bin/sh\nexit 0\n",
+        "condor_config_val": (
+            f"#!/bin/sh\necho {_UPDATE_INTERVAL_SECONDS}\nexit {interval_exit}\n"
+        ),
         "condor_status": (
             f"#!/bin/sh\ncat <<'JSON'\n{slots}\nJSON\nexit {slots_exit}\n"
         ),
@@ -148,14 +159,13 @@ def test_lane_jobs_carry_their_work_key_submitter_and_wait(tmp_path: Path) -> No
         work_key=LaneWorkKey("test-unit"),
         submitter_worktree="issue-orchestrator-wt-alpha",
     )
-    # Running time is measured from the start, not from submission.
+    # Time in the current state — the only age the port promises.
     assert running.seconds_in_state == 60.0
     assert running.request_cpus == 3
     assert running.priority == 59
     assert running.exclusive == ()
 
     assert queued.state is PoolJobState.QUEUED
-    # A queued job's clock starts when it was submitted.
     assert queued.seconds_in_state == 30.0
     assert queued.exclusive == ("codexlogin", "claudelogin")
 
@@ -299,7 +309,9 @@ def test_a_count_the_scheduler_spelled_as_a_float_is_still_that_count(
 
     state = _inspect(
         tmp_path,
-        slots=json.dumps([{"Machine": "host.local", "TotalSlotCpus": 18.0}]),
+        slots=json.dumps(
+            [{**_IDLE_SLOT, "TotalSlotCpus": 18.0}]
+        ),
         jobs=json.dumps([job]),
     )
 
@@ -367,3 +379,204 @@ def test_the_inspector_never_asks_for_command_lines_or_environments() -> None:
 def test_the_inspector_rejects_anything_but_resolved_tools() -> None:
     with pytest.raises(ValueError, match="CondorTools"):
         CondorPoolInspector("condor_q")  # type: ignore[arg-type]
+
+
+# --- #7138 round 1, finding 4: fabricated job ages -------------------
+
+
+def test_a_suspended_job_is_aged_from_when_it_was_suspended(
+    tmp_path: Path,
+) -> None:
+    """The port promises time in the CURRENT state.
+
+    A job that ran for 600s and was frozen 10s ago has been suspended
+    for 10s. Reporting 600s reads as a ten-minute freeze and would send
+    an operator hunting a stall that never happened (finding 4, #7138).
+    """
+    job = dict(_RUNNING_LANE_JOB)
+    job["JobStatus"] = 7
+    job["JobCurrentStartDate"] = _SERVER_TIME - 600
+    job["EnteredCurrentStatus"] = _SERVER_TIME - 10
+
+    state = _inspect(tmp_path, slots=json.dumps([_IDLE_SLOT]), jobs=json.dumps([job]))
+
+    assert type(state) is PoolOnline
+    assert state.jobs[0].state is PoolJobState.SUSPENDED
+    assert state.jobs[0].seconds_in_state == 10.0
+
+
+def test_a_requeued_job_is_aged_from_the_requeue_not_from_submission(
+    tmp_path: Path,
+) -> None:
+    """Time in state, not time since submission."""
+    job = dict(_QUEUED_LANE_JOB)
+    job["QDate"] = _SERVER_TIME - 3600
+    job["EnteredCurrentStatus"] = _SERVER_TIME - 45
+
+    state = _inspect(tmp_path, slots=json.dumps([_IDLE_SLOT]), jobs=json.dumps([job]))
+
+    assert type(state) is PoolOnline
+    assert state.jobs[0].seconds_in_state == 45.0
+
+
+def test_a_job_with_no_state_timestamp_is_a_defect_not_a_zero(
+    tmp_path: Path,
+) -> None:
+    """Zero reads as "just entered", which is a fabricated fact.
+
+    An absent required timestamp is the scheduler contradicting this
+    adapter; it must surface, not be smoothed into a plausible age
+    (finding 4, #7138).
+    """
+    job = {key: value for key, value in _RUNNING_LANE_JOB.items()}
+    job.pop("EnteredCurrentStatus", None)
+
+    with pytest.raises(PoolInspectionError, match="EnteredCurrentStatus"):
+        _inspect(tmp_path, slots=json.dumps([_IDLE_SLOT]), jobs=json.dumps([job]))
+
+
+# --- #7138 round 1, finding 3: dead/stale pool called online ---------
+
+
+def test_a_collector_with_no_execute_slots_is_not_online(tmp_path: Path) -> None:
+    """An empty answer is not a pool that can run anything.
+
+    Reporting "online, 0 cpus" invites the reader to conclude their lane
+    is merely queued behind others (finding 3, #7138).
+    """
+    state = _inspect(tmp_path, slots="[]", jobs="")
+
+    assert type(state) is not PoolOnline
+    assert type(state) is PoolUnknownHealth
+    assert "no execute" in state.detail.lower()
+
+
+def test_stale_cached_slot_ads_are_not_reported_as_online(tmp_path: Path) -> None:
+    """The collector serves a dead startd's ad until it expires.
+
+    Stopping condor_startd leaves capacity visible for up to
+    CLASSAD_LIFETIME. Believing it reports a machine that cannot run a
+    single lane as an idle pool with cpus to spare (finding 3, #7138).
+    """
+    stale = dict(_IDLE_SLOT)
+    stale["LastHeardFrom"] = _NOW - 3600
+
+    state = _inspect(tmp_path, slots=json.dumps([stale]), jobs="")
+
+    assert type(state) is not PoolOnline
+    assert type(state) is PoolUnknownHealth
+    assert "stale" in state.detail.lower()
+
+
+def test_a_fresh_populated_pool_is_online(tmp_path: Path) -> None:
+    """The positive case still has to hold after all that."""
+    state = _inspect(tmp_path, slots=json.dumps([_IDLE_SLOT]), jobs="")
+
+    assert type(state) is PoolOnline
+    assert state.capacity.total_cpus == 18
+
+
+def test_freshness_that_cannot_be_established_is_never_online(
+    tmp_path: Path,
+) -> None:
+    """Unknown health must read as unknown, never as online."""
+    unstamped = {key: value for key, value in _IDLE_SLOT.items()}
+    unstamped.pop("LastHeardFrom", None)
+
+    state = _inspect(tmp_path, slots=json.dumps([unstamped]), jobs="")
+
+    assert type(state) is not PoolOnline
+
+
+# --- the scrub asymmetry, on the status path -------------------------
+
+
+def test_the_freshness_threshold_is_read_from_the_pool_not_the_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A question ABOUT the pool must be answered BY the pool.
+
+    ``UPDATE_INTERVAL`` decides how old an advertisement may be before
+    the pool is called stale. Read through the unscrubbed path, an
+    ambient ``_CONDOR_UPDATE_INTERVAL`` export would widen that window
+    from the caller's own environment and certify a dead pool as fresh
+    — the bypass #7132 closed for the policy check, which this path
+    must not reopen.
+    """
+    binaries = tmp_path / "bin"
+    binaries.mkdir(exist_ok=True)
+    # Answer with whatever the environment says, so a leaked override
+    # is visible in the result rather than silently absorbed.
+    (binaries / "condor_config_val").write_text(
+        "#!/bin/sh\necho \"${_CONDOR_UPDATE_INTERVAL:-300}\"\n"
+    )
+    (binaries / "condor_config_val").chmod(0o755)
+    for name in ("condor_submit", "condor_rm"):
+        tool = binaries / name
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+    stale = dict(_IDLE_SLOT)
+    stale["LastHeardFrom"] = _NOW - 3600
+    for name, payload in (
+        ("condor_status", json.dumps([stale])),
+        ("condor_q", ""),
+    ):
+        tool = binaries / name
+        tool.write_text(f"#!/bin/sh\ncat <<'JSON'\n{payload}\nJSON\n")
+        tool.chmod(0o755)
+    tools = CondorTools(
+        submit=binaries / "condor_submit",
+        remove=binaries / "condor_rm",
+        query=binaries / "condor_q",
+        config_query=binaries / "condor_config_val",
+        pool_query=binaries / "condor_status",
+    )
+    # An hour-old advertisement, and an override that would forgive it.
+    monkeypatch.setenv("_CONDOR_UPDATE_INTERVAL", "999999")
+
+    state = CondorPoolInspector(tools).inspect()
+
+    assert type(state) is PoolUnknownHealth, (
+        "an ambient macro override must not decide the freshness window"
+    )
+    assert "stale" in state.detail.lower()
+
+
+def test_the_queue_and_slot_queries_keep_the_caller_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the asymmetry, deliberately.
+
+    ``condor_status``/``condor_q`` ask the pool for its state, and must
+    reach the SAME pool a submission would — including when an override
+    redirects it. Scrubbing here would describe a pool the lane would
+    never run on.
+    """
+    binaries = tmp_path / "bin"
+    binaries.mkdir(exist_ok=True)
+    seen = tmp_path / "seen"
+    for name in ("condor_submit", "condor_rm", "condor_config_val"):
+        tool = binaries / name
+        tool.write_text("#!/bin/sh\necho 300\n")
+        tool.chmod(0o755)
+    (binaries / "condor_status").write_text(
+        f"#!/bin/sh\nprintf '%s' \"${{_CONDOR_COLLECTOR_HOST:-unset}}\" > {seen}\n"
+        "echo '[]'\n"
+    )
+    (binaries / "condor_status").chmod(0o755)
+    (binaries / "condor_q").write_text("#!/bin/sh\n")
+    (binaries / "condor_q").chmod(0o755)
+    tools = CondorTools(
+        submit=binaries / "condor_submit",
+        remove=binaries / "condor_rm",
+        query=binaries / "condor_q",
+        config_query=binaries / "condor_config_val",
+        pool_query=binaries / "condor_status",
+    )
+    monkeypatch.setenv("_CONDOR_COLLECTOR_HOST", "elsewhere.example")
+
+    CondorPoolInspector(tools).inspect()
+
+    assert seen.read_text() == "elsewhere.example", (
+        "the state queries must see the environment a submission would"
+    )

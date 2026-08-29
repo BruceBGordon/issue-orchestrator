@@ -22,9 +22,11 @@ default path must not pay for importing a backend it will not use.
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
+from enum import StrEnum
 from types import MappingProxyType
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 from ..adapters.direct_lane_executor import (
     DirectLaneExecutor,
@@ -174,3 +176,125 @@ def build_pool_inspector(backend: str) -> ExecutorPoolInspector:
     alongside the dispatch history that is still readable.
     """
     return _resolve(backend).pool_inspector_factory()
+
+
+# --- which backend is actually in play -------------------------------
+#
+# Selection is a separate question from construction, and it has its
+# own failure mode: not "that backend does not exist" but "nothing here
+# says which backend this machine uses". Reporting tools were inventing
+# an answer to that (finding 1, #7138) — a status command that prints
+# `direct` on a repository configured for the scheduler is worse than
+# one that admits it does not know, because it looks like an answer.
+
+# The variable the Makefile reads, and the one a gate command sets
+# ahead of it. Both name the same choice, so both are recognised.
+_COMMAND_ASSIGNMENT_NAMES = ("LANE_EXECUTOR", BACKEND_ENVIRONMENT_VARIABLE)
+
+
+class BackendSource(StrEnum):
+    """Where a backend selection came from. Printed, so operators can
+    see WHY a backend is in play and fix the right thing."""
+
+    FLAG = "--backend"
+    ENVIRONMENT = "environment"
+    VALIDATION_COMMAND = "repository validation command"
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedBackend:
+    """A backend some source actually established."""
+
+    name: str
+    source: BackendSource
+
+    def __post_init__(self) -> None:
+        if type(self.name) is not str or not self.name:
+            raise ValueError("SelectedBackend.name must be a non-empty string")
+        if type(self.source) is not BackendSource:
+            raise ValueError("SelectedBackend.source must be a BackendSource")
+
+
+@dataclass(frozen=True, slots=True)
+class UnknownBackend:
+    """Nothing established which backend is in play — say so, never guess."""
+
+    reason: str
+
+    def __post_init__(self) -> None:
+        if type(self.reason) is not str or not self.reason:
+            raise ValueError("UnknownBackend.reason must be a non-empty string")
+
+
+BackendSelection = SelectedBackend | UnknownBackend
+
+
+def backend_in_command(command: str) -> str | None:
+    """Read the backend out of a gate command, or ``None``.
+
+    The repository declares its backend by prefixing the gate command
+    with the assignment make reads (``LANE_EXECUTOR=condor make ...``).
+    This is the ONE place that extraction happens: a second reading of
+    the same string somewhere else is how two tools come to disagree
+    about what the gate will do.
+    """
+    if type(command) is not str:
+        raise ValueError("backend_in_command requires a string")
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        # An unparseable command tells us nothing; it does not entitle
+        # us to a guess.
+        return None
+    selected: str | None = None
+    for token in tokens:
+        name, separator, value = token.partition("=")
+        if not separator:
+            continue
+        if name in _COMMAND_ASSIGNMENT_NAMES and value:
+            # Later assignments win, matching a shell reading the line.
+            selected = value
+    return selected
+
+
+def select_backend(
+    *,
+    explicit: str | None,
+    environment: Mapping[str, str],
+    validation_commands: Sequence[str],
+) -> BackendSelection:
+    """Establish which backend is in play, or report that nothing does.
+
+    Precedence mirrors what actually decides at run time: an explicit
+    request beats the ambient environment, which beats what the
+    repository's own gate command sets. There is deliberately no final
+    default — inventing ``direct`` here is what made a scheduler-backed
+    repository report the wrong pool.
+    """
+    if explicit is not None:
+        return SelectedBackend(name=explicit, source=BackendSource.FLAG)
+    ambient = environment.get(BACKEND_ENVIRONMENT_VARIABLE)
+    if ambient:
+        return SelectedBackend(name=ambient, source=BackendSource.ENVIRONMENT)
+    configured = {
+        found
+        for command in validation_commands
+        if (found := backend_in_command(command)) is not None
+    }
+    if len(configured) > 1:
+        # Two gates disagreeing is a real defect in the repository's
+        # configuration, and picking one would hide it.
+        return UnknownBackend(
+            "the repository's validation commands disagree about the lane "
+            f"backend ({', '.join(sorted(configured))}); fix them or pass "
+            "--backend"
+        )
+    if configured:
+        return SelectedBackend(
+            name=configured.pop(), source=BackendSource.VALIDATION_COMMAND
+        )
+    return UnknownBackend(
+        "nothing establishes which lane backend is in play: "
+        f"${BACKEND_ENVIRONMENT_VARIABLE} is unset and no repository "
+        "validation command selects one — pass --backend to say which"
+    )

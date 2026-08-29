@@ -30,7 +30,10 @@ from ...domain.lane_execution import (
     LaneExecutorUnavailableError,
 )
 
-_TOOL_TIMEOUT_SECONDS = 30.0
+#: The general bound on one scheduler tool invocation. Public
+#: because a caller with no budget of its own asks for it by name
+#: rather than restating the number.
+TOOL_TIMEOUT_SECONDS = 30.0
 
 # Where scripts/condor-personal.sh installs the personal pool. Resolving
 # it here means a config-file opt-in works from any process — the
@@ -167,7 +170,7 @@ class CondorTools:
     def invoke(
         self,
         arguments: tuple[str, ...],
-        timeout_seconds: float = _TOOL_TIMEOUT_SECONDS,
+        timeout_seconds: float = TOOL_TIMEOUT_SECONDS,
     ) -> subprocess.CompletedProcess[str]:
         """Run one scheduler tool against this pool, bounded in time.
 
@@ -198,7 +201,7 @@ class CondorTools:
     def read_configuration(
         self,
         *query: str,
-        timeout_seconds: float = _TOOL_TIMEOUT_SECONDS,
+        timeout_seconds: float = TOOL_TIMEOUT_SECONDS,
     ) -> subprocess.CompletedProcess[str]:
         """Ask the pool what its own configuration says.
 

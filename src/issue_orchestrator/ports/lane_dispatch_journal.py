@@ -126,11 +126,22 @@ class LaneDispatchHistory:
 
     location: str
     entries: tuple[LaneDispatchEntry, ...]
+    #: Rows inside the scanned window that predate the machine-state
+    #: envelope (#7135) and so cannot be represented as records. Counted
+    #: rather than dropped in silence: the journal is shared by every
+    #: worktree on the machine, so a worktree on older code is still
+    #: appending such rows, and a reader that hid them would quietly
+    #: under-report how much history it actually looked at.
+    predating_envelope: int = 0
 
     def __post_init__(self) -> None:
         if type(self.location) is not str or not self.location:
             raise ValueError(
                 "LaneDispatchHistory.location must be a non-empty string"
+            )
+        if type(self.predating_envelope) is not int or self.predating_envelope < 0:
+            raise ValueError(
+                "LaneDispatchHistory.predating_envelope must be non-negative"
             )
         if type(self.entries) is not tuple or any(
             type(entry) is not LaneDispatchEntry for entry in self.entries

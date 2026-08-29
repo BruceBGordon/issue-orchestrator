@@ -13,6 +13,7 @@ Read-only by construction: the only tools it invokes are queries.
 from __future__ import annotations
 
 import json
+import time
 from typing import cast
 
 from ...domain.lane_execution import (
@@ -32,6 +33,7 @@ from ...ports.executor_pool import (
     PoolOffline,
     PoolOnline,
     PoolState,
+    PoolUnknownHealth,
 )
 from .tools import CondorTools
 
@@ -45,14 +47,34 @@ _JOB_ATTRIBUTES = (
     "LaneSubmitter",
     "Owner",
     "JobPrio",
-    "QDate",
-    "JobCurrentStartDate",
     "EnteredCurrentStatus",
     "RequestCpus",
     "ConcurrencyLimits",
     "ServerTime",
 )
-_SLOT_ATTRIBUTES = ("Machine", "TotalSlotCpus", "DynamicSlot")
+# ``LastHeardFrom`` is stamped by the collector when it last received
+# this resource's advertisement — the only attribute that distinguishes
+# a live machine from a dead one whose ad the collector is still
+# serving from cache (finding 3, #7138).
+_SLOT_ATTRIBUTES = (
+    "Name",
+    "Machine",
+    "TotalSlotCpus",
+    "DynamicSlot",
+    "LastHeardFrom",
+)
+
+# How often a resource is required to re-advertise. Read from the pool
+# rather than assumed, so the staleness bound is the pool's own promise.
+_UPDATE_INTERVAL_SETTING = "UPDATE_INTERVAL"
+# One missed advertisement is jitter; two is a daemon that stopped
+# talking. Kept well under the collector's cache expiry, which is what
+# makes a dead startd's ad linger in the first place.
+_MISSED_UPDATES_BEFORE_STALE = 2
+# An ad stamped in the future means the clock this reader is using and
+# the clock the collector used disagree, so no age computed from them
+# means anything. Small tolerance absorbs ordinary drift.
+_CLOCK_SKEW_TOLERANCE_SECONDS = 60.0
 
 # HTCondor's JobStatus codes, translated once. Every code the scheduler
 # defines is mapped: an unmapped code means the scheduler grew a state
@@ -67,16 +89,13 @@ _JOB_STATUS_STATES = {
     6: PoolJobState.FINISHING,
     7: PoolJobState.SUSPENDED,
 }
-# Which timestamp answers "how long has it been like this". Queued jobs
-# date from submission; started jobs from their start; a held job from
-# whenever it entered that status.
-_STATE_SINCE_ATTRIBUTES = {
-    PoolJobState.QUEUED: "QDate",
-    PoolJobState.RUNNING: "JobCurrentStartDate",
-    PoolJobState.SUSPENDED: "JobCurrentStartDate",
-    PoolJobState.HELD: "EnteredCurrentStatus",
-    PoolJobState.FINISHING: "EnteredCurrentStatus",
-}
+# One timestamp answers "how long has it been like this" for every
+# state, because the scheduler stamps it on every status transition.
+# A per-state table of *other* timestamps is how a suspended job came
+# to be aged from when it started RUNNING (finding 4, #7138): that is
+# time-in-run, not time-in-state, and the two diverge exactly when an
+# operator most needs the difference.
+_STATE_SINCE_ATTRIBUTE = "EnteredCurrentStatus"
 
 
 def resolve_pool_inspector() -> ExecutorPoolInspector:
@@ -122,12 +141,93 @@ class CondorPoolInspector:
         )
         if type(jobs) is PoolOffline:
             return jobs
-        return PoolOnline(
-            capacity=_read_capacity(cast(tuple[dict[str, object], ...], slots)),
-            jobs=tuple(
-                _read_job(ad) for ad in cast(tuple[dict[str, object], ...], jobs)
-            ),
+        counted = _counted_slots(cast(tuple[dict[str, object], ...], slots))
+        capacity = _read_capacity(counted)
+        queue = tuple(
+            _read_job(ad) for ad in cast(tuple[dict[str, object], ...], jobs)
         )
+        unhealthy = self._health_objection(counted)
+        if unhealthy is not None:
+            return PoolUnknownHealth(
+                capacity=capacity, jobs=queue, detail=unhealthy
+            )
+        return PoolOnline(capacity=capacity, jobs=queue)
+
+    def _health_objection(
+        self, counted: tuple[dict[str, object], ...]
+    ) -> str | None:
+        """Why this pool must not be called online, or ``None`` if it may.
+
+        Answering the query is not evidence of health: the collector
+        keeps serving a stopped daemon's advertisement until it expires,
+        so a pool with no running execute daemon reports full capacity
+        for minutes. Health is therefore asserted only from evidence —
+        resources exist, and the collector heard from each of them
+        recently enough — and every other outcome, including "could not
+        tell", is an objection (finding 3, #7138).
+        """
+        if not counted:
+            return (
+                "the pool answered but advertises no execute resources: "
+                "nothing can run here (is condor_startd running?)"
+            )
+        interval = self._update_interval_seconds()
+        if interval is None:
+            return (
+                "the pool did not report its "
+                f"{_UPDATE_INTERVAL_SETTING}, so how recently it last "
+                "heard from its machines cannot be established"
+            )
+        allowed = interval * _MISSED_UPDATES_BEFORE_STALE
+        now = time.time()
+        for slot in counted:
+            heard = slot.get("LastHeardFrom")
+            if type(heard) is not int:
+                return (
+                    "the pool did not say when it last heard from "
+                    f"{_slot_name(slot)}, so its liveness cannot be "
+                    "established"
+                )
+            age = now - heard
+            if age < -_CLOCK_SKEW_TOLERANCE_SECONDS:
+                return (
+                    f"{_slot_name(slot)} was last heard from "
+                    f"{-age:.0f}s in the future: this reader's clock and "
+                    "the pool's disagree, so no age here is meaningful"
+                )
+            if age > allowed:
+                return (
+                    f"the pool last heard from {_slot_name(slot)} "
+                    f"{age:.0f}s ago, more than "
+                    f"{_MISSED_UPDATES_BEFORE_STALE} advertisement "
+                    f"intervals ({allowed:.0f}s): this record is STALE and "
+                    "its capacity may belong to a machine that is gone"
+                )
+        return None
+
+    def _update_interval_seconds(self) -> float | None:
+        """The pool's own re-advertisement interval, or None if unreadable.
+
+        Read through :meth:`CondorTools.read_configuration`, not
+        :meth:`~CondorTools.invoke`, because this is a question ABOUT
+        the pool: a per-process ``_CONDOR_UPDATE_INTERVAL`` export would
+        otherwise let the caller's own environment widen the staleness
+        window and certify a dead pool as fresh. The queue and slot
+        queries above keep using ``invoke`` deliberately — those ask
+        the pool for its state, and must reach the SAME pool a
+        submission would, overrides included.
+        """
+        try:
+            completed = self._tools.read_configuration(_UPDATE_INTERVAL_SETTING)
+        except LaneExecutorError:
+            return None
+        if completed.returncode != 0:
+            return None
+        try:
+            interval = float(completed.stdout.strip())
+        except ValueError:
+            return None
+        return interval if interval > 0 else None
 
     def _query(
         self, arguments: tuple[str, ...]
@@ -183,19 +283,29 @@ class _AbsentPoolInspector:
         return PoolOffline(self._detail)
 
 
-def _read_capacity(slots: tuple[dict[str, object], ...]) -> PoolCapacity:
-    """Total the pool's machines and cpus without double counting.
+def _counted_slots(
+    slots: tuple[dict[str, object], ...],
+) -> tuple[dict[str, object], ...]:
+    """The advertisements that represent real capacity.
 
     A partitionable slot carves dynamic child slots out of itself while
     jobs run, and both appear in the listing; counting the children too
-    would report a machine as larger the busier it gets. Only the
-    non-dynamic slots are real capacity.
+    would report a machine as larger the busier it gets. Selecting once
+    here means capacity and the liveness check judge the same records.
     """
+    return tuple(slot for slot in slots if slot.get("DynamicSlot") is not True)
+
+
+def _slot_name(slot: dict[str, object]) -> str:
+    name = slot.get("Name")
+    return name if type(name) is str and name else str(slot.get("Machine"))
+
+
+def _read_capacity(counted: tuple[dict[str, object], ...]) -> PoolCapacity:
+    """Total the machines and cpus the counted advertisements describe."""
     machines: set[str] = set()
     total_cpus = 0
-    for slot in slots:
-        if slot.get("DynamicSlot") is True:
-            continue
+    for slot in counted:
         machine = slot.get("Machine")
         if type(machine) is not str or not machine:
             raise PoolInspectionError("a pool slot reported no machine name")
@@ -205,11 +315,10 @@ def _read_capacity(slots: tuple[dict[str, object], ...]) -> PoolCapacity:
 
 
 def _read_job(ad: dict[str, object]) -> PoolJob:
-    state = _read_state(ad)
     return PoolJob(
         origin=_read_origin(ad),
-        state=state,
-        seconds_in_state=_read_seconds_in_state(ad, state),
+        state=_read_state(ad),
+        seconds_in_state=_read_seconds_in_state(ad),
         # Reported as-is, never floored to one: rounding a job's request
         # up would overstate how much of the machine is spoken for, and
         # "in use" is the number an operator acts on.
@@ -256,19 +365,19 @@ def _read_origin(ad: dict[str, object]) -> PoolJobOrigin:
     return ForeignJobOrigin(owner=owner)
 
 
-def _read_seconds_in_state(ad: dict[str, object], state: PoolJobState) -> float:
+def _read_seconds_in_state(ad: dict[str, object]) -> float:
     """Age the job against the scheduler's own clock, not this process's.
 
     ``ServerTime`` travels with every record precisely so a reader on a
-    machine with a skewed clock cannot report a negative wait.
+    machine with a skewed clock cannot report a negative wait. A missing
+    stamp raises rather than reading as zero: "just entered this state"
+    is a specific claim, and inventing it is how a frozen lane gets
+    reported as one that only just froze.
     """
-    since = ad.get(_STATE_SINCE_ATTRIBUTES[state])
-    if type(since) is not int:
-        # A job can be observed in the instant between admission and the
-        # scheduler stamping its start; that is a real state, not a
-        # defect, and zero is the honest age for it.
-        return 0.0
-    return max(0.0, float(_read_int(ad, "ServerTime") - since))
+    return max(
+        0.0,
+        float(_read_int(ad, "ServerTime") - _read_int(ad, _STATE_SINCE_ATTRIBUTE)),
+    )
 
 
 def _read_exclusive(ad: dict[str, object]) -> tuple[str, ...]:

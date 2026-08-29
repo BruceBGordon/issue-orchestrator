@@ -167,19 +167,24 @@ class PoolCapacity:
 
 
 @dataclass(frozen=True, slots=True)
-class PoolOnline:
-    """The pool answered: here is its capacity and everything in it."""
+class AnsweredPool:
+    """The facts a pool that answered reported about itself.
+
+    Shared by every answered state so a consumer reads capacity and
+    jobs the same way whether or not the pool proved healthy — the
+    jobs in a stale pool's queue are still the jobs in its queue.
+    """
 
     capacity: PoolCapacity
     jobs: tuple[PoolJob, ...]
 
     def __post_init__(self) -> None:
         if type(self.capacity) is not PoolCapacity:
-            raise ValueError("PoolOnline.capacity must be a PoolCapacity")
+            raise ValueError("capacity must be a PoolCapacity")
         if type(self.jobs) is not tuple or any(
             type(job) is not PoolJob for job in self.jobs
         ):
-            raise ValueError("PoolOnline.jobs must be a tuple of PoolJob")
+            raise ValueError("jobs must be a tuple of PoolJob")
 
     @property
     def claimed_cpus(self) -> int:
@@ -200,12 +205,51 @@ class PoolOnline:
 
 
 @dataclass(frozen=True, slots=True)
+class PoolOnline(AnsweredPool):
+    """The pool answered AND proved it can run work right now.
+
+    "Online" is a claim about capability, not about a socket having
+    accepted a connection. It is reported only when the pool has
+    execute resources and their liveness is *established* — see
+    :class:`PoolUnknownHealth` for why the weaker reading is dangerous.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class PoolUnknownHealth(AnsweredPool):
+    """The pool answered, but is not provably able to run work.
+
+    Three situations that look identical from a naive query and must
+    never be rendered as "online":
+
+    - it has no execute resources at all;
+    - its resource records are stale, because a scheduler's collector
+      keeps serving a dead daemon's cached advertisement for minutes
+      after the daemon stops;
+    - liveness could not be established at all.
+
+    Each is a different sentence in ``detail``. Capacity and jobs are
+    still carried, because whatever the pool did say remains a fact an
+    operator can use — it just may describe a machine that is gone.
+    """
+
+    detail: str
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if type(self.detail) is not str or not self.detail:
+            raise ValueError("PoolUnknownHealth.detail must be a non-empty string")
+
+
+@dataclass(frozen=True, slots=True)
 class PoolOffline:
     """There is no pool to report on, and this is why.
 
     Not an error: the scheduling backend is opt-in, so "the configured
     backend has no pool" and "the pool is not running" are both ordinary
-    states an operator is entitled to see spelled out.
+    states an operator is entitled to see spelled out. Distinct from
+    :class:`PoolUnknownHealth`, where a pool *did* answer — there, the
+    facts it gave are still worth printing.
     """
 
     detail: str
@@ -216,9 +260,9 @@ class PoolOffline:
 
 
 #: What an inspection produced. Closed union: every consumer must handle
-#: the offline case explicitly instead of rendering a misleading empty
-#: pool.
-PoolState = PoolOnline | PoolOffline
+#: the not-online cases explicitly instead of rendering a misleading
+#: empty or stale pool as a healthy one.
+PoolState = PoolOnline | PoolUnknownHealth | PoolOffline
 
 
 class PoolInspectionError(RuntimeError):

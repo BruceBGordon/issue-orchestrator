@@ -702,9 +702,12 @@ def cmd_e2e_reset(args: argparse.Namespace) -> int:
 def cmd_executor_status(args: argparse.Namespace) -> int:
     """Show the validation-lane executor pool and recent lane dispatch.
 
-    Deliberately independent of orchestrator configuration: the pool is
-    machine-wide, shared by every worktree of every repository on the
-    host, so this must answer even where no config would load.
+    Tolerates a missing configuration — the pool is machine-wide, shared
+    by every worktree of every repository on the host, so this must
+    answer even where no config would load. It does NOT ignore one that
+    is present: the repository's gate command is what selects the
+    backend, and reporting on a different one is worse than reporting
+    that the backend is unknown (finding 1, #7138).
     """
     from .cli_tools.executor_status import main as executor_status_main
 

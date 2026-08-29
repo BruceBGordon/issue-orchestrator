@@ -34,8 +34,8 @@ from .event_classifier import (
     classify_event_log,
 )
 from .submit_compiler import CompiledSubmitDescription, compile_submit_description
-from .tools import CondorTools
-from .tools import CondorTools
+from .tools import TOOL_TIMEOUT_SECONDS, CondorTools
+from .tools import TOOL_TIMEOUT_SECONDS, CondorTools
 
 _POLL_INTERVAL_SECONDS = 0.1
 # The scheduler's periodic expressions evaluate on an interval, so a
@@ -157,7 +157,7 @@ class CondorLaneExecutor:
             return terminal
         except LaneExecutorError as error:
             if job_id is not None and streams is not None:
-                self._remove(job_id, _TOOL_TIMEOUT_SECONDS)
+                self._remove(job_id, TOOL_TIMEOUT_SECONDS)
                 streams.pump()
                 self._collect_job_accounting(
                     job_id, run_directory, _job_accounting_budget()

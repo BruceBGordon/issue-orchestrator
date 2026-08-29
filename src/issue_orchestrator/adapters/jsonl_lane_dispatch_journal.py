@@ -21,6 +21,7 @@ from typing import cast
 from ..domain.lane_execution import LaneWorkKey
 from ..infra.machine_state import (
     MachineStateEnvelopeError,
+    MachineStateEnvelopeMissing,
     machine_state_fields,
     machine_state_from_fields,
 )
@@ -98,11 +99,21 @@ class JsonlLaneDispatchJournal:
             for number, line in enumerate(raw.splitlines(), start=1)
             if line.strip()
         ]
+        entries: list[LaneDispatchEntry] = []
+        predating = 0
+        for number, line in numbered[-limit:]:
+            try:
+                entries.append(self._parse(number, line))
+            except MachineStateEnvelopeMissing:
+                # Written before the envelope existed, or by a worktree
+                # still running code that predates it. Valid when
+                # written, so not corruption — but unrepresentable, so
+                # counted and reported rather than dropped silently.
+                predating += 1
         return LaneDispatchHistory(
             location=str(self._path),
-            entries=tuple(
-                self._parse(number, line) for number, line in numbered[-limit:]
-            ),
+            entries=tuple(entries),
+            predating_envelope=predating,
         )
 
     def _parse(self, line_number: int, line: str) -> LaneDispatchEntry:
@@ -143,6 +154,12 @@ class JsonlLaneDispatchJournal:
                 # envelope exists to end (#7127).
                 machine_state=machine_state_from_fields(fields),
             )
+        except MachineStateEnvelopeMissing:
+            # Not corruption — an older-schema row. Propagate the
+            # narrower signal so the caller can count it; catching the
+            # base class here would swallow the distinction and report
+            # every pre-envelope row as garbage.
+            raise
         except MachineStateEnvelopeError as error:
             raise self._corrupt(line_number, str(error)) from error
         except ValueError as error:

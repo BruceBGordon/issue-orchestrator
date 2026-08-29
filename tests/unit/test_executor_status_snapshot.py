@@ -8,11 +8,24 @@ policy — not any adapter's storage or transport.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from issue_orchestrator.domain.lane_execution import LaneWorkKey
+from issue_orchestrator.execution.lane_backends import (
+    BackendSource,
+    SelectedBackend,
+    UnknownBackend,
+)
+from issue_orchestrator.infra.lane_declarations import (
+    LaneDeclaration,
+    LaneDeclarationError,
+    LaneDeclarations,
+)
 from issue_orchestrator.observation.executor_status import (
+    DeclarationsRead,
+    DeclarationsUnavailable,
     FactSource,
     build_executor_status_snapshot,
 )
@@ -33,8 +46,21 @@ from issue_orchestrator.ports.lane_dispatch_journal import (
     LaneDispatchRecord,
 )
 from issue_orchestrator.ports.lane_runtime_history import LaneRuntimeHistoryError
+from issue_orchestrator.ports.machine_state import MachineState
 
 _NOW = datetime(2026, 8, 28, 12, 0, 0, tzinfo=timezone.utc)
+
+_MACHINE_STATE = MachineState(
+    sampled_at=datetime(2026, 8, 28, 11, 59, 0, tzinfo=timezone.utc),
+    loadavg_1m=7.91,
+    loadavg_5m=12.51,
+    loadavg_15m=9.0,
+    cpu_idle_percent=85.68,
+    cpu_idle_source="host_statistics(HOST_CPU_LOAD_INFO) over 0.1s",
+    physical_cores=18,
+    probe_error=None,
+)
+
 
 
 class _StaticInspector:
@@ -104,12 +130,32 @@ def _entry(
             queue_wait_seconds=queue_wait,
             observed_runtime_seconds=runtime,
             exit_code=exit_code,
+            machine_state=_MACHINE_STATE,
         ),
     )
 
 
 def _history(*entries: LaneDispatchEntry) -> LaneDispatchHistory:
-    return LaneDispatchHistory(location="/repo/.git/lane-dispatch.jsonl", entries=entries)
+    return LaneDispatchHistory(
+        location="/repo/.git/lane-dispatch.jsonl", entries=entries
+    )
+
+
+_CONDOR = SelectedBackend(name="condor", source=BackendSource.ENVIRONMENT)
+
+
+def _declaration(request_cpus: int = 2) -> LaneDeclaration:
+    return LaneDeclaration(
+        request_cpus=request_cpus, memory_mb=1024, suspendability="anywhere", exclusive=()
+    )
+
+
+def _declarations(*work_keys: str) -> LaneDeclarations:
+    return LaneDeclarations(lanes={key: _declaration() for key in work_keys})
+
+
+def _refuse_declarations() -> LaneDeclarations:
+    raise LaneDeclarationError("lane declarations file not found: /repo/lanes.yaml")
 
 
 def _build(
@@ -118,13 +164,20 @@ def _build(
     inspector: object | None = None,
     journal: object | None = None,
     runtime_history: object | None = None,
+    declarations=None,
+    backend=None,
     recent_limit: int = 50,
 ):
+    resolved = inspector or _StaticInspector(pool or PoolOffline("no pool here"))
     return build_executor_status_snapshot(
-        inspector=inspector or _StaticInspector(pool or PoolOffline("no pool here")),
+        backend=_CONDOR if backend is None else backend,
+        inspector_for=lambda name: resolved,
+        declarations_reader=(
+            declarations if callable(declarations) else lambda: _declarations()
+        ),
+        declarations_location="/repo/.issue-orchestrator/lanes.yaml",
         journal_reader=journal or _StaticJournalReader(_history()),
         runtime_history=runtime_history or _StaticRuntimeHistory(),
-        backend="condor",
         captured_at=_NOW,
         recent_limit=recent_limit,
     )
@@ -158,14 +211,14 @@ def test_the_pool_and_the_journal_are_joined_into_one_snapshot() -> None:
         runtime_history=_StaticRuntimeHistory({"test-unit": 59}),
     )
 
-    assert snapshot.backend == "condor"
+    assert snapshot.backend == _CONDOR
     assert snapshot.captured_at == _NOW
     assert type(snapshot.pool) is PoolOnline
     assert snapshot.journal_location == "/repo/.git/lane-dispatch.jsonl"
     assert snapshot.records_scanned == 1
     assert snapshot.faults == ()
     assert snapshot.is_degraded is False
-    lane = snapshot.lanes[0]
+    lane = snapshot.lanes[0].history
     assert lane.work_key == LaneWorkKey("test-unit")
     assert lane.runs == 1
     assert lane.last_runtime_seconds == 64.0
@@ -186,7 +239,7 @@ def test_each_lane_is_summarized_from_its_most_recent_record() -> None:
         runtime_history=_StaticRuntimeHistory({"test-unit": 59, "typecheck": 12}),
     )
 
-    lanes = {lane.work_key.value: lane for lane in snapshot.lanes}
+    lanes = {row.work_key.value: row.history for row in snapshot.lanes}
     assert lanes["test-unit"].runs == 2
     assert lanes["test-unit"].last_runtime_seconds == 64.0
     assert lanes["test-unit"].last_exit_code == 0
@@ -293,10 +346,12 @@ def test_an_empty_journal_is_not_a_fault() -> None:
 def test_the_captured_moment_must_be_unambiguous() -> None:
     with pytest.raises(ValueError, match="captured_at"):
         build_executor_status_snapshot(
-            inspector=_StaticInspector(PoolOffline("none")),
+            backend=_CONDOR,
+            inspector_for=lambda name: _StaticInspector(PoolOffline("none")),
+            declarations_reader=_declarations,
+            declarations_location="/repo/lanes.yaml",
             journal_reader=_StaticJournalReader(_history()),
             runtime_history=_StaticRuntimeHistory(),
-            backend="direct",
             captured_at=datetime(2026, 8, 28, 12, 0, 0),
         )
 
@@ -313,3 +368,114 @@ def test_snapshot_faults_must_name_a_source_and_a_reason() -> None:
         SnapshotFault(source=FactSource.POOL, detail="")
     with pytest.raises(ValueError, match="FactSource"):
         SnapshotFault(source="pool", detail="broken")  # type: ignore[arg-type]
+
+
+# --- #7138 round 1, finding 2: declarations never observed -----------
+
+
+def test_a_declared_lane_that_never_ran_still_appears(tmp_path: Path) -> None:
+    """Only the declarations can mention a lane with no history.
+
+    A journal-only view silently omits every lane that has not run —
+    exactly the lanes an operator is most likely to be asking about
+    (finding 2, #7138).
+    """
+    snapshot = _build(
+        declarations=lambda: _declarations("test-unit", "execenv.memory-oom"),
+        journal=_StaticJournalReader(_history(_entry("test-unit"))),
+    )
+
+    rows = {row.work_key.value: row for row in snapshot.lanes}
+    assert set(rows) == {"test-unit", "execenv.memory-oom"}
+    assert rows["execenv.memory-oom"].history is None
+    assert rows["execenv.memory-oom"].routing is not None
+    # Never-run lanes sort last: nothing is known about their cost.
+    assert snapshot.lanes[-1].work_key.value == "execenv.memory-oom"
+
+
+def test_routing_facts_come_from_the_canonical_declarations() -> None:
+    """cpus/memory/suspendability/exclusives are shown, not re-derived."""
+    declaration = LaneDeclaration(
+        request_cpus=8, memory_mb=6144, suspendability="never", exclusive=("codexlogin",)
+    )
+    snapshot = _build(
+        declarations=lambda: LaneDeclarations(lanes={"test-unit": declaration}),
+        journal=_StaticJournalReader(_history(_entry("test-unit"))),
+    )
+
+    routing = snapshot.lanes[0].routing
+    assert routing is not None
+    assert routing.request_cpus == 8
+    assert routing.memory_mb == 6144
+    assert routing.suspendability == "never"
+    assert routing.exclusive == ("codexlogin",)
+
+
+def test_unreadable_declarations_are_a_loud_fault_not_an_empty_repo() -> None:
+    """Missing or malformed declarations must be distinguishable from
+    an unused journal: every lane is unrunnable until it is fixed
+    (finding 2, #7138)."""
+    snapshot = _build(
+        declarations=_refuse_declarations,
+        journal=_StaticJournalReader(_history(_entry("test-unit"))),
+    )
+
+    assert type(snapshot.declarations) is DeclarationsUnavailable
+    assert [fault.source for fault in snapshot.faults] == [
+        FactSource.LANE_DECLARATIONS
+    ]
+    assert "not found" in snapshot.faults[0].detail
+    assert snapshot.is_degraded is True
+    # The journal side still survives.
+    assert [row.work_key.value for row in snapshot.lanes] == ["test-unit"]
+
+
+def test_readable_declarations_say_where_they_were_read() -> None:
+    snapshot = _build(declarations=lambda: _declarations("test-unit"))
+    assert type(snapshot.declarations) is DeclarationsRead
+    assert snapshot.declarations.path == "/repo/.issue-orchestrator/lanes.yaml"
+
+
+def test_a_journaled_lane_missing_from_declarations_is_still_shown() -> None:
+    """It ran once and cannot run again — that is worth a row."""
+    snapshot = _build(
+        declarations=lambda: _declarations(),
+        journal=_StaticJournalReader(_history(_entry("test-unit"))),
+    )
+
+    assert snapshot.lanes[0].work_key.value == "test-unit"
+    assert snapshot.lanes[0].routing is None
+    assert snapshot.lanes[0].history is not None
+
+
+# --- #7138 round 1, finding 1: wrong active backend ------------------
+
+
+def test_an_unknown_backend_yields_no_pool_and_says_why() -> None:
+    """No guess, and no silently empty pool section either."""
+    snapshot = _build(backend=UnknownBackend(reason="nothing establishes it"))
+
+    assert type(snapshot.backend) is UnknownBackend
+    assert type(snapshot.pool) is PoolOffline
+    assert "nothing establishes it" in snapshot.pool.detail
+
+
+def test_the_pool_is_inspected_for_the_selected_backend() -> None:
+    """The snapshot must not inspect a backend nobody selected."""
+    asked: list[str] = []
+
+    def inspector_for(name: str):
+        asked.append(name)
+        return _StaticInspector(PoolOffline("none"))
+
+    build_executor_status_snapshot(
+        backend=SelectedBackend(name="condor", source=BackendSource.FLAG),
+        inspector_for=inspector_for,
+        declarations_reader=_declarations,
+        declarations_location="/repo/lanes.yaml",
+        journal_reader=_StaticJournalReader(_history()),
+        runtime_history=_StaticRuntimeHistory(),
+        captured_at=_NOW,
+    )
+
+    assert asked == ["condor"]

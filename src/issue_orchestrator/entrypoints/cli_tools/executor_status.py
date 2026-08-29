@@ -23,29 +23,41 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+
+import yaml
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Sequence
 
 from ...domain.lane_execution import LaneExecutorUnavailableError
 from ...execution.lane_backends import (
     BACKEND_ENVIRONMENT_VARIABLE,
     BACKEND_NAMES,
-    DIRECT_BACKEND,
+    SelectedBackend,
+    UnknownBackend,
     build_pool_inspector,
+    select_backend,
 )
+from ...infra.config_paths import get_config_path, list_configs
+from ...infra.env import get_env
+from ...infra.lane_declarations import LANES_FILE_RELATIVE, load_lane_declarations
 from ...observation.executor_status import (
     DEFAULT_RECENT_DISPATCH_LIMIT,
+    DeclarationsRead,
+    DeclarationsUnavailable,
     ExecutorStatusSnapshot,
-    LaneDispatchSummary,
+    LaneRow,
     build_executor_status_snapshot,
 )
+from ...ports.machine_state import MachineState
 from ...ports.executor_pool import (
+    AnsweredPool,
     ForeignJobOrigin,
     LaneJobOrigin,
     PoolJob,
     PoolJobState,
     PoolOffline,
-    PoolOnline,
+    PoolUnknownHealth,
 )
 from .lane_run import build_dispatch_journal_reader, build_runtime_history
 
@@ -54,7 +66,7 @@ _FAULT_EXIT_CODE = 70
 _MISCONFIGURED_EXIT_CODE = 78
 # Column indexes whose cells are numbers, so digits line up.
 _JOB_NUMERIC_COLUMNS = frozenset({1, 2, 3})
-_LANE_NUMERIC_COLUMNS = frozenset({1, 2, 3, 4, 5})
+_LANE_NUMERIC_COLUMNS = frozenset({1, 2, 5, 6, 7, 8, 9, 10})
 # Ordered so the rows an operator is waiting on come first.
 _JOB_STATE_ORDER = (
     PoolJobState.RUNNING,
@@ -67,25 +79,84 @@ _JOB_STATE_ORDER = (
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parse_arguments(argv)
-    backend = str(arguments.backend)
+    worktree = Path.cwd()
+    backend = select_backend(
+        explicit=arguments.backend,
+        environment=os.environ,
+        validation_commands=_configured_validation_commands(worktree),
+    )
     try:
-        inspector = build_pool_inspector(backend)
+        snapshot = build_executor_status_snapshot(
+            backend=backend,
+            inspector_for=build_pool_inspector,
+            declarations_reader=lambda: load_lane_declarations(worktree),
+            declarations_location=str(worktree / LANES_FILE_RELATIVE),
+            journal_reader=build_dispatch_journal_reader(),
+            runtime_history=build_runtime_history(),
+            captured_at=datetime.now(timezone.utc),
+            recent_limit=int(arguments.scan),
+        )
     except LaneExecutorUnavailableError as error:
         # A backend nobody implements is a misconfiguration, not a
         # missing pool: say which setting is wrong instead of printing a
         # snapshot of a backend that does not exist.
         print(f"executor-status: {error}", file=sys.stderr)
         return _MISCONFIGURED_EXIT_CODE
-    snapshot = build_executor_status_snapshot(
-        inspector=inspector,
-        journal_reader=build_dispatch_journal_reader(),
-        runtime_history=build_runtime_history(),
-        backend=backend,
-        captured_at=datetime.now(timezone.utc),
-        recent_limit=int(arguments.scan),
-    )
     print(render_executor_status(snapshot))
-    return _FAULT_EXIT_CODE if snapshot.is_degraded else 0
+    if snapshot.is_degraded:
+        return _FAULT_EXIT_CODE
+    # An unestablished backend is a configuration gap the operator
+    # closes with --backend, and the rest of the snapshot is still
+    # printed above; it must not read as a clean run.
+    return _MISCONFIGURED_EXIT_CODE if type(backend) is UnknownBackend else 0
+
+
+def _configured_validation_commands(worktree: Path) -> tuple[str, ...]:
+    """The repository's own gate commands, from the canonical config owner.
+
+    This is what makes the reported backend the one the gate will
+    actually use: the repository selects its backend by prefixing these
+    commands, and reading them is the only way to see that without
+    guessing. Best-effort by design — the pool is machine-wide and this
+    command must still answer where no configuration loads — but a
+    repository that HAS configured a backend is never overruled, because
+    no default is left to overrule it with.
+
+    Exactly one config is read (the mode's primary, or the one an
+    explicit environment selection names). Reading every config in the
+    mode would compare a repository's alternative deployments against
+    each other and report them as a contradiction.
+    """
+    from ...infra.config import Config
+
+    try:
+        path = _active_config_path(worktree)
+        if path is None:
+            return ()
+        validation = Config.load(path).validation
+    except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError):
+        # An unreadable config establishes nothing. It must not crash a
+        # status command whose other sources are fine, and it must not
+        # invent a backend either — the selection owner reports unknown.
+        return ()
+    return tuple(
+        command
+        for command in (validation.quick.cmd, validation.publish.cmd)
+        if type(command) is str and command
+    )
+
+
+def _active_config_path(worktree: Path) -> Path | None:
+    """The config this repository would actually launch with."""
+    explicit = get_env("CONFIG_PATH")
+    if explicit:
+        candidate = Path(explicit)
+        return candidate if candidate.is_file() else None
+    for repo_root in [worktree, *worktree.parents]:
+        names = list_configs(repo_root)
+        if names:
+            return get_config_path(repo_root, names[0])
+    return None
 
 
 def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -102,10 +173,12 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         choices=BACKEND_NAMES,
-        default=os.environ.get(BACKEND_ENVIRONMENT_VARIABLE, DIRECT_BACKEND),
+        default=None,
         help=(
-            "Backend to report on; defaults to "
-            f"${BACKEND_ENVIRONMENT_VARIABLE} or '{DIRECT_BACKEND}'."
+            "Backend to report on. Left out, it is established from "
+            f"${BACKEND_ENVIRONMENT_VARIABLE} or the repository's "
+            "validation command; if neither says, the snapshot reports "
+            "the backend as unknown rather than assuming one."
         ),
     )
     parser.add_argument(
@@ -133,7 +206,7 @@ def render_executor_status(snapshot: ExecutorStatusSnapshot) -> str:
     if type(snapshot) is not ExecutorStatusSnapshot:
         raise ValueError("render_executor_status requires an ExecutorStatusSnapshot")
     lines = [
-        f"Executor pool — backend {snapshot.backend}, "
+        f"Executor pool — {_render_backend(snapshot)}, "
         f"captured {_render_timestamp(snapshot.captured_at)}",
         "",
     ]
@@ -146,20 +219,43 @@ def render_executor_status(snapshot: ExecutorStatusSnapshot) -> str:
     return "\n".join(lines)
 
 
+def _render_backend(snapshot: ExecutorStatusSnapshot) -> str:
+    """Name the backend AND what established it.
+
+    The source is not trivia: an operator reading the wrong backend
+    needs to know whether to change a flag, an environment variable, or
+    the repository's gate command.
+    """
+    backend = snapshot.backend
+    if type(backend) is UnknownBackend:
+        return "backend UNKNOWN"
+    if type(backend) is not SelectedBackend:
+        raise AssertionError("backend selection is a closed union")
+    return f"backend {backend.name} (from {backend.source.value})"
+
+
 def _render_pool(snapshot: ExecutorStatusSnapshot) -> list[str]:
     pool = snapshot.pool
     if type(pool) is PoolOffline:
         # Loud, not silent: an absent pool gets a labelled line and its
         # reason, never an empty table that reads as "idle".
         return ["POOL: unavailable", f"  {pool.detail}"]
-    if type(pool) is not PoolOnline:
+    if not isinstance(pool, AnsweredPool):
         raise AssertionError("pool state is a closed union")
     machines = "machine" if pool.capacity.machines == 1 else "machines"
-    header = (
-        f"POOL: online — {pool.capacity.machines} {machines}, "
+    counts = (
+        f"{pool.capacity.machines} {machines}, "
         f"{pool.capacity.total_cpus} cpus, "
         f"{pool.claimed_cpus} in use; {_render_job_counts(pool)}"
     )
+    if type(pool) is PoolUnknownHealth:
+        # Never "online": the pool answered, but nothing proved it can
+        # run anything. The reason comes first, because the numbers
+        # underneath it may describe a machine that is gone.
+        header = f"POOL: health UNKNOWN — {pool.detail}"
+        header = f"{header}\n  it reported: {counts}"
+    else:
+        header = f"POOL: online — {counts}"
     if not pool.jobs:
         return [header, "  (nothing queued or running)"]
     rows = [
@@ -172,7 +268,7 @@ def _render_pool(snapshot: ExecutorStatusSnapshot) -> list[str]:
     ]
 
 
-def _render_job_counts(pool: PoolOnline) -> str:
+def _render_job_counts(pool: AnsweredPool) -> str:
     """Name only the states that actually have jobs in them.
 
     A held job is the single most important thing this line can say, so
@@ -186,7 +282,7 @@ def _render_job_counts(pool: PoolOnline) -> str:
     return ", ".join(counted) if counted else "nothing in the queue"
 
 
-def _ordered_jobs(pool: PoolOnline) -> list[PoolJob]:
+def _ordered_jobs(pool: AnsweredPool) -> list[PoolJob]:
     """Running first, then waiting, longest in state first within each."""
     ordered: list[PoolJob] = []
     for state in _JOB_STATE_ORDER:
@@ -223,36 +319,121 @@ def _render_job_row(job: PoolJob) -> tuple[str, ...]:
 
 
 def _render_history(snapshot: ExecutorStatusSnapshot) -> list[str]:
-    header = f"RECENT DISPATCH: {snapshot.journal_location}"
+    """One table per lane: how it is routed, and what it last cost."""
+    declarations = snapshot.declarations
+    if type(declarations) is DeclarationsRead:
+        where = f"LANES: {declarations.path}"
+    elif type(declarations) is DeclarationsUnavailable:
+        # Loud: without declarations, "no routing" below means "not
+        # known", not "not declared" — and every lane here is unrunnable
+        # until the file is fixed.
+        where = f"LANES: declarations UNREADABLE — {declarations.detail}"
+    else:
+        raise AssertionError("declarations state is a closed union")
+    scanned = f"{snapshot.records_scanned} record(s) scanned"
+    if snapshot.records_predating_envelope:
+        # Say how thin the history really is. These rows are readable
+        # JSON that simply predates the machine-state envelope, so
+        # counting them silently would overstate the sample behind
+        # every runtime below.
+        scanned += (
+            f", {snapshot.records_predating_envelope} skipped as older "
+            "than the machine-state envelope"
+        )
+    header = (
+        f"{where}\n  dispatch journal: {snapshot.journal_location} ({scanned})"
+    )
     if not snapshot.lanes:
         return [
             header,
-            "  (no dispatch records — lanes record here as they complete)",
+            "  (no lanes: none declared, and none recorded in the journal)",
         ]
     rows = [
-        ("LANE", "RUNS", "LAST RUNTIME", "LAST QUEUE WAIT", "PRI", "EXIT", "WHEN"),
+        (
+            "LANE",
+            "CPUS",
+            "MEM MB",
+            "FREEZE",
+            "EXCLUSIVE",
+            "RUNS",
+            "LAST RUNTIME",
+            "LAST QUEUE WAIT",
+            "PRI",
+            "EXIT",
+            "IDLE",
+            "BACKEND",
+            "WHEN",
+        ),
         *(_render_lane_row(lane) for lane in snapshot.lanes),
     ]
-    scanned = (
-        f"{header} ({snapshot.records_scanned} record(s) scanned, "
-        "highest dispatch priority first)"
-    )
     return [
-        scanned,
+        f"{header}, highest dispatch priority first",
         *(f"  {row}" for row in _render_table(rows, _LANE_NUMERIC_COLUMNS)),
     ]
 
 
-def _render_lane_row(lane: LaneDispatchSummary) -> tuple[str, ...]:
+def _render_lane_row(lane: LaneRow) -> tuple[str, ...]:
+    routing = lane.routing
+    if routing is None:
+        # Undeclared: `lane-run` refuses these, so the row exists to say
+        # the lane cannot run, not merely that a column is empty.
+        declared = ("—", "—", "undeclared", "—")
+    else:
+        declared = (
+            str(routing.request_cpus),
+            str(routing.memory_mb),
+            routing.suspendability,
+            ",".join(routing.exclusive) if routing.exclusive else "-",
+        )
+    history = lane.history
+    if history is None:
+        # Declared but never dispatched in the scanned window — a fact
+        # only the declarations could contribute.
+        return (
+            lane.work_key.value,
+            *declared,
+            "0",
+            "—",
+            "—",
+            "—",
+            "—",
+            "—",
+            "—",
+            "never",
+        )
     return (
         lane.work_key.value,
-        str(lane.runs),
-        _render_duration(lane.last_runtime_seconds),
-        _render_duration(lane.last_queue_wait_seconds),
-        str(lane.learned_priority),
-        str(lane.last_exit_code),
-        _render_timestamp(lane.last_recorded_at),
+        *declared,
+        str(history.runs),
+        _render_duration(history.last_runtime_seconds),
+        _render_duration(history.last_queue_wait_seconds),
+        str(history.learned_priority),
+        str(history.last_exit_code),
+        # How idle the host was when that runtime was measured. Printed
+        # beside it deliberately: a duration read without its contention
+        # is the ambiguity the envelope exists to end, and a runtime
+        # measured on a pegged machine is not this lane's cost. Idle
+        # share rather than load average — on macOS load counts parked
+        # threads, so a host reading 12.5 can be 85% idle.
+        _render_idle(history.last_machine_state),
+        # The backend the lane actually last ran on. Printed because a
+        # row that contradicts the header is the clearest possible
+        # signal that the selected backend is not the one in use.
+        history.last_backend,
+        _render_timestamp(history.last_recorded_at),
     )
+
+
+def _render_idle(state: MachineState) -> str:
+    """The host's idle share when the reading was taken, or why not.
+
+    A failed probe reads ``?`` rather than a number: an invented figure
+    here would be worse than an admitted gap, which is the same rule the
+    envelope itself follows.
+    """
+    if state.cpu_idle_percent is None:
+        return "?"
+    return f"{state.cpu_idle_percent:.0f}%"
 
 
 def _render_faults(snapshot: ExecutorStatusSnapshot) -> list[str]:
