@@ -57,7 +57,15 @@ DEFAULT_COLS = 120
 _MAX_ROWS = MAX_TERMINAL_ROWS
 _MAX_COLS = MAX_TERMINAL_COLS
 _BLANK = " "
-_REPLACEMENT = "\ufffd"
+_C1_START = 0x80
+_C1_END = 0x9F
+_C1_IND = 0x84
+_C1_NEL = 0x85
+_C1_CSI = 0x9B
+#: C1 introducers that open a string sequence: DCS, SOS, OSC, PM, APC.
+_C1_STRING_INTRODUCERS = frozenset({0x90, 0x98, 0x9D, 0x9E, 0x9F})
+#: The same five as two-byte escapes: ESC P, ESC X, ESC ], ESC ^, ESC _.
+_ESCAPE_STRING_INTRODUCERS = frozenset({0x50, 0x58, 0x5D, 0x5E, 0x5F})
 _TAB_WIDTH = 8
 
 _ESC = 0x1B
@@ -95,6 +103,10 @@ class TerminalViewport:
         self._cols = min(cols, _MAX_COLS)
         self._grid: list[list[str]] = self._blank_grid()
         self._written: list[bool] = [False] * self._rows
+        # Cells actually touched on each row. The terminal trims *untouched*
+        # trailing cells but keeps a space someone wrote, so a plain rstrip()
+        # renders a different row than the viewer shows.
+        self._extent: list[int] = [0] * self._rows
         self._row = 0
         self._col = 0
         self._saved: tuple[int, int] = (0, 0)
@@ -112,14 +124,16 @@ class TerminalViewport:
             return
         rows = min(rows, _MAX_ROWS)
         cols = min(cols, _MAX_COLS)
-        old_grid, old_written = self._grid, self._written
+        old_grid, old_written, old_extent = self._grid, self._written, self._extent
         self._rows, self._cols = rows, cols
         self._grid = self._blank_grid()
         self._written = [False] * rows
+        self._extent = [0] * rows
         for index in range(min(len(old_grid), rows)):
             row = old_grid[index][:cols]
             self._grid[index][: len(row)] = row
             self._written[index] = old_written[index]
+            self._extent[index] = min(old_extent[index], cols)
         self._scroll_top = 0
         self._scroll_bottom = rows - 1
         self._row = min(self._row, rows - 1)
@@ -155,6 +169,21 @@ class TerminalViewport:
                     # Genuinely truncated at the chunk edge — hold it over.
                     self._pending = buffer[index:]
                     return
+                if not char:
+                    # Undecodable: xterm's UTF-8 decoder drops the byte rather
+                    # than substituting anything, so nothing reaches the screen
+                    # and the cluster in progress is untouched.
+                    index += consumed
+                    continue
+                codepoint = ord(char)
+                if _C1_START <= codepoint <= _C1_END:
+                    self._cluster = EMPTY_CLUSTER
+                    resumed = self._apply_c1(codepoint, buffer, index + consumed)
+                    if resumed is None:
+                        self._pending = buffer[index:]
+                        return
+                    index = resumed
+                    continue
                 self._print(char)
                 index += consumed
                 continue
@@ -171,7 +200,9 @@ class TerminalViewport:
 
     def render(self) -> RenderedScreen:
         """Freeze the current screen. Non-mutating; safe to call repeatedly."""
-        rows = tuple("".join(row).rstrip() for row in self._grid)
+        rows = tuple(
+            "".join(row[:extent]) for row, extent in zip(self._grid, self._extent)
+        )
         written = tuple(
             text for text, was_written in zip(rows, self._written) if was_written
         )
@@ -193,7 +224,7 @@ class TerminalViewport:
         if byte == 0x0D:  # CR
             self._col = 0
             return
-        if byte == 0x0A:  # LF
+        if byte in (0x0A, 0x0B, 0x0C):  # LF, VT, FF all index a line
             self._line_feed()
             return
         if byte == 0x08:  # BS
@@ -228,6 +259,9 @@ class TerminalViewport:
                 if self._col + offset < self._cols:
                     self._grid[self._row][self._col + offset] = ""
             self._written[self._row] = True
+            self._extent[self._row] = max(
+                self._extent[self._row], min(self._col + cells, self._cols)
+            )
         self._col += cells
 
     def _attach_combining(self, char: str) -> None:
@@ -240,6 +274,7 @@ class TerminalViewport:
         # mark behind a space that was never printed.
         self._grid[self._row][column] = char if cell == _BLANK else cell + char
         self._written[self._row] = True
+        self._extent[self._row] = max(self._extent[self._row], column + 1)
 
     def _line_feed(self) -> None:
         if self._row == self._scroll_bottom:
@@ -252,12 +287,37 @@ class TerminalViewport:
         for _ in range(count):
             del self._grid[top]
             del self._written[top]
+            del self._extent[top]
             self._grid.insert(bottom, [_BLANK] * self._cols)
             # A row scrolled into view is blank *because this replay scrolled
             # it*, so it is authoritative, not unknown history.
             self._written.insert(bottom, True)
+            self._extent.insert(bottom, 0)
 
     # -- escape handling ---------------------------------------------------
+
+    def _apply_c1(self, codepoint: int, buffer: bytes, payload: int) -> int | None:
+        """Apply a C1 control, returning where parsing resumes.
+
+        Measured against the vendored xterm (``tools/measure_xterm_widths.js
+        controls``): of the 32 C1s, only IND and NEL move the cursor, six
+        introduce a sequence exactly as their two-byte ESC forms do, and the
+        remaining 24 — U+008D among them, despite being RI on paper — are
+        consumed with no visible effect. Treating them as text is what let a
+        NEL keep a footer on one row that xterm splits across two (#7141 r5).
+        """
+        if codepoint == _C1_IND:
+            self._line_feed()
+            return payload
+        if codepoint == _C1_NEL:
+            self._col = 0
+            self._line_feed()
+            return payload
+        if codepoint == _C1_CSI:
+            return self._scan_csi(buffer, payload)
+        if codepoint in _C1_STRING_INTRODUCERS:
+            return _scan_string_sequence(buffer, payload)
+        return payload
 
     def _apply_escape(self, buffer: bytes, start: int) -> int | None:
         """Return bytes consumed from ``start``, or None if incomplete."""
@@ -265,9 +325,11 @@ class TerminalViewport:
             return None
         marker = buffer[start + 1]
         if marker == 0x5B:  # '['
-            return self._apply_csi(buffer, start)
-        if marker in (0x5D, 0x50, 0x5E, 0x5F):  # OSC / DCS / PM / APC
-            return _string_sequence_length(buffer, start)
+            end = self._scan_csi(buffer, start + 2)
+            return None if end is None else end - start
+        if marker in _ESCAPE_STRING_INTRODUCERS:  # OSC / DCS / SOS / PM / APC
+            end = _scan_string_sequence(buffer, start + 2)
+            return None if end is None else end - start
         if marker == 0x37:  # ESC 7 save cursor
             self._saved = (self._row, self._col)
             return 2
@@ -279,8 +341,13 @@ class TerminalViewport:
             return 2
         return 2
 
-    def _apply_csi(self, buffer: bytes, start: int) -> int | None:
-        index = start + 2
+    def _scan_csi(self, buffer: bytes, payload: int) -> int | None:
+        """Apply a CSI whose parameters start at ``payload``; return its end.
+
+        Shared by ``ESC [`` and the single-codepoint C1 CSI (U+009B), which the
+        terminal treats as the same sequence — measured identical.
+        """
+        index = payload
         size = len(buffer)
         while index < size and (0x30 <= buffer[index] <= 0x3F):
             index += 1
@@ -289,10 +356,9 @@ class TerminalViewport:
         if index >= size:
             return None
         final = buffer[index]
-        params_raw = buffer[start + 2 : index].decode("ascii", errors="replace")
-        consumed = index + 1 - start
+        params_raw = buffer[payload:index].decode("ascii", errors="replace")
         self._dispatch_csi(chr(final), params_raw)
-        return consumed
+        return index + 1
 
     def _dispatch_csi(self, final: str, params_raw: str) -> None:
         if params_raw.startswith("?"):
@@ -308,6 +374,7 @@ class TerminalViewport:
     def _reset(self) -> None:
         self._grid = self._blank_grid()
         self._written = [True] * self._rows
+        self._extent = [0] * self._rows
         self._row = self._col = 0
         self._cluster = EMPTY_CLUSTER
         self._scroll_top, self._scroll_bottom = 0, self._rows - 1
@@ -344,6 +411,9 @@ class TerminalViewport:
         for column in range(start, stop):
             self._grid[self._row][column] = _BLANK
         self._written[self._row] = True
+        if stop >= self._cols:
+            # Erasing to the end of the line untouches those cells again.
+            self._extent[self._row] = min(self._extent[self._row], start)
 
     def _erase_span(self, mode: int) -> tuple[int, int]:
         if mode == 1:
@@ -368,6 +438,7 @@ class TerminalViewport:
         for index in indexes:
             self._grid[index] = [_BLANK] * self._cols
             self._written[index] = True
+            self._extent[index] = 0
 
     def _set_scroll_region(self, params: list[int]) -> None:
         top = (params[0] if params else 1) or 1
@@ -385,8 +456,10 @@ class TerminalViewport:
         for _ in range(_amount(params)):
             del self._grid[bottom]
             del self._written[bottom]
+            del self._extent[bottom]
             self._grid.insert(top, [_BLANK] * self._cols)
             self._written.insert(top, True)
+            self._extent.insert(top, 0)
 
     # Defined inside the class body so the handlers are plain names here
     # rather than private attribute access on the class from outside.
@@ -423,7 +496,11 @@ def _decode_utf8(buffer: bytes, index: int, size: int) -> tuple[str, int]:
     """Decode one UTF-8 character at ``index``; return ``(char, consumed)``.
 
     ``consumed == 0`` means the sequence is genuinely truncated at the end of
-    the chunk and the caller should hold the bytes over.
+    the chunk and the caller should hold the bytes over. An empty ``char`` with
+    a non-zero ``consumed`` means the bytes are undecodable and the terminal
+    drops them — measured: xterm's decoder emits nothing at all for an invalid
+    byte, so substituting a replacement character would shift every column
+    after it.
 
     A declared byte count is not enough on its own: every byte after the lead
     must be a continuation (0x80-0xBF). A lead that announces three bytes and
@@ -435,15 +512,16 @@ def _decode_utf8(buffer: bytes, index: int, size: int) -> tuple[str, int]:
     lead = buffer[index]
     width = _utf8_width(lead)
     if width == 1:
-        return _REPLACEMENT, 1
+        return "", 1
     end = index + width
     for offset in range(index + 1, min(end, size)):
         if not _is_continuation(buffer[offset]):
-            # Corrupt, not truncated: the lead alone is the bad byte.
-            return _REPLACEMENT, 1
+            # Corrupt, not truncated: drop the lead and re-read the next byte.
+            return "", 1
     if end > size:
         return "", 0
-    return buffer[index:end].decode("utf-8", errors="replace")[:1] or _REPLACEMENT, width
+    decoded = buffer[index:end].decode("utf-8", errors="ignore")[:1]
+    return decoded, width
 
 
 def _is_continuation(byte: int) -> bool:
@@ -466,16 +544,21 @@ def _utf8_width(lead: int) -> int:
     return 1
 
 
-def _string_sequence_length(buffer: bytes, start: int) -> int | None:
-    """Length of an OSC/DCS/PM/APC string sequence, or None if unterminated."""
-    index = start + 2
+def _scan_string_sequence(buffer: bytes, payload: int) -> int | None:
+    """End of an OSC/DCS/SOS/PM/APC string whose body starts at ``payload``.
+
+    ``None`` when unterminated, which leaves the bytes pending and therefore
+    unrendered — the same visible result as the terminal sitting in the string
+    state waiting for a terminator that never comes.
+    """
+    index = payload
     size = len(buffer)
     while index < size:
         byte = buffer[index]
         if byte == _BEL:
-            return index + 1 - start
+            return index + 1
         if byte == _ESC and index + 1 < size and buffer[index + 1] == 0x5C:
-            return index + 2 - start
+            return index + 2
         if byte == _ESC and index + 1 >= size:
             return None
         index += 1

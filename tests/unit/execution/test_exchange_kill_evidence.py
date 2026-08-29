@@ -1401,3 +1401,37 @@ class TestReplayRunsUnderTheBudget:
             (captured[0] / RUN_IDENTITY_FILENAME).read_text(encoding="utf-8")
         )
         assert identity["composer_state"]["state"] == "composer_stranded"
+
+
+class TestControlCharactersCannotForgeAMarker:
+    """#7141 round 5: a marker split across rows is not on the screen at all."""
+
+    def test_a_nel_inside_the_marker_span_defeats_a_stranded_verdict(
+        self, tmp_path: Path
+    ) -> None:
+        """The reported reproduction: xterm splits the row, so no row matches."""
+        footer = "\u001b[34;2H\u001b[K  tab to \u0085queue message".encode("utf-8")
+        path = _recording(tmp_path / "nel.jsonl", (footer,))
+
+        verdict = classify_composer_state(path)
+
+        assert verdict.state is not ComposerState.COMPOSER_STRANDED
+
+    def test_the_same_footer_without_the_nel_is_still_stranded(
+        self, tmp_path: Path
+    ) -> None:
+        """Control: the marker still works, so this is not a blanket refusal."""
+        footer = "\u001b[34;2H\u001b[K  tab to queue message".encode("utf-8")
+        path = _recording(tmp_path / "clean.jsonl", (footer,))
+
+        assert classify_composer_state(path).state is ComposerState.COMPOSER_STRANDED
+
+    def test_a_vertical_tab_inside_the_marker_span_defeats_it_too(
+        self, tmp_path: Path
+    ) -> None:
+        footer = b"\x1b[34;2H\x1b[K  tab to \x0bqueue message"
+        path = _recording(tmp_path / "vt.jsonl", (footer,))
+
+        assert (
+            classify_composer_state(path).state is not ComposerState.COMPOSER_STRANDED
+        )

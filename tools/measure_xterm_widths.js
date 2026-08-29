@@ -7,6 +7,7 @@
 //
 //   node tools/measure_xterm_widths.js widths      # advance per codepoint
 //   node tools/measure_xterm_widths.js screens     # cursor + rows per probe
+//   node tools/measure_xterm_widths.js controls    # C1 (U+0080-U+009F) behaviour
 //
 // Emit-only: it prints JSON for a human (or a test author) to read. Nothing
 // imports it at runtime.
@@ -18,8 +19,17 @@ const { Terminal } = require(
     path.join(__dirname, '../src/issue_orchestrator/static/vendor/xterm/xterm.js'),
 );
 
-function write(term, text) {
-    return new Promise((resolve) => term.write(text, resolve));
+function write(term, data) {
+    return new Promise((resolve) => term.write(data, resolve));
+}
+
+function readViewport(buffer, rows) {
+    const out = [];
+    for (let y = 0; y < rows; y += 1) {
+        const line = buffer.getLine(buffer.baseY + y);
+        out.push(line ? line.translateToString(true) : '');
+    }
+    return out;
 }
 
 // Codepoints whose advance we care about: ASCII, CJK, Hangul, combining marks,
@@ -49,8 +59,8 @@ async function measureWidths() {
     const term = new Terminal({ cols: 20, rows: 4, allowProposedApi: true });
     const out = {};
     for (const cp of sampleCodepoints()) {
-        await write(term, '\x1b[H\x1b[2J');
-        await write(term, 'A' + String.fromCodePoint(cp));
+        await write(term, new TextEncoder().encode('\x1b[H\x1b[2J'));
+        await write(term, new TextEncoder().encode('A' + String.fromCodePoint(cp)));
         out[cp] = term.buffer.active.cursorX - 1;
     }
     console.log(JSON.stringify(out));
@@ -74,13 +84,12 @@ async function measureScreens() {
     const out = {};
     for (const [name, probe] of Object.entries(SCREENS)) {
         const term = new Terminal({ cols: probe.cols, rows: probe.rows, allowProposedApi: true });
-        await write(term, probe.text);
+        await write(term, new TextEncoder().encode(probe.text));
         const buffer = term.buffer.active;
-        const rows = [];
-        for (let y = 0; y < probe.rows; y += 1) {
-            const line = buffer.getLine(y);
-            rows.push(line ? line.translateToString(true) : '');
-        }
+        // getLine() indexes the whole buffer, scrollback included, so a probe
+        // that scrolls must be read from baseY or it reports lines that have
+        // already left the screen.
+        const rows = readViewport(buffer, probe.rows);
         out[name] = {
             cols: probe.cols,
             text: probe.text,
@@ -92,8 +101,62 @@ async function measureScreens() {
     console.log(JSON.stringify(out, null, 2));
 }
 
+// C1 controls (U+0080-U+009F) arrive in a recording as two UTF-8 bytes. Some
+// are inert, two move the cursor, and six introduce a sequence — so they are
+// measured as raw BYTES in three contexts: a plain row, mid-screen (where a
+// cursor move is visible), and on the last row (where it scrolls).
+function c1Probes() {
+    const encoder = new TextEncoder();
+    const bytes = (text) => Array.from(encoder.encode(text));
+    const probes = {};
+    for (let cp = 0x80; cp <= 0x9f; cp += 1) {
+        const control = bytes(String.fromCodePoint(cp));
+        const tag = cp.toString(16).toUpperCase();
+        probes[`c1_${tag}_inline`] = {
+            cols: 20, rows: 4, bytes: [...bytes('AB'), ...control, ...bytes('CD')],
+        };
+        probes[`c1_${tag}_midscreen`] = {
+            cols: 10, rows: 5,
+            bytes: [...bytes('r0\r\nr1\r\nr2'), ...control, ...bytes('X')],
+        };
+        probes[`c1_${tag}_lastrow`] = {
+            cols: 10, rows: 3,
+            bytes: [...bytes('a\r\nb\r\nc'), ...control, ...bytes('X')],
+        };
+    }
+    // The reported reproduction: a NEL inside the marker span.
+    probes.c1_nel_splits_the_marker = {
+        cols: 40, rows: 4,
+        bytes: [...bytes('tab to '), ...bytes('\u0085'), ...bytes('queue message')],
+    };
+    // 0x9B really does introduce a control sequence.
+    probes.c1_csi_erases_the_display = {
+        cols: 20, rows: 3,
+        bytes: [...bytes('HELLO'), ...bytes('\u009b'), ...bytes('2J')],
+    };
+    return probes;
+}
+
+async function measureControls() {
+    const out = {};
+    for (const [name, probe] of Object.entries(c1Probes())) {
+        const term = new Terminal({ cols: probe.cols, rows: probe.rows, allowProposedApi: true });
+        await write(term, new Uint8Array(probe.bytes));
+        const buffer = term.buffer.active;
+        out[name] = {
+            cols: probe.cols,
+            bytes: probe.bytes,
+            cursorX: buffer.cursorX,
+            cursorY: buffer.cursorY,
+            rows: readViewport(buffer, probe.rows),
+        };
+    }
+    console.log(JSON.stringify(out, null, 2));
+}
+
 const mode = process.argv[2] || 'screens';
-(mode === 'widths' ? measureWidths() : measureScreens()).catch((error) => {
+const MODES = { widths: measureWidths, screens: measureScreens, controls: measureControls };
+(MODES[mode] || measureScreens)().catch((error) => {
     console.error(error);
     process.exit(1);
 });

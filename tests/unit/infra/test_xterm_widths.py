@@ -161,3 +161,80 @@ class TestTableInvariants:
         assert wcwidth(0x7F) == 0
         assert wcwidth(0x9F) == 0
         assert wcwidth(0xA0) == 1
+
+
+def _measured_controls() -> dict[str, dict[str, object]]:
+    return json.loads(
+        (_FIXTURES / "measured_c1_controls.json").read_text(encoding="utf-8")
+    )
+
+
+class TestC1ControlsMatchTheBundledTerminal:
+    """#7141 round 5: C1s are controls to xterm, not text.
+
+    Regenerate with ``node tools/measure_xterm_widths.js controls``. Each probe
+    is a raw BYTE sequence, so nothing here depends on a string write path
+    behaving the same as the byte path a recording actually replays.
+    """
+
+    @pytest.mark.parametrize("probe", sorted(_measured_controls()))
+    def test_screen_matches(self, probe: str) -> None:
+        expected = _measured_controls()[probe]
+        rows = expected["rows"]
+        assert isinstance(rows, list)
+        assert isinstance(expected["bytes"], list)
+        view = TerminalViewport(rows=len(rows), cols=int(expected["cols"]))
+
+        view.feed(bytes(expected["bytes"]))
+
+        rendered = view.render()
+        assert list(rendered.rows) == rows
+        assert rendered.cursor_col == expected["cursorX"]
+        assert rendered.cursor_row == expected["cursorY"]
+
+    def test_the_fixture_covers_every_c1(self) -> None:
+        """An xterm upgrade must re-measure all 32, not a convenient subset."""
+        probes = _measured_controls()
+        for codepoint in range(0x80, 0xA0):
+            tag = f"{codepoint:X}"
+            for context in ("inline", "midscreen", "lastrow"):
+                assert f"c1_{tag}_{context}" in probes
+
+    def test_nel_breaks_the_line(self) -> None:
+        view = TerminalViewport(rows=4, cols=40)
+
+        view.feed("tab to \u0085queue message".encode("utf-8"))
+
+        assert view.render().rows[:2] == ("tab to ", "queue message")
+
+    def test_index_keeps_the_column_while_breaking_the_line(self) -> None:
+        view = TerminalViewport(rows=4, cols=20)
+
+        view.feed("AB\u0084CD".encode("utf-8"))
+
+        assert view.render().rows[:2] == ("AB", "  CD")
+
+    def test_the_c1_csi_introduces_a_sequence(self) -> None:
+        view = TerminalViewport(rows=3, cols=20)
+
+        view.feed("HELLO\u009b2J".encode("utf-8"))
+
+        assert view.render().rows == ("", "", "")
+
+    def test_the_inert_c1s_leave_no_mark(self) -> None:
+        """24 of the 32 are consumed with no visible effect — U+008D included."""
+        for codepoint in (0x80, 0x88, 0x8D, 0x97, 0x9C):
+            view = TerminalViewport(rows=3, cols=20)
+
+            view.feed(f"AB{chr(codepoint)}CD".encode("utf-8"))
+
+            assert view.render().rows[0] == "ABCD", f"U+{codepoint:04X} left a mark"
+
+    def test_vertical_tab_and_form_feed_index_a_line(self) -> None:
+        """Measured alongside the C1 sweep: VT and FF are line feeds, not text."""
+        for control in (0x0B, 0x0C):
+            view = TerminalViewport(rows=4, cols=10)
+
+            view.feed(b"ab" + bytes([control]) + b"X")
+
+            assert view.render().rows[:2] == ("ab", "  X")

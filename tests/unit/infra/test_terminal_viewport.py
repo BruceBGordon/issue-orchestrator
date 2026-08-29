@@ -341,14 +341,25 @@ class TestMalformedByteStreams:
 
         assert view.render().rows[0] == "東"
 
-    def test_an_overlong_or_invalid_lead_is_one_replacement_character(self) -> None:
+    def test_an_undecodable_byte_is_dropped_not_substituted(self) -> None:
+        """Measured: xterm's decoder emits nothing at all for an invalid byte.
+
+        Round 2 substituted U+FFFD, which shifts every column after it and can
+        change where a row wraps — the same class of divergence as the C1 bug.
+        """
         view = _viewport()
 
         view.feed(b"\xffX")
 
-        rendered = view.render().rows[0]
-        assert rendered.endswith("X")
-        assert len(rendered) == 2
+        assert view.render().rows[0] == "X"
+
+    def test_a_dropped_byte_does_not_break_a_cluster(self) -> None:
+        """A byte the decoder never emits cannot separate what surrounds it."""
+        view = _viewport()
+
+        view.feed(b"A\xff" + "\u0301".encode("utf-8"))
+
+        assert view.render().rows[0] == "A\u0301"
 
 
 class TestWideCharacterCells:
