@@ -42,6 +42,7 @@ derivable from the journal itself at zero runtime cost.
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import logging
 import math
@@ -101,8 +102,60 @@ class _HostCpuLoadInfo(ctypes.Structure):
     _fields_ = [("cpu_ticks", ctypes.c_uint * 4)]
 
 
+# Control-flow signals that mean THE CALLER IS BEING TORN DOWN. They are
+# the only things allowed out of the containment below, because
+# containing them would defeat the teardown rather than protect a
+# record: the operator's Ctrl-C must win, and swallowing a cancellation
+# or a generator close silently breaks the caller's own contract.
+# SystemExit is deliberately NOT here — see the boundary docstring.
+_NEVER_CONTAINED: tuple[type[BaseException], ...] = (
+    KeyboardInterrupt,
+    GeneratorExit,
+    asyncio.CancelledError,
+)
+_UNRENDERABLE = "<unrenderable exception>"
+# A hostile or merely enormous exception must not bloat every JSONL row.
+_MAX_PROBE_ERROR_CHARS = 500
+
+
+def _safe_type_name(value: object) -> str:
+    """The type's name, without trusting a hostile metaclass for it."""
+    try:
+        name = type(value).__name__
+    except BaseException:
+        return _UNRENDERABLE
+    if type(name) is not str or not name:
+        return _UNRENDERABLE
+    return name
+
+
+def describe_exception(error: BaseException) -> str:
+    """Render an exception for the record WITHOUT trusting the exception.
+
+    An exception is user code: ``__str__`` and ``__repr__`` can raise,
+    return a non-string, or return megabytes. Rendering one inside a
+    containment boundary and letting that rendering raise is how the
+    boundary leaks (round 1 finding A) — so every attempt is itself
+    contained and the last resort is a constant.
+    """
+    try:
+        rendered = repr(error)
+    except BaseException:
+        rendered = ""
+    if type(rendered) is not str or not rendered:
+        rendered = _safe_type_name(error)
+    return rendered[:_MAX_PROBE_ERROR_CHARS]
+
+
 def sample_machine_state(sampler: MachineStateSampler) -> MachineState:
-    """Read host contention, containing any sampling failure here.
+    """Read host contention, containing any sampling failure here."""
+    return sample_machine_state_from(lambda: sampler)
+
+
+def sample_machine_state_from(
+    acquire: Callable[[], MachineStateSampler],
+) -> MachineState:
+    """Acquire the probe and read it inside ONE containment.
 
     THE owner decision for observability-probe failure semantics: this
     repository is fail-fast, and this is the one deliberate exception.
@@ -111,23 +164,40 @@ def sample_machine_state(sampler: MachineStateSampler) -> MachineState:
     false failures this forensics work exists to remove. The failure is
     contained, not swallowed — it lands in the record as ``probe_error``,
     in the same JSONL the analyst is already reading, so a degrading
-    sampler is visible rather than invisible.
+    sampler is visible rather than invisible. Obtaining the probe is as
+    much "the probe" as reading it, so both happen inside the boundary.
+
+    **BaseException policy** (round 1 finding A). ``except Exception``
+    was not a boundary: a sampler raising ``SystemExit``, or a signal
+    handler raising one during the sampling window, sailed straight
+    through and replaced an ALREADY-DECIDED lane outcome before it could
+    be journaled. So this catches ``BaseException`` and re-raises only
+    ``_NEVER_CONTAINED`` — the teardown signals whose whole meaning is
+    "stop, the caller is going away".
+
+    ``SystemExit`` is therefore contained and recorded, including one
+    delivered by a signal handler mid-sample. That is a real trade, made
+    deliberately: the alternative is a probe silently replacing the
+    gate's exit code with its own, which is the exact harm this boundary
+    exists to prevent. The window is bounded by the sampler's own
+    timeout, an interrupt still wins, and a supervisor that means it
+    will follow SIGTERM with SIGKILL.
     """
     try:
-        state = sampler.sample()
-    # Deliberately broad: the point is that NOTHING a sampler does
-    # reaches the caller. See the docstring above for why.
-    except Exception as error:
-        logger.warning("machine-state sampling failed: %r", error)
-        return unmeasured_machine_state(
-            f"{type(error).__name__}: {error}", source="sampler raised"
-        )
+        state = acquire().sample()
+    except _NEVER_CONTAINED:
+        raise
+    except BaseException as error:
+        reason = describe_exception(error)
+        logger.warning("machine-state sampling failed: %s", reason)
+        return unmeasured_machine_state(reason, source="sampler raised")
     if type(state) is not MachineState:
         # A sampler answering with the wrong type is a bug, but not one
         # worth failing a gate over: record it like any failed probe.
-        logger.warning("machine-state sampler returned %r", type(state))
+        name = _safe_type_name(state)
+        logger.warning("machine-state sampler returned %s", name)
         return unmeasured_machine_state(
-            f"sampler returned {type(state).__name__}, not MachineState",
+            f"sampler returned {name}, not MachineState",
             source="sampler contract violated",
         )
     return state

@@ -7,7 +7,10 @@ forced platform, so no test depends on the host it runs on.
 
 from __future__ import annotations
 
+import asyncio
+import signal
 import sys
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -17,12 +20,14 @@ from issue_orchestrator.infra.machine_state import (
     CpuTicks,
     HostMachineStateSampler,
     default_machine_state_sampler,
+    describe_exception,
     idle_percent_between,
     machine_state_fields,
     parse_proc_stat_idle_percent,
     parse_proc_stat_ticks,
     read_mach_cpu_ticks,
     sample_machine_state,
+    sample_machine_state_from,
     stamp_machine_state,
     unmeasured_machine_state,
 )
@@ -176,7 +181,13 @@ class TestHostSampler:
 
 
 class TestSamplingFailureNeverPropagates:
-    """The one deliberate exception to fail-fast, owned in one place."""
+    """The one deliberate exception to fail-fast, owned in one place.
+
+    Round 1 finding A: `except Exception` plus an f-string was not a
+    boundary. The reviewer escaped it three ways, all reproduced here -
+    each one could replace an ALREADY-DECIDED lane outcome before it was
+    journaled, which is the precise harm this boundary exists to stop.
+    """
 
     def test_a_raising_sampler_becomes_a_recorded_probe_error(self) -> None:
         class _Exploding:
@@ -188,6 +199,148 @@ class TestSamplingFailureNeverPropagates:
         assert "probe host melted" in state.probe_error
         assert state.loadavg_1m is None
         assert state.cpu_idle_percent is None
+
+    def test_an_exception_whose_str_raises_is_still_contained(self) -> None:
+        """Escape 1: rendering the error was itself unguarded, so a
+        hostile __str__ escaped the boundary as a fresh exception."""
+
+        class _Hostile(Exception):
+            def __str__(self) -> str:
+                raise ValueError("cannot render me")
+
+        class _Sampler:
+            def sample(self) -> MachineState:
+                raise _Hostile()
+
+        state = sample_machine_state(_Sampler())
+        assert state.probe_error is not None
+        assert "_Hostile" in state.probe_error
+
+    def test_an_exception_whose_repr_also_raises_falls_back_to_its_type(
+        self,
+    ) -> None:
+        """Every rendering attempt is contained, so the last resort is a
+        name obtained without calling the exception's own code."""
+
+        class _WhollyHostile(Exception):
+            def __str__(self) -> str:
+                raise ValueError("no str")
+
+            def __repr__(self) -> str:
+                raise ValueError("no repr")
+
+        class _Sampler:
+            def sample(self) -> MachineState:
+                raise _WhollyHostile()
+
+        state = sample_machine_state(_Sampler())
+        assert state.probe_error == "_WhollyHostile"
+
+    def test_an_enormous_rendering_cannot_bloat_the_record(self) -> None:
+        class _Verbose(Exception):
+            def __repr__(self) -> str:
+                return "x" * 10_000_000
+
+        class _Sampler:
+            def sample(self) -> MachineState:
+                raise _Verbose()
+
+        state = sample_machine_state(_Sampler())
+        assert state.probe_error is not None
+        assert len(state.probe_error) <= 500
+
+    def test_a_sampler_raising_system_exit_is_contained(self) -> None:
+        """Escape 2: SystemExit is not an Exception, so it sailed
+        through and would have replaced the gate's exit code with its
+        own."""
+
+        class _Exiting:
+            def sample(self) -> MachineState:
+                raise SystemExit(3)
+
+        state = sample_machine_state(_Exiting())
+        assert state.probe_error is not None
+        assert "SystemExit" in state.probe_error
+
+    @pytest.mark.skipif(
+        not hasattr(signal, "setitimer"), reason="POSIX timers required"
+    )
+    def test_a_signal_handler_exiting_mid_sample_is_contained(self) -> None:
+        """Escape 3: the asynchronous version of the same hole - a
+        handler raising SystemExit while the probe is inside its sample
+        window. Delivered for real with a live interval timer rather
+        than simulated, because 'the sampler raised it' and 'the signal
+        arrived during it' are different code paths."""
+
+        def die(signum: int, frame: object) -> None:
+            del signum, frame
+            raise SystemExit("terminated mid-sample")
+
+        class _Slow:
+            def sample(self) -> MachineState:
+                time.sleep(0.5)
+                raise AssertionError("the alarm should have fired first")
+
+        previous = signal.signal(signal.SIGALRM, die)
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0.05)
+            state = sample_machine_state(_Slow())
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+
+        assert state.probe_error is not None
+        assert "SystemExit" in state.probe_error
+
+    @pytest.mark.parametrize(
+        "signal_type", [KeyboardInterrupt, GeneratorExit, asyncio.CancelledError]
+    )
+    def test_teardown_signals_are_never_contained(
+        self, signal_type: type[BaseException]
+    ) -> None:
+        """The other half of the policy. Containing these would defeat
+        a teardown rather than protect a record: the operator's Ctrl-C
+        must win, and swallowing a cancellation or a generator close
+        silently breaks the caller's own contract."""
+
+        class _TornDown:
+            def sample(self) -> MachineState:
+                raise signal_type()
+
+        with pytest.raises(signal_type):
+            sample_machine_state(_TornDown())
+
+    def test_acquiring_the_probe_is_inside_the_boundary_too(self) -> None:
+        """Obtaining the sampler is as much 'the probe' as reading it;
+        a composition root that blows up building one must not take the
+        already-decided outcome with it."""
+
+        def acquire() -> MachineStateSampler:
+            raise RuntimeError("no sampler for you")
+
+        state = sample_machine_state_from(acquire)
+        assert state.probe_error is not None
+        assert "no sampler for you" in state.probe_error
+
+    def test_a_teardown_signal_while_acquiring_still_propagates(self) -> None:
+        def acquire() -> MachineStateSampler:
+            raise KeyboardInterrupt()
+
+        with pytest.raises(KeyboardInterrupt):
+            sample_machine_state_from(acquire)
+
+    def test_the_renderer_never_raises_whatever_it_is_handed(self) -> None:
+        """The rendering helper is the boundary's last line, so it is
+        pinned directly: normal errors keep their message, hostile ones
+        degrade to a name, and nothing escapes."""
+
+        class _Hostile(Exception):
+            def __repr__(self) -> str:
+                raise ValueError("no repr")
+
+        assert "boom" in describe_exception(ValueError("boom"))
+        assert describe_exception(_Hostile()) == "_Hostile"
+        assert describe_exception(KeyboardInterrupt()) == "KeyboardInterrupt()"
 
     def test_a_sampler_answering_with_the_wrong_type_is_contained(self) -> None:
         class _Wrong:

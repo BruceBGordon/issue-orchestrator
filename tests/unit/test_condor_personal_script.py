@@ -234,7 +234,10 @@ def test_lane_config_never_states_per_job_accounting_unconditionally(
 
 
 def _per_job_history_config(
-    tmp_path: Path, spool_value: str, config_dir: Path
+    tmp_path: Path,
+    spool_value: str,
+    config_dir: Path,
+    extra_stubs: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run write_per_job_history_config against stubbed tools.
 
@@ -255,6 +258,10 @@ def _per_job_history_config(
     unprivileged_sudo = stubs / "sudo"
     unprivileged_sudo.write_text('#!/bin/bash\nexec "$@"\n')
     unprivileged_sudo.chmod(0o755)
+    for name, body in (extra_stubs or {}).items():
+        stub = stubs / name
+        stub.write_text(body)
+        stub.chmod(0o755)
     return subprocess.run(
         [
             "bash",
@@ -329,6 +336,76 @@ def test_an_unpreparable_directory_writes_no_knob_at_all(tmp_path: Path) -> None
     assert result.returncode == 0, result.stderr
     assert not (config_dir / _CONFIG_NAME).exists()
     assert "per-job accounting is off" in result.stderr
+
+
+def test_a_regular_file_at_the_history_path_is_refused(tmp_path: Path) -> None:
+    """Round 1 finding B, escape 1: `find -perm -0002` matches a
+    world-writable FILE just as happily as a directory, so the knob was
+    emitted for something the schedd cannot open as one."""
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    impostor = spool / "per-job-history"
+    impostor.write_text("not a directory\n")
+    impostor.chmod(0o777)
+    config_dir = tmp_path / "config.d"
+    config_dir.mkdir()
+
+    result = _per_job_history_config(tmp_path, str(spool), config_dir)
+    assert result.returncode == 0, result.stderr
+    assert not (config_dir / _CONFIG_NAME).exists()
+    assert "not a plain directory" in result.stderr
+    assert impostor.is_file(), "the impostor must be left alone, not replaced"
+
+
+def test_a_symlink_at_the_history_path_is_refused_before_any_chmod(
+    tmp_path: Path,
+) -> None:
+    """Round 1 finding B, escape 2: `[ -d ]` follows symlinks, so a
+    symlink here passed the existence check and the SUDO chmod below
+    then re-moded whatever it pointed at. The refusal must happen before
+    anything is chmodded, so the target's mode is the assertion."""
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir(mode=0o700)
+    (spool / "per-job-history").symlink_to(unrelated)
+    config_dir = tmp_path / "config.d"
+    config_dir.mkdir()
+
+    result = _per_job_history_config(tmp_path, str(spool), config_dir)
+    assert result.returncode == 0, result.stderr
+    assert not (config_dir / _CONFIG_NAME).exists()
+    assert "not a plain directory" in result.stderr
+    assert unrelated.stat().st_mode & 0o7777 == 0o700, (
+        "the symlink's target was re-moded by a chmod that should never "
+        "have run"
+    )
+
+
+def test_a_failed_chmod_leaves_no_knob_even_though_it_is_world_writable(
+    tmp_path: Path,
+) -> None:
+    """Round 1 finding B, escape 3: verifying only the other-write bit
+    accepted a pre-existing 0777 directory whose chmod silently failed -
+    world-writable but NOT sticky, so any uid could delete another's
+    ClassAd. The check must assert the mode OUTCOME."""
+    spool = tmp_path / "spool"
+    history = spool / "per-job-history"
+    history.mkdir(parents=True, mode=0o777)
+    history.chmod(0o777)
+    config_dir = tmp_path / "config.d"
+    config_dir.mkdir()
+
+    result = _per_job_history_config(
+        tmp_path,
+        str(spool),
+        config_dir,
+        extra_stubs={"chmod": "#!/bin/bash\nexit 1\n"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert history.stat().st_mode & 0o7777 == 0o777, "stub chmod must be inert"
+    assert not (config_dir / _CONFIG_NAME).exists()
+    assert "sticky, world-writable" in result.stderr
 
 
 def test_verification_escalates_like_the_creation_did(tmp_path: Path) -> None:

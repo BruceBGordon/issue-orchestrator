@@ -217,6 +217,15 @@ prepare_per_job_history_dir() {
     return 1
   fi
   history="$spool/per-job-history"
+  # Refuse to TOUCH anything that is not already a plain directory
+  # (round 1 finding B). chmod follows symlinks, so a symlink here would
+  # let the sudo chmod below re-mode an unrelated target; and a regular
+  # file would sail through a bare world-writable check and get the knob
+  # emitted for something the schedd cannot open as a directory.
+  if [ -L "$history" ] || { [ -e "$history" ] && [ ! -d "$history" ]; }; then
+    echo "condor-personal: $history exists and is not a plain directory; per-job accounting is off" >&2
+    return 1
+  fi
   # Create if absent, then force the mode UNCONDITIONALLY: a directory
   # left behind by the earlier broken attempt (root-owned, 0755) must be
   # repaired rather than inherited, and `install -d`'s behaviour on an
@@ -229,27 +238,37 @@ prepare_per_job_history_dir() {
   chmod 1777 "$history" 2>/dev/null \
     || sudo chmod 1777 "$history" 2>/dev/null \
     || true
-  # Verify the invariant instead of assuming the command that should
-  # have established it worked.
-  if ! world_writable_dir "$history"; then
-    echo "condor-personal: $history is not writable by every uid; per-job accounting is off (a directory the schedd cannot write would crash it)" >&2
+  # Verify the OUTCOME, never the commands that should have produced it:
+  # a chmod that silently failed on a pre-existing 0777 directory left it
+  # world-writable but NOT sticky, which the first version accepted.
+  if ! usable_history_dir "$history"; then
+    echo "condor-personal: $history is not a sticky, world-writable directory; per-job accounting is off (a directory the schedd cannot write would crash it)" >&2
     return 1
   fi
   echo "$history"
 }
 
-# The portable "is this world-writable?" question: `find -perm -0002`
-# asks the filesystem instead of parsing a mode string, and needs no
-# guess about which uid the daemons use. Escalated the same way the
-# creation was, because a spool directory this user cannot even
-# TRAVERSE (a system install's /var/spool/condor may be condor-only)
-# would otherwise report a perfectly good directory as unusable.
-world_writable_dir() {
+# The whole invariant as one filesystem question, no mode-string parsing
+# and no guess about which uid the daemons use:
+#
+#   -type d    a real directory. find does not follow symlinks, so this
+#              also rejects a symlink pointing at one.
+#   -perm -1003  sticky (01000) AND other-write (0002) AND other-execute
+#              (0001) - the bits that actually let any uid enter and
+#              create here while keeping it safe for several of them.
+#              A "has these bits" test, not an exact mode, so a setgid
+#              bit inherited from the spool is not a spurious refusal.
+#
+# Escalated the same way the creation was, because a spool directory
+# this user cannot even TRAVERSE (a system install's /var/spool/condor
+# may be condor-only) would otherwise report a good directory as
+# unusable and switch accounting off on exactly the pools that need it.
+usable_history_dir() {
   local target="$1"
-  if [ -n "$(find "$target" -maxdepth 0 -perm -0002 2>/dev/null)" ]; then
+  if [ -n "$(find "$target" -maxdepth 0 -type d -perm -1003 2>/dev/null)" ]; then
     return 0
   fi
-  if [ -n "$(sudo find "$target" -maxdepth 0 -perm -0002 2>/dev/null)" ]; then
+  if [ -n "$(sudo find "$target" -maxdepth 0 -type d -perm -1003 2>/dev/null)" ]; then
     return 0
   fi
   return 1

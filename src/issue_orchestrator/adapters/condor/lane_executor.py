@@ -64,6 +64,10 @@ _JOB_ACCOUNTING_FILE_NAME = "lane.classad"
 # shortly after its terminal event reaches the log. Bounded so a pool
 # that never writes it costs seconds, never the gate.
 _JOB_ACCOUNTING_WAIT_SECONDS = 10.0
+# Much tighter while unwinding a cancellation: the operator pressed
+# Ctrl-C and is owed a prompt exit, so the ClassAd gets the couple of
+# seconds it normally needs after a removal and no more.
+_CANCELLED_ACCOUNTING_WAIT_SECONDS = 2.0
 _JOB_IDENTIFIER_RE = re.compile(r"\d+\.\d+")
 
 
@@ -318,6 +322,21 @@ class CondorLaneExecutor:
             if job_id is not None and streams is not None:
                 self._remove(job_id)
                 streams.pump()
+                # This directory is retained too, so it gets the same
+                # accounting as every other retained one — the removal
+                # above is exactly what makes the ClassAd appear. Two
+                # guards keep that from costing anything: a much shorter
+                # wait, and a containment so a slow or unhappy
+                # collection can never displace the exception that is
+                # already unwinding (a second Ctrl-C included).
+                try:
+                    self._collect_job_accounting(
+                        job_id,
+                        run_directory,
+                        wait_seconds=_CANCELLED_ACCOUNTING_WAIT_SECONDS,
+                    )
+                except BaseException:
+                    pass
             raise
         finally:
             if retain_run_directory:
@@ -433,8 +452,18 @@ class CondorLaneExecutor:
             )
         raise AssertionError("lane job state is a closed union")
 
-    def _collect_job_accounting(self, job_id: str, run_directory: Path) -> None:
+    def _collect_job_accounting(
+        self,
+        job_id: str,
+        run_directory: Path,
+        wait_seconds: float = _JOB_ACCOUNTING_WAIT_SECONDS,
+    ) -> None:
         """Copy this job's final ClassAd into the retained diagnostics.
+
+        Runs on EVERY path that retains the run directory, cancellation
+        included (round 1 finding C) — the retention and accounting
+        decisions are one, and a lane killed by Ctrl-C is exactly the
+        one whose final ClassAd a reader wants.
 
         Best-effort by construction, and deliberately so: this runs while
         a lane is ALREADY ending badly, so a diagnostic that could raise
@@ -471,7 +500,7 @@ class CondorLaneExecutor:
             )
             return
         source = directory / f"history.{job_id}"
-        deadline = time.monotonic() + _JOB_ACCOUNTING_WAIT_SECONDS
+        deadline = time.monotonic() + wait_seconds
         while not source.is_file() and time.monotonic() < deadline:
             time.sleep(_POLL_INTERVAL_SECONDS)
         try:

@@ -52,7 +52,7 @@ from ...infra.lane_declarations import (
 )
 from ...infra.machine_state import (
     default_machine_state_sampler,
-    sample_machine_state,
+    sample_machine_state_from,
 )
 from ...infra.validation_timings import resolve_git_common_dir
 from ...ports.lane_dispatch_journal import (
@@ -170,9 +170,12 @@ def _conclude_completed(
                 exit_code=outcome.exit_code,
                 # Sampled after the lane concluded, so the reading
                 # describes the machine the lane just competed on and
-                # cannot itself perturb the lane's own timing.
-                machine_state=sample_machine_state(
-                    _build_machine_state_sampler()
+                # cannot itself perturb the lane's own timing. The
+                # SEAM is passed, not its result: building the probe
+                # happens inside the containment too, so nothing about
+                # the probe can replace this lane's decided outcome.
+                machine_state=sample_machine_state_from(
+                    _build_machine_state_sampler
                 ),
             )
         )

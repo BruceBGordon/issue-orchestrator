@@ -8,10 +8,12 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.adapters.condor import lane_executor as lane_executor_module
 from issue_orchestrator.adapters.condor.lane_executor import (
     CondorLaneExecutor,
     CondorTools,
@@ -214,6 +216,101 @@ def test_an_unexpected_job_identifier_is_never_turned_into_a_read_path(
     assert "unexpected job identifier" in capsys.readouterr().err
     for directory in retained:
         assert not (directory / "lane.classad").exists()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+class _InterruptOnFirstWait:
+    """Stands in for the executor module's ``time``.
+
+    A Ctrl-C lands in whatever the executor is waiting on, which for a
+    lane that has not concluded is the poll loop's sleep. Raising there
+    is the interrupt, delivered deterministically — an interval timer
+    would race the submission it has to land after, and widening the
+    timer until the race is rare is the flaky-test band-aid, not a
+    deterministic test. Only the FIRST wait is interrupted, so the
+    collection that follows still gets a working clock.
+    """
+
+    def __init__(self) -> None:
+        self.interrupted = False
+
+    def sleep(self, seconds: float) -> None:
+        if not self.interrupted:
+            self.interrupted = True
+            raise KeyboardInterrupt()
+        time.sleep(seconds)
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+
+def test_a_cancelled_lane_also_collects_its_per_job_accounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1 finding C: the cancellation path retained the run
+    directory but skipped collection, so after Ctrl-C the ClassAd
+    existed and lane.classad did not — contradicting the stated coupling
+    of retention and accounting.
+
+    The job never reaches a terminal event, the interrupt arrives in the
+    poll loop, and the condor_rm stub plays the schedd by writing the
+    ClassAd as the job leaves the queue — which is what makes collection
+    on this path worth doing at all.
+    """
+    history = tmp_path / "per-job-history"
+    history.mkdir()
+    classad = "ExitCode = undefined\nRemoveReason = \"via condor_rm\"\n"
+    binaries = tmp_path / "bin"
+    pending_log = (
+        "000 (007.000.000) 2026-08-29 12:00:00 Job submitted from host: <127.0.0.1>\n"
+        "...\n"
+        "001 (007.000.000) 2026-08-29 12:00:01 Job executing on host: <127.0.0.1>\n"
+        "...\n"
+    )
+    _write_stubs(
+        binaries,
+        {
+            "condor_submit": (
+                "#!/bin/sh\n"
+                'log=$(awk -F" = " \'/^log/{print $2}\' "$2")\n'
+                f"cat > \"$log\" <<'EVENTS'\n{pending_log}EVENTS\n"
+                f"echo '{_JOB_ID}'\n"
+            ),
+            # The schedd writes the per-job ClassAd when the job leaves
+            # the queue, which a removal is exactly what causes.
+            "condor_rm": (
+                "#!/bin/sh\n"
+                f"cat > '{history}/history.{_JOB_ID}' <<'AD'\n{classad}AD\n"
+            ),
+            "condor_q": "#!/bin/sh\nexit 0\n",
+            "condor_config_val": f"#!/bin/sh\necho '{history}'\n",
+        },
+    )
+    tools = CondorTools(
+        submit=binaries / "condor_submit",
+        remove=binaries / "condor_rm",
+        query=binaries / "condor_q",
+    )
+
+    work_key = "lifecycle.cancelled"
+    before = set(Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"))
+    executor = CondorLaneExecutor(tools)
+    monkeypatch.setattr(lane_executor_module, "time", _InterruptOnFirstWait())
+    with pytest.raises(KeyboardInterrupt):
+        executor.run(
+            LaneCommand(
+                work_key=LaneWorkKey(work_key),
+                arguments=(sys.executable, "-c", "pass"),
+                working_directory=tmp_path,
+                deadline=LaneDeadline(300.0),
+            ),
+            LaneResources(request_cpus=1),
+        )
+
+    retained = set(Path(tempfile.gettempdir()).glob(f"lane-{work_key}*")) - before
+    assert retained, "a cancelled lane must retain its diagnostics"
+    for directory in retained:
+        assert (directory / "lane.classad").read_text() == classad
         shutil.rmtree(directory, ignore_errors=True)
 
 

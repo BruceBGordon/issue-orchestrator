@@ -385,7 +385,15 @@ open. So every row of both
   with nulls and a `probe_error`; an observability probe that could turn
   a green lane red would manufacture the failures this exists to
   explain. This is the one deliberate exception to the repository's
-  fail-fast stance, owned in `infra/machine_state.py`.
+  fail-fast stance, owned in `infra/machine_state.py`. It is a
+  `BaseException` boundary, not an `Exception` one: a sampler raising
+  `SystemExit` — or a signal handler raising one mid-sample — is
+  contained and recorded, because the alternative is a probe replacing
+  the gate's own exit code. Only teardown signals get out
+  (`KeyboardInterrupt`, `GeneratorExit`, `CancelledError`): the
+  operator's Ctrl-C must win. Rendering the failure is itself contained,
+  so an exception whose `__str__` or `__repr__` raises degrades to its
+  type name instead of escaping.
 - **Concurrency is derivable, not sampled.** A running-job count would
   cost a scheduler subprocess per record; instead, each dispatch row's
   end instant, runtime and queue wait let overlap be reconstructed from
@@ -398,9 +406,13 @@ does **not** end cleanly, its retained run directory collects that file
 as `lane.classad` beside `lane.sub`, `lane.events`, `lane.out` and
 `lane.err` — memory and CPU usage, slot, hold reason and every
 timestamp travel with the diagnostics instead of staying in a rotating
-global history. Collection is best-effort by construction: it runs while
-a lane is already failing, so a pool without the knob costs the ClassAd
-and a stderr line, never the lane's own result.
+global history. Collection runs on **every** path that retains the run
+directory, cancellation included — a lane killed by Ctrl-C is exactly the
+one whose final ClassAd a reader wants, and the removal is what makes it
+appear (it waits a couple of seconds there rather than the usual ten, so
+an interrupt still exits promptly). It is best-effort by construction: it
+runs while a lane is already ending badly, so a pool without the knob
+costs the ClassAd and a stderr line, never the lane's own result.
 
 **That knob is a loaded gun, and the pool helper treats it as one.** A
 *missing* per-job history directory is safe — condor logs `must point to
@@ -413,10 +425,13 @@ immediately re-EXCEPTs on the same queued job, forever. So:
 - `scripts/condor-personal.sh up` creates the directory mode **1777**
   (sticky, world-writable) rather than guessing which uid the daemons
   run as — the submitting user on the tarball pools, `condor` on a
-  system install. It then *verifies* world-writability and writes the
-  `PER_JOB_HISTORY_DIR` knob into a managed optional config
-  (`93-io-per-job-history.conf`) **only** if that check passed, removing
-  a previously written one otherwise.
+  system install. It refuses to touch the path at all if something
+  other than a plain directory is already there (a symlink would send
+  the privileged `chmod` at an unrelated target), then *verifies the
+  outcome* — a real non-symlink directory carrying sticky, other-write
+  and other-execute — and writes the `PER_JOB_HISTORY_DIR` knob into a
+  managed optional config (`93-io-per-job-history.conf`) **only** if
+  that check passed, removing a previously written one otherwise.
 - The worst case is therefore per-job accounting silently off, never a
   dead pool. `condor-personal.sh up` prints why when it turns off.
 - The execenv image makes the same guarantee at build time, and the
