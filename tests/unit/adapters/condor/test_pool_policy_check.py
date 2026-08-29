@@ -25,6 +25,11 @@ from issue_orchestrator.ports.lane_policy_check import LanePolicyCheck
 
 _BACKOFF_FILE = "91-io-load-backoff.conf"
 _CAPACITY_FILE = "92-io-pool-capacity.conf"
+_REQUIRED_KNOBS = {
+    "CONCURRENCY_LIMIT_DEFAULT",
+    "PERIODIC_EXPR_INTERVAL",
+    "MOUNT_UNDER_SCRATCH",
+}
 
 # A modern pool that opted out of both optional policies: the three
 # hard settings in place, an intent record present and declaring
@@ -347,6 +352,140 @@ def test_a_pool_with_no_intent_record_is_loud_drift(tmp_path: Path) -> None:
         invariant.knob for invariant in report.invariants
     }
     assert "predates policy-intent records" in report.remedy
+
+
+# --- malformed intent is drift, never "declared" (N1, #7132 review) ---
+
+
+def test_the_reviewers_reproduction_bogus_intent_with_the_file_present(
+    tmp_path: Path,
+) -> None:
+    """N1 verbatim: IO_INTENT_LOAD_BACKOFF=Bogus with the 91 file
+    installed used to exit 0 ("5 required settings hold"), because any
+    value except exactly "False" was read as declared intent. A value
+    the installer never writes is not intent — it is a hand-edited or
+    corrupt record, and guessing at it either invents an opt-in nobody
+    asked for or silently drops one that was."""
+    report = _inspect(
+        _pool(tmp_path, backoff_intent="Bogus", installed=(_BACKOFF_FILE,))
+    )
+
+    assert _drifted(report) == {"IO_INTENT_LOAD_BACKOFF"}
+    described = report.drifted[0].describe()
+    assert "IO_INTENT_LOAD_BACKOFF" in described
+    assert "'Bogus'" in described, "the message must name the malformed value"
+    assert "'True or False'" in described
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Bogus",
+        "yes",
+        "1",
+        "0",
+        # The config tool canonicalizes NOTHING (verified live), so a
+        # casing the installer never writes reached the check as-is.
+        # Tolerating it would be tolerating a hand-edit.
+        "true",
+        "TRUE",
+        "false",
+        "FALSE",
+        # Internal whitespace, which condor does NOT strip (it only
+        # trims around the value) - so this one is reachable.
+        "True False",
+    ],
+)
+def test_any_sentinel_value_outside_the_schema_is_drift(
+    tmp_path: Path, value: str
+) -> None:
+    report = _inspect(
+        _pool(tmp_path, backoff_intent=value, installed=(_BACKOFF_FILE,))
+    )
+
+    assert _drifted(report) == {"IO_INTENT_LOAD_BACKOFF"}
+    assert _observed(report, "IO_INTENT_LOAD_BACKOFF") == value
+
+
+def test_an_emptied_sentinel_is_indistinguishable_from_a_missing_one(
+    tmp_path: Path,
+) -> None:
+    """`IO_INTENT_LOAD_BACKOFF =` reads back as "Not defined" from the
+    real tool — an emptied macro and an absent one are the same
+    observation. Both land on the same loud path, so neither can be
+    used to quietly disable the check."""
+    report = _inspect(_stub_tools(tmp_path, values={**_HEALTHY, "IO_INTENT_LOAD_BACKOFF": ""}))
+
+    assert _drifted(report) == {"IO_INTENT_LOAD_BACKOFF"}
+    assert _observed(report, "IO_INTENT_LOAD_BACKOFF") == ""
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "abc", "007", "1.5", "100%", "5 0"])
+def test_any_capacity_value_outside_the_schema_is_drift(
+    tmp_path: Path, value: str
+) -> None:
+    """The installer writes a base-10-normalized positive integer, so
+    anything else is a hand-edit. "007" matters most: it is a value
+    whose meaning depends on who parses it (7 or 8), and the pool was
+    never sized with it."""
+    report = _inspect(
+        _pool(tmp_path, capacity_intent=value, installed=(_CAPACITY_FILE,))
+    )
+
+    assert _drifted(report) == {"IO_INTENT_CAPACITY_PERCENT"}
+    described = report.drifted[0].describe()
+    assert "IO_INTENT_CAPACITY_PERCENT" in described
+    assert repr(value) in described
+
+
+def test_malformed_intent_suppresses_the_file_judgements_it_governs(
+    tmp_path: Path,
+) -> None:
+    """A record that cannot be trusted for one macro is not trusted
+    for the rest: the check reports what it knows (the record is bad)
+    and refuses to pronounce on files whose intent it cannot read."""
+    report = _inspect(
+        _pool(tmp_path, backoff_intent="Bogus", installed=(_BACKOFF_FILE,))
+    )
+
+    judged = {invariant.knob for invariant in report.invariants}
+    assert _BACKOFF_FILE not in judged
+    assert _CAPACITY_FILE not in judged
+    # The hard settings are still asserted - they do not depend on intent.
+    assert _REQUIRED_KNOBS <= judged
+
+
+def test_every_malformed_intent_macro_is_named_in_one_pass(
+    tmp_path: Path,
+) -> None:
+    report = _inspect(
+        _pool(tmp_path, backoff_intent="maybe", capacity_intent="lots")
+    )
+
+    assert _drifted(report) == {
+        "IO_INTENT_LOAD_BACKOFF",
+        "IO_INTENT_CAPACITY_PERCENT",
+    }
+
+
+def test_a_well_formed_record_still_passes(tmp_path: Path) -> None:
+    """The strictness must not reject what the installer writes: both
+    boolean states and a canonical dial are accepted."""
+    for backoff, capacity, installed in (
+        ("True", None, (_BACKOFF_FILE,)),
+        ("False", None, ()),
+        ("False", "150", (_CAPACITY_FILE,)),
+        ("True", "1", (_BACKOFF_FILE, _CAPACITY_FILE)),
+    ):
+        report = _inspect(
+            _pool(
+                tmp_path,
+                backoff_intent=backoff,
+                capacity_intent=capacity,
+                installed=installed,
+            )
+        )
+        assert report.drifted == (), (backoff, capacity, installed)
 
 
 def test_policy_file_presence_follows_what_the_pool_actually_reads(

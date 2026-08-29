@@ -148,6 +148,16 @@ cannot be installed out of step with them. `IO_INTENT_LOAD_BACKOFF` is
 written in *both* states deliberately: its presence is what proves a
 pool has an intent record at all.
 
+The record is validated against exactly that schema, because the
+config tool returns macro values **verbatim** — it canonicalizes
+nothing, so `true`, `Bogus` and `007` all reach the check as written.
+The sentinel must be literally `True` or `False`, and the dial must be
+absent or a positive integer with no leading zeros. Anything else did
+not come from `up`; it came from a hand-edit, and it is drift naming
+the macro and its value. There is deliberately no case or leading-zero
+tolerance: `007` is a value whose meaning depends on who parses it,
+and the pool was never sized with it.
+
 **A pool started before this existed reads as a legacy pool and fails
 preflight**, naming `IO_INTENT_LOAD_BACKOFF` with an empty value. That
 is intentional — on such a pool "opted out" and "removed by hand" are

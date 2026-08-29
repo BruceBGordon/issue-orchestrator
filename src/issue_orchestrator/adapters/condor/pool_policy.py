@@ -23,10 +23,13 @@ Two further policy files are optional, installed only when their
 opt-in was set at install time. They are asserted too, against the
 intent record the installer writes in the same pass
 (``90-io-policy-intent.conf``, read through this same config channel):
-each must be present if and only if it was asked for. A pool carrying
-no intent record at all is a pool built before the installer recorded
-one — it is reported as drift rather than trusted, because on such a
-pool "opted out" and "removed by hand" are indistinguishable.
+each must be present if and only if it was asked for. The intent
+record is itself validated against the exact schema the installer
+writes: a pool carrying no record (built before the installer recorded
+one) or a record carrying a value the installer would never write
+(hand-edited, corrupt) is reported as drift rather than trusted,
+because on such a pool "opted out" and "removed by hand" are
+indistinguishable.
 
 Scope: this reads the pool's effective *configuration*, which is what
 the daemons read. Daemons still running a configuration older than the
@@ -36,6 +39,7 @@ rewrites policy.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from ...domain.lane_execution import (
@@ -61,18 +65,33 @@ _REQUIRED_SETTINGS: tuple[tuple[str, str], ...] = (
 # intent is stale policy nobody asked for, and intent without the file
 # is policy silently missing — the second of which was reproduced as a
 # false green (C1, #7132 review) back when these were merely reported.
-_MANAGED_POLICY_FILES: tuple[tuple[str, str], ...] = (
-    ("91-io-load-backoff.conf", "IO_INTENT_LOAD_BACKOFF"),
-    ("92-io-pool-capacity.conf", "IO_INTENT_CAPACITY_PERCENT"),
-)
+_BACKOFF_FILE = "91-io-load-backoff.conf"
+_CAPACITY_FILE = "92-io-pool-capacity.conf"
 
-# The macro whose mere presence proves the pool carries an intent
-# record at all. The installer writes it in both states (True/False)
-# for exactly this reason, so a pool built before intent records
-# existed reads as legacy instead of as "opted out of everything".
+# The macro whose well-formed presence proves the pool carries an
+# intent record at all. The installer writes it in both states
+# (True/False) for exactly this reason, so a pool built before intent
+# records existed reads as legacy instead of as "opted out of
+# everything". It governs the backoff policy file.
 _INTENT_SENTINEL = "IO_INTENT_LOAD_BACKOFF"
-_INTENT_DECLARED = "True or False"
-_NEGATED_INTENT = "False"
+# Governs the capacity dial file; absent means the dial was not asked
+# for, which is a legitimate state rather than a missing record.
+_CAPACITY_INTENT = "IO_INTENT_CAPACITY_PERCENT"
+
+# The config tool returns macro values VERBATIM — no canonicalization
+# whatsoever (verified live: `true`, `TRUE`, `Bogus`, `yes` and `007`
+# all read back exactly as written). So a value outside the schema
+# cannot have come from this installer; it came from a hand-edit or a
+# corrupt file, and is DRIFT (N1, #7132 review — `Bogus` was read as
+# declared intent and preflighted clean). The schemas are therefore
+# EXACT: the two literals the installer writes, and the canonical
+# base-10 form its arithmetic produces. Deliberately no case or
+# leading-zero tolerance — `007` is a value whose meaning depends on
+# who reads it, and tolerating it is how a hand-edit passes as intent.
+_BOOLEAN_INTENT = ("True", "False")
+_BOOLEAN_SCHEMA = "True or False"
+_CAPACITY_SCHEMA = "absent, or a positive integer without leading zeros"
+_CANONICAL_POSITIVE_INTEGER = re.compile(r"^[1-9][0-9]*$")
 
 _INSTALLED = "installed"
 _ABSENT = "absent"
@@ -82,20 +101,34 @@ _REMEDY = (
     "re-run `scripts/condor-personal.sh up` with the "
     "IO_CONDOR_LOAD_BACKOFF / IO_POOL_CAPACITY_PERCENT opt-ins you intend "
     "this pool to carry (docs/user/condor_lanes.md); an IO_INTENT_* knob "
-    "reported as '' means the pool predates policy-intent records and must "
-    "be rebuilt that way before the gate will dispatch"
+    "reported as '' means the pool predates policy-intent records, and any "
+    "other unexpected value means the record was hand-edited — either way "
+    "it must be rebuilt that way before the gate will dispatch"
 )
 
 
-def _declares_intent(value: str) -> bool:
-    """Whether an intent macro asks for its policy to be installed.
+def _malformed_intent(sentinel: str, capacity: str) -> tuple[LanePolicyInvariant, ...]:
+    """Every intent macro whose value is outside the schema.
 
-    One rule reads both encodings the installer writes — a boolean for
-    the backoff policy, a number-or-nothing for the capacity dial — so
-    neither file needs its own interpretation here: intent is declared
-    when the macro carries a value and that value is not a negation.
+    An intent record the installer did not write cannot be read as
+    intent at all: guessing at `Bogus` either invents an opt-in nobody
+    asked for or silently drops one that was. Every malformed macro is
+    named in one pass, so a hand-mangled record is fixed in one round.
     """
-    return value not in ("", _NEGATED_INTENT)
+    malformed: list[LanePolicyInvariant] = []
+    if sentinel not in _BOOLEAN_INTENT:
+        malformed.append(
+            LanePolicyInvariant(
+                knob=_INTENT_SENTINEL, expected=_BOOLEAN_SCHEMA, observed=sentinel
+            )
+        )
+    if capacity != "" and _CANONICAL_POSITIVE_INTEGER.match(capacity) is None:
+        malformed.append(
+            LanePolicyInvariant(
+                knob=_CAPACITY_INTENT, expected=_CAPACITY_SCHEMA, observed=capacity
+            )
+        )
+    return tuple(malformed)
 
 
 class CondorPoolPolicyCheck:
@@ -132,32 +165,34 @@ class CondorPoolPolicyCheck:
     ) -> tuple[LanePolicyInvariant, ...]:
         """Assert each managed policy file is present iff it was intended.
 
-        A pool with no intent record cannot be judged this way, and
-        "cannot be judged" is itself drift: it is a pool built before
-        the installer recorded intent, so nothing here can tell its
-        opted-out policy from its silently-removed policy. It is
-        reported loudly as one invariant naming the missing record,
-        which the remedy tells the operator how to restore.
+        An intent record that is missing (a pool built before the
+        installer recorded one) or malformed (hand-edited, corrupt)
+        cannot be judged this way, and "cannot be judged" is itself
+        drift: on such a pool "opted out" and "removed by hand" are
+        the same observation. The offending macros are named and
+        NOTHING they govern is judged — a record that cannot be
+        trusted for one macro is not trusted for the rest, and the
+        remedy tells the operator to rebuild it.
         """
-        declared = {knob: self._setting(knob) for _, knob in _MANAGED_POLICY_FILES}
-        if declared[_INTENT_SENTINEL] == "":
-            return (
-                LanePolicyInvariant(
-                    knob=_INTENT_SENTINEL,
-                    expected=_INTENT_DECLARED,
-                    observed="",
-                ),
-            )
+        sentinel = self._setting(_INTENT_SENTINEL)
+        capacity = self._setting(_CAPACITY_INTENT)
+        malformed = _malformed_intent(sentinel, capacity)
+        if malformed:
+            return malformed
+        # Both values are now known-good, so each file's intent is read
+        # by its own validated rule rather than a shared heuristic.
+        intended = {
+            _BACKOFF_FILE: sentinel == "True",
+            _CAPACITY_FILE: capacity != "",
+        }
         installed = {Path(source).name for source in sources}
         return tuple(
             LanePolicyInvariant(
                 knob=name,
-                expected=(
-                    _INSTALLED if _declares_intent(declared[knob]) else _ABSENT
-                ),
+                expected=_INSTALLED if intended[name] else _ABSENT,
                 observed=_INSTALLED if name in installed else _ABSENT,
             )
-            for name, knob in _MANAGED_POLICY_FILES
+            for name in (_BACKOFF_FILE, _CAPACITY_FILE)
         )
 
     def _setting(self, knob: str) -> str:
