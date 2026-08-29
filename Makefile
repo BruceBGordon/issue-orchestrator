@@ -3,7 +3,13 @@
 # GNU make detection - required for parallel validation with grouped output
 # On macOS: brew install make (provides gmake)
 # On Linux: GNU make is the default
-GMAKE := $(shell command -v gmake 2>/dev/null || command -v make)
+# `override` (round 6): GMAKE exists solely as the macOS gmake-vs-make
+# host fact, already shell-derived; nothing in the repo, CI, or docs
+# overrides it on a command line (audited). It sits on the verdict
+# enforcement path - the scheduler lane's wrapped command re-invokes
+# $(GMAKE), and a selective decoy there runs INSIDE the sanctioned
+# wrapper, making the real layer mint a green for work never done.
+override GMAKE := $(shell command -v gmake 2>/dev/null || command -v make)
 GMAKE_VERSION := $(shell $(GMAKE) --version 2>/dev/null | head -1)
 
 # Default target
@@ -314,20 +320,121 @@ PYTEST_DURATIONS ?= 10
 PYTEST_DURATIONS_MIN ?= 1.0
 PYTEST_TIMINGS ?= --durations=$(PYTEST_DURATIONS) --durations-min=$(PYTEST_DURATIONS_MIN)
 
+# Per-lane verdict caching rides TIMED_RUN because it is the one
+# wrapper every gate lane — scheduler-backed and host-side alike —
+# already runs through. The Makefile contributes only the two calls;
+# ALL policy (membership, SHA integrity, corruption handling, the
+# only-green rule) lives in the lane-verdict CLI. Inert unless the
+# gate phase exports LANE_VERDICT_SHA/LANE_VERDICT_LANES: check exit
+# 0 = cached green, skip; 3 = run; anything else = real error and the
+# lane fails with it (a corrupt store is never green). The wrapper
+# NEVER alters a lane's own outcome: record is attempted only for
+# green lanes and is best-effort - a failed recording warns loudly,
+# leaves no verdict, and preserves the lane's status exactly. The
+# wrapped command runs in a subshell with the verdict environment
+# UNSET: only this outer wrapper owns consulting and recording - a
+# nested make (the scheduler lane's inner direct invocation) must
+# never mint a green the outer lane's postconditions haven't earned.
+# Engagement is TRANSPORT-CHECKED with $(origin): only ENVIRONMENT
+# delivery (the gate phase's channel) engages the layer. Command-line
+# assignments are refused loudly - make forwards those to sub-makes
+# through MAKEFLAGS past any env unset, and a child sees a
+# hand-exported MAKEFLAGS override the same way, so origin-checking
+# closes every override transport by definition (MFLAGS carries no
+# variable definitions at all). The guard uses
+# -z (not -n) so recipe text stays free of " -n ", which the phase
+# tests read as an xdist width marker.
 define TIMED_RUN
 	@target="$(1)"; \
+	set +e; \
 	start=$$(date +%s); \
 	start_hr=$$(date '+%Y-%m-%dT%H:%M:%S%z'); \
 	echo "[validate-timing] START target=$$target at=$$start_hr"; \
-	set +e; \
-	{ $(2); }; \
-	status=$$?; \
+	verdict_on=0; \
+	if [ -z "$$LANE_VERDICT_SHA" ]; then \
+		:; \
+	elif [ -z "$(LANE_VERDICT_OVERRIDDEN)" ]; then \
+		verdict_on=1; \
+	else \
+		echo "[lane-verdict] ignoring LANE_VERDICT_* for $$target - non-environment transport on: $(LANE_VERDICT_OVERRIDDEN) - the environment is the only sanctioned transport; lane runs uncached" >&2; \
+	fi; \
+	if [ $$verdict_on -eq 1 ]; then \
+		$(LANE_VERDICT) check --worktree "$(LANE_VERDICT_WORKTREE)" --target "$$target"; vrc=$$?; \
+	else \
+		vrc=3; \
+	fi; \
+	if [ $$vrc -eq 0 ]; then \
+		status=0; \
+	elif [ $$vrc -ne 3 ]; then \
+		status=$$vrc; \
+	else \
+		( unset LANE_VERDICT_SHA LANE_VERDICT_LANES; $(2) ); \
+		status=$$?; \
+		if [ $$verdict_on -eq 0 ] || [ $$status -ne 0 ]; then \
+			:; \
+		elif ! $(LANE_VERDICT) record --worktree "$(LANE_VERDICT_WORKTREE)" --target "$$target" --exit-status $$status; then \
+			echo "[lane-verdict] warning: could not record green for $$target (store at $(CURDIR)) - no verdict left, lane outcome preserved" >&2; \
+		fi; \
+	fi; \
 	end=$$(date +%s); \
 	end_hr=$$(date '+%Y-%m-%dT%H:%M:%S%z'); \
 	elapsed=$$((end-start)); \
 	echo "[validate-timing] END target=$$target status=$$status elapsed=$${elapsed}s at=$$end_hr"; \
 	exit $$status
 endef
+
+# The verdict CLI runs AFTER the wrapped command, which may have cd'd
+# away from the worktree (test-vscode ends in `cd packages/vscode &&
+# npm test` - a relative interpreter 127'd there and clobbered a green
+# lane's status on the first live gate). Correct by construction: the
+# interpreter is absolutized when it is a path, and the worktree is
+# passed explicitly as $(CURDIR) - never inferred from the shell's cwd.
+# Every variable in the verdict layer's enforcement chain carries the
+# `override` directive: round 4 proved the policy helpers are
+# themselves ordinary make variables, and a command-line assignment
+# (LANE_VERDICT_VARIABLES=... to narrow the declared set,
+# LANE_VERDICT_OVERRIDDEN= to blank the collection) bypassed the whole
+# origin check. `override` is GNU make's documented mechanism for
+# winning against command-line assignments at every make level. The
+# chain: the CLI invocation (a replaced LANE_VERDICT could answer
+# 'cached' for every lane), its interpreter, the declared variable
+# set, the override collection, and the worktree (derived from the
+# shell, see the derivation audit below). Shell-level state
+# (verdict_on, vrc, status, target) is untouchable by make
+# assignments.
+# DERIVATION AUDIT (round 5): every value the enforcement chain
+# trusts bottoms out in override-pinned variables, SHELL OUTPUT, the
+# $(origin) builtin, or literals - never a command-line-assignable
+# name. The worktree comes from the shell (make cannot override the
+# process's cwd; CURDIR it CAN override, and a decoy CURDIR re-aimed
+# the store at a cache nobody validated). The layer's interpreter
+# derives from the pinned worktree's canonical venv, NOT $(PYTHON):
+# a decoy $(PYTHON) is exactly positioned to lie selectively to the
+# layer's own invocations while the venv path either IS the real
+# interpreter or fails loudly (127) - fail-fast, no follow-the-build
+# indirection. The exclusion list is EMPTY as of round 6: the
+# $(GMAKE) exclusion was disproven by a selective decoy (delegate the
+# outer calls, lie about the inner re-invocation) minting a real
+# per-lane verdict - the second such precedent after $(PYTHON), so
+# GMAKE is now override-pinned at its definition. Any future
+# exclusion candidate must survive the selective-decoy test, and two
+# precedents say it will not. Ambient process environment (PATH,
+# underlying every $(shell) derivation and every tool invocation
+# alike) is the shared trust floor of the whole build, not a
+# make-override channel.
+override LANE_VERDICT_WORKTREE := $(shell pwd)
+override LANE_VERDICT_PYTHON := $(LANE_VERDICT_WORKTREE)/.venv/bin/python
+override LANE_VERDICT = $(LANE_VERDICT_PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_verdict
+# The layer's COMPLETE variable set. Engagement requires EVERY one of
+# these to be environment-origin (undefined is fine - absence is
+# handled separately); one override-origin variable anywhere refuses
+# the whole layer, because a mixed delivery lets an override replace
+# a gate-owned input (round 3: command-line LANES silently swapped
+# the lane set under an environment SHA). The origin check ITERATES
+# this list, so a future LANE_VERDICT_* variable is covered by
+# construction - add it here and the transport check owns it.
+override LANE_VERDICT_VARIABLES := LANE_VERDICT_SHA LANE_VERDICT_LANES
+override LANE_VERDICT_OVERRIDDEN = $(strip $(foreach v,$(LANE_VERDICT_VARIABLES),$(if $(filter environment undefined,$(origin $(v))),,$(v))))
 
 # Two-pass typecheck: strict for core (domain/ports/control), standard for rest
 # --warnings ensures 0 warnings required (exit code 1 if warnings reported)
@@ -828,7 +935,16 @@ ifeq ($(LANE_EXECUTOR),condor)
 # invisible to the scheduler, so the learned dispatch order cannot
 # reach it and make's arbitrary ordering decides instead. Submission
 # must never be the bottleneck — admission is the pool's job.
+# Per-lane verdict caching is enabled for the flat gate ONLY, here:
+# the SHA is read exactly once per gate, and the lane set is the SAME
+# variable the fan executes — a lane added to the fan is cacheable by
+# construction, and a target outside it (phase aggregates included)
+# is never cached. Direct mode is deliberately excluded tonight: its
+# phased topology has different leaves, and the re-run waste this
+# layer removes lives in the condor publish-gate path.
 	$(call TIMED_RUN,validate-pr-flat-phase,\
+		LANE_VERDICT_SHA=$$(git rev-parse HEAD) \
+		LANE_VERDICT_LANES="$(_VALIDATE_PR_FLAT_TARGETS)" \
 		$(GMAKE) -j$(words $(_VALIDATE_PR_FLAT_TARGETS)) --output-sync=target _validate-pr-flat-impl)
 else
 	$(call TIMED_RUN,validate-main-phase,\
@@ -841,7 +957,10 @@ endif
 # policy — every lane must pass either way, and the pool's admission
 # (request_cpus, exclusives) replaces the sequential phase structure
 # that protected the direct path from oversubscription.
-_VALIDATE_PR_FLAT_TARGETS := typecheck lint-arch lint-complexity test-unit \
+# `override`: this list feeds the fan's prerequisites, the -j width,
+# AND the exported LANE_VERDICT_LANES - a command-line assignment
+# would narrow all three (a shrunken fan is a vacuous suite green).
+override _VALIDATE_PR_FLAT_TARGETS := typecheck lint-arch lint-complexity test-unit \
 	test-simulated-core test-simulated-agent \
 	test-integration-core-slice-1 test-integration-core-slice-2 test-integration-core-slice-3 \
 	test-integration-agent-claude test-integration-agent-codex test-integration-agent-chain \

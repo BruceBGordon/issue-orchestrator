@@ -230,6 +230,27 @@ def test_core_validation_runs_live_codex_marker_serially():
     )
 
 
+def _wrapped_command(recipe_line: str) -> str:
+    """The $(2) region of a TIMED_RUN recipe, without the envelope.
+
+    TIMED_RUN wraps every lane command with timing and verdict-cache
+    machinery whose own text carries flags (-z, -m, -ne ...). Flag
+    assertions against the whole recipe line match the envelope
+    instead of the command — that false-positived twice in one night —
+    so probes must cut out the wrapped command first. The anchor is
+    the scrubbed subshell TIMED_RUN expands:
+    `( unset LANE_VERDICT_SHA LANE_VERDICT_LANES; <cmd> ); status=$?`.
+    """
+    import re as _re
+
+    found = _re.search(
+        r"\( unset LANE_VERDICT_SHA LANE_VERDICT_LANES; (.*?) \); status=\$\?",
+        recipe_line,
+    )
+    assert found, f"not a TIMED_RUN recipe line: {recipe_line[:200]}"
+    return found.group(1)
+
+
 def test_agent_backed_integration_runs_serial_by_default():
     lines = _dry_run("test-integration-agent")
     pytest_line = lines[
@@ -241,8 +262,9 @@ def test_agent_backed_integration_runs_serial_by_default():
         )
     ]
 
-    assert " -n " not in f" {pytest_line} "
-    assert " -m " not in f" {pytest_line} "
+    command = _wrapped_command(pytest_line)
+    assert " -n " not in f" {command} "
+    assert " -m " not in f" {command} "
     assert all("test-integration-agent-live-codex" not in line for line in lines)
 
 
@@ -257,8 +279,9 @@ def test_agent_backed_integration_allows_explicit_parallel_override():
         )
     ]
 
-    assert " -n 2 " in f" {pytest_line} "
-    assert " -m " not in f" {pytest_line} "
+    command = _wrapped_command(pytest_line)
+    assert " -n 2 " in f" {command} "
+    assert " -m " not in f" {command} "
     assert all("test-integration-agent-live-codex" not in line for line in lines)
 
 
