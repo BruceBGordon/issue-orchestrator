@@ -10,10 +10,14 @@ state machine — has exactly one owner,
 :class:`issue_orchestrator.execution.lane_yield.AcknowledgedLaneYield`
 (A2/A3, #7134 review). Nothing else may talk to a transport directly.
 
-The asymmetry the owner enforces: raising to safe is a scheduling
-hint (failure degrades, loudly, to never-eligible), but lowering to
+The asymmetry the owner enforces: a failed raise lands in
+confirmed-UNKNOWN — the publication may have applied, so degrading
+is forbidden and only an acknowledged False recovers. Lowering to
 unsafe is a CORRECTNESS boundary — protected work must not start
-until the transport acknowledges the lane is unfreezable again.
+until the transport acknowledges the lane is unfreezable again; a
+failed lower over a possibly-True published state is fatal
+(:class:`LaneYieldError`), never a degradation. The only path to
+never-eligible is an acknowledged, provably-False external state.
 """
 
 from __future__ import annotations

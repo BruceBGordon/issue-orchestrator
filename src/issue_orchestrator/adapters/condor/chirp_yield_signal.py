@@ -119,11 +119,15 @@ def inside_scheduler_job() -> bool:
 def resolve_lane_yield_transport() -> ChirpYieldTransport | None:
     """The chirp transport inside a chirp-capable job; None elsewhere.
 
-    None outside a job is silent (there is no consumer to publish to);
-    None INSIDE a job is loud, because a cooperative lane that cannot
-    publish runs with `never` semantics the operator should know
-    about — and the owner's opening lower() will then be inert-safe
-    only because the submit description already pinned False.
+    None outside a job is silent and ordinary (there is no consumer
+    to publish to, and composition stays inert). None INSIDE a job is
+    a refusal, not a degradation: the composition owner escalates it
+    to :class:`~issue_orchestrator.ports.lane_yield_signal.LaneYieldError`
+    at lane startup (pytest_configure), because a lane that cannot
+    publish cannot perform the acknowledged opening False that the
+    submit description's possible True demands — it must not run.
+    The stderr line below is diagnosis for that refusal, not a
+    license to continue.
     """
     if not inside_scheduler_job():
         return None
