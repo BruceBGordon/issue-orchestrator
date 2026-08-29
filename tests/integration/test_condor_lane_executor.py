@@ -34,6 +34,14 @@ pytestmark = [
     pytest.mark.requires_infra,
 ]
 
+# Backstops, not coordination (#7148). The tests below wait for scheduler
+# state they can observe — a lane RUNNING, a lane IDLE in the queue — and
+# these bound how long that state may take to appear before the wait fails
+# and names the state that never arrived.
+_DISPATCH_BACKSTOP_SECONDS = 120.0
+# How long a lane's thread may take to conclude once its job is done with.
+_LANE_JOIN_BACKSTOP_SECONDS = 180.0
+
 # Ceiling on the owner-load spike if every cleanup path fails: long enough to
 # cover the 180s suspension wait it has to outlast, short enough that an
 # escaped burner cannot become someone else's unexplained gate.
@@ -211,12 +219,11 @@ def test_queue_wait_is_never_billed_to_the_lane_deadline(tmp_path: Path) -> None
     queued behind an exclusive token for longer than its own runtime
     deadline must still run and complete once the token frees."""
     import threading
-    import time as _time
 
-    def run_lane(name: str, sleep_seconds: float, deadline: float) -> object:
+    def run_lane(work_key: str, sleep_seconds: float, deadline: float) -> object:
         return CondorLaneExecutor(CondorTools.resolve()).run(
             LaneCommand(
-                work_key=LaneWorkKey(f"contract.queuebill-{name}"),
+                work_key=LaneWorkKey(work_key),
                 arguments=(sys.executable, "-c", f"import time; time.sleep({sleep_seconds})"),
                 working_directory=tmp_path,
                 deadline=LaneDeadline(deadline),
@@ -225,21 +232,32 @@ def test_queue_wait_is_never_billed_to_the_lane_deadline(tmp_path: Path) -> None
         )
 
     results: dict[str, object] = {}
+    holder_key = _unique_lane_key("contract.queuebill-holder")
     holder = threading.Thread(
-        target=lambda: results.__setitem__("holder", run_lane("holder", 12.0, 60.0))
+        target=lambda: results.__setitem__("holder", run_lane(holder_key, 12.0, 60.0))
     )
     holder.start()
-    _time.sleep(1.0)
-    # Queued behind a 12s holder with only an 8s deadline of its own:
-    # the ~11s queue wait exceeds the deadline, which is the
-    # discriminator. The runtime margin (8s budget for ~1s of work) is
-    # deliberately generous: under emulation (this amd64 execution
-    # environment on Apple Silicon) interpreter startup alone can eat
-    # several seconds, and a native-calibrated margin turns this test
-    # into an emulation-speed test - observed live: a 4s deadline
-    # removed a healthy 1s lane 5s after its execute event.
-    results["queued"] = run_lane("queued", 1.0, 8.0)
-    holder.join(timeout=120)
+    try:
+        # Wait for the EVENT this test's discriminator needs — the holder
+        # actually holding the token — instead of a stagger long enough to
+        # hope it does (#7148). A slow match under a fixed 1s sleep meant
+        # the "queued" lane never queued, and the queue-wait assertion
+        # below then failed for a reason that has nothing to do with
+        # billing.
+        _await_status(holder_key, _RUNNING, _DISPATCH_BACKSTOP_SECONDS)
+        # Queued behind a 12s holder with only an 8s deadline of its own:
+        # the ~11s queue wait exceeds the deadline, which is the
+        # discriminator. The runtime margin (8s budget for ~1s of work) is
+        # deliberately generous: under emulation (this amd64 execution
+        # environment on Apple Silicon) interpreter startup alone can eat
+        # several seconds, and a native-calibrated margin turns this test
+        # into an emulation-speed test - observed live: a 4s deadline
+        # removed a healthy 1s lane 5s after its execute event.
+        results["queued"] = run_lane(
+            _unique_lane_key("contract.queuebill-queued"), 1.0, 8.0
+        )
+    finally:
+        holder.join(timeout=_LANE_JOIN_BACKSTOP_SECONDS)
 
     assert type(results["holder"]) is LaneCompleted
     queued = results["queued"]
@@ -285,10 +303,12 @@ def test_higher_priority_lane_dispatches_first_from_a_contended_queue(
         "time.sleep(float(sys.argv[3]))\n"
     )
 
-    def run_lane(name: str, sleep_seconds: float, priority: int) -> None:
+    def run_lane(
+        work_key: str, name: str, sleep_seconds: float, priority: int
+    ) -> None:
         outcome = CondorLaneExecutor(CondorTools.resolve()).run(
             LaneCommand(
-                work_key=LaneWorkKey(f"contract.dispatch-{name}"),
+                work_key=LaneWorkKey(work_key),
                 arguments=(
                     sys.executable,
                     "-c",
@@ -308,18 +328,38 @@ def test_higher_priority_lane_dispatches_first_from_a_contended_queue(
         )
         assert type(outcome) is LaneCompleted and outcome.exit_code == 0
 
-    threads = [threading.Thread(target=run_lane, args=("blocker", 6.0, 0))]
+    blocker_key = _unique_lane_key("contract.dispatch-blocker")
+    low_key = _unique_lane_key("contract.dispatch-low")
+    high_key = _unique_lane_key("contract.dispatch-high")
+    threads = [
+        threading.Thread(target=run_lane, args=(blocker_key, "blocker", 6.0, 0))
+    ]
     threads[0].start()
-    time.sleep(1.5)
-    # Deliberately submit the LOW-priority lane first: only the
-    # priority hint, not arrival order, may decide who runs next.
-    threads.append(threading.Thread(target=run_lane, args=("low", 2.0, 1)))
-    threads[1].start()
-    time.sleep(1.0)
-    threads.append(threading.Thread(target=run_lane, args=("high", 2.0, 100)))
-    threads[2].start()
+    try:
+        # Both waits are on scheduler-observed state, not on a stagger
+        # (#7148): the contention this test needs exists once the blocker
+        # HOLDS the token and the low-priority lane is QUEUED behind it.
+        # Sleeping instead made the setup a race against dispatch latency,
+        # and losing it failed the priority assertion, not the setup.
+        _await_status(blocker_key, _RUNNING, _DISPATCH_BACKSTOP_SECONDS)
+        # Deliberately submit the LOW-priority lane first: only the
+        # priority hint, not arrival order, may decide who runs next.
+        threads.append(
+            threading.Thread(target=run_lane, args=(low_key, "low", 2.0, 1))
+        )
+        threads[1].start()
+        _await_status(low_key, _IDLE, _DISPATCH_BACKSTOP_SECONDS)
+        threads.append(
+            threading.Thread(target=run_lane, args=(high_key, "high", 2.0, 100))
+        )
+        threads[2].start()
+    finally:
+        # Joining is cleanup and belongs here; asserting is a verdict and
+        # does not — a verdict raised out of a ``finally`` would replace
+        # whatever failure sent us into it.
+        for thread in threads:
+            thread.join(timeout=_LANE_JOIN_BACKSTOP_SECONDS)
     for thread in threads:
-        thread.join(timeout=180)
         assert not thread.is_alive(), "a dispatch-order lane never concluded"
 
     started = [
@@ -487,6 +527,7 @@ def _job_status(work_key: str) -> str:
     )
     return result.stdout.strip()
 
+_IDLE = "1"
 _RUNNING = "2"
 _SUSPENDED_STATUS = "7"
 
