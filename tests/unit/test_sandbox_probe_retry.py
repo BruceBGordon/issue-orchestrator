@@ -15,8 +15,10 @@ import pytest
 
 from tests.sandbox_probe_retry import (
     TIMEOUT_RETURNCODE,
+    AllEvidence,
+    CreatedPaths,
     ProbeTimeout,
-    run_until_paths_created,
+    run_until_evidence,
 )
 
 
@@ -48,9 +50,9 @@ def test_snapshots_preserve_first_attempt_breach_before_later_overwrite(
             completed.write_text("done", encoding="utf-8")
         return _completed()
 
-    probe = run_until_paths_created(
+    probe = run_until_evidence(
         run_attempt,
-        expected_paths=(completed,),
+        evidence=CreatedPaths((completed,)),
         observed_paths=(network_status,),
     )
 
@@ -74,9 +76,9 @@ def test_timeout_then_success_retries_and_completes(tmp_path: Path) -> None:
         completed.write_text("done", encoding="utf-8")
         return _completed("second attempt ok")
 
-    probe = run_until_paths_created(
+    probe = run_until_evidence(
         run_attempt,
-        expected_paths=(completed,),
+        evidence=CreatedPaths((completed,)),
         observed_paths=(completed,),
     )
 
@@ -108,9 +110,9 @@ def test_timed_out_attempt_with_all_paths_present_is_not_success(
             raise _timeout()
         return _completed()
 
-    probe = run_until_paths_created(
+    probe = run_until_evidence(
         run_attempt,
-        expected_paths=(completed,),
+        evidence=CreatedPaths((completed,)),
         observed_paths=(completed,),
     )
 
@@ -142,9 +144,9 @@ def test_retry_cannot_inherit_the_timed_out_attempt_s_files(tmp_path: Path) -> N
             raise _timeout()
         return _completed("second attempt did nothing")
 
-    probe = run_until_paths_created(
+    probe = run_until_evidence(
         run_attempt,
-        expected_paths=(completed,),
+        evidence=CreatedPaths((completed,)),
         observed_paths=(completed,),
     )
 
@@ -156,8 +158,8 @@ def test_retry_cannot_inherit_the_timed_out_attempt_s_files(tmp_path: Path) -> N
     # The killed attempt's file was cleared, so the caller's positive control
     # (`assert path.exists()`) fails instead of passing on a stale artifact.
     assert not completed.exists()
-    assert probe.attempts[0].produced_expected_paths
-    assert not probe.attempts[1].produced_expected_paths
+    assert probe.attempts[0].produced_required_evidence
+    assert not probe.attempts[1].produced_required_evidence
 
 
 def test_clearing_is_limited_to_the_attempt_owned_outputs(tmp_path: Path) -> None:
@@ -183,9 +185,9 @@ def test_clearing_is_limited_to_the_attempt_owned_outputs(tmp_path: Path) -> Non
         completed.write_text("done", encoding="utf-8")
         return _completed()
 
-    probe = run_until_paths_created(
+    probe = run_until_evidence(
         run_attempt,
-        expected_paths=(completed,),
+        evidence=CreatedPaths((completed,)),
         observed_paths=(completed, planted, escaped),
     )
 
@@ -207,9 +209,9 @@ def test_two_timeouts_exhaust_and_fail_loudly(tmp_path: Path) -> None:
         completed.write_text("done", encoding="utf-8")
         raise _timeout()
 
-    probe = run_until_paths_created(
+    probe = run_until_evidence(
         run_attempt,
-        expected_paths=(completed,),
+        evidence=CreatedPaths((completed,)),
         observed_paths=(completed,),
     )
 
@@ -236,9 +238,9 @@ def test_exhausted_run_still_exposes_every_attempt_snapshot(tmp_path: Path) -> N
         escaped.write_text("ESCAPED", encoding="utf-8")
         raise _timeout()
 
-    probe = run_until_paths_created(
+    probe = run_until_evidence(
         run_attempt,
-        expected_paths=(completed,),
+        evidence=CreatedPaths((completed,)),
         observed_paths=(escaped,),
     )
 
@@ -257,9 +259,9 @@ def test_missing_expected_paths_without_timeout_does_not_raise(tmp_path: Path) -
     """
     completed = tmp_path / "completed.txt"
 
-    probe = run_until_paths_created(
+    probe = run_until_evidence(
         lambda: _completed(),
-        expected_paths=(completed,),
+        evidence=CreatedPaths((completed,)),
         observed_paths=(completed,),
     )
 
@@ -267,3 +269,144 @@ def test_missing_expected_paths_without_timeout_does_not_raise(tmp_path: Path) -
     assert probe.snapshots == ({completed: None}, {completed: None})
     assert probe.completed_attempt is None
     probe.require_completed()
+
+
+class _StdoutContains:
+    """Evidence that lives in the process output, not on disk.
+
+    Stands in for the native-tool probes, whose proof is a ``tool_use`` in the
+    CLI's event stream: there is nothing on disk to check, and nothing to clear
+    between attempts.
+    """
+
+    def __init__(self, needle: str) -> None:
+        self.needle = needle
+        self.resets = 0
+
+    def reset(self) -> None:
+        self.resets += 1
+
+    def missing_from(self, result: subprocess.CompletedProcess[str]) -> str | None:
+        if self.needle in (result.stdout or ""):
+            return None
+        return f"the output never contained {self.needle!r}"
+
+
+def test_completed_attempt_without_its_evidence_is_retried() -> None:
+    """A clean exit that did not do the work must not end the run.
+
+    Path existence cannot express this: the native-tool probes write nothing,
+    so before evidence became the caller's declaration they ran with no retry
+    at all and one short-circuited interaction failed the gate.
+    """
+    streams = ["I declined to do that", "tool_use: Write"]
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["probe"], 0, stdout=streams.pop(0))
+
+    evidence = _StdoutContains("tool_use: Write")
+    probe = run_until_evidence(
+        run_attempt, evidence=evidence, observed_paths=(), max_attempts=3
+    )
+
+    assert len(probe.attempts) == 2
+    assert probe.attempts[0].missing_evidence == (
+        "the output never contained 'tool_use: Write'"
+    )
+    assert probe.completed_attempt is not None
+    assert probe.completed_attempt.number == 2
+    assert evidence.resets == 1, "reset runs before each retry, never before the first"
+
+
+def test_evidence_never_produced_exhausts_without_masking_the_caller() -> None:
+    """Exhaustion leaves no completed attempt and does not raise as a timeout.
+
+    ``require_completed`` guards timeouts only, so the caller's own assertion —
+    which names the boundary that went unexercised — is what fails.
+    """
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["probe"], 0, stdout="no tool call")
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=_StdoutContains("tool_use: Write"),
+        observed_paths=(),
+        max_attempts=3,
+    )
+
+    assert len(probe.attempts) == 3
+    assert probe.completed_attempt is None
+    assert not probe.timed_out
+    assert probe.missing_evidence == "the output never contained 'tool_use: Write'"
+    probe.require_completed()  # must not raise: this is not a timeout
+
+
+def test_all_evidence_requires_every_part_and_resets_every_part(
+    tmp_path: Path,
+) -> None:
+    """A conjunction reports the first unmet part and clears all of them.
+
+    The in-worktree positive control needs both: the agent attempted the write
+    AND the content landed, with the sink cleared so a retry cannot inherit it.
+    """
+    sink = tmp_path / "landed.txt"
+    stream_evidence = _StdoutContains("tool_use: Write")
+    evidence = AllEvidence((stream_evidence, CreatedPaths((sink,))))
+    attempts = 0
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            # Landed the file but never called the tool — an inherited artifact
+            # from somewhere else, not this probe's proof.
+            sink.write_text("stale", encoding="utf-8")
+            return subprocess.CompletedProcess(["probe"], 0, stdout="declined")
+        sink.write_text("fresh", encoding="utf-8")
+        return subprocess.CompletedProcess(["probe"], 0, stdout="tool_use: Write")
+
+    probe = run_until_evidence(
+        run_attempt, evidence=evidence, observed_paths=(sink,), max_attempts=3
+    )
+
+    assert probe.attempts[0].missing_evidence == (
+        "the output never contained 'tool_use: Write'"
+    ), "the first unmet part is the one reported"
+    assert stream_evidence.resets == 1
+    assert sink.read_text(encoding="utf-8") == "fresh", (
+        "the stale artifact must have been cleared before the retry"
+    )
+    assert probe.completed_attempt is not None
+    assert probe.completed_attempt.number == 2
+
+
+def test_timed_out_attempt_never_counts_even_with_its_evidence_present() -> None:
+    """A killed attempt proves nothing, whatever its output contained."""
+    attempts = 0
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise subprocess.TimeoutExpired(
+                cmd=["probe"], timeout=1, output=b"tool_use: Write", stderr=b""
+            )
+        return subprocess.CompletedProcess(["probe"], 0, stdout="tool_use: Write")
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=_StdoutContains("tool_use: Write"),
+        observed_paths=(),
+        max_attempts=3,
+    )
+
+    assert attempts == 2
+    assert probe.attempts[0].produced_required_evidence, (
+        "the evidence was present in the killed attempt's captured output..."
+    )
+    assert not probe.attempts[0].is_complete_evidence, (
+        "...but a timed-out attempt is never usable evidence"
+    )
+    assert probe.completed_attempt is not None
+    assert probe.completed_attempt.number == 2
