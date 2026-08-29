@@ -114,6 +114,20 @@ phantom. Measure with
 `/usr/bin/time -l gmake <lane-target> LANE_EXECUTOR=direct` — busy
 cores = (user+sys)/wall — and record the result in `lanes.yaml`.
 
+## Per-lane verdict cache (gate re-runs pay only for what failed)
+
+Within one tree SHA, the publish gate records each lane's GREEN verdict
+(`.issue-orchestrator/validation/lanes/<sha>/`, worktree-local). A gate
+re-run at the same SHA skips lanes already proven green — a loud
+`[lane-verdict] <lane> cached-green-at-<sha>` line says so — and runs
+only the lanes without a verdict, so a transient failure (a provider
+stall, a flaky lane) costs one lane's re-run instead of the whole fan.
+Failures are never cached; any commit invalidates everything
+(whole-tree keying, deliberately naive); a corrupt verdict file fails
+the lane loudly rather than ever counting as green. The layer lives in
+`TIMED_RUN` + the `lane-verdict` CLI and is enabled only by the condor
+publish gate; every other make path is untouched.
+
 ## Pool capacity dial (opt-in)
 
 One number scales the whole pool's admission capacity as a percentage

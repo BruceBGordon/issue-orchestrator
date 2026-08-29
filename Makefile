@@ -314,20 +314,44 @@ PYTEST_DURATIONS ?= 10
 PYTEST_DURATIONS_MIN ?= 1.0
 PYTEST_TIMINGS ?= --durations=$(PYTEST_DURATIONS) --durations-min=$(PYTEST_DURATIONS_MIN)
 
+# Per-lane verdict caching rides TIMED_RUN because it is the one
+# wrapper every gate lane — scheduler-backed and host-side alike —
+# already runs through. The Makefile contributes only the two calls;
+# ALL policy (membership, SHA integrity, corruption handling, the
+# only-green rule) lives in the lane-verdict CLI. Inert unless the
+# gate phase exports LANE_VERDICT_SHA/LANE_VERDICT_LANES: check exit
+# 0 = cached green, skip; 3 = run; anything else = real error and the
+# lane fails with it (a corrupt store is never green). The guard uses
+# -z (not -n) so recipe text stays free of " -n ", which the phase
+# tests read as an xdist width marker.
 define TIMED_RUN
 	@target="$(1)"; \
+	set +e; \
 	start=$$(date +%s); \
 	start_hr=$$(date '+%Y-%m-%dT%H:%M:%S%z'); \
 	echo "[validate-timing] START target=$$target at=$$start_hr"; \
-	set +e; \
-	{ $(2); }; \
-	status=$$?; \
+	if [ -z "$$LANE_VERDICT_SHA" ]; then \
+		vrc=3; \
+	else \
+		$(LANE_VERDICT) check --target "$$target"; vrc=$$?; \
+	fi; \
+	if [ $$vrc -eq 0 ]; then \
+		status=0; \
+	elif [ $$vrc -ne 3 ]; then \
+		status=$$vrc; \
+	else \
+		{ $(2); }; \
+		status=$$?; \
+		[ -z "$$LANE_VERDICT_SHA" ] || { $(LANE_VERDICT) record --target "$$target" --exit-status $$status || status=$$?; }; \
+	fi; \
 	end=$$(date +%s); \
 	end_hr=$$(date '+%Y-%m-%dT%H:%M:%S%z'); \
 	elapsed=$$((end-start)); \
 	echo "[validate-timing] END target=$$target status=$$status elapsed=$${elapsed}s at=$$end_hr"; \
 	exit $$status
 endef
+
+LANE_VERDICT = $(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_verdict
 
 # Two-pass typecheck: strict for core (domain/ports/control), standard for rest
 # --warnings ensures 0 warnings required (exit code 1 if warnings reported)
@@ -788,7 +812,16 @@ ifeq ($(LANE_EXECUTOR),condor)
 # invisible to the scheduler, so the learned dispatch order cannot
 # reach it and make's arbitrary ordering decides instead. Submission
 # must never be the bottleneck — admission is the pool's job.
+# Per-lane verdict caching is enabled for the flat gate ONLY, here:
+# the SHA is read exactly once per gate, and the lane set is the SAME
+# variable the fan executes — a lane added to the fan is cacheable by
+# construction, and a target outside it (phase aggregates included)
+# is never cached. Direct mode is deliberately excluded tonight: its
+# phased topology has different leaves, and the re-run waste this
+# layer removes lives in the condor publish-gate path.
 	$(call TIMED_RUN,validate-pr-flat-phase,\
+		LANE_VERDICT_SHA=$$(git rev-parse HEAD) \
+		LANE_VERDICT_LANES="$(_VALIDATE_PR_FLAT_TARGETS)" \
 		$(GMAKE) -j$(words $(_VALIDATE_PR_FLAT_TARGETS)) --output-sync=target _validate-pr-flat-impl)
 else
 	$(call TIMED_RUN,validate-main-phase,\
