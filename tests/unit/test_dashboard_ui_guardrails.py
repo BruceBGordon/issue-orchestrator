@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 import re
 
@@ -1763,6 +1764,66 @@ def test_dashboard_bundle_loaded_marker_supports_browser_waits() -> None:
     legacy_wrapper = DASHBOARD_JS.read_text(encoding="utf-8")
 
     assert "window.dashboardBundleLoaded = true;" in legacy_wrapper
+
+
+def _js_string_literals(source: str) -> list[tuple[int, str]]:
+    """Every string constant in a Python module except docstrings.
+
+    Playwright hands JS to the browser as string literals, so this is the
+    set of places a browser test can smuggle in page script. Docstrings are
+    excluded so a test may still *describe* the forbidden pattern.
+    """
+    tree = ast.parse(source)
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+        and isinstance(node.body[0].value.value, str)
+    }
+    return [
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    ]
+
+
+_DASHBOARD_DATA_WRITE = re.compile(r"\bdashboardData\b(?:\.\w+)*\s*=(?!=)")
+
+
+def test_browser_tests_do_not_seed_the_server_owned_dashboard_data_global() -> None:
+    """``window.dashboardData`` belongs to the server, not to a test.
+
+    ``dashboard/core.js`` replaces the whole object on every
+    ``refreshViewModel`` — at boot, when the SSE stream opens, and on each
+    refresh event after that. A browser test that writes its own values in
+    is racing those refreshes: the seeded value survives only until the next
+    one lands, and any UI rendered after that silently reverts to the
+    server's answer. #7140 was exactly this — a per-row agent ``<select>``
+    lost its injected option mid-test and ``select_option`` burned a 30 s
+    timeout with "did not find some options", reproducibly whenever
+    ``/api/view-model`` took as little as 200 ms longer than usual.
+
+    The supported way to give a browser test different dashboard state is to
+    configure the fixture orchestrator (``tests/e2e_web/conftest.py``), so
+    the initial render and every refresh agree.
+    """
+    offenders: list[str] = []
+    for path in sorted((ROOT / "tests" / "e2e_web").rglob("*.py")):
+        for lineno, literal in _js_string_literals(path.read_text(encoding="utf-8")):
+            if _DASHBOARD_DATA_WRITE.search(literal):
+                offenders.append(f"{path.relative_to(ROOT)}:{lineno}")
+
+    assert not offenders, (
+        "browser tests must not write window.dashboardData (it is replaced "
+        "wholesale by every refreshViewModel — see #7140). Configure the "
+        "fixture orchestrator in tests/e2e_web/conftest.py instead. "
+        f"Offending sites: {offenders}"
+    )
 
 
 def test_dashboard_first_paint_boot_runs_before_stylesheets() -> None:
