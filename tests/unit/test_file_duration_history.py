@@ -14,6 +14,10 @@ from issue_orchestrator.adapters.json_file_duration_history import (
     FileDurationHistoryError,
     InertFileDurationHistory,
     JsonFileDurationHistory,
+    LegacyUnstampedPin,
+    StampedPin,
+    UndatablePin,
+    classify_pin_date,
 )
 from issue_orchestrator.infra.file_duration_store import (
     STORE_DIRNAME,
@@ -51,7 +55,18 @@ def write_pin(
     return path
 
 
-DAY = 24 * 60 * 60
+HOUR = 60 * 60
+DAY = 24 * HOUR
+
+
+def redate_pin(tmp_path: Path, epoch: str, seconds_ago: float) -> None:
+    """Move an existing pin's recorded date without touching its
+    weights — what a forward wall-clock correction looks like from the
+    pin's point of view."""
+    path = pin_path(tmp_path, epoch)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["published_at"] = time.time() - seconds_ago
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def published(seconds_ago: float) -> str:
@@ -174,7 +189,9 @@ def test_a_delayed_slice_still_gets_its_own_gates_pin(tmp_path: Path) -> None:
     history.record_success({"tests/x/test_a.py": 5.0})
     original = history.pinned_weights("gate-delayed")
 
-    for index in range(12):
+    # Well past the retention depth, so count pressure is real and not
+    # merely nominal — this is the round-1 reproduction.
+    for index in range(60):
         history.record_success({"tests/x/test_b.py": float(index + 1)})
         history.pinned_weights(f"gate-{index:02d}")
 
@@ -195,15 +212,113 @@ def test_a_pin_records_when_it_was_published(tmp_path: Path) -> None:
     assert before - 0.001 <= payload["published_at"] <= time.time() + 0.001
 
 
-def test_pins_past_the_retention_bound_are_pruned_on_the_next_publish(
+def test_eviction_needs_age_and_depth_to_agree(tmp_path: Path) -> None:
+    """Sixty pins aged one hour apart. The newest fifty are protected
+    whatever the clock says; of the ten beyond that depth, every one is
+    also past the age bound, so those are the ten that go. Both
+    conditions had to hold."""
+    for hours in range(1, 61):
+        write_pin(tmp_path, f"gate-{hours:02d}", published(hours * HOUR))
+    store(tmp_path).pinned_weights("fresh")
+
+    survivors = {path.name for path in store_directory(tmp_path).glob("pinned-*.json")}
+    # The fresh pin is itself the newest, so the protected fifty are it
+    # plus gate-01..gate-49; gate-50 and older are past both bounds.
+    assert survivors == {"pinned-fresh.json"} | {
+        f"pinned-gate-{hours:02d}.json" for hours in range(1, 50)
+    }
+    assert len(survivors) == 50
+
+
+def test_count_pressure_alone_evicts_nothing(tmp_path: Path) -> None:
+    """Round 1's failure mode, at ten times the pressure: many newer
+    epochs, none of them old. Nothing may be dropped."""
+    for index in range(60):
+        write_pin(tmp_path, f"gate-{index:02d}", published(60))
+    store(tmp_path).pinned_weights("fresh")
+    assert len(list(store_directory(tmp_path).glob("pinned-*.json"))) == 61
+
+
+def test_a_forward_clock_correction_cannot_evict_a_live_pin(
     tmp_path: Path,
 ) -> None:
-    write_pin(tmp_path, "ancient", published(DAY + 60))
-    write_pin(tmp_path, "recent", published(60))
-    store(tmp_path).pinned_weights("fresh")
-    assert not pin_path(tmp_path, "ancient").exists()
-    assert pin_path(tmp_path, "recent").exists()
-    assert pin_path(tmp_path, "fresh").exists()
+    """Round 2's failure mode. A wall-clock correction past the age
+    bound makes every pin — including the one a still-running gate is
+    about to read — look more than a day old at once. Age alone would
+    delete them all, that slice would republish from newer history, and
+    its partition would disagree with the one its siblings already ran:
+    the same omit-and-duplicate signature as round 1.
+
+    Depth is what survives the jump: a live gate's pin is among the
+    newest by recorded time no matter what the clock claims."""
+    history = store(tmp_path)
+    history.record_success({"tests/x/test_a.py": 5.0})
+    live = history.pinned_weights("live-gate")
+
+    # The clock corrects forward by thirty hours: every existing pin
+    # now dates itself well past the bound.
+    write_pin(tmp_path, "sibling-one", published(30 * HOUR))
+    write_pin(tmp_path, "sibling-two", published(30 * HOUR))
+    redate_pin(tmp_path, "live-gate", 30 * HOUR)
+
+    history.record_success({"tests/x/test_b.py": 900.0})
+    history.pinned_weights("later-gate")
+
+    assert pin_path(tmp_path, "live-gate").exists()
+    assert history.pinned_weights("live-gate") == live == {"tests/x/test_a.py": 5.0}
+
+
+def test_an_absurd_neighbour_date_cannot_fail_a_publish(tmp_path: Path) -> None:
+    """A stamp of 10**400 is an int no float can hold; converting it
+    raised OverflowError straight out of pruning and failed an
+    otherwise-good publish (round 2, finding 3). It is not a date, so
+    the pin is undatable — and undatable pins are kept."""
+    write_pin(
+        tmp_path,
+        "absurd",
+        json.dumps({"weights": {}, "published_at": 10**400}),
+        age_seconds=30 * DAY,
+    )
+    assert store(tmp_path).pinned_weights("fresh") == {}
+    assert pin_path(tmp_path, "absurd").exists()
+
+
+def test_a_pin_with_an_unusable_date_still_answers(tmp_path: Path) -> None:
+    """Dating a pin governs RETENTION only. A gate reading its own pin
+    must still get its own partition even if the stamp is damaged —
+    refusing to answer would be the same coverage hole by another
+    route."""
+    write_pin(
+        tmp_path,
+        "damaged-date",
+        json.dumps({"weights": {"tests/x/test_a.py": 7.0}, "published_at": "soon"}),
+    )
+    assert store(tmp_path).pinned_weights("damaged-date") == {"tests/x/test_a.py": 7.0}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{not json",
+        '["weights"]',
+        '{"weights": {}, "published_at": "yesterday"}',
+        '{"weights": {}, "published_at": null}',
+        '{"weights": {}, "published_at": NaN}',
+        '{"weights": {}, "published_at": Infinity}',
+        '{"weights": {}, "published_at": 0}',
+        '{"published_at": null}',
+    ],
+)
+def test_an_undatable_pin_is_retained_however_old(
+    tmp_path: Path, payload: str
+) -> None:
+    """Round 2, finding 2: every one of these collapsed to "no
+    timestamp" and took the legacy mtime path, which DELETES. A pin
+    whose age cannot be established is never evicted, whatever its
+    mtime says."""
+    write_pin(tmp_path, "damaged", payload, age_seconds=30 * DAY)
+    assert store(tmp_path).pinned_weights("fresh") == {}
+    assert pin_path(tmp_path, "damaged").exists()
 
 
 def test_an_unstamped_pin_is_held_far_longer(tmp_path: Path) -> None:
@@ -234,6 +349,61 @@ def test_pruning_keeps_a_pin_it_cannot_date(tmp_path: Path) -> None:
     write_pin(tmp_path, "damaged", "{not json")
     assert store(tmp_path).pinned_weights("fresh") == {}
     assert pin_path(tmp_path, "damaged").exists()
+
+
+# --- the three pin-date states are distinct -----------------------------------
+
+
+def test_a_well_formed_dated_pin_is_stamped(tmp_path: Path) -> None:
+    now = time.time()
+    path = write_pin(tmp_path, "good", published(60))
+    dated = classify_pin_date(path, now)
+    assert type(dated) is StampedPin
+    assert now - 61 <= dated.published_at <= now
+
+
+def test_a_pin_document_without_a_date_is_legacy(tmp_path: Path) -> None:
+    path = write_pin(tmp_path, "legacy", json.dumps({"weights": {}}), age_seconds=DAY)
+    dated = classify_pin_date(path, time.time())
+    assert type(dated) is LegacyUnstampedPin
+
+
+@pytest.mark.parametrize(
+    ("name", "payload"),
+    [
+        ("garbled", "{not json"),
+        ("not_a_mapping", '["weights"]'),
+        ("no_weights", '{"other": 1}'),
+        ("text_date", '{"weights": {}, "published_at": "yesterday"}'),
+        ("null_date", '{"weights": {}, "published_at": null}'),
+        ("nan_date", '{"weights": {}, "published_at": NaN}'),
+        ("infinite_date", '{"weights": {}, "published_at": Infinity}'),
+        ("prehistoric_date", '{"weights": {}, "published_at": 0}'),
+        ("absurd_date", '{"weights": {}, "published_at": ' + str(10**400) + "}"),
+    ],
+)
+def test_anything_that_is_not_a_date_is_undatable(
+    tmp_path: Path, name: str, payload: str
+) -> None:
+    """These are the states round 2 collapsed together. Each one has to
+    be distinguishable from "a legacy pin with no date", because that
+    one is evictable and these are not."""
+    path = write_pin(tmp_path, name, payload)
+    dated = classify_pin_date(path, time.time())
+    assert type(dated) is UndatablePin
+    assert name in dated.reason
+
+
+def test_a_date_far_in_the_future_is_not_a_date(tmp_path: Path) -> None:
+    path = write_pin(tmp_path, "future", published(-30 * DAY))
+    assert type(classify_pin_date(path, time.time())) is UndatablePin
+
+
+def test_a_missing_pin_is_undatable(tmp_path: Path) -> None:
+    store_directory(tmp_path).mkdir()
+    assert type(classify_pin_date(pin_path(tmp_path, "gone"), time.time())) is (
+        UndatablePin
+    )
 
 
 @pytest.mark.parametrize("epoch", ["", "../escape", "with/slash", "a" * 65])

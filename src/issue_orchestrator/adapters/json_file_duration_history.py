@@ -24,30 +24,45 @@ Two kinds of file live here:
     would hand the last slice a different partition than the first —
     and two different partitions of one file list can drop a file
     between them. The first ask of an epoch publishes the snapshot;
-    every later ask, from any process, is answered from it.
+    every later ask, from any process, is answered from it. Which pins
+    may be deleted is :class:`_PinRetention`'s decision alone, taken
+    over the typed :data:`PinDate` states — never a guess about which
+    pins are still being read.
 """
 
 from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import math
 import os
 import re
 import statistics
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, TextIO, cast
 
+_logger = logging.getLogger(__name__)
+
 _ROLLING_WINDOW = 5
-# Retention is by AGE, never by count — see _prune_pinned. Gates take
-# minutes; a day is three orders of magnitude of headroom.
+# Eviction needs age AND depth to agree — see _PinRetention. Gates take
+# minutes, so a day is three orders of magnitude of headroom...
 _PIN_RETENTION_SECONDS = 24 * 60 * 60
+# ...and the newest pins are protected outright however old the clock
+# says they are, so a wall-clock correction cannot age a live pin out.
+# Fifty is far more than the handful of gates that can overlap.
+_PIN_RETENTION_DEPTH = 50
 # Pins written before the payload carried its own timestamp fall back
 # to mtime, which is not the file's own account of itself, so they are
 # held far longer before anything is assumed about their age.
 _UNSTAMPED_PIN_RETENTION_SECONDS = 7 * _PIN_RETENTION_SECONDS
+# A recorded stamp outside these bounds is not a date, it is damage.
+# 2020-01-01T00:00:00Z: no pin predates the feature by years.
+_EARLIEST_SANE_PUBLISH_TIME = 1577836800.0
+_FUTURE_TOLERANCE_SECONDS = 48 * 60 * 60
 _HISTORY_FILENAME = "history.json"
 _LOCK_FILENAME = "history.lock"
 _PINNED_PREFIX = "pinned-"
@@ -56,6 +71,46 @@ _DURATIONS_FIELD = "durations"
 _WEIGHTS_FIELD = "weights"
 _PUBLISHED_AT_FIELD = "published_at"
 _SAFE_EPOCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+@dataclass(frozen=True)
+class StampedPin:
+    """The pin recorded its own publication time, and it makes sense."""
+
+    published_at: float
+
+
+@dataclass(frozen=True)
+class LegacyUnstampedPin:
+    """A well-formed pin from before pins dated themselves.
+
+    All that is known about it is mtime — metadata *about* the file
+    rather than the file's own account of itself.
+    """
+
+    modified_at: float
+
+
+@dataclass(frozen=True)
+class UndatablePin:
+    """Nothing trustworthy could be learned about this pin's age.
+
+    Unreadable, not JSON, not a pin document, or carrying a stamp that
+    is not a date (non-numeric, NaN, infinite, absurd magnitude). This
+    state exists because collapsing it into "no timestamp" was the
+    round-2 defect: a garbled pin then took the legacy path, and the
+    legacy path deletes.
+    """
+
+    reason: str
+
+
+# Closed union: every pin is in exactly one of these states, and each
+# state has its own retention policy. Keeping them distinct is the
+# whole point — a `float | None` cannot tell the owner whether absence
+# means "old format" (evictable when very old) or "unreadable" (never
+# evictable).
+PinDate = StampedPin | LegacyUnstampedPin | UndatablePin
 
 
 class FileDurationHistoryError(RuntimeError):
@@ -140,70 +195,38 @@ class JsonFileDurationHistory:
     def _prune_pinned(self) -> None:
         """Drop only pins no live reader can possibly still want.
 
-        By age, never by count. Counting guesses at liveness, and the
-        guess is wrong exactly when it costs the most: a busy day
-        publishes enough newer epochs to evict a pin whose own gate is
-        still running, that delayed slice republishes from newer
-        history, and its partition disagrees with the one its siblings
-        already ran — so the combined gate silently omits some files
-        and runs others twice (B1, #7133 review; reproduced with
-        eleven concurrent gates). Age cannot make that mistake: gates
-        take minutes, so a pin a day old has no reader, and the store
-        stays bounded because a day holds a finite number of gates.
-
         Runs under the lock on the publish path only — a reader never
         deletes — and never raises: an unreadable neighbour must not
-        fail a publish that is otherwise fine.
+        fail a publish that is otherwise fine. What may be dropped is
+        decided by :class:`_PinRetention`; this method only gathers the
+        neighbourhood and carries out the verdict.
         """
         now = time.time()
         try:
             pins = list(self._directory.glob(f"{_PINNED_PREFIX}*{_PINNED_SUFFIX}"))
         except OSError:
             return
-        for pin in pins:
-            if not self._is_expired(pin, now):
-                continue
+        dated = {pin: self._dated(pin, now) for pin in pins}
+        for stale in _PinRetention(now).evictable(dated):
             try:
-                pin.unlink()
+                stale.unlink()
             except OSError:
                 pass
 
-    def _is_expired(self, path: Path, now: float) -> bool:
-        """Whether one pin is old enough that nothing can be reading it.
+    def _dated(self, pin: Path, now: float) -> PinDate:
+        """Classify one neighbour, contained.
 
-        Anything unreadable is kept: retention must never delete a pin
-        it could not positively date.
-        """
-        published = self._recorded_publish_time(path)
-        if published is not None:
-            return now - published > _PIN_RETENTION_SECONDS
-        try:
-            return now - path.stat().st_mtime > _UNSTAMPED_PIN_RETENTION_SECONDS
-        except OSError:
-            return False
-
-    def _recorded_publish_time(self, path: Path) -> float | None:
-        """The timestamp the pin recorded for itself, if it has one.
-
-        Authoritative over mtime, which is metadata *about* the file
-        rather than the file's own account: a copy, a restore, or a
-        rsync rewrites it, and a pin that looked older than it is would
-        be evicted early — the very failure age retention exists to
-        prevent. Pins written before this field existed have no such
-        account, so they fall back to mtime under a far longer bound.
+        One pathological neighbour must never fail an otherwise-good
+        publish — a pin carrying 10**400 raised OverflowError straight
+        out of pruning (round 2, finding 3). Containment is honest
+        here rather than a swallowed error, because "we could not
+        classify it" IS a modelled state, and that state is always
+        retained.
         """
         try:
-            payload = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError):
-            return None
-        if not isinstance(payload, dict):
-            return None
-        stamp = cast(dict[str, object], payload).get(_PUBLISHED_AT_FIELD)
-        if type(stamp) is int:
-            return float(stamp)
-        if type(stamp) is float and math.isfinite(stamp):
-            return stamp
-        return None
+            return classify_pin_date(pin, now)
+        except Exception as error:
+            return UndatablePin(f"{pin.name} could not be classified: {error!r}")
 
     def _read_pinned(self, path: Path) -> dict[str, float] | None:
         payload = self._read_json(path)
@@ -302,6 +325,127 @@ class JsonFileDurationHistory:
                     os.unlink(temporary)
                 except OSError:
                     pass
+
+
+class _PinRetention:
+    """Which pins may be deleted — and, far more importantly, which may not.
+
+    Every earlier version of this policy evicted on a single signal,
+    and each single signal was wrong on its own:
+
+    - **Count alone** (round 1): a busy day publishes enough newer
+      epochs to evict a pin whose gate is still running.
+    - **Age alone** (round 2): a forward wall-clock correction past the
+      bound ages every live pin out at once.
+
+    Both produce the same silent failure — the delayed slice
+    republishes from newer history, its partition disagrees with the
+    one its siblings already ran, and the combined gate omits some
+    files and runs others twice. So eviction of a dated pin requires
+    the two to **agree**: older than the age bound *and* outside the
+    newest ``_PIN_RETENTION_DEPTH`` pins by recorded time. A clock jump
+    alone cannot evict, because a live gate's pin is among the newest.
+    Count pressure alone cannot evict, because recent pins are young.
+    The store still stays bounded: a quiet store cannot exceed the
+    depth plus one day of gates.
+
+    The undated states keep their own policies, which is why they are
+    modelled separately (round 2, finding 2).
+    """
+
+    def __init__(self, now: float) -> None:
+        self._now = now
+
+    def evictable(self, dated: Mapping[Path, PinDate]) -> list[Path]:
+        protected = self._protected(dated)
+        evictable: list[Path] = []
+        for path, date in sorted(dated.items()):
+            if type(date) is UndatablePin:
+                # Never delete what could not be read. Said out loud,
+                # because a pin nobody can date is also a pin nobody
+                # will ever clean up.
+                _logger.warning(
+                    "[file-durations] retaining undatable pin: %s", date.reason
+                )
+                continue
+            if self._expired(date) and path not in protected:
+                evictable.append(path)
+        return evictable
+
+    def _protected(self, dated: Mapping[Path, PinDate]) -> frozenset[Path]:
+        """The newest dated pins, kept whatever the clock now says."""
+        stamped = {
+            path: date.published_at
+            for path, date in dated.items()
+            if type(date) is StampedPin
+        }
+        ranked = sorted(stamped, key=lambda path: (-stamped[path], path.name))
+        return frozenset(ranked[:_PIN_RETENTION_DEPTH])
+
+    def _expired(self, date: PinDate) -> bool:
+        if type(date) is StampedPin:
+            return self._now - date.published_at > _PIN_RETENTION_SECONDS
+        if type(date) is LegacyUnstampedPin:
+            return self._now - date.modified_at > _UNSTAMPED_PIN_RETENTION_SECONDS
+        return False
+
+
+def classify_pin_date(path: Path, now: float) -> PinDate:
+    """Date one pin file, keeping the three outcomes distinct.
+
+    Collapsing them into ``float | None`` was the round-2 defect: a
+    garbled pin and a legacy pin then took the same path, and the
+    legacy path deletes.
+    """
+    payload = _load_pin_document(path)
+    if payload is None:
+        return UndatablePin(f"{path.name} is not a readable pin document")
+    if _PUBLISHED_AT_FIELD not in payload:
+        return _legacy_date(path, payload)
+    return _recorded_date(path, payload[_PUBLISHED_AT_FIELD], now)
+
+
+def _load_pin_document(path: Path) -> dict[str, object] | None:
+    try:
+        payload = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        # OSError covers a pin this process may not read; ValueError
+        # covers both malformed JSON and undecodable bytes.
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return cast(dict[str, object], payload)
+
+
+def _legacy_date(path: Path, payload: Mapping[str, object]) -> PinDate:
+    """A pin with no recorded date — but only if it is really a pin.
+
+    A document carrying no weights is not "a pin missing its date", it
+    is a file nobody can interpret, and an absent date there is
+    indistinguishable from corruption.
+    """
+    if not isinstance(payload.get(_WEIGHTS_FIELD), dict):
+        return UndatablePin(f"{path.name} has no date and no weights")
+    try:
+        return LegacyUnstampedPin(path.stat().st_mtime)
+    except OSError:
+        return UndatablePin(f"{path.name} has no recorded date and no readable mtime")
+
+
+def _recorded_date(path: Path, stamp: object, now: float) -> PinDate:
+    """A recorded stamp, accepted only if it is actually a date."""
+    # A bool is an int to Python but never a timestamp to anyone else.
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return UndatablePin(f"{path.name} has a non-numeric date {stamp!r}")
+    if isinstance(stamp, float) and not math.isfinite(stamp):
+        return UndatablePin(f"{path.name} has a non-finite date {stamp!r}")
+    # Bounds are compared BEFORE any float() conversion: a Python int
+    # compares exactly at any magnitude, while float(10**400) raises
+    # OverflowError — which escaped pruning and failed an otherwise-good
+    # publish (round 2, finding 3).
+    if not _EARLIEST_SANE_PUBLISH_TIME <= stamp <= now + _FUTURE_TOLERANCE_SECONDS:
+        return UndatablePin(f"{path.name} has an out-of-range date {stamp!r}")
+    return StampedPin(float(stamp))
 
 
 class _DirectoryLock:

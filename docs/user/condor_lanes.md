@@ -217,13 +217,17 @@ constant to go stale in the source.
   `SLICE_WEIGHTS_EPOCH` per gate (the flat fan is one make process, and
   the scheduler wrapper carries the stamp into the job); the first
   slice to ask publishes `pinned-<epoch>.json` and every other slice of
-  that gate is answered from it. Pins are retained by **age**, not by
-  count — a pin is dropped only once it is older than a day, which no
-  running gate can be. Counting would guess at liveness and guess
-  wrong exactly when it costs most: a busy day publishes enough newer
-  epochs to evict a pin whose gate is still running, and that slice
-  then republishes from newer history and disagrees with the partition
-  its siblings already ran.
+  that gate is answered from it. Retention never guesses at liveness:
+  a pin is dropped only when **age and depth agree** — older than a day
+  *and* outside the newest fifty pins by recorded date. Either signal
+  alone is wrong on its own. Count alone lets a busy day evict a pin
+  whose gate is still running; age alone lets one forward wall-clock
+  correction age every live pin out at once. Both end the same way —
+  the delayed slice republishes from newer history, its partition
+  disagrees with the one its siblings already ran, and the combined
+  gate omits some files and runs others twice. A pin whose age cannot
+  be established at all (unreadable, not JSON, or carrying something
+  that is not a date) is never evicted, and says so at `WARNING`.
 - **Capture is backend-neutral.** It is a pytest plugin
   (`infra/pytest_file_durations.py`) enabled by the slice recipe, so a
   scheduler backend — which re-invokes that same recipe inside its job
