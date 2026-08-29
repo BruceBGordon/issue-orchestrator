@@ -24,6 +24,12 @@ from .rusage_report import RUSAGE_FILE_NAME, compile_rusage_capture
 # TERM-then-KILL escalation.
 _REMOVAL_GRACE_SECONDS = 10
 
+# The signals the shim must outlive so the scheduler's hard kill still
+# arrives (see _compile_exec_script). TERM is the configured soft kill;
+# HUP and INT are here because the rule is about the whole class of
+# catchable terminations, not the one signal that exposed it.
+_SOFT_KILL_SIGNALS = "TERM HUP INT"
+
 
 @dataclass(frozen=True, slots=True)
 class CompiledSubmitDescription:
@@ -160,25 +166,56 @@ def _compile_exec_script(arguments: tuple[str, ...], rusage_path: Path) -> str:
     The shim runs the lane instead of ``exec``-ing it, because a
     process that has replaced itself cannot report anything afterwards
     and the CPU measurement has to come from the shell that waited for
-    the lane. The consequences are deliberate:
+    the lane. Everything else about the shim exists to make that
+    invisible:
 
-    - The lane's exit status is captured and re-raised verbatim,
-      signal deaths (128+N) included, so nothing downstream can tell
-      the difference.
-    - The shim becomes the lane's parent rather than the lane itself.
-      Deadline removal and suspension still reach the lane because the
-      scheduler signals the whole process family, not one pid — the
-      same tracking whose one documented hole on macOS is a
-      ``setsid``-detached grandchild (ADR-0001), which a plain child
-      is not.
-    - The report is written on the way out and its failure is
-      swallowed: a lane that ran correctly must never fail over its
-      own instrumentation.
+    - **The lane's exit status is re-raised verbatim**, signal deaths
+      (128+N) included.
+    - **The lane's stderr is byte-identical.** A surviving shell
+      announces its dead child ("Killed: 9") on its own stderr, which
+      is the lane's error file — output the lane never produced (B,
+      #7136 review). So the real stderr is duplicated to fd 3, the
+      shell's own stderr goes to ``/dev/null``, and the lane is
+      handed fd 3 as its stderr (closing the spare in the child, so
+      the lane inherits no descriptor it did not have before). The
+      split is exactly right: a failed ``execve`` is reported by the
+      already-redirected CHILD and still reaches the lane's error
+      file, while the job-status notice comes from the parent and is
+      discarded.
+    - **The shim outlives the soft kill; the lane does not have to.**
+      This is the subtle one, and it was caught only against a live
+      pool. The scheduler's deadline removal sends a soft kill, waits
+      out ``job_max_vacate_time``, then hard-kills the job's whole
+      family. A plain shell dies instantly on the soft kill, the
+      scheduler sees the job's primary process gone, and the hard kill
+      that would have reaped a signal-resistant descendant never
+      comes — the lane's process tree survives its own deadline. So
+      the shim ignores the soft-kill signals and keeps waiting, which
+      is exactly the lifetime an ``exec``-ed lane had. The lane must
+      NOT inherit that immunity (a lane deserves its chance to shut
+      down gracefully), and it does not: ignored dispositions survive
+      fork and exec, so the subshell resets them before ``exec``-ing.
+      Measured against the live pool: 5/5 containment with this, 1/3
+      and 2/3 for shapes without it, 3/3 for the plain ``exec`` shim
+      it restores parity with. ``SIGKILL`` is unaffected — it cannot
+      be ignored, and needs no help.
+    - **The subshell ``exec``s the lane**, so it costs a fork but no
+      resident process: the running tree is the shim plus the lane,
+      exactly one process more than before.
+
+    Verified empirically on ``bash`` 3.2 (macOS ``/bin/sh``),
+    ``bash`` 5, ``dash`` (Linux ``/bin/sh``), and ``zsh``: identical
+    stdout, stderr, and exit status for clean exits, non-zero exits,
+    and signal deaths; the lane's signal dispositions left at their
+    defaults; and the shim surviving a soft kill to report its lane's
+    real status.
     """
     quoted = " ".join(shlex.quote(argument) for argument in arguments)
     return (
         "#!/bin/sh\n"
-        f"{quoted}\n"
+        "exec 3>&2 2>/dev/null\n"
+        f"trap '' {_SOFT_KILL_SIGNALS}\n"
+        f"( trap - {_SOFT_KILL_SIGNALS}; exec {quoted} 2>&3 3>&- ) 2>/dev/null\n"
         "__lane_status=$?\n"
         f"{compile_rusage_capture(rusage_path)}"
         'exit "$__lane_status"\n'

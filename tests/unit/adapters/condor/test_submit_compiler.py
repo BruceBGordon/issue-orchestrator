@@ -44,9 +44,12 @@ def test_compiles_complete_description_with_runtime_deadline(
     assert compiled.exec_script_path == tmp_path / "lane.exec"
     assert compiled.exec_script_text == (
         "#!/bin/sh\n"
-        "/usr/bin/gmake test-unit PARALLEL=8\n"
+        "exec 3>&2 2>/dev/null\n"
+        "trap '' TERM HUP INT\n"
+        "( trap - TERM HUP INT; exec /usr/bin/gmake test-unit PARALLEL=8"
+        " 2>&3 3>&- ) 2>/dev/null\n"
         "__lane_status=$?\n"
-        f"times > {tmp_path / 'lane.rusage'} 2>/dev/null || :\n"
+        f"{{ times; }} >{tmp_path / 'lane.rusage'}\n"
         'exit "$__lane_status"\n'
     )
     assert "initialdir = /repo/worktree" in compiled.text
@@ -328,16 +331,128 @@ def test_shim_reports_the_lane_exit_code_verbatim(tmp_path: Path) -> None:
     assert _run_shim(tmp_path, (sys.executable, "-c", "pass")) == 0
 
 
-def test_shim_reports_a_signal_death_as_the_shell_does(tmp_path: Path) -> None:
-    """A lane killed by a signal must still surface as 128+N, the same
-    number an `exec`-ing shim produced."""
-    import signal
+# The shells a lane's shim can actually land on: bash 3.2 is macOS
+# /bin/sh, dash is the Linux /bin/sh (and the execenv container's).
+# Each is only exercised where it exists — an absent shell is not an
+# unmet prerequisite, it is a platform that cannot run that shell.
+_SHELLS = tuple(
+    candidate
+    for candidate in ("/bin/sh", "/bin/bash", "/bin/dash", "/bin/zsh")
+    if Path(candidate).exists()
+)
+
+# stdout, stderr, a non-zero exit, and a signal death, from one lane.
+_TALKATIVE_LANE = (
+    "import os, signal, sys\n"
+    "sys.stdout.write('lane stdout line\\n')\n"
+    "sys.stdout.flush()\n"
+    "sys.stderr.write('lane stderr line\\n')\n"
+    "sys.stderr.flush()\n"
+    "mode = sys.argv[1]\n"
+    "if mode == 'signal':\n"
+    "    os.kill(os.getpid(), signal.SIGKILL)\n"
+    "raise SystemExit(int(mode))\n"
+)
+
+
+def _direct_result(argv: tuple[str, ...]) -> tuple[int, str, str]:
+    """What the lane produces with no shim at all — the baseline the
+    shim must reproduce byte for byte.
+
+    A signal death is normalized to the shell's 128+N encoding, which
+    is what every backend already reports (`LaneCompleted(128 + N)`);
+    Python's own negative-returncode spelling of the same fact is not
+    a difference the shim could or should preserve.
+    """
+    import subprocess
+
+    produced = subprocess.run(list(argv), capture_output=True, text=True)
+    status = produced.returncode
+    return (
+        128 - status if status < 0 else status,
+        produced.stdout,
+        produced.stderr,
+    )
+
+
+def _shim_result(
+    tmp_path: Path, argv: tuple[str, ...], shell: str, label: str
+) -> tuple[int, str, str]:
+    import subprocess
+
+    run_directory = tmp_path / f"run-{shell.replace('/', '_')}-{label}"
+    run_directory.mkdir()
+    compiled = compile_submit_description(
+        _command(argv), LaneResources(request_cpus=1), run_directory
+    )
+    compiled.exec_script_path.write_text(compiled.exec_script_text)
+    compiled.exec_script_path.chmod(0o755)
+    produced = subprocess.run(
+        [shell, str(compiled.exec_script_path)], capture_output=True, text=True
+    )
+    return produced.returncode, produced.stdout, produced.stderr
+
+
+@pytest.mark.parametrize("shell", _SHELLS)
+@pytest.mark.parametrize("mode", ("0", "9", "signal"))
+def test_shim_output_is_byte_identical_to_running_the_lane_directly(
+    tmp_path: Path, shell: str, mode: str
+) -> None:
+    """B (#7136 review), reproduced: measuring cost the shim its
+    `exec`, and a surviving shell announces its dead child
+    ('Killed: 9') on the lane's error file — output the lane never
+    produced. The contract is equivalence, so the assertion compares
+    against the lane run with no shim rather than against a
+    hand-written expectation, in every shell a lane can land on.
+
+    The previous version of this test captured the output and checked
+    only the exit code, which is exactly how the regression got in.
+    """
     import sys
 
-    killed = _run_shim(
-        tmp_path, (sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
+    argv = (sys.executable, "-c", _TALKATIVE_LANE, mode)
+    assert _shim_result(tmp_path, argv, shell, mode) == _direct_result(argv)
+
+
+@pytest.mark.parametrize("shell", _SHELLS)
+def test_a_lane_that_cannot_be_executed_still_reports_why(
+    tmp_path: Path, shell: str
+) -> None:
+    """The other half of the stderr split: silencing the parent must
+    not silence the CHILD. A failed execve is diagnosed by the
+    already-redirected child process, so the reason still reaches the
+    lane's error file — losing it would turn a broken lane command
+    into a bare 127."""
+    argv = ("/bin/sh", "-c", "exec /nonexistent/lane/binary")
+    shimmed = _shim_result(tmp_path, argv, shell, "notfound")
+    assert shimmed == _direct_result(argv)
+    assert "/nonexistent/lane/binary" in shimmed[2]
+
+
+@pytest.mark.parametrize("shell", _SHELLS)
+def test_the_report_is_written_in_every_shell(tmp_path: Path, shell: str) -> None:
+    """`times` output shape is POSIX-fixed but its precision is not,
+    and the capture runs in whichever /bin/sh the platform provides."""
+    from issue_orchestrator.adapters.condor.rusage_report import read_cpu_seconds
+
+    import sys
+
+    run_directory = tmp_path / f"cpu-{shell.replace('/', '_')}"
+    run_directory.mkdir()
+    compiled = compile_submit_description(
+        _command((sys.executable, "-c", _CPU_WORK)),
+        LaneResources(request_cpus=1),
+        run_directory,
     )
-    assert killed == 128 + int(signal.SIGKILL)
+    compiled.exec_script_path.write_text(compiled.exec_script_text)
+    compiled.exec_script_path.chmod(0o755)
+    import subprocess
+
+    assert (
+        subprocess.run([shell, str(compiled.exec_script_path)]).returncode == 0
+    )
+    cpu_seconds = read_cpu_seconds(compiled.rusage_path)
+    assert cpu_seconds is not None and cpu_seconds > 0.05, cpu_seconds
 
 
 def test_shim_still_exits_cleanly_when_the_report_cannot_be_written(
@@ -388,3 +503,85 @@ def test_shim_report_does_not_pollute_lane_output(tmp_path: Path) -> None:
     )
     assert produced.stdout == "lane output\n"
     assert produced.stderr == ""
+
+
+@pytest.mark.parametrize("shell", _SHELLS)
+def test_the_lane_keeps_default_signal_dispositions(
+    tmp_path: Path, shell: str
+) -> None:
+    """The shim ignores the soft-kill signals so it can outlive them;
+    the LANE must not inherit that. Ignored dispositions survive fork
+    and exec, so a shim that forgot to reset them would silently make
+    every lane unkillable by anything short of SIGKILL — no graceful
+    shutdown, every deadline removal a hard kill."""
+    import sys
+
+    probe = (
+        "import signal, sys\n"
+        "for name in ('SIGTERM', 'SIGHUP', 'SIGINT'):\n"
+        "    disposition = signal.getsignal(getattr(signal, name))\n"
+        "    assert disposition != signal.SIG_IGN, name\n"
+        "sys.exit(0)\n"
+    )
+    returncode, _, stderr = _shim_result(
+        tmp_path, (sys.executable, "-c", probe), shell, "dispositions"
+    )
+    assert returncode == 0, stderr
+
+
+@pytest.mark.parametrize("shell", _SHELLS)
+def test_the_shim_outlives_a_soft_kill_and_still_reports_its_lane(
+    tmp_path: Path, shell: str
+) -> None:
+    """The property the live pool caught and these tests did not.
+
+    A shim that dies on the soft kill tells the scheduler the job is
+    over, so the hard kill that would reap a signal-resistant
+    descendant never arrives and the lane's tree survives its own
+    deadline. The shim must stay alive until the lane it is waiting
+    for is genuinely finished, exactly as an `exec`-ed lane did — and
+    must still report that lane's real exit status afterwards.
+    """
+    import os
+    import signal as signal_module
+    import subprocess
+    import sys
+    import time
+
+    run_directory = tmp_path / f"soft-kill-{shell.replace('/', '_')}"
+    run_directory.mkdir()
+    started = run_directory / "started"
+    lane = (
+        "import pathlib, sys, time\n"
+        "pathlib.Path(sys.argv[1]).write_text('up')\n"
+        "time.sleep(3)\n"
+        "raise SystemExit(5)\n"
+    )
+    compiled = compile_submit_description(
+        _command((sys.executable, "-c", lane, str(started))),
+        LaneResources(request_cpus=1),
+        run_directory,
+    )
+    compiled.exec_script_path.write_text(compiled.exec_script_text)
+    compiled.exec_script_path.chmod(0o755)
+    process = subprocess.Popen(
+        [shell, str(compiled.exec_script_path)], start_new_session=True
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not started.exists():
+            time.sleep(0.05)
+        assert started.exists(), "lane never started"
+        os.kill(process.pid, signal_module.SIGTERM)
+        time.sleep(0.5)
+        assert process.poll() is None, (
+            "the shim died on the soft kill: the scheduler would see the "
+            "job end and never hard-kill the surviving lane tree"
+        )
+        assert process.wait(timeout=30) == 5, (
+            "the shim survived but lost its lane's exit status"
+        )
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)

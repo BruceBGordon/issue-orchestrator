@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -105,7 +106,7 @@ def test_capture_fragment_is_a_real_shell_measurement(tmp_path: Path) -> None:
     script = tmp_path / "shim.sh"
     script.write_text(
         "#!/bin/sh\n"
-        f"{sys.executable} -c {_quote(burn)}\n"
+        f"{sys.executable} -c {shlex.quote(burn)}\n"
         "__lane_status=$?\n"
         f"{compile_rusage_capture(report)}"
         'exit "$__lane_status"\n',
@@ -133,7 +134,18 @@ def test_capture_fragment_quotes_awkward_directories(tmp_path: Path) -> None:
     awkward = tmp_path / "lane dir; rm -rf x" / RUSAGE_FILE_NAME
     fragment = compile_rusage_capture(awkward)
     assert str(awkward) in fragment
-    assert fragment.startswith("times > '")
+    assert fragment == "{ times; } >" + shlex.quote(str(awkward)) + "\n"
+
+
+def test_capture_wraps_the_special_builtin_in_a_group() -> None:
+    """`times` is a POSIX special built-in, and a redirection error on
+    one may abort a non-interactive shell — which would swallow the
+    lane's exit status the moment the run directory turned unwritable.
+    Redirecting a command GROUP makes the same failure an ordinary
+    failed command, which is also why no `|| :` guard is needed."""
+    fragment = compile_rusage_capture(Path("/tmp/lane.rusage"))
+    assert fragment.startswith("{ times; } >")
+    assert "|| :" not in fragment
 
 
 def test_an_unusable_report_abstains_loudly_without_failing_the_lane(
@@ -148,34 +160,39 @@ def test_an_unusable_report_abstains_loudly_without_failing_the_lane(
     report = _report(tmp_path, "0m0.001s 0m0.002s\ntruncated")
     assert measure_busy_cores(report, 30.0, "test-unit") is None
     warning = capsys.readouterr().err
-    assert "test-unit" in warning
-    assert "teaches no CPU demand" in warning
+    assert warning.startswith("[lane-cpu] WARNING test-unit:")
+    assert "unusable" in warning
     assert "truncated" in warning
 
 
-def test_an_absent_report_abstains_quietly(
+def test_an_absent_report_on_a_completed_lane_is_loud(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A removed lane never reaches its shim. That is expected, not a
-    defect, and must not spray warnings across every timeout."""
-    assert measure_busy_cores(tmp_path / RUSAGE_FILE_NAME, 30.0, "x") is None
+    """C (#7136 review): this function is only reached for a lane that
+    ran to its own exit, so a missing report means the shim never ran
+    its capture — a swallowed redirection, a lost run directory, a
+    shim that no longer measures. Reading that as 'normal' let a
+    broken shim disable CPU learning forever with nobody the wiser.
+    Non-fatal, but never silent."""
+    missing = tmp_path / RUSAGE_FILE_NAME
+    assert measure_busy_cores(missing, 30.0, "test-unit") is None
+    warning = capsys.readouterr().err
+    assert warning.startswith("[lane-cpu] WARNING test-unit:")
+    assert str(missing) in warning
+
+
+def test_a_coarse_runtime_abstains_quietly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The one non-failure way to get no number: the report is there
+    and healthy, the runtime is simply too coarse to divide by. That
+    is not an instrumentation defect and must not be warned about, or
+    every trivial lane cries wolf."""
+    report = _report(tmp_path, _BASH_32)
+    assert measure_busy_cores(report, 0.0, "test-unit") is None
     assert capsys.readouterr().err == ""
 
 
 def test_a_usable_report_becomes_busy_cores(tmp_path: Path) -> None:
     report = _report(tmp_path, "0m0.001s 0m0.002s\n0m30.000s 0m30.000s\n")
     assert measure_busy_cores(report, 30.0, "test-unit") == pytest.approx(2.0)
-
-
-def test_a_usable_report_over_a_zero_runtime_still_abstains(
-    tmp_path: Path,
-) -> None:
-    """Sub-second lanes have a real report and no denominator."""
-    report = _report(tmp_path, _BASH_32)
-    assert measure_busy_cores(report, 0.0, "test-unit") is None
-
-
-def _quote(text: str) -> str:
-    import shlex
-
-    return shlex.quote(text)

@@ -362,14 +362,43 @@ Lanes measure their own CPU demand the same way they measure their own
 duration. Each scheduled lane's exec shim reports the CPU its process
 tree burned (the POSIX `times` built-in, written to `lane.rusage` in
 the run directory and collected like the event log); busy cores =
-CPU-seconds / observed runtime. Successes record it beside the runtime
-in the same per-lane history file, and the next submission requests
-`ceil(rolling median)`, floored at one core.
+CPU-seconds / observed runtime. Successes record it in
+`lane-runtime-history/busy-cores/<work-key>.json`, and the next
+submission requests `ceil(rolling median)`, floored at one core.
 
 The measurement is taken in the shim rather than read from the
 scheduler because the scheduler's own CPU attributes report a flat 0.0
 on the macOS pool, which has no cgroups to account against. Doing it
 in the shim makes the mechanism identical on every platform.
+
+Measuring costs the shim its `exec` — a process that has replaced
+itself cannot report anything afterwards — so the shim runs the lane
+and re-raises its status. Two things make that invisible, and both are
+load-bearing: the lane's stderr is routed around the shell so a
+surviving shell's "Killed: 9" notice never lands in the lane's error
+file, and the shim ignores the soft-kill signals so it outlives a
+deadline removal exactly as an `exec`-ed lane did. Without the second,
+the scheduler sees the job's primary process vanish on the soft kill
+and never sends the hard kill that reaps a signal-resistant
+descendant — the lane's tree survives its own deadline. The lane
+itself keeps default signal dispositions.
+
+The CPU dimension lives in a *sibling* file rather than beside the
+runtimes in `<work-key>.json`, because the history is shared by every
+worktree of the repository and a worktree checked out before this
+feature still runs gates: its writer rewrites `<work-key>.json`
+wholesale with runtimes only, which would erase a CPU key stored
+inside it. Both files are still written under the one per-key lock, so
+old and new writers serialize rather than race. To reset one lane's
+CPU evidence, delete its file from the `busy-cores/` directory; the
+runtime history is untouched.
+
+If a completed lane produces no report, the gate log carries a
+`[lane-cpu] WARNING <lane>: ...` line naming the lane and the missing
+file — instrumentation never fails a lane that ran correctly, but it
+must not fail silently either. The same fact is queryable afterwards:
+a `lane-dispatch.jsonl` row with `"backend": "condor"` and a null
+`observed_busy_cores` is a scheduled lane that measured nothing.
 
 The declaration governs in both directions, asymmetrically:
 

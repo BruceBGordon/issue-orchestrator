@@ -55,16 +55,28 @@ _SECONDS_PER_MINUTE = 60.0
 
 
 def compile_rusage_capture(rusage_path: Path) -> str:
-    """The shim lines that report the lane subtree's CPU, in shell.
+    """The shim line that reports the lane subtree's CPU, in shell.
 
     Emitted after the lane has been waited for and before the shim
-    exits with the lane's own status. A failure to write the report is
-    swallowed (``|| :``): the measurement is a side channel, and a
-    full disk must never turn a green lane red.
+    exits with the lane's own status.
+
+    ``times`` is wrapped in a command group rather than run bare, and
+    that is not decoration: POSIX says a redirection error on a
+    *special built-in* — which ``times`` is — may abort a
+    non-interactive shell, which would swallow the lane's exit status
+    the moment the run directory turned unwritable. Redirecting the
+    group instead makes a failed redirection an ordinary failed
+    command. That is also why no ``|| :`` guard is needed to keep a
+    green lane green: verified on bash 3.2, bash 5, dash, and zsh,
+    an unwritable target loses the report, leaves the exit status
+    untouched, and prints nothing (the shell's own stderr is
+    ``/dev/null`` by this point, which keeps instrumentation noise out
+    of the lane's error file). The missing report is not swallowed
+    either — :func:`measure_busy_cores` reports it.
     """
     if not rusage_path.is_absolute():
         raise ValueError("compile_rusage_capture rusage_path must be absolute")
-    return f"times > {shlex.quote(str(rusage_path))} 2>/dev/null || :\n"
+    return f"{{ times; }} >{shlex.quote(str(rusage_path))}\n"
 
 
 def read_cpu_seconds(rusage_path: Path) -> float | None:
@@ -129,24 +141,46 @@ def measure_busy_cores(
 ) -> float | None:
     """The whole side channel as one answer: cores, or nothing.
 
-    This is where "the report is unusable" is decided, so the rule
-    lives in one place instead of being re-invented by each caller.
-    An unreadable report is announced on stderr and then dropped: a
-    lane that ran correctly must never fail over its own
-    instrumentation, but a silently swallowed measurement failure
-    would leave the loop permanently inert with nobody the wiser. The
-    raw report goes into the message because the run directory holding
-    it is deleted moments later on a clean completion.
+    Called for a lane that RAN TO ITS OWN EXIT, so a report should
+    exist. This is where every way of not getting one is judged, so
+    the rule lives in one place instead of being re-invented by each
+    caller.
+
+    Two of the three ways are instrumentation failures and both are
+    announced on stderr (C, #7136 review): an unreadable report means
+    the shim's contract is broken, and a MISSING report on a completed
+    lane means the shim never ran its capture at all — a swallowed
+    redirection, a lost run directory, a shim that no longer measures.
+    Either way the lane's result is untouched, because a lane that ran
+    correctly must never fail over its own instrumentation; but
+    neither may pass silently, or a broken shim disables learning
+    forever with nobody the wiser. Warnings pair with the dispatch
+    journal, where a ``condor``-backend row whose ``observed_busy_cores``
+    is null is the same fact, queryable after the fact.
+
+    The third way is not a failure: a runtime too coarse to divide by
+    (see :func:`busy_cores`). That one is silent.
+
+    Unreadable reports carry their raw text into the message, because
+    the run directory holding them is deleted moments later on a clean
+    completion.
     """
     try:
         cpu_seconds = read_cpu_seconds(rusage_path)
     except ValueError as error:
-        print(
-            f"lane {lane_name}: CPU report unusable, this run teaches no "
-            f"CPU demand: {error}",
-            file=sys.stderr,
-        )
+        _warn(lane_name, f"CPU report unusable: {error}")
         return None
     if cpu_seconds is None:
+        _warn(
+            lane_name,
+            f"the lane completed but wrote no CPU report at {rusage_path} — "
+            "its exec shim did not run the capture, so CPU demand cannot "
+            "be learned from this run",
+        )
         return None
     return busy_cores(cpu_seconds, runtime_seconds)
+
+
+def _warn(lane_name: str, detail: str) -> None:
+    """One shape for every instrumentation complaint, greppable."""
+    print(f"[lane-cpu] WARNING {lane_name}: {detail}", file=sys.stderr)
