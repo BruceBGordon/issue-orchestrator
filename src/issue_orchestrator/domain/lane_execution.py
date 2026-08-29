@@ -12,6 +12,7 @@ translated at the adapter (anti-corruption layer), never leaked upward.
 
 from __future__ import annotations
 
+import enum
 import math
 import re
 from dataclasses import dataclass
@@ -26,6 +27,27 @@ _EXCLUSIVE_RESOURCE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 # deadline reports 124, matching coreutils ``timeout`` and the direct
 # path's historical behavior, so callers cannot tell backends apart.
 LANE_TIMEOUT_EXIT_CODE = 124
+
+
+class LaneSuspendability(enum.Enum):
+    """When, if ever, a lane may be frozen by machine-load backoff.
+
+    Only the client knows this. ``NEVER``: a lane holding a live
+    provider exchange must not be paused mid-turn — the response
+    window expires while frozen and the thaw manufactures a
+    provider-outage failure indistinguishable from a real one.
+    ``ANYWHERE``: hermetic lanes freeze and thaw safely at any point.
+    ``COOPERATIVE``: freezable only at safe points the running lane
+    itself advertises (for example between test items) — the lane
+    starts unsafe and every transition is the lane's own explicit
+    signal, so an advertisement that never arrives degrades to NEVER,
+    not to ANYWHERE. NEVER is the fail-safe default everywhere: a lane
+    nobody classified is never frozen.
+    """
+
+    NEVER = "never"
+    ANYWHERE = "anywhere"
+    COOPERATIVE = "cooperative"
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,15 +112,11 @@ class LaneResources:
     # and the real workload is OOM-killed at a ~256MB ceiling. The
     # default fits light lanes; heavy lanes must declare their budget.
     request_memory_mb: int = 1024
-    # Whether the lane tolerates being frozen mid-run (machine-load
-    # backoff). Only the client knows this: hermetic lanes freeze and
-    # thaw safely anywhere, but a lane holding a live provider exchange
-    # must never be paused mid-turn — the response window expires while
-    # frozen and the thaw manufactures a provider-outage failure
-    # indistinguishable from a real one. The default is the FAIL-SAFE
+    # When, if ever, machine-load backoff may freeze this lane — see
+    # :class:`LaneSuspendability`. The default is the FAIL-SAFE
     # direction: a lane nobody classified is never frozen — freezing
     # requires an explicit declaration, not an author's memory.
-    suspendable: bool = False
+    suspendability: LaneSuspendability = LaneSuspendability.NEVER
 
     def __post_init__(self) -> None:
         if type(self.request_cpus) is not int or self.request_cpus < 1:
@@ -109,8 +127,10 @@ class LaneResources:
             )
         if type(self.priority) is not int or self.priority < 0:
             raise ValueError("LaneResources.priority must be a non-negative integer")
-        if type(self.suspendable) is not bool:
-            raise ValueError("LaneResources.suspendable must be a bool")
+        if type(self.suspendability) is not LaneSuspendability:
+            raise ValueError(
+                "LaneResources.suspendability must be a LaneSuspendability"
+            )
         if type(self.exclusive) is not tuple:
             raise ValueError("LaneResources.exclusive must be a tuple")
         for token in self.exclusive:

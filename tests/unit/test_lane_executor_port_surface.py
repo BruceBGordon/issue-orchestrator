@@ -31,8 +31,11 @@ def test_lane_resources_surface_is_pinned() -> None:
         "request_memory_mb",
         # Deliberate widening (#7114): load-backoff eligibility is a
         # client-known correctness fact (live exchanges must never be
-        # frozen mid-turn), not a tuning knob.
-        "suspendable",
+        # frozen mid-turn), not a tuning knob. Deliberately reshaped
+        # (#7124) from bool to the three-valued LaneSuspendability so
+        # cooperative lanes — freezable only at self-advertised safe
+        # points — are expressible without weakening either old value.
+        "suspendability",
     )
 
 

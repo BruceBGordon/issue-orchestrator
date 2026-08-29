@@ -173,7 +173,7 @@ belongs to exactly one, and its name says which:
 
 | Parameter family | What it is | Consumed by |
 |---|---|---|
-| `.issue-orchestrator/lanes.yaml` rows | **Measured** per-lane demand (request_cpus, memory_mb), suspendability, exclusives — one schema-validated home, resolved by `lane-run` per work key | Scheduling backend admission only; the direct backend accepts-and-ignores |
+| `.issue-orchestrator/lanes.yaml` rows | **Measured** per-lane demand (request_cpus, memory_mb), three-valued suspendability (`never`/`anywhere`/`cooperative`), exclusives — one schema-validated home, resolved by `lane-run` per work key | Scheduling backend admission only; the direct backend accepts-and-ignores |
 | `LANE_WORKERS_*`, `*_PARALLEL` (Makefile) | How parallel the suite itself runs (xdist `-n`) — part of the command text | The suite, in every mode |
 | `VALIDATE_*_JOBS` phase widths (Makefile) | Host protection: keeps xdist-heavy suites from trampling each other | Direct mode only — the flat fan + pool admission replaces this structure |
 | `IO_POOL_CAPACITY_PERCENT` | The one throughput dial (below) | The pool |
@@ -238,13 +238,23 @@ Three rules are built in, each load-bearing:
 - **Owner load, never total load.** The policy subtracts the load
   condor's own jobs cause; suspending on total load would trip on the
   gate's own lane fan and oscillate against its own reflection.
-- **Only lanes that declared it safe.** Hermetic lanes declare
-  `suspendable: true` in `.issue-orchestrator/lanes.yaml`; lanes
-  holding live provider exchanges declare `suspendable: false`
-  (frozen mid-turn, their response window expires and the thaw
-  manufactures a provider-outage failure). The field is
-  schema-required — a lane nobody classified fails validation
-  loudly instead of defaulting either way.
+- **Only lanes whose classification permits it.** Every lane
+  declares one of three `suspendability` values in
+  `.issue-orchestrator/lanes.yaml`: `anywhere` (hermetic — freeze and
+  thaw safely at any point), `never` (live provider exchanges: frozen
+  mid-turn, the response window expires and the thaw manufactures a
+  provider-outage failure), or `cooperative` — freezable **only at
+  safe points the running lane advertises itself**. A cooperative
+  lane's job starts unsafe; enabling the opt-in pytest plugin
+  (`-p issue_orchestrator.entrypoints.pytest_cooperative_yield`)
+  advertises safe between test items and unsafe during them via
+  `condor_chirp`, so a live agent turn or an open test fixture is
+  never interrupted while idle gaps between items are fair game. The
+  fail-safe direction is built in at every layer: no advertisement
+  (no chirp, plugin absent, xdist workers — which stay silent because
+  they share one job ad), stale state, or a pre-migration job all
+  mean never-frozen. The field is schema-required — a lane nobody
+  classified fails validation loudly instead of defaulting.
 - **Frozen time is charged to nothing.** The compiled lane deadline
   subtracts suspension time (a freeze must not manufacture a timeout),
   and observed runtime excludes it (a freeze must not teach the

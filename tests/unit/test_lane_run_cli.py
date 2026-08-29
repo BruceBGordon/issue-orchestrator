@@ -18,6 +18,7 @@ from issue_orchestrator.domain.lane_execution import (
     LaneCompleted,
     LaneOutcome,
     LaneResources,
+    LaneSuspendability,
     LaneWorkKey,
 )
 from issue_orchestrator.entrypoints.cli_tools import lane_run as lane_run_module
@@ -62,7 +63,7 @@ def declared_lane(monkeypatch: pytest.MonkeyPatch) -> None:
         lane_run_module,
         "_load_declaration",
         lambda work_key: LaneDeclaration(
-            request_cpus=1, memory_mb=1024, suspendable=False
+            request_cpus=1, memory_mb=1024, suspendability="never"
         ),
     )
 
@@ -184,7 +185,7 @@ def test_declared_facts_cross_the_port_boundary(
         lambda work_key: LaneDeclaration(
             request_cpus=7,
             memory_mb=2048,
-            suspendable=True,
+            suspendability="cooperative",
             exclusive=("codex",),
         ),
     )
@@ -193,7 +194,10 @@ def test_declared_facts_cross_the_port_boundary(
     assert len(executor.resources) == 1
     assert executor.resources[0].request_cpus == 7
     assert executor.resources[0].request_memory_mb == 2048
-    assert executor.resources[0].suspendable is True
+    assert (
+        executor.resources[0].suspendability
+        is LaneSuspendability.COOPERATIVE
+    )
     assert executor.resources[0].exclusive == ("codex",)
 
 
@@ -367,7 +371,14 @@ def test_undeclared_lane_fails_as_configuration_error(
     assert _run("/usr/bin/true") == 78
 
 
-def test_suspendable_domain_validation_rejects_non_bool() -> None:
-    for bad in (1, "yes", None):
+def test_suspendability_domain_validation_rejects_non_enum() -> None:
+    """The domain speaks the enum only — raw strings and the old
+    booleans are declaration-layer vocabulary that must be mapped
+    before crossing into LaneResources."""
+    for bad in (True, "anywhere", 1, None):
         with pytest.raises(ValueError):
-            LaneResources(request_cpus=1, suspendable=bad)  # type: ignore[arg-type]
+            LaneResources(request_cpus=1, suspendability=bad)  # type: ignore[arg-type]
+    assert (
+        LaneResources(request_cpus=1).suspendability
+        is LaneSuspendability.NEVER
+    )

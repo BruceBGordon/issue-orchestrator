@@ -18,6 +18,7 @@ import pytest
 
 from issue_orchestrator.adapters.condor import CondorLaneExecutor, CondorTools
 from issue_orchestrator.domain.lane_execution import (
+    LaneSuspendability,
     LaneCommand,
     LaneCompleted,
     LaneDeadline,
@@ -575,7 +576,9 @@ def test_owner_load_spike_freezes_only_suspendable_lanes(tmp_path: Path) -> None
     script = "import time; time.sleep(90)"
     outcomes: dict[str, object] = {}
 
-    def run_lane(work_key: str, suspendable: bool) -> None:
+    def run_lane(
+        work_key: str, suspendability: LaneSuspendability
+    ) -> None:
         outcomes[work_key] = CondorLaneExecutor(CondorTools.resolve()).run(
             LaneCommand(
                 work_key=LaneWorkKey(work_key),
@@ -583,12 +586,17 @@ def test_owner_load_spike_freezes_only_suspendable_lanes(tmp_path: Path) -> None
                 working_directory=tmp_path,
                 deadline=LaneDeadline(300.0),
             ),
-            LaneResources(request_cpus=1, suspendable=suspendable),
+            LaneResources(request_cpus=1, suspendability=suspendability),
         )
 
     threads = [
-        threading.Thread(target=run_lane, args=(freezable_key, True)),
-        threading.Thread(target=run_lane, args=(exempt_key, False)),
+        threading.Thread(
+            target=run_lane,
+            args=(freezable_key, LaneSuspendability.ANYWHERE),
+        ),
+        threading.Thread(
+            target=run_lane, args=(exempt_key, LaneSuspendability.NEVER)
+        ),
     ]
     burners: list[subprocess.Popen[bytes]] = []
     try:

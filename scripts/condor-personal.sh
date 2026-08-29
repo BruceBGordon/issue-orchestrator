@@ -147,9 +147,10 @@ EOF
 #   1. Key on owner load, never total load: SUSPEND over total LoadAvg
 #      would trip on the gate's own lane fan and oscillate against its
 #      own reflection.
-#   2. Only lanes that declared themselves suspendable may freeze - a
-#      live provider exchange frozen mid-turn thaws into a manufactured
-#      provider-outage failure.
+#   2. Only lanes whose declared classification permits it may freeze:
+#      "anywhere" always, "cooperative" only at self-advertised safe
+#      points, "never" never - a live provider exchange frozen mid-turn
+#      thaws into a manufactured provider-outage failure.
 #   3. The compiled lane deadline subtracts CumulativeSuspensionTime,
 #      so frozen time never burns a lane's budget (submit_compiler.py
 #      owns that half of the contract).
@@ -168,10 +169,17 @@ write_load_backoff_config() {
   # the same host (B1, #7118 review — verified live: two busy dynamic
   # slots on one 18-core host advertised LoadAvg 3.16 and 0.0 while
   # TotalLoadAvg was 3.16).
+  # Eligibility is the job's own three-valued classification:
+  # "anywhere" lanes freeze whenever the owner needs the machine;
+  # "cooperative" lanes freeze ONLY while their own chirp
+  # advertisement holds SafeToSuspend true (=?= keeps every undefined
+  # or stale state on the not-frozen side); "never" lanes — and any
+  # job predating the classification vocabulary — match nothing.
   cat > "${config_dir}/91-io-load-backoff.conf" <<EOF
 OwnerLoadAvg = (TotalLoadAvg - TotalCondorLoadAvg)
-WANT_SUSPEND = (TARGET.SuspendableLane =?= True)
-SUSPEND = (\$(OwnerLoadAvg) > ${IO_CONDOR_SUSPEND_LOAD:-5.0}) && (TARGET.SuspendableLane =?= True)
+LaneEligibleToFreeze = ((TARGET.SuspendableLane =?= "anywhere") || ((TARGET.SuspendableLane =?= "cooperative") && (TARGET.SafeToSuspend =?= True)))
+WANT_SUSPEND = \$(LaneEligibleToFreeze)
+SUSPEND = (\$(OwnerLoadAvg) > ${IO_CONDOR_SUSPEND_LOAD:-5.0}) && \$(LaneEligibleToFreeze)
 CONTINUE = (\$(OwnerLoadAvg) < ${IO_CONDOR_CONTINUE_LOAD:-2.0})
 EOF
 }

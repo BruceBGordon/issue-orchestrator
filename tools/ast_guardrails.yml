@@ -20,6 +20,9 @@ layer_boundaries:
       # execution/lane_backends.py, which is why lane_preflight.py
       # needs no exemption.
       - src/issue_orchestrator/entrypoints/cli_tools/lane_run.py
+      # the cooperative-yield pytest plugin composes its own adapter
+      # (chirp yield signal) the same way
+      - src/issue_orchestrator/entrypoints/pytest_cooperative_yield.py
   - name: core_no_github_adapter_imports
     description: "Core control and observation layers must not import GitHub adapters directly"
     deny_in:

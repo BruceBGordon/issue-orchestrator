@@ -15,6 +15,7 @@ file masquerading as configuration.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -32,21 +33,31 @@ class LaneDeclaration(BaseModel):
     ``request_cpus`` is MEASURED demand (busy cores via
     ``/usr/bin/time -l`` on the lane's direct-mode target), never the
     suite's worker count — an I/O-bound suite keeps many workers busy
-    on few cores. ``suspendable`` is required, never defaulted: a lane
-    nobody classified must fail loudly here, not silently opt into or
-    out of machine-load freezing.
+    on few cores. ``suspendability`` is required, never defaulted: a
+    lane nobody classified must fail loudly here, not silently opt
+    into or out of machine-load freezing. Its three values are
+    ``never`` (live provider exchange — frozen mid-turn manufactures a
+    provider-outage failure), ``anywhere`` (hermetic), and
+    ``cooperative`` (freezable only at safe points the running lane
+    advertises itself; degrades to never when no advertisement
+    arrives).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     # strict=True per scalar (C1, #7122 review): lax pydantic coerces
     # `true` to 1, "8" to 8, and 1 to True — a YAML typo could silently
-    # under-request one CPU or flip suspension policy. The exclusive
-    # tuple stays lax only for the YAML-list-to-tuple container step;
-    # its tokens are re-validated strictly by LaneResources.
+    # under-request one CPU or flip suspension policy. The Literal
+    # needs no strict flag (pydantic refuses to stack one): it is an
+    # exact-VALUE check, so a leftover boolean `true` from the
+    # pre-three-value schema, a 1, or a misspelling are all loud
+    # errors, never a guessed mapping — the coercion tests prove each.
+    # The exclusive tuple stays lax only for the YAML-list-to-tuple
+    # container step; its tokens are re-validated strictly by
+    # LaneResources.
     request_cpus: int = Field(ge=1, strict=True)
     memory_mb: int = Field(ge=1, strict=True)
-    suspendable: bool = Field(strict=True)
+    suspendability: Literal["never", "anywhere", "cooperative"]
     exclusive: tuple[str, ...] = ()
 
 
@@ -90,6 +101,6 @@ def load_lane_declaration(worktree: Path, work_key: str) -> LaneDeclaration:
             f"lane {work_key!r} is not declared in "
             f"{worktree / LANES_FILE_RELATIVE} — add a row with its "
             "measured request_cpus, memory_mb, and an explicit "
-            "suspendable classification"
+            "suspendability classification"
         )
     return declaration

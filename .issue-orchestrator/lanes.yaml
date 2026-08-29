@@ -12,10 +12,14 @@
 #                 backend's protection is make's own job graph.
 #   memory_mb     budget for the lane's whole tree; sizes the slot and
 #                 the container's kernel ceiling where enforced.
-#   suspendable   REQUIRED, both ways explicit: hermetic lanes freeze
-#                 and thaw safely under machine-load backoff; a lane
-#                 holding a live provider exchange must never be
-#                 frozen mid-turn.
+#   suspendability REQUIRED, three values explicit: `never` (a lane
+#                 holding a live provider exchange must never be frozen
+#                 mid-turn), `anywhere` (hermetic lanes freeze and thaw
+#                 safely under machine-load backoff), `cooperative`
+#                 (freezable only at safe points the running lane
+#                 advertises itself — e.g. between test items via the
+#                 pytest_cooperative_yield plugin; no advertisement
+#                 means never-frozen, the fail-safe direction).
 #
 # Measurements 2026-08-28 (18-core host): test-unit 8.0 busy cores at
 # 12 workers; typecheck 1.8; integration slice 0.85 at 4 workers
@@ -29,51 +33,51 @@ lanes:
   typecheck:
     request_cpus: 2 # measured 1.8
     memory_mb: 4096
-    suspendable: true
+    suspendability: anywhere
   test-unit:
     request_cpus: 8 # measured 8.0 at 12 workers
     memory_mb: 6144
-    suspendable: true
+    suspendability: anywhere
   test-simulated-core:
     request_cpus: 7 # measured 6.6 — spawns orchestrator subprocesses
     memory_mb: 2048
-    suspendable: true
+    suspendability: anywhere
   test-simulated-agent:
     request_cpus: 2 # unmeasured; historical
     memory_mb: 1024
-    suspendable: true
+    suspendability: anywhere
   test-integration-core-local:
     request_cpus: 4 # unmeasured; historical
     memory_mb: 3072
-    suspendable: true
+    suspendability: anywhere
   test-integration-core-slice-1:
     request_cpus: 2 # measured 0.85 at 4 workers; headroom for bursts
     memory_mb: 2048
-    suspendable: true
+    suspendability: anywhere
   test-integration-core-slice-2:
     request_cpus: 2 # slices are homogeneous by construction
     memory_mb: 2048
-    suspendable: true
+    suspendability: anywhere
   test-integration-core-slice-3:
     request_cpus: 2
     memory_mb: 2048
-    suspendable: true
+    suspendability: anywhere
   test-integration-agent:
     request_cpus: 4 # unmeasured; historical
     memory_mb: 2048
-    suspendable: false
+    suspendability: never
   test-integration-agent-claude:
     request_cpus: 1 # provider-wait dominated
     memory_mb: 1024
-    suspendable: false
+    suspendability: never
   test-integration-agent-codex:
     request_cpus: 1
     memory_mb: 1024
-    suspendable: false
+    suspendability: never
   test-integration-agent-chain:
     request_cpus: 1
     memory_mb: 1024
-    suspendable: false
+    suspendability: never
   # Kernel-ceiling proof lanes, submitted by docker/execenv/selftest.sh
   # (not the Makefile): the same 400MB allocation must SUCCEED under
   # the first budget and be kernel-killed under the second — the
@@ -82,8 +86,8 @@ lanes:
   execenv.memory-ok:
     request_cpus: 1
     memory_mb: 1024
-    suspendable: false
+    suspendability: never
   execenv.memory-oom:
     request_cpus: 1
     memory_mb: 128
-    suspendable: false
+    suspendability: never

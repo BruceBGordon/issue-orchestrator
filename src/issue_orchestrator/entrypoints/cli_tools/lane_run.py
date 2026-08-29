@@ -36,6 +36,7 @@ from ...domain.lane_execution import (
     LaneExecutorError,
     LaneExecutorUnavailableError,
     LaneResources,
+    LaneSuspendability,
     LaneTimedOut,
     LaneWorkKey,
 )
@@ -99,7 +100,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 exclusive=declaration.exclusive,
                 priority=priority,
                 request_memory_mb=declaration.memory_mb,
-                suspendable=declaration.suspendable,
+                suspendability=LaneSuspendability(declaration.suspendability),
             ),
         )
     except LaneDeclarationError as error:
