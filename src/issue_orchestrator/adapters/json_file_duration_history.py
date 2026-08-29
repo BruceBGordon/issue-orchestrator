@@ -40,6 +40,7 @@ import os
 import re
 import statistics
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -203,7 +204,10 @@ class JsonFileDurationHistory:
             # whole point of the pin is that it wins for everyone.
             published = self._read_pinned(pinned_path)
             if published is not None:
-                self._ensure_ledgered(epoch, pinned_path)
+                # A sibling slice published between our miss and our
+                # turn at the lock. Repair under the lock we already
+                # hold — taking it again would deadlock this thread.
+                self._ensure_ledgered_while_locked(epoch, pinned_path)
                 return published
             document = self._read_document()
             if epoch in document.pinned_epochs:
@@ -259,22 +263,41 @@ class JsonFileDurationHistory:
         return weights
 
     def _ensure_ledgered(self, epoch: str, pinned_path: Path) -> None:
-        """Durably record an epoch whose snapshot exists unrecorded.
+        """Durably record an unrecorded snapshot. Caller holds no lock.
 
-        Two things leave one: a store written before the ledger
-        existed, and — until the ordering above shipped — a publish
-        that died between its writes. Repairing on the way past is what
-        stops such a snapshot from decaying into a silent recompute
-        once retention reclaims it.
+        Two things leave a snapshot the ledger never recorded: a store
+        written before the ledger existed, and — until the write
+        ordering shipped — a publish that died between its writes.
+        Repairing on the way past is what stops such a snapshot from
+        decaying into a silent recompute once retention reclaims it.
+
+        This is the entry point for callers OUTSIDE the lock. The one
+        inside it must call :meth:`_ensure_ledgered_while_locked`
+        instead; acquiring the directory lock twice in one thread
+        blocks forever, because each acquisition opens its own file
+        description.
         """
         if epoch in self._read_document().pinned_epochs:
             return
         with self._locked():
-            document = self._read_document()
-            if epoch in document.pinned_epochs:
-                return
-            document.pinned_epochs[epoch] = self._pin_publish_time(pinned_path)
-            self._write_document(document)
+            self._ensure_ledgered_while_locked(epoch, pinned_path)
+
+    def _ensure_ledgered_while_locked(self, epoch: str, pinned_path: Path) -> None:
+        """The repair itself. The caller MUST already hold the lock.
+
+        Re-reads under the lock before writing, so it is correct
+        whether it was reached from the unlocked wrapper (which just
+        acquired) or from a locked section that discovered the
+        snapshot on its own re-read.
+        """
+        document = self._read_document()
+        if epoch in document.pinned_epochs:
+            return
+        document.pinned_epochs[epoch] = self._pin_publish_time(pinned_path)
+        # Durable before the snapshot is handed back: _write_document
+        # fsyncs the payload and the directory entry, so a reader that
+        # returns has already made the record survive a power cut.
+        self._write_document(document)
 
     def _pin_publish_time(self, pinned_path: Path) -> float:
         """The best honest date for a snapshot being ledgered late."""
@@ -587,11 +610,37 @@ class _DirectoryLock:
     data file would race across the inodes ``os.replace`` swaps in.
     """
 
+    # Which lock files this thread already holds. flock is owned by the
+    # open file description, not the process, so a second acquisition
+    # from the same thread waits on the first and never wakes. That
+    # made a nested call hang a gate lane silently until its deadline;
+    # naming it here turns the worst failure mode this store has —
+    # an invisible stall — into an immediate, named error. It is not a
+    # reentrant lock: nesting stays forbidden, it just says so.
+    _held_by_thread = threading.local()
+
     def __init__(self, path: Path) -> None:
         self._path = path
         self._handle: TextIO | None = None
 
+    @classmethod
+    def _held(cls) -> set[str]:
+        held = cast("set[str] | None", getattr(cls._held_by_thread, "paths", None))
+        if held is not None:
+            return held
+        fresh: set[str] = set()
+        cls._held_by_thread.paths = fresh
+        return fresh
+
     def __enter__(self) -> "_DirectoryLock":
+        key = str(self._path)
+        held = self._held()
+        if key in held:
+            raise FileDurationHistoryError(
+                f"the file duration history lock at {self._path} is already held "
+                "by this thread; acquiring it again would block forever. A "
+                "caller inside the lock must use the *_while_locked variant."
+            )
         try:
             self._handle = open(self._path, "w")
             fcntl.flock(self._handle, fcntl.LOCK_EX)
@@ -599,9 +648,11 @@ class _DirectoryLock:
             raise FileDurationHistoryError(
                 f"cannot lock file duration history at {self._path}: {error}"
             ) from error
+        held.add(key)
         return self
 
     def __exit__(self, *_: object) -> None:
+        self._held().discard(str(self._path))
         if self._handle is not None:
             self._handle.close()
             self._handle = None

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
+import signal
 import time
 from pathlib import Path
+from typing import Iterator
 
 import pytest
 
@@ -623,6 +626,140 @@ def test_repairing_the_ledger_needs_no_second_visit(tmp_path: Path) -> None:
     pin_path(tmp_path, "legacy-gate").unlink()
     with pytest.raises(PinnedEpochExpiredError):
         store(tmp_path).pinned_weights("legacy-gate")
+
+
+# --- who holds the lock when repair runs --------------------------------------
+
+
+class WatchdogExpired(Exception):
+    """Deliberately not an OSError.
+
+    TimeoutError is one, so a watchdog raised as TimeoutError gets
+    caught by the store's own ``except OSError`` and re-reported as a
+    lock failure — the deadlock would still fail the test, but under a
+    misleading name.
+    """
+
+
+@contextlib.contextmanager
+def fails_instead_of_hanging(seconds: float = 5.0) -> Iterator[None]:
+    """Bound a call a regression would block on forever.
+
+    This is not timing-based coordination — nothing waits on the alarm
+    when the code is correct. It exists because the failure it guards
+    is an invisible stall: a nested lock acquisition never returns, so
+    without a bound a regression would hang the suite (and, in a gate,
+    burn the whole lane deadline in silence) instead of failing.
+    """
+
+    def expire(signum: int, frame: object) -> None:
+        del signum, frame
+        raise WatchdogExpired(
+            "call never returned - a nested directory-lock acquisition deadlocks"
+        )
+
+    previous = signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_a_sibling_publishing_while_we_wait_for_the_lock_does_not_deadlock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The repair path reached from INSIDE the lock.
+
+    A sibling slice publishes between this process's miss and its turn
+    at the lock, so the locked re-read finds a snapshot — possibly one
+    no ledger records — and must repair it while already holding the
+    lock. Repairing through the unlocked entry point instead asks for
+    the same lock a second time, and flock belongs to the open file
+    description rather than the process, so the second acquisition
+    waits on the first and never wakes.
+
+    The earlier repair tests only ever discovered a snapshot on the
+    unlocked fast path, which is why they never reached this.
+    """
+    history = store(tmp_path)
+    history.record_success({"tests/x/test_a.py": 5.0})
+
+    real_flock = adapter.fcntl.flock
+    published: list[str] = []
+
+    def a_sibling_publishes_just_before_we_get_the_lock(
+        handle: object, operation: int
+    ) -> None:
+        real_flock(handle, operation)  # pyright: ignore[reportArgumentType]
+        if published:
+            return
+        published.append("raced-gate")
+        write_pin(
+            tmp_path,
+            "raced-gate",
+            json.dumps(
+                {"weights": {"tests/x/test_a.py": 5.0}, "published_at": time.time()}
+            ),
+        )
+
+    monkeypatch.setattr(
+        adapter.fcntl, "flock", a_sibling_publishes_just_before_we_get_the_lock
+    )
+
+    with fails_instead_of_hanging():
+        weights = history.pinned_weights("raced-gate")
+
+    assert weights == {"tests/x/test_a.py": 5.0}
+    assert published == ["raced-gate"], "the race never happened - probe broken"
+
+    # The repair was durable before the snapshot was handed back.
+    document = json.loads(
+        (store_directory(tmp_path) / "history.json").read_text(encoding="utf-8")
+    )
+    assert "raced-gate" in document["pinned_epochs"]
+
+    # And it holds: once retention reclaims that snapshot the epoch is
+    # refused, not silently recomputed.
+    pin_path(tmp_path, "raced-gate").unlink()
+    history.record_success({"tests/x/test_b.py": 900.0})
+    with fails_instead_of_hanging():
+        with pytest.raises(PinnedEpochExpiredError):
+            history.pinned_weights("raced-gate")
+
+
+def test_a_nested_lock_acquisition_is_refused_not_hung(tmp_path: Path) -> None:
+    """One owner, one discipline, and a named error the moment anyone
+    breaks it — rather than the stall that hid this defect."""
+    lock_path = tmp_path / "guard.lock"
+    with fails_instead_of_hanging():
+        with adapter._DirectoryLock(lock_path):  # noqa: SLF001
+            with pytest.raises(FileDurationHistoryError, match="already held"):
+                with adapter._DirectoryLock(lock_path):  # noqa: SLF001
+                    pass
+
+
+def test_the_lock_is_reusable_after_release(tmp_path: Path) -> None:
+    """The nesting guard must not leak: a released lock is takeable
+    again, or the second gate on this store would fail spuriously."""
+    lock_path = tmp_path / "guard.lock"
+    with fails_instead_of_hanging():
+        for _ in range(3):
+            with adapter._DirectoryLock(lock_path):  # noqa: SLF001
+                pass
+
+
+def test_a_failed_acquisition_does_not_mark_the_lock_held(tmp_path: Path) -> None:
+    """A lock that could not be taken must not look taken afterwards."""
+    missing = tmp_path / "no-such-directory" / "guard.lock"
+    with pytest.raises(FileDurationHistoryError, match="cannot lock"):
+        with adapter._DirectoryLock(missing):  # noqa: SLF001
+            pass
+    (tmp_path / "no-such-directory").mkdir()
+    with fails_instead_of_hanging():
+        with adapter._DirectoryLock(missing):  # noqa: SLF001
+            pass
 
 
 # --- corrupt state is loud ----------------------------------------------------
