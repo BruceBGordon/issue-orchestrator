@@ -88,6 +88,22 @@ class DirectLaneExecutor:
         observed_runtime = time.monotonic() - started_at
         # No scheduler, no queue: the lane started the moment it was
         # asked to, so the queue wait is identically zero.
+        #
+        # CPU demand is deliberately NOT measured here, and this
+        # backend reports no busy-cores figure at all. It could — the
+        # lane is a direct child, so getrusage(RUSAGE_CHILDREN) around
+        # the wait would give an exact number — but the number would
+        # be wrong for its only consumer. Busy cores is CPU-seconds
+        # over WALL time, and the direct path runs lanes concurrently
+        # out of make's own job graph: contention leaves the numerator
+        # unchanged while inflating the denominator, so every
+        # measurement comes out systematically LOW. Learned evidence
+        # may only lower a request, so feeding deflated numbers into
+        # the loop would quietly shrink every lane's request and
+        # oversubscribe the scheduler that consumes it — a backend
+        # this one never even talks to. The rule is: only a backend
+        # whose measuring conditions match the consumer of the number
+        # reports one, so the scheduler learns from itself.
         if exit_code < 0:
             # Signal death reports as 128+N in every backend.
             return LaneCompleted(128 - exit_code, observed_runtime, 0.0)

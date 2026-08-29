@@ -12,6 +12,7 @@ from issue_orchestrator.adapters.jsonl_lane_dispatch_journal import (
     InertLaneDispatchJournal,
     JsonlLaneDispatchJournal,
 )
+from issue_orchestrator.domain.lane_cpu_request import LaneCpuRequest
 from issue_orchestrator.domain.lane_execution import LaneWorkKey
 from issue_orchestrator.ports.lane_dispatch_journal import (
     LaneDispatchJournalError,
@@ -31,7 +32,11 @@ _MACHINE_STATE = MachineState(
 )
 
 
-def _record(exit_code: int = 0) -> LaneDispatchRecord:
+def _record(
+    exit_code: int = 0,
+    cpu_request: LaneCpuRequest | None = None,
+    observed_busy_cores: float | None = 7.5,
+) -> LaneDispatchRecord:
     return LaneDispatchRecord(
         work_key=LaneWorkKey("test-unit"),
         backend="condor",
@@ -40,6 +45,8 @@ def _record(exit_code: int = 0) -> LaneDispatchRecord:
         observed_runtime_seconds=45.0,
         exit_code=exit_code,
         machine_state=_MACHINE_STATE,
+        cpu_request=cpu_request or LaneCpuRequest.resolve(8, 6.2),
+        observed_busy_cores=observed_busy_cores,
     )
 
 
@@ -59,6 +66,42 @@ def test_records_append_as_one_json_row_each(tmp_path: Path) -> None:
     assert first["queue_wait_seconds"] == 12.0
     assert first["observed_runtime_seconds"] == 45.0
     assert first["recorded_at"]
+    # The sizing decision lands as flat sibling columns so the
+    # measured-vs-declared divergence is one jq expression away.
+    assert first["declared_cpus"] == 8
+    assert first["request_cpus"] == 7
+    assert first["learned_busy_cores"] == 6.2
+    assert first["observed_busy_cores"] == 7.5
+    assert first["cpu_request_capped"] is False
+
+
+def test_unmeasured_dimensions_stay_null_never_zero(tmp_path: Path) -> None:
+    """A run nobody measured must not serialize as 0.0 cores: a reader
+    aggregating the column would treat the lane as free."""
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    journal.record(
+        _record(
+            cpu_request=LaneCpuRequest.resolve(4, None),
+            observed_busy_cores=None,
+        )
+    )
+    row = json.loads((tmp_path / "lane-dispatch.jsonl").read_text().strip())
+    assert row["learned_busy_cores"] is None
+    assert row["observed_busy_cores"] is None
+    assert row["request_cpus"] == 4
+
+
+def test_capped_evidence_is_visible_in_the_record(tmp_path: Path) -> None:
+    """A lane whose evidence exceeded its declaration was REFUSED that
+    capacity. The refusal has to be greppable, or a real change in
+    demand looks identical to agreement."""
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    journal.record(_record(cpu_request=LaneCpuRequest.resolve(2, 16.0)))
+    row = json.loads((tmp_path / "lane-dispatch.jsonl").read_text().strip())
+    assert row["declared_cpus"] == 2
+    assert row["request_cpus"] == 2
+    assert row["learned_busy_cores"] == 16.0
+    assert row["cpu_request_capped"] is True
 
 
 def test_every_row_carries_the_machine_state_envelope(tmp_path: Path) -> None:
@@ -97,6 +140,8 @@ def test_a_record_without_a_reading_is_rejected() -> None:
             observed_runtime_seconds=1.0,
             exit_code=0,
             machine_state=None,  # type: ignore[arg-type]
+            cpu_request=LaneCpuRequest.resolve(1, None),
+            observed_busy_cores=None,
         )
 
 
@@ -273,6 +318,8 @@ def test_record_validation_rejects_nonsense() -> None:
             observed_runtime_seconds=1.0,
             exit_code=0,
             machine_state=_MACHINE_STATE,
+            cpu_request=LaneCpuRequest.resolve(1, None),
+            observed_busy_cores=None,
         )
     with pytest.raises(ValueError, match="queue_wait_seconds"):
         LaneDispatchRecord(
@@ -283,6 +330,8 @@ def test_record_validation_rejects_nonsense() -> None:
             observed_runtime_seconds=1.0,
             exit_code=0,
             machine_state=_MACHINE_STATE,
+            cpu_request=LaneCpuRequest.resolve(1, None),
+            observed_busy_cores=None,
         )
     with pytest.raises(ValueError, match="backend"):
         LaneDispatchRecord(
@@ -293,6 +342,32 @@ def test_record_validation_rejects_nonsense() -> None:
             observed_runtime_seconds=1.0,
             exit_code=0,
             machine_state=_MACHINE_STATE,
+            cpu_request=LaneCpuRequest.resolve(1, None),
+            observed_busy_cores=None,
+        )
+    with pytest.raises(ValueError, match="observed_busy_cores"):
+        LaneDispatchRecord(
+            work_key=LaneWorkKey("test-unit"),
+            backend="condor",
+            priority=0,
+            queue_wait_seconds=0.0,
+            observed_runtime_seconds=1.0,
+            exit_code=0,
+            machine_state=_MACHINE_STATE,
+            cpu_request=LaneCpuRequest.resolve(1, None),
+            observed_busy_cores=float("inf"),
+        )
+    with pytest.raises(ValueError, match="cpu_request"):
+        LaneDispatchRecord(
+            work_key=LaneWorkKey("test-unit"),
+            backend="condor",
+            priority=0,
+            queue_wait_seconds=0.0,
+            observed_runtime_seconds=1.0,
+            exit_code=0,
+            machine_state=_MACHINE_STATE,
+            cpu_request=4,  # type: ignore[arg-type]
+            observed_busy_cores=None,
         )
 
 

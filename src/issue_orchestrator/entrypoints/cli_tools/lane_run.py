@@ -18,6 +18,7 @@ import argparse
 import os
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -26,6 +27,7 @@ from ...adapters.jsonl_lane_dispatch_journal import (
     InertLaneDispatchJournal,
     JsonlLaneDispatchJournal,
 )
+from ...domain.lane_cpu_request import LaneCpuRequest
 from ...domain.lane_execution import (
     LaneCommand,
     LaneCompleted,
@@ -88,23 +90,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         executor = build_lane_executor(str(arguments.backend))
         history = build_runtime_history()
         journal = _build_journal()
-        work_key = LaneWorkKey(str(arguments.work_key))
         # Scheduling facts are declared in ONE place —
         # .issue-orchestrator/lanes.yaml — resolved here by the
         # lane's logical work key. The Makefile carries commands and
         # work keys only.
+        work_key = LaneWorkKey(str(arguments.work_key))
         declaration = _load_declaration(work_key.value)
-        # Dispatch order is learned, never declared: the rolling
-        # median of this lane's past runtimes (LPT — longer
-        # lanes first). Zero history means priority 0, exactly
-        # the naive first run.
-        priority = history.learned_priority(work_key)
+        dispatch = _decide_dispatch(
+            work_key, str(arguments.backend), declaration, history
+        )
         outcome = executor.run(
             _build_command(arguments),
             LaneResources(
-                request_cpus=declaration.request_cpus,
+                request_cpus=dispatch.cpu_request.request_cpus,
                 exclusive=declaration.exclusive,
-                priority=priority,
+                priority=dispatch.priority,
                 request_memory_mb=declaration.memory_mb,
                 suspendability=LaneSuspendability(declaration.suspendability),
             ),
@@ -125,9 +125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"lane-run: {error}", file=sys.stderr)
         return _BACKEND_FAULT_EXIT_CODE
     if type(outcome) is LaneCompleted:
-        return _conclude_completed(
-            arguments, priority, history, journal, work_key, outcome
-        )
+        return _conclude_completed(dispatch, history, journal, outcome)
     if type(outcome) is LaneTimedOut:
         print(
             f"lane-run: lane {arguments.work_key!r} exceeded its "
@@ -139,34 +137,80 @@ def main(argv: Sequence[str] | None = None) -> int:
     raise AssertionError("lane outcome is a closed union")
 
 
+@dataclass(frozen=True, slots=True)
+class _LaneDispatch:
+    """Everything this invocation decided before the lane ran.
+
+    Bundled rather than passed as loose scalars so the decision and
+    its evidence travel together into the log, the journal, and the
+    learning loop — the three consumers that must agree about what
+    was submitted and why.
+    """
+
+    work_key: LaneWorkKey
+    backend: str
+    priority: int
+    cpu_request: LaneCpuRequest
+
+
+def _decide_dispatch(
+    work_key: LaneWorkKey,
+    backend: str,
+    declaration: LaneDeclaration,
+    history: LaneRuntimeHistory,
+) -> _LaneDispatch:
+    """Turn the declaration plus learned history into one submission.
+
+    Both learned dimensions are consumed here and nowhere else:
+
+    - Dispatch order is learned, never declared: the rolling median of
+      this lane's past runtimes (LPT — longer lanes first). Zero
+      history means priority 0, exactly the naive first run.
+    - CPU demand starts at the declared value and may only be lowered
+      by evidence. The declaration is the seed AND the ceiling; the
+      policy itself lives in LaneCpuRequest so no caller can grow a
+      second version of it.
+    """
+    return _LaneDispatch(
+        work_key=work_key,
+        backend=backend,
+        priority=history.learned_priority(work_key),
+        cpu_request=LaneCpuRequest.resolve(
+            declaration.request_cpus, history.learned_busy_cores(work_key)
+        ),
+    )
+
+
 def _conclude_completed(
-    arguments: argparse.Namespace,
-    priority: int,
+    dispatch: _LaneDispatch,
     history: LaneRuntimeHistory,
     journal: LaneDispatchJournal,
-    work_key: LaneWorkKey,
     outcome: LaneCompleted,
 ) -> int:
     """Record what the completed lane teaches, then report its exit.
 
-    The stderr line puts priority, queue wait, and runtime in the gate
-    log where a reader already is; the journal (a behavior-level port)
-    owns persistence and its failure semantics. Failed lanes are
-    journaled too — a kill's dispatch facts are diagnosis, even though
-    only successes feed the learning loop."""
+    The stderr line puts priority, queue wait, runtime, and the sizing
+    decision in the gate log where a reader already is; the journal (a
+    behavior-level port) owns persistence and its failure semantics.
+    Failed lanes are journaled too — a kill's dispatch facts are
+    diagnosis, even though only successes feed the learning loop."""
+    request = dispatch.cpu_request
     print(
-        f"[lane-dispatch] {arguments.work_key} backend={arguments.backend} "
-        f"priority={priority} queue_wait={outcome.queue_wait_seconds:.1f}s "
+        f"[lane-dispatch] {dispatch.work_key.value} backend={dispatch.backend} "
+        f"priority={dispatch.priority} "
+        f"queue_wait={outcome.queue_wait_seconds:.1f}s "
         f"runtime={outcome.observed_runtime_seconds:.1f}s "
-        f"exit={outcome.exit_code}",
+        f"exit={outcome.exit_code} "
+        f"request_cpus={request.request_cpus}/{request.declared_cpus} "
+        f"busy_cores={_format_busy_cores(outcome.observed_busy_cores)}",
         file=sys.stderr,
     )
     try:
         journal.record(
             LaneDispatchRecord(
-                work_key=work_key,
-                backend=str(arguments.backend),
-                priority=priority,
+                work_key=dispatch.work_key,
+                backend=dispatch.backend,
+                priority=dispatch.priority,
                 queue_wait_seconds=outcome.queue_wait_seconds,
                 observed_runtime_seconds=outcome.observed_runtime_seconds,
                 exit_code=outcome.exit_code,
@@ -179,6 +223,8 @@ def _conclude_completed(
                 machine_state=sample_machine_state_from(
                     _build_machine_state_sampler
                 ),
+                cpu_request=request,
+                observed_busy_cores=outcome.observed_busy_cores,
             )
         )
     except LaneDispatchJournalError as error:
@@ -186,13 +232,26 @@ def _conclude_completed(
         return _BACKEND_FAULT_EXIT_CODE
     if outcome.exit_code == 0:
         # Only successes teach: a failed run's duration is the
-        # failure's, not the lane's.
+        # failure's, not the lane's. The CPU dimension rides the same
+        # rule and the same call — a backend that did not measure
+        # passes None, which records a runtime and nothing else.
         try:
-            history.record_success(work_key, outcome.observed_runtime_seconds)
+            history.record_success(
+                dispatch.work_key,
+                outcome.observed_runtime_seconds,
+                outcome.observed_busy_cores,
+            )
         except LaneRuntimeHistoryError as error:
             print(f"lane-run: {error}", file=sys.stderr)
             return _BACKEND_FAULT_EXIT_CODE
     return outcome.exit_code
+
+
+def _format_busy_cores(measured: float | None) -> str:
+    """An unmeasured run says so; it never prints a 0.00 it did not see."""
+    if measured is None:
+        return "unmeasured"
+    return f"{measured:.2f}"
 
 
 def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -269,12 +328,22 @@ def build_runtime_history() -> LaneRuntimeHistory:
 class _InertLaneRuntimeHistory:
     """No-repo stand-in: always naive, never persists."""
 
-    def record_success(self, work_key: LaneWorkKey, runtime_seconds: float) -> None:
-        del work_key, runtime_seconds
+    def record_success(
+        self,
+        work_key: LaneWorkKey,
+        runtime_seconds: float,
+        busy_cores: float | None,
+    ) -> None:
+        del work_key, runtime_seconds, busy_cores
 
     def learned_priority(self, work_key: LaneWorkKey) -> int:
         del work_key
         return 0
+
+    def learned_busy_cores(self, work_key: LaneWorkKey) -> float | None:
+        del work_key
+        # Nothing known: the declared seed answers, as on a first run.
+        return None
 
 
 def _build_command(arguments: argparse.Namespace) -> LaneCommand:

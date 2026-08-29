@@ -11,8 +11,9 @@ edit this file, making the widening a deliberate, reviewed decision.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 
-from issue_orchestrator.domain import lane_execution
+from issue_orchestrator.domain import lane_cpu_request, lane_execution
 from issue_orchestrator.ports import lane_dispatch_journal, machine_state
 from issue_orchestrator.ports.lane_executor import LaneExecutor
 from issue_orchestrator.ports.lane_policy_check import LanePolicyCheck
@@ -57,8 +58,25 @@ def test_lane_outcome_surfaces_are_pinned() -> None:
         # visible per lane without pool archaeology. Backend-agnostic:
         # the direct backend reports 0.0.
         "queue_wait_seconds",
+        # Deliberate widening (#7131): measured CPU demand, the second
+        # thing a run teaches. Optional by design — None means "this
+        # backend did not measure this run", a third state distinct
+        # from a measured zero. Precedent: queue_wait_seconds above.
+        "observed_busy_cores",
     )
     assert _field_names(lane_execution.LaneTimedOut) == ("elapsed_seconds",)
+
+
+def test_cpu_request_surface_is_pinned() -> None:
+    """New contract (#7131): the sizing decision travels as one value
+    object, keeping declared/learned/submitted together. A record that
+    carried only the winner could not distinguish "no history" from
+    "history agrees", nor show a capped divergence at all."""
+    assert _field_names(lane_cpu_request.LaneCpuRequest) == (
+        "declared_cpus",
+        "learned_busy_cores",
+        "request_cpus",
+    )
 
 
 def test_executor_port_has_exactly_one_operation() -> None:
@@ -95,6 +113,11 @@ def test_dispatch_journal_surface_is_pinned() -> None:
         # the ambiguity. Measurement only — nothing may schedule,
         # order, or gate on it.
         "machine_state",
+        # Deliberate widening (#7131): the whole sizing decision and
+        # what the run then used, so measured-vs-declared divergence
+        # is readable from the journal without re-deriving either side.
+        "cpu_request",
+        "observed_busy_cores",
     )
 
 
@@ -153,10 +176,23 @@ def test_machine_state_surface_is_pinned() -> None:
     assert operations == ["sample"]
 
 
-def test_history_port_has_exactly_two_operations() -> None:
+def test_history_port_operations_are_pinned() -> None:
+    """Deliberate widening (#7131): the store learns a SECOND dimension
+    of the same run — how much CPU the lane kept busy, which sizes its
+    admission request, alongside how long it ran, which orders
+    dispatch. One more reader (learned_busy_cores) and one more
+    argument on the writer, both named so a caller must decide rather
+    than default into recording a zero it never observed."""
     operations = sorted(
         name
         for name in vars(LaneRuntimeHistory)
         if not name.startswith("_") and callable(getattr(LaneRuntimeHistory, name))
     )
-    assert operations == ["learned_priority", "record_success"]
+    assert operations == [
+        "learned_busy_cores",
+        "learned_priority",
+        "record_success",
+    ]
+    assert tuple(
+        inspect.signature(LaneRuntimeHistory.record_success).parameters
+    ) == ("self", "work_key", "runtime_seconds", "busy_cores")

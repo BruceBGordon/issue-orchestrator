@@ -17,6 +17,7 @@ from ...domain.lane_execution import (
     LaneResources,
     LaneSuspendability,
 )
+from .rusage_report import RUSAGE_FILE_NAME, compile_rusage_capture
 
 # Grace between the scheduler's soft kill and its hard kill when a job
 # is removed (deadline or cancellation). Mirrors the direct backend's
@@ -32,6 +33,9 @@ class CompiledSubmitDescription:
     (``exec_script_text``) rather than the scheduler's line-oriented
     ``arguments`` syntax, which cannot carry newlines — and lane
     commands legitimately contain them (``python -c`` scripts).
+
+    ``rusage_path`` is where that shim leaves the lane's CPU report,
+    collected from the run directory exactly like the event log.
     """
 
     text: str
@@ -40,6 +44,7 @@ class CompiledSubmitDescription:
     output_path: Path
     error_path: Path
     event_log_path: Path
+    rusage_path: Path
 
 
 def compile_submit_description(
@@ -71,6 +76,7 @@ def compile_submit_description(
     error_path = run_directory / "lane.err"
     event_log_path = run_directory / "lane.events"
     exec_script_path = run_directory / "lane.exec"
+    rusage_path = run_directory / RUSAGE_FILE_NAME
     # Ceiling, never floor: a floored deadline would let the scheduler
     # remove a lane before its promised budget elapsed.
     timeout = max(1, math.ceil(command.deadline.timeout_seconds))
@@ -137,18 +143,43 @@ def compile_submit_description(
     return CompiledSubmitDescription(
         text="\n".join(lines) + "\n",
         exec_script_path=exec_script_path,
-        exec_script_text=_compile_exec_script(command.arguments),
+        exec_script_text=_compile_exec_script(command.arguments, rusage_path),
         output_path=output_path,
         error_path=error_path,
         event_log_path=event_log_path,
+        rusage_path=rusage_path,
     )
 
 
-def _compile_exec_script(arguments: tuple[str, ...]) -> str:
-    """Compile the exact argv into a POSIX-sh exec shim.
+def _compile_exec_script(arguments: tuple[str, ...], rusage_path: Path) -> str:
+    """Compile the exact argv into a POSIX-sh shim that also measures.
 
     ``shlex.quote`` escaping survives spaces, quotes, and newlines,
     so the lane runs with byte-exact arguments.
+
+    The shim runs the lane instead of ``exec``-ing it, because a
+    process that has replaced itself cannot report anything afterwards
+    and the CPU measurement has to come from the shell that waited for
+    the lane. The consequences are deliberate:
+
+    - The lane's exit status is captured and re-raised verbatim,
+      signal deaths (128+N) included, so nothing downstream can tell
+      the difference.
+    - The shim becomes the lane's parent rather than the lane itself.
+      Deadline removal and suspension still reach the lane because the
+      scheduler signals the whole process family, not one pid — the
+      same tracking whose one documented hole on macOS is a
+      ``setsid``-detached grandchild (ADR-0001), which a plain child
+      is not.
+    - The report is written on the way out and its failure is
+      swallowed: a lane that ran correctly must never fail over its
+      own instrumentation.
     """
     quoted = " ".join(shlex.quote(argument) for argument in arguments)
-    return f"#!/bin/sh\nexec {quoted}\n"
+    return (
+        "#!/bin/sh\n"
+        f"{quoted}\n"
+        "__lane_status=$?\n"
+        f"{compile_rusage_capture(rusage_path)}"
+        'exit "$__lane_status"\n'
+    )

@@ -186,7 +186,12 @@ declared lane no target submits is a dead row).
 Workers and requests are different numbers on purpose: most lanes are
 I/O-bound (an integration slice keeps 4 workers busy on 0.85 cores),
 so requesting worker-count cores rations capacity that is mostly
-phantom. Measure with
+phantom.
+
+The declared `request_cpus` is the **seed and the ceiling**, not the
+truth — lanes measure themselves and the request follows (see
+[Learned CPU requests](#learned-cpu-requests)). To seed a brand-new
+lane by hand, measure with
 `/usr/bin/time -l gmake <lane-target> LANE_EXECUTOR=direct` — busy
 cores = (user+sys)/wall — and record the result in `lanes.yaml`.
 
@@ -351,8 +356,58 @@ constant to go stale in the source.
   next gate seeds them again. A corrupt store fails loudly (the message
   names the file) rather than silently reverting to a guess.
 
+## Learned CPU requests
+
+Lanes measure their own CPU demand the same way they measure their own
+duration. Each scheduled lane's exec shim reports the CPU its process
+tree burned (the POSIX `times` built-in, written to `lane.rusage` in
+the run directory and collected like the event log); busy cores =
+CPU-seconds / observed runtime. Successes record it beside the runtime
+in the same per-lane history file, and the next submission requests
+`ceil(rolling median)`, floored at one core.
+
+The measurement is taken in the shim rather than read from the
+scheduler because the scheduler's own CPU attributes report a flat 0.0
+on the macOS pool, which has no cgroups to account against. Doing it
+in the shim makes the mechanism identical on every platform.
+
+The declaration governs in both directions, asymmetrically:
+
+- **Empty history submits the declared value**, unchanged. A lane
+  nobody has measured behaves exactly as before.
+- **Evidence may only lower the request.** A lane measuring under its
+  declaration hands capacity back to the pool.
+- **Evidence may never raise it.** A lane suddenly "measuring" sixteen
+  cores is far likelier to be a broken measurement than a lane that
+  got eight times hungrier, and granting that would drain the pool.
+  The divergence is recorded (`cpu_request_capped` in the dispatch
+  journal) so a *sustained* rise shows up as evidence for a human to
+  act on by editing `lanes.yaml` — deliberately, not automatically.
+- **Only the scheduling backend measures.** The direct backend runs
+  lanes concurrently out of make's own job graph, which inflates wall
+  time without changing CPU time and so under-measures busy cores
+  systematically. Since evidence may only lower a request, feeding
+  those numbers in would quietly shrink every request and
+  oversubscribe the pool. Only a backend whose measuring conditions
+  match the consumer of the number reports one.
+- **Short lanes abstain.** The scheduler's event log carries
+  whole-second timestamps, so a lane finishing inside a second has no
+  denominator to divide by and teaches nothing.
+
+Known limitation while only the downward path exists: a measurement
+taken while the lane was starved of CPU looks exactly like a lane that
+wants less, and lowers the request permanently — a lane that needed
+eight cores but got four on a busy host learns "four", and four is
+then all it can ever measure. Watch for it in
+`lane-dispatch.jsonl`: a lane whose `request_cpus` has walked away
+from its `declared_cpus` over successive runs while
+`observed_busy_cores` tracks the request rather than sitting below it
+is stuck, not tuned. Delete that lane's file from the history
+directory to reset it to the declared seed.
+
 Every completed lane also reports its dispatch facts — the priority it
-ran with, how long it queued, how long it executed — as a
+ran with, how long it queued, how long it executed, what it requested
+against what was declared, and what it actually used — as a
 `[lane-dispatch]` line in the gate log and a row in
 `<git-common-dir>/issue-orchestrator/lane-dispatch.jsonl`, so dispatch
 quality is checkable without pool archaeology. Jobs additionally carry
@@ -566,6 +621,9 @@ a prompt or a token cannot reach the terminal through it.
   loop, with `infra/file_duration_store.py` resolving its one shared
   home, `infra/pytest_file_durations.py` capturing, and
   `scripts/lane_slices.py` consuming.
+- `domain/lane_cpu_request.py` — the one home of the seed/ceiling
+  policy: declared value when nothing is measured, learned evidence
+  only ever downward.
 - `observation/executor_status.py` — joins the pool, the dispatch
   journal, and the learning loop into one snapshot, and owns what
   happens when a source is absent or broken.

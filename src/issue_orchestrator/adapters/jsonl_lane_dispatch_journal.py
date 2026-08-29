@@ -69,6 +69,20 @@ class JsonlLaneDispatchJournal:
                         record.observed_runtime_seconds, 1
                     ),
                     "exit_code": record.exit_code,
+                    # The sizing decision is flattened into sibling
+                    # columns so a jq one-liner can compare them;
+                    # nesting would make the divergence query the
+                    # awkward one. The machine-state envelope below
+                    # nests for the opposite reason — it is one unit
+                    # shared with the validation timings — so the two
+                    # cannot collide.
+                    "declared_cpus": record.cpu_request.declared_cpus,
+                    "request_cpus": record.cpu_request.request_cpus,
+                    "learned_busy_cores": _rounded(
+                        record.cpu_request.learned_busy_cores
+                    ),
+                    "observed_busy_cores": _rounded(record.observed_busy_cores),
+                    "cpu_request_capped": record.cpu_request.is_capped,
                     # Same envelope shape and same owner as the
                     # validation timings beside it, so one query reads
                     # host contention across both files (#7127).
@@ -199,6 +213,13 @@ class JsonlLaneDispatchJournal:
             f"dispatch journal {self._path} is corrupt at line "
             f"{line_number}: {detail}"
         )
+
+
+def _rounded(value: float | None) -> float | None:
+    """Keep an unmeasured dimension null — never round it into a 0.0."""
+    if value is None:
+        return None
+    return round(value, 2)
 
 
 class InertLaneDispatchJournal:

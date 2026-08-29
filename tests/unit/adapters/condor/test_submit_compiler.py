@@ -43,7 +43,11 @@ def test_compiles_complete_description_with_runtime_deadline(
     assert "arguments" not in compiled.text
     assert compiled.exec_script_path == tmp_path / "lane.exec"
     assert compiled.exec_script_text == (
-        "#!/bin/sh\nexec /usr/bin/gmake test-unit PARALLEL=8\n"
+        "#!/bin/sh\n"
+        "/usr/bin/gmake test-unit PARALLEL=8\n"
+        "__lane_status=$?\n"
+        f"times > {tmp_path / 'lane.rusage'} 2>/dev/null || :\n"
+        'exit "$__lane_status"\n'
     )
     assert "initialdir = /repo/worktree" in compiled.text
     assert "getenv = true" in compiled.text
@@ -58,6 +62,7 @@ def test_compiles_complete_description_with_runtime_deadline(
     assert compiled.output_path == tmp_path / "lane.out"
     assert compiled.error_path == tmp_path / "lane.err"
     assert compiled.event_log_path == tmp_path / "lane.events"
+    assert compiled.rusage_path == tmp_path / "lane.rusage"
 
 
 def test_exclusive_tokens_compile_to_concurrency_limits(tmp_path: Path) -> None:
@@ -276,3 +281,110 @@ def test_unquotable_submitter_name_is_rejected(tmp_path: Path) -> None:
         compile_submit_description(
             command, LaneResources(request_cpus=1), tmp_path
         )
+
+
+# A fixed amount of arithmetic. Machine load stretches how long this
+# takes but never how much CPU it costs, so bounds on the measured CPU
+# stay meaningful on a busy host.
+_CPU_WORK = "total = 0\nfor index in range(3_000_000):\n    total += index * index\n"
+
+
+def _run_shim(tmp_path: Path, arguments: tuple[str, ...]) -> int:
+    import subprocess
+
+    compiled = compile_submit_description(
+        _command(arguments), LaneResources(request_cpus=1), tmp_path
+    )
+    compiled.exec_script_path.write_text(compiled.exec_script_text)
+    compiled.exec_script_path.chmod(0o755)
+    return subprocess.run(
+        [str(compiled.exec_script_path)], capture_output=True
+    ).returncode
+
+
+def test_shim_reports_the_lane_cpu_beside_the_event_log(tmp_path: Path) -> None:
+    """The shim measures because the scheduler cannot: its own CPU
+    attributes read a flat 0.0 on a pool without cgroups, so the whole
+    learning loop would be inert on the development host."""
+    import sys
+
+    from issue_orchestrator.adapters.condor.rusage_report import read_cpu_seconds
+
+    # Fixed WORK, not fixed wall time: a busy-for-N-seconds loop burns
+    # less than N CPU-seconds on a contended machine, which would make
+    # any lower bound a load test.
+    assert _run_shim(tmp_path, (sys.executable, "-c", _CPU_WORK)) == 0
+    cpu_seconds = read_cpu_seconds(tmp_path / "lane.rusage")
+    assert cpu_seconds is not None and cpu_seconds > 0.05, cpu_seconds
+
+
+def test_shim_reports_the_lane_exit_code_verbatim(tmp_path: Path) -> None:
+    """Measuring costs the shim its `exec`, so it is now the lane's
+    parent rather than the lane itself. Nothing downstream may be able
+    to tell: the lane's own status is captured and re-raised."""
+    import sys
+
+    assert _run_shim(tmp_path, (sys.executable, "-c", "raise SystemExit(9)")) == 9
+    assert _run_shim(tmp_path, (sys.executable, "-c", "pass")) == 0
+
+
+def test_shim_reports_a_signal_death_as_the_shell_does(tmp_path: Path) -> None:
+    """A lane killed by a signal must still surface as 128+N, the same
+    number an `exec`-ing shim produced."""
+    import signal
+    import sys
+
+    killed = _run_shim(
+        tmp_path, (sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
+    )
+    assert killed == 128 + int(signal.SIGKILL)
+
+
+def test_shim_still_exits_cleanly_when_the_report_cannot_be_written(
+    tmp_path: Path,
+) -> None:
+    """Instrumentation must never turn a green lane red: an
+    unwritable run directory loses the measurement and nothing else."""
+    import sys
+
+    run_directory = tmp_path / "readonly"
+    run_directory.mkdir()
+    compiled = compile_submit_description(
+        _command((sys.executable, "-c", "pass")),
+        LaneResources(request_cpus=1),
+        run_directory,
+    )
+    compiled.exec_script_path.write_text(compiled.exec_script_text)
+    compiled.exec_script_path.chmod(0o755)
+    run_directory.chmod(0o555)
+    try:
+        import subprocess
+
+        completed = subprocess.run(
+            [str(compiled.exec_script_path)], capture_output=True
+        )
+    finally:
+        run_directory.chmod(0o755)
+    assert completed.returncode == 0
+    assert not compiled.rusage_path.exists()
+
+
+def test_shim_report_does_not_pollute_lane_output(tmp_path: Path) -> None:
+    """`times` writes to stdout by default. Unredirected, every lane's
+    output would gain two mystery timing lines — and any consumer
+    parsing that output would break."""
+    import subprocess
+    import sys
+
+    compiled = compile_submit_description(
+        _command((sys.executable, "-c", "print('lane output')")),
+        LaneResources(request_cpus=1),
+        tmp_path,
+    )
+    compiled.exec_script_path.write_text(compiled.exec_script_text)
+    compiled.exec_script_path.chmod(0o755)
+    produced = subprocess.run(
+        [str(compiled.exec_script_path)], capture_output=True, text=True
+    )
+    assert produced.stdout == "lane output\n"
+    assert produced.stderr == ""
