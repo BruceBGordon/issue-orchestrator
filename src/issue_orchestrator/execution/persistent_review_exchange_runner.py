@@ -108,6 +108,11 @@ class PersistentReviewExchangeRunner:
     ) -> None:
         self._session_output = session_output
         self._pair_registry = pair_registry
+        # Read off the registry rather than injected separately: the registry
+        # owns the recorder because the registry is what destroys the evidence,
+        # and taking it from there makes it impossible to wire the round loop
+        # and the teardown to two different recorders (#7141 finding 2).
+        self._kill_evidence = pair_registry.kill_evidence
         self._turn_mailbox = turn_mailbox
         self._coder_prompt_addendum = coder_prompt_addendum
 
@@ -186,6 +191,7 @@ class PersistentReviewExchangeRunner:
             exchange_run=exchange_run,
             session_output=self._session_output,
             pair_registry=self._pair_registry,
+            kill_evidence=self._kill_evidence,
             persistent_pair_root=persistent_pair_root_for_worktree(coder_worktree),
             coder_worktree_path=coder_worktree,
             reviewer_worktree_factory=_make_reviewer_worktree,

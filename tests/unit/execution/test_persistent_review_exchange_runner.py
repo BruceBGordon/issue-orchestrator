@@ -46,6 +46,9 @@ from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
 from issue_orchestrator.domain.repository_launch_selection import (
     RepositoryLaunchSelection,
 )
+from issue_orchestrator.execution.persistent_exchange_pair_registry_inmemory import (
+    InMemoryPersistentExchangePairRegistry,
+)
 from issue_orchestrator.execution import persistent_review_exchange_runner as prer
 from issue_orchestrator.domain.coder_prompt import PreparedCoderPromptAddendum
 from issue_orchestrator.domain.session_key import TaskKind
@@ -476,3 +479,47 @@ def test_run_propagates_inner_exceptions_without_releasing_pair(
     # pair's death.
     assert not runner._pair_registry.release.called  # noqa: SLF001
     assert not runner._pair_registry.shutdown_all.called  # noqa: SLF001
+
+
+class TestKillEvidenceWiring:
+    """The round loop and the teardown must share ONE recorder.
+
+    The registry owns it because the registry is what destroys the evidence;
+    the runner reads it back off the registry it already holds. Pinning the
+    forwarding here is what stops the two halves drifting onto two different
+    recorders, which would lose every supervisor-killed round (#7141 finding 2).
+    """
+
+    def test_the_runner_forwards_the_registry_recorder_to_the_exchange(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        registry = InMemoryPersistentExchangePairRegistry()
+        seen: dict[str, Any] = {}
+        exchange_run = _make_exchange_run(tmp_path)
+
+        def _capture_kwargs(**kwargs: Any) -> ReviewExchangeOutcome:
+            seen.update(kwargs)
+            return _canned_outcome(exchange_run)
+
+        monkeypatch.setattr(prer, "run_persistent_session_exchange", _capture_kwargs)
+        monkeypatch.setattr(prer, "resolve_current_branch", lambda _worktree: "branch")
+        runner = prer.PersistentReviewExchangeRunner(
+            MagicMock(name="session_output"), registry
+        )
+
+        runner.run(
+            exchange_run=exchange_run,
+            coder_worktree=tmp_path / "coder",
+            issue_number=42,
+            issue_title="t",
+            coder_label="agent:coder",
+            reviewer_label="agent:reviewer",
+            coder_agent=_make_agent(tmp_path),
+            reviewer_agent=_make_agent(tmp_path),
+            runtime_config=_runtime_config(tmp_path),
+            max_rounds=1,
+            max_no_progress=1,
+            require_validation=False,
+        )
+
+        assert seen["kill_evidence"] is registry.kill_evidence

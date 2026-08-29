@@ -108,8 +108,9 @@ from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
 from .exchange_kill_evidence import (
     CapturedKillEvidence,
     ExchangeKillEvidenceRecorder,
+    RoundIdentity,
     RoundKillFacts,
-    build_exchange_kill_evidence_recorder,
+    RoundTicket,
 )
 from .persistent_exchange_pair_registry_inmemory import (
     InMemoryPersistentExchangePairRegistry,
@@ -289,6 +290,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     turn_mailbox: "TurnMailbox | None" = None,
     response_channels: ReviewExchangeResponseChannels | None = None,
     coder_prompt_addendum: str | None = None,
+    kill_evidence: ExchangeKillEvidenceRecorder | None = None,
 ) -> ReviewExchangeOutcome:
     """Run the coder↔reviewer exchange against a registry-owned persistent pair.
 
@@ -659,9 +661,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                 coder_mirror=coder_mirror,
                 reviewer_mirror=reviewer_mirror,
                 turn_mailbox=turn_mailbox,
-                kill_evidence=build_exchange_kill_evidence_recorder(
-                    coder_worktree_path
-                ),
+                kill_evidence=kill_evidence,
                 response_channels=effective_response_channels,
                 coder_prompt_addendum=coder_prompt_addendum,
             ),
@@ -2230,9 +2230,58 @@ class _RoleRoundCommand:
     kill_evidence: ExchangeKillEvidenceRecorder | None = None
 
 
-def _capture_round_kill_evidence(
+def _round_identity(
     command: _RoleRoundCommand,
     session: PersistentSession,
+) -> RoundIdentity:
+    """Where this round's evidence lives, in the one shape the owner takes."""
+    attempt = command.turn_started.scope.attempt_index.value
+    return RoundIdentity(
+        issue_number=command.issue_number,
+        role=command.role.value,
+        round_index=command.cycle_index,
+        attempt_index=attempt,
+        respawn_retries=command.respawn_retries,
+        session_name=command.session_name,
+        exchange_run_id=command.exchange_run_id,
+        agent_pid=session.proc.pid,
+        recording_path=command.recording_path,
+        run_dir=command.run_dir,
+        exchange_dir=command.exchange_dir,
+        worktree=command.owner.worktree,
+        response_file=command.workspace.response_file,
+        # The turn tag from ``build_prompt_inbox_notice``: short enough to
+        # survive terminal wrapping, unique per turn.
+        prompt_marker=f"round={command.cycle_index} attempt={attempt}",
+    )
+
+
+def _register_round(
+    recorder: ExchangeKillEvidenceRecorder | None,
+    identity: RoundIdentity,
+) -> RoundTicket | None:
+    """Announce the round as in flight so a teardown can retain it.
+
+    Registration happens at round *start*, not at failure: a supervisor
+    wall-clock deadline kills a wedged worker that never reaches the failure
+    branch below, and without a registration there is nothing for the teardown
+    to find (#7141 finding 2).
+    """
+    return None if recorder is None else recorder.round_started(identity)
+
+
+def _finish_round(
+    recorder: ExchangeKillEvidenceRecorder | None,
+    ticket: RoundTicket | None,
+) -> None:
+    """Clear the in-flight registration. Idempotent."""
+    if recorder is not None and ticket is not None:
+        recorder.round_finished(ticket)
+
+
+def _capture_round_kill_evidence(
+    command: _RoleRoundCommand,
+    identity: RoundIdentity,
     error: BaseException,
     failure_reason: str,
 ) -> CapturedKillEvidence | None:
@@ -2248,27 +2297,11 @@ def _capture_round_kill_evidence(
     recorder = command.kill_evidence
     if recorder is None:
         return None
-    attempt = command.turn_started.scope.attempt_index.value
-    return recorder.capture(
+    return recorder.capture_declared_failure(
         RoundKillFacts(
-            issue_number=command.issue_number,
-            role=command.role.value,
-            round_index=command.cycle_index,
-            attempt_index=attempt,
-            respawn_retries=command.respawn_retries,
+            identity=identity,
             failure_reason=failure_reason,
             error_text=str(error),
-            session_name=command.session_name,
-            exchange_run_id=command.exchange_run_id,
-            agent_pid=session.proc.pid,
-            recording_path=command.recording_path,
-            run_dir=command.run_dir,
-            exchange_dir=command.exchange_dir,
-            worktree=command.owner.worktree,
-            response_file=command.workspace.response_file,
-            # The turn tag from ``build_prompt_inbox_notice``: short enough to
-            # survive terminal wrapping, unique per turn.
-            prompt_marker=f"round={command.cycle_index} attempt={attempt}",
             idle_trace=persistent_round_idle_trace(error),
         )
     )
@@ -2349,6 +2382,8 @@ def _send_role_round(command: _RoleRoundCommand) -> ReviewExchangeResponse | Non
             return mailbox.try_take(mailbox_key)
 
         response_reader = _read_from_mailbox
+    identity = _round_identity(command, session)
+    ticket = _register_round(command.kill_evidence, identity)
     try:
         parsed = send_round(
             session,
@@ -2361,6 +2396,7 @@ def _send_role_round(command: _RoleRoundCommand) -> ReviewExchangeResponse | Non
             # of unattributed silence).
             role_label=f"{role_value}@round-{cycle_index}",
             response_reader=response_reader,
+            on_idle_detector=None if ticket is None else ticket.attach_detector,
         )
     except (PersistentRoundTimeoutError, PersistentRoundError) as exc:
         # Release the slot before respawn/return so a straggling delivery
@@ -2369,12 +2405,16 @@ def _send_role_round(command: _RoleRoundCommand) -> ReviewExchangeResponse | Non
         if use_mailbox:
             assert turn_mailbox is not None
             turn_mailbox.close(mailbox_key)
+        # This round is over: deregister before capturing so a teardown racing
+        # us cannot capture the same round twice, and so the respawn retry
+        # below registers a fresh attempt rather than extending this one.
+        _finish_round(command.kill_evidence, ticket)
         failure_reason = persistent_round_failure_reason(exc)
         # Retain the kill evidence HERE, not after the respawn branch below:
         # prompt_not_accepted is respawn-retryable, so a capture placed after
         # that branch would miss the very failure this exists for, and the
         # respawn's fresh output would already have polluted the recording tail.
-        captured = _capture_round_kill_evidence(command, session, exc, failure_reason)
+        captured = _capture_round_kill_evidence(command, identity, exc, failure_reason)
         composer_state = None if captured is None else captured.composer.state.value
         logger.warning(
             "[REVIEW_EXCHANGE] %s round failed issue=%s session_name=%s "
@@ -2483,6 +2523,11 @@ def _send_role_round(command: _RoleRoundCommand) -> ReviewExchangeResponse | Non
             },
         )
         return None
+
+    finally:
+        # Idempotent; covers the success path and any escape this function
+        # does not catch.
+        _finish_round(command.kill_evidence, ticket)
 
     # Verdict received: release the slot so any duplicate/straggling delivery
     # for this turn is rejected rather than buffered for the next turn.

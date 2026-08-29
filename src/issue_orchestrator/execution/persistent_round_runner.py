@@ -368,6 +368,7 @@ def send_round(
     sleep: Callable[[float], None] = time.sleep,
     role_label: str | None = None,
     response_reader: Callable[[], dict[str, Any] | None] | None = None,
+    on_idle_detector: Callable[[RoundIdleDetector], None] | None = None,
 ) -> dict[str, Any]:
     """Inject ``prompt`` into the persistent agent and wait for its response.
 
@@ -396,6 +397,10 @@ def send_round(
     stay alive without producing any PTY/recording activity or response after
     prompt delivery. This catches the "prompt rendered, agent never engaged"
     failure mode before the full round timeout.
+
+    ``on_idle_detector`` (when supplied) is handed the round's live
+    :class:`RoundIdleDetector` once the poll loop owns it, so an out-of-band
+    teardown can retain the idle trajectory of a round still running here.
 
     ``now`` and ``sleep`` are injectable for deterministic tests.
     """
@@ -477,6 +482,7 @@ def send_round(
         label=label,
         read_response=read_response,
         file_channel=file_channel,
+        on_idle_detector=on_idle_detector,
     )
 
 
@@ -495,6 +501,7 @@ def _wait_for_round_response(
     label: str,
     read_response: Callable[[], dict[str, Any] | None],
     file_channel: bool,
+    on_idle_detector: Callable[[RoundIdleDetector], None] | None,
 ) -> dict[str, Any]:
     """Poll until the response arrives (via ``read_response``), the agent
     exits, or the deadline expires.
@@ -517,6 +524,12 @@ def _wait_for_round_response(
         activity_since=now(),
         recording_bytes=_safe_recording_size(session),
     )
+    if on_idle_detector is not None:
+        # Hand the live detector to the caller's kill-evidence registration so
+        # a supervisor tearing this exchange down can retain the trajectory of
+        # a round that is still wedged here. ``snapshot`` is non-mutating, so
+        # the reader never writes to this thread's object.
+        on_idle_detector(detector)
     last_heartbeat = now()
     while now() < deadline:
         current = now()
@@ -569,6 +582,7 @@ def _wait_for_round_response(
                 raise PersistentRoundError(
                     f"Agent exited (code={ret}) leaving invalid JSON in {response_file}",
                     failure_reason=RoundFailureReason.INVALID_RESPONSE,
+                    idle_trace=detector.snapshot(now()),
                 )
             logger.warning(
                 "[send_round] agent exited before responding role=%s pid=%d "

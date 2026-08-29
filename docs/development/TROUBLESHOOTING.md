@@ -162,6 +162,17 @@ The exchange directory gets a matching
 `round-R-<role>-attempt-A-respawn-K.kill-evidence.json` back-pointer, so the
 cross-reference runs both ways and correlation never needs mtime archaeology.
 
+Two kinds of kill land here:
+
+- `failure_reason` other than `abandoned_by_teardown` — the round declared its
+  own failure (prompt not accepted, timeout, process exit).
+- `failure_reason: abandoned_by_teardown` — the round was *still running* when
+  the pair was released (supervisor wall-clock deadline, operator cancel,
+  orchestrator shutdown). The capture is taken by the pair registry before it
+  closes the sessions. If the wedged round had reached its poll loop the live
+  idle trajectory comes with it; otherwise `idle_trace_unavailable` says why
+  there is none.
+
 ```bash
 KILLS=.issue-orchestrator/diagnostics/exchange-kills
 
@@ -170,7 +181,8 @@ jq -c 'select(.branch == "my-branch") | {captured_at, role, failure_reason, comp
 
 # Did the prompt ever submit? composer_stranded = the injected text never left
 # the composer (injection/settle race); composer_emptied = the submit
-# registered and the provider then went silent.
+# registered and the provider then went silent; undetermined = the recording
+# could not be reconstructed faithfully, so no verdict was guessed.
 jq '.composer_state' $KILLS/<capture>/run-identity.json
 
 # Did the agent produce anything at all after the prompt?
@@ -180,6 +192,16 @@ jq '.idle_trace | {window_seconds, idle_for_seconds, bytes_drained_total}' $KILL
 A frozen `bytes_drained_total` across the whole `samples` trajectory means the
 agent never engaged with the prompt. Combine that with `composer_stranded` and
 you are looking at the PR #6484 injection/settle family, not a provider stall.
+
+`composer_state` is read off the **rendered final viewport**, not the raw byte
+history, so an erased footer cannot support a verdict. `matched_marker` names
+the affordance that decided it and `evidence_snippet` is the screen row it came
+from — check them before acting on the classification. `replayed_from_start:
+false` means only a trailing window of the recording was replayed; the verdict
+is still sound (only rows the replay wrote are searched) but the screen above
+the footer band may be incomplete. A holding marker outranks a busy marker when
+both are visible: "tab to queue message" is direct evidence of unsent composer
+text, while "esc to interrupt" only says the agent is busy.
 
 Captures accumulate; prune the directory manually when it gets large.
 

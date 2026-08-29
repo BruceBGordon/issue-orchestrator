@@ -4,12 +4,17 @@ Every recording here is a hand-built fixture in the real on-disk format
 (``{event_type, offset_ms, data_b64}`` NDJSON plus resize rows). No live
 providers, no PTYs, no clocks — the recorder takes an injected clock and the
 classifier is a pure function of the file.
+
+The discriminator reads the *rendered viewport* (``infra.terminal_viewport``),
+so fixtures here paint screens the way a real TUI does: cursor addressing and
+erase-in-line, not append-only text (#7141 finding 1).
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -26,8 +31,8 @@ from issue_orchestrator.execution.exchange_kill_evidence import (
     RECORDING_COPY_FILENAME,
     RUN_IDENTITY_FILENAME,
     ExchangeKillEvidenceRecorder,
+    RoundIdentity,
     RoundKillFacts,
-    build_exchange_kill_evidence_recorder,
     classify_composer_state,
     resolve_retained_diagnostics_root,
 )
@@ -73,26 +78,24 @@ def _recording(path: Path, chunks: Iterable[bytes], *, resize: bool = True) -> P
 
 
 # The two screens the discriminator has to tell apart. Both echo the same turn
-# tag; only the footer differs — which is the whole point of the classifier.
+# tag in the transcript; only the footer band differs — which is the whole
+# point of the classifier.
 _PROMPT_ECHO = (
-    b"\x1b[2m> Review-exchange reviewer turn round=2 attempt=1 is ready.\x1b[0m\r\n"
+    b"\x1b[1;1H\x1b[2m> Review-exchange reviewer turn round=2 attempt=1 is ready."
+    b"\x1b[0m"
 )
-_STRANDED_TAIL = (
-    _PROMPT_ECHO,
-    b"\x1b[2m  \xe2\x8f\xb5\xe2\x8f\xb5 tab to queue message\x1b[0m\r\n",
+_STRANDED_FOOTER = (
+    b"\x1b[34;2H\x1b[K  \xe2\x8f\xb5\xe2\x8f\xb5 tab to queue message"
 )
-_EMPTIED_TAIL = (
-    _PROMPT_ECHO,
-    b"\x1b[1m\xe2\x8f\xba Compacting conversation\x1b[0m (esc to interrupt)\r\n",
-)
+_EMPTIED_FOOTER = b"\x1b[34;2H\x1b[K  Working\xe2\x80\xa6 (esc to interrupt)"
 
 
-def _stranded_recording(tmp_path: Path) -> Path:
-    return _recording(tmp_path / "stranded.jsonl", _STRANDED_TAIL)
+def _stranded_recording(tmp_path: Path, name: str = "stranded.jsonl") -> Path:
+    return _recording(tmp_path / name, (_PROMPT_ECHO, _STRANDED_FOOTER))
 
 
-def _emptied_recording(tmp_path: Path) -> Path:
-    return _recording(tmp_path / "emptied.jsonl", _EMPTIED_TAIL)
+def _emptied_recording(tmp_path: Path, name: str = "emptied.jsonl") -> Path:
+    return _recording(tmp_path / name, (_PROMPT_ECHO, _EMPTIED_FOOTER))
 
 
 def _main_worktree(root: Path) -> Path:
@@ -118,16 +121,36 @@ def _linked_worktree(root: Path) -> tuple[Path, Path]:
     return linked, repo
 
 
-def _facts(
+def _identity(
     tmp_path: Path,
     *,
     recording: Path,
     worktree: Path | None = None,
     respawn_retries: int = 0,
-    prompt_marker: str = "round=2 attempt=1",
-) -> RoundKillFacts:
+    issue_number: int = 7128,
+    role: str = "reviewer",
+) -> RoundIdentity:
     exchange_dir = tmp_path / "run" / "exchange"
     exchange_dir.mkdir(parents=True, exist_ok=True)
+    return RoundIdentity(
+        issue_number=issue_number,
+        role=role,
+        round_index=2,
+        attempt_index=1,
+        respawn_retries=respawn_retries,
+        session_name="review-exchange-7128-20260829T040000Z",
+        exchange_run_id="run-7128-abc",
+        agent_pid=4242,
+        recording_path=recording,
+        run_dir=tmp_path / "run",
+        exchange_dir=exchange_dir,
+        worktree=worktree if worktree is not None else _main_worktree(tmp_path),
+        response_file=tmp_path / "review-response.json",
+        prompt_marker="round=2 attempt=1",
+    )
+
+
+def _trace() -> object:
     detector = RoundIdleDetector(
         window_seconds=120.0,
         deadline_seconds=3600.0,
@@ -138,30 +161,23 @@ def _facts(
     )
     detector.observe(1.0, drained=64, recording_bytes=74)
     detector.observe(200.0, drained=0, recording_bytes=74)
+    return detector.snapshot(200.0)
+
+
+def _facts(tmp_path: Path, **kwargs: object) -> RoundKillFacts:
     return RoundKillFacts(
-        issue_number=7128,
-        role="reviewer",
-        round_index=2,
-        attempt_index=1,
-        respawn_retries=respawn_retries,
+        identity=_identity(tmp_path, **kwargs),  # type: ignore[arg-type]
         failure_reason="prompt_not_accepted",
         error_text="Agent did not produce terminal output for 120.0s",
-        session_name="review-exchange-7128-20260829T040000Z",
-        exchange_run_id="run-7128-abc",
-        agent_pid=4242,
-        recording_path=recording,
-        run_dir=tmp_path / "run",
-        exchange_dir=exchange_dir,
-        worktree=worktree if worktree is not None else _main_worktree(tmp_path),
-        response_file=tmp_path / "review-response.json",
-        prompt_marker=prompt_marker,
-        idle_trace=detector.snapshot(200.0),
+        idle_trace=_trace(),  # type: ignore[arg-type]
     )
 
 
 def _recorder(root: Path, **overrides: object) -> ExchangeKillEvidenceRecorder:
     return ExchangeKillEvidenceRecorder(
-        root, clock=lambda: _FROZEN_AT, **overrides  # type: ignore[arg-type]
+        resolve_root=lambda _worktree: root,
+        clock=lambda: _FROZEN_AT,
+        **overrides,  # type: ignore[arg-type]
     )
 
 
@@ -180,7 +196,7 @@ class TestComposerStateDiscriminator:
         assert verdict.matched_marker == "queue_message_footer"
         assert "tab to queue message" in verdict.evidence_snippet
         assert verdict.prompt_marker_present is True
-        assert verdict.scanned_events == 2
+        assert verdict.replayed_from_start is True
 
     def test_emptied_composer_fixture(self, tmp_path: Path) -> None:
         verdict = classify_composer_state(
@@ -201,34 +217,48 @@ class TestComposerStateDiscriminator:
         assert verdict.state is ComposerState.UNDETERMINED
         assert verdict.prompt_marker_present is True
 
-    def test_latest_marker_wins_when_both_families_appear(self, tmp_path: Path) -> None:
-        stranded_then_submitted = _recording(
+    def test_a_holding_footer_outranks_a_busy_footer(self, tmp_path: Path) -> None:
+        """Both can be on screen at once, and that IS the stranded case.
+
+        "esc to interrupt" only says the agent is busy; "tab to queue message"
+        says the composer is holding text the agent never took. A prompt
+        stranded while the agent works shows both, so the holding marker wins
+        on meaning — not on which was painted last.
+        """
+        both = _recording(
             tmp_path / "both.jsonl",
-            (*_STRANDED_TAIL, *_EMPTIED_TAIL),
+            (
+                b"\x1b[33;2H\x1b[K  Working (esc to interrupt)",
+                b"\x1b[34;2H\x1b[K  tab to queue message",
+            ),
         )
-        submitted_then_stranded = _recording(
+        reversed_paint = _recording(
             tmp_path / "both2.jsonl",
-            (*_EMPTIED_TAIL, *_STRANDED_TAIL),
+            (
+                b"\x1b[34;2H\x1b[K  tab to queue message",
+                b"\x1b[33;2H\x1b[K  Working (esc to interrupt)",
+            ),
         )
 
         assert (
-            classify_composer_state(stranded_then_submitted).state
-            is ComposerState.COMPOSER_EMPTIED
+            classify_composer_state(both).state is ComposerState.COMPOSER_STRANDED
         )
         assert (
-            classify_composer_state(submitted_then_stranded).state
+            classify_composer_state(reversed_paint).state
             is ComposerState.COMPOSER_STRANDED
         )
 
     def test_no_marker_is_undetermined_not_a_guess(self, tmp_path: Path) -> None:
         verdict = classify_composer_state(
-            _recording(tmp_path / "quiet.jsonl", (b"nothing familiar here\r\n",))
+            _recording(tmp_path / "quiet.jsonl", (b"nothing familiar here",))
         )
 
         assert verdict.state is ComposerState.UNDETERMINED
         assert verdict.matched_marker is None
 
-    def test_missing_recording_is_undetermined_with_the_path(self, tmp_path: Path) -> None:
+    def test_missing_recording_is_undetermined_with_the_path(
+        self, tmp_path: Path
+    ) -> None:
         verdict = classify_composer_state(tmp_path / "gone.jsonl")
 
         assert verdict.state is ComposerState.UNDETERMINED
@@ -243,57 +273,92 @@ class TestComposerStateDiscriminator:
     def test_non_utf8_pty_bytes_do_not_break_the_decode(self, tmp_path: Path) -> None:
         path = _recording(
             tmp_path / "binary.jsonl",
-            (b"\xff\xfe\x00garbage", b"  tab to queue message\r\n"),
+            (b"\xff\xfe\x00", b"\x1b[34;2H\x1b[K  tab to queue message"),
         )
 
         assert classify_composer_state(path).state is ComposerState.COMPOSER_STRANDED
 
-    def test_malformed_rows_and_bad_base64_are_skipped(self, tmp_path: Path) -> None:
-        path = _recording(tmp_path / "mixed.jsonl", (b"  tab to queue message\r\n",))
+
+class TestDiscriminatorRefusesToGuess:
+    """#7141 finding 1: a verdict must never come from unreadable history."""
+
+    def test_erased_footer_cannot_produce_a_stranded_verdict(
+        self, tmp_path: Path
+    ) -> None:
+        path = _recording(
+            tmp_path / "cleared.jsonl",
+            (
+                _PROMPT_ECHO,
+                _STRANDED_FOOTER,
+                b"\x1b[2J\x1b[H",
+                b"\x1b[1;1HProvider is streaming a fresh answer now.",
+            ),
+        )
+
+        verdict = classify_composer_state(path, prompt_marker="round=2 attempt=1")
+
+        assert verdict.state is not ComposerState.COMPOSER_STRANDED
+        assert verdict.prompt_marker_present is False
+
+    def test_repainted_footer_row_reflects_the_current_render(
+        self, tmp_path: Path
+    ) -> None:
+        path = _recording(
+            tmp_path / "repaint.jsonl", (_STRANDED_FOOTER, _EMPTIED_FOOTER)
+        )
+
+        assert classify_composer_state(path).state is ComposerState.COMPOSER_EMPTIED
+
+    def test_half_written_recording_is_undetermined(self, tmp_path: Path) -> None:
+        path = _stranded_recording(tmp_path)
         with path.open("a", encoding="utf-8") as handle:
-            handle.write('{"event_type": "output", "data_b64": "!!not base64!!"}\n')
-            handle.write("{ this is not json at all\n")
-            handle.write('{"event_type": "output"}\n')
-            handle.write('{"partial": "row with no newline"')
+            handle.write('{"schema_version": 1, "event_type": "outp')
 
         verdict = classify_composer_state(path)
 
-        assert verdict.state is ComposerState.COMPOSER_STRANDED
-        assert verdict.scanned_events == 1
+        assert verdict.state is ComposerState.UNDETERMINED
+        assert "incomplete" in verdict.evidence_snippet
 
-    def test_decode_work_is_bounded_to_the_tail(self, tmp_path: Path) -> None:
-        """A huge recording is not fully decoded — only its final events are."""
-        chunks = [b"  tab to queue message\r\n"]
-        chunks.extend(b"filler line %d\r\n" % index for index in range(2_000))
-        chunks.append(b"  working (esc to interrupt)\r\n")
-        path = _recording(tmp_path / "huge.jsonl", chunks)
-        assert path.stat().st_size > 100_000
+    def test_unparseable_row_is_undetermined(self, tmp_path: Path) -> None:
+        path = _stranded_recording(tmp_path)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write("{ this is not json at all\n")
 
-        verdict = classify_composer_state(path, tail_events=5)
+        assert classify_composer_state(path).state is ComposerState.UNDETERMINED
 
-        assert verdict.scanned_events <= 5
-        # The stranded marker is far outside the window, so it must not win.
-        assert verdict.state is ComposerState.COMPOSER_EMPTIED
+    def test_content_scrolled_off_the_screen_is_not_matched(
+        self, tmp_path: Path
+    ) -> None:
+        """Only what the viewport still shows can support a verdict."""
+        chunks = [_STRANDED_FOOTER]
+        chunks.extend(b"filler line %d\r\n" % index for index in range(200))
+        path = _recording(tmp_path / "scrolled.jsonl", chunks)
 
-    def test_byte_window_drops_the_partial_leading_row(self, tmp_path: Path) -> None:
-        path = _recording(
-            tmp_path / "windowed.jsonl",
-            (b"x" * 4_000, b"  tab to queue message\r\n"),
+        assert classify_composer_state(path).state is not (
+            ComposerState.COMPOSER_STRANDED
         )
 
-        verdict = classify_composer_state(path, tail_bytes=512)
+    def test_replay_is_bounded_and_says_so(self, tmp_path: Path) -> None:
+        path = _recording(
+            tmp_path / "big.jsonl",
+            (b"x" * 6000, _STRANDED_FOOTER),
+        )
 
+        verdict = classify_composer_state(path, replay_bytes=2048)
+
+        assert verdict.replayed_from_start is False
         assert verdict.state is ComposerState.COMPOSER_STRANDED
-        assert verdict.scanned_events == 1
 
 
 # ---------------------------------------------------------------------------
-# Retained root resolution
+# Retained root
 # ---------------------------------------------------------------------------
 
 
 class TestRetainedRootResolution:
-    def test_primary_worktree_anchors_on_the_repository_root(self, tmp_path: Path) -> None:
+    def test_primary_worktree_anchors_on_the_repository_root(
+        self, tmp_path: Path
+    ) -> None:
         worktree = _main_worktree(tmp_path)
 
         root = resolve_retained_diagnostics_root(worktree)
@@ -317,7 +382,19 @@ class TestRetainedRootResolution:
         plain.mkdir()
 
         assert resolve_retained_diagnostics_root(plain) is None
-        assert build_exchange_kill_evidence_recorder(plain) is None
+
+    def test_capture_refuses_a_volatile_home(self, tmp_path: Path) -> None:
+        """No retained root means no capture — never a write into the run dir."""
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        recorder = ExchangeKillEvidenceRecorder(clock=lambda: _FROZEN_AT)
+
+        assert (
+            recorder.capture_declared_failure(
+                _facts(tmp_path, recording=_stranded_recording(tmp_path), worktree=plain)
+            )
+            is None
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -326,12 +403,14 @@ class TestRetainedRootResolution:
 
 
 class TestCaptureArtifacts:
-    def test_writes_recording_copy_idle_trace_and_identity(self, tmp_path: Path) -> None:
+    def test_writes_recording_copy_idle_trace_and_identity(
+        self, tmp_path: Path
+    ) -> None:
         root = tmp_path / "retained"
         recording = _stranded_recording(tmp_path)
         facts = _facts(tmp_path, recording=recording)
 
-        captured = _recorder(root).capture(facts)
+        captured = _recorder(root).capture_declared_failure(facts)
 
         assert captured is not None
         directory = captured.directory
@@ -343,7 +422,7 @@ class TestCaptureArtifacts:
 
     def test_directory_name_carries_the_correlation_keys(self, tmp_path: Path) -> None:
         """Naming supports gate→session correlation without mtime archaeology."""
-        captured = _recorder(tmp_path / "retained").capture(
+        captured = _recorder(tmp_path / "retained").capture_declared_failure(
             _facts(tmp_path, recording=_stranded_recording(tmp_path))
         )
 
@@ -355,7 +434,7 @@ class TestCaptureArtifacts:
     def test_identity_pins_branch_head_sha_and_run_paths(self, tmp_path: Path) -> None:
         facts = _facts(tmp_path, recording=_stranded_recording(tmp_path))
 
-        captured = _recorder(tmp_path / "retained").capture(facts)
+        captured = _recorder(tmp_path / "retained").capture_declared_failure(facts)
 
         assert captured is not None
         identity = json.loads(
@@ -363,18 +442,21 @@ class TestCaptureArtifacts:
         )
         assert identity["branch"] == _BRANCH
         assert identity["head_sha"] == _SHA
-        assert identity["session_name"] == facts.session_name
+        assert identity["session_name"] == facts.identity.session_name
         assert identity["exchange_run_id"] == "run-7128-abc"
         assert identity["issue_key"] == "issue-7128"
         assert identity["failure_reason"] == "prompt_not_accepted"
         assert identity["agent_pid"] == 4242
-        assert identity["original_recording"] == str(facts.recording_path)
-        assert identity["run_dir"] == str(facts.run_dir)
-        assert identity["exchange_dir"] == str(facts.exchange_dir)
+        assert identity["original_recording"] == str(facts.identity.recording_path)
+        assert identity["run_dir"] == str(facts.identity.run_dir)
+        assert identity["exchange_dir"] == str(facts.identity.exchange_dir)
         assert identity["composer_state"]["state"] == "composer_stranded"
+        assert identity["retained_dir"] == str(captured.directory)
 
-    def test_idle_trace_file_holds_the_window_and_trajectory(self, tmp_path: Path) -> None:
-        captured = _recorder(tmp_path / "retained").capture(
+    def test_idle_trace_file_holds_the_window_and_trajectory(
+        self, tmp_path: Path
+    ) -> None:
+        captured = _recorder(tmp_path / "retained").capture_declared_failure(
             _facts(tmp_path, recording=_stranded_recording(tmp_path))
         )
 
@@ -387,15 +469,15 @@ class TestCaptureArtifacts:
         assert trace["poll_iterations"] == 2
         assert trace["bytes_drained_total"] == 64
         assert trace["idle_for_seconds"] == 199.0
-        assert [s["bytes_drained_total"] for s in trace["samples"]] == [64]
+        assert payload["idle_trace_unavailable"] is None
 
     def test_cross_reference_runs_both_ways(self, tmp_path: Path) -> None:
         facts = _facts(tmp_path, recording=_stranded_recording(tmp_path))
 
-        captured = _recorder(tmp_path / "retained").capture(facts)
+        captured = _recorder(tmp_path / "retained").capture_declared_failure(facts)
 
         assert captured is not None
-        back = facts.exchange_dir / (
+        back = facts.identity.exchange_dir / (
             "round-2-reviewer-attempt-1-respawn-0.kill-evidence.json"
         )
         pointer = json.loads(back.read_text(encoding="utf-8"))
@@ -411,8 +493,12 @@ class TestCaptureArtifacts:
         recorder = _recorder(root)
         recording = _stranded_recording(tmp_path)
 
-        recorder.capture(_facts(tmp_path, recording=recording, respawn_retries=0))
-        recorder.capture(_facts(tmp_path, recording=recording, respawn_retries=1))
+        recorder.capture_declared_failure(
+            _facts(tmp_path, recording=recording, respawn_retries=0)
+        )
+        recorder.capture_declared_failure(
+            _facts(tmp_path, recording=recording, respawn_retries=1)
+        )
 
         lines = (root / INDEX_FILENAME).read_text(encoding="utf-8").splitlines()
         assert [json.loads(line)["respawn_retries"] for line in lines] == [0, 1]
@@ -423,8 +509,8 @@ class TestCaptureArtifacts:
         recorder = _recorder(root)
         recording = _stranded_recording(tmp_path)
 
-        first = recorder.capture(_facts(tmp_path, recording=recording))
-        second = recorder.capture(
+        first = recorder.capture_declared_failure(_facts(tmp_path, recording=recording))
+        second = recorder.capture_declared_failure(
             _facts(tmp_path, recording=recording, respawn_retries=1)
         )
 
@@ -432,16 +518,101 @@ class TestCaptureArtifacts:
         assert first.directory != second.directory
         assert second.directory.name.endswith("respawn-1")
 
-    def test_same_second_collision_gets_a_distinct_directory(self, tmp_path: Path) -> None:
+    def test_same_second_collision_gets_a_distinct_directory(
+        self, tmp_path: Path
+    ) -> None:
         root = tmp_path / "retained"
         recorder = _recorder(root)
         recording = _stranded_recording(tmp_path)
 
-        first = recorder.capture(_facts(tmp_path, recording=recording))
-        second = recorder.capture(_facts(tmp_path, recording=recording))
+        first = recorder.capture_declared_failure(_facts(tmp_path, recording=recording))
+        second = recorder.capture_declared_failure(
+            _facts(tmp_path, recording=recording)
+        )
 
         assert first is not None and second is not None
         assert second.directory.name.endswith("-2")
+
+
+class TestCaptureAtomicity:
+    """#7141 finding 3: a capture is all-or-nothing under its final name."""
+
+    def test_a_failed_artifact_write_leaves_no_final_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from issue_orchestrator.execution import exchange_kill_evidence as module
+
+        root = tmp_path / "retained"
+        recorder = _recorder(root)
+        calls: list[Path] = []
+        real_write = module._write_json
+
+        def _flaky(path: Path, payload: dict[str, object]) -> None:
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError("disk full on the second artifact")
+            real_write(path, payload)
+
+        monkeypatch.setattr(module, "_write_json", _flaky)
+
+        assert (
+            recorder.capture_declared_failure(
+                _facts(tmp_path, recording=_stranded_recording(tmp_path))
+            )
+            is None
+        )
+        assert list(root.iterdir()) == [], "a partial capture must leave nothing behind"
+
+    def test_a_successful_capture_leaves_no_staging_directory(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "retained"
+
+        captured = _recorder(root).capture_declared_failure(
+            _facts(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        assert captured is not None
+        assert [entry.name for entry in root.iterdir() if entry.is_dir()] == [
+            captured.directory.name
+        ]
+        assert not list(captured.directory.glob("*.part"))
+
+    def test_index_repairs_a_trailing_partial_line_before_appending(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "retained"
+        root.mkdir(parents=True)
+        index = root / INDEX_FILENAME
+        index.write_text(
+            '{"kind": "exchange_kill_evidence", "issue_key": "issue-1"}\n'
+            '{"kind": "exchange_kill_evi',
+            encoding="utf-8",
+        )
+
+        captured = _recorder(root).capture_declared_failure(
+            _facts(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        assert captured is not None
+        lines = index.read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            json.loads(line)
+        assert len(lines) == 2
+
+    def test_index_leaves_a_well_framed_file_alone(self, tmp_path: Path) -> None:
+        root = tmp_path / "retained"
+        root.mkdir(parents=True)
+        index = root / INDEX_FILENAME
+        index.write_text('{"kind": "keep me"}\n', encoding="utf-8")
+
+        _recorder(root).capture_declared_failure(
+            _facts(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        lines = index.read_text(encoding="utf-8").splitlines()
+        assert json.loads(lines[0])["kind"] == "keep me"
+        assert len(lines) == 2
 
 
 class TestRecordingCopyRobustness:
@@ -449,12 +620,12 @@ class TestRecordingCopyRobustness:
         self, tmp_path: Path
     ) -> None:
         chunks = [b"filler %d\r\n" % index for index in range(400)]
-        chunks.append(b"  tab to queue message\r\n")
+        chunks.append(_STRANDED_FOOTER)
         recording = _recording(tmp_path / "huge.jsonl", chunks)
 
-        captured = _recorder(tmp_path / "retained", max_copy_bytes=2_000).capture(
-            _facts(tmp_path, recording=recording)
-        )
+        captured = _recorder(
+            tmp_path / "retained", max_copy_bytes=2_000
+        ).capture_declared_failure(_facts(tmp_path, recording=recording))
 
         assert captured is not None
         assert captured.recording_truncated is True
@@ -477,7 +648,7 @@ class TestRecordingCopyRobustness:
         with recording.open("a", encoding="utf-8") as handle:
             handle.write('{"schema_version": 1, "event_type": "out')
 
-        captured = _recorder(tmp_path / "retained").capture(
+        captured = _recorder(tmp_path / "retained").capture_declared_failure(
             _facts(tmp_path, recording=recording)
         )
 
@@ -493,7 +664,7 @@ class TestRecordingCopyRobustness:
     ) -> None:
         facts = _facts(tmp_path, recording=tmp_path / "never-written.jsonl")
 
-        captured = _recorder(tmp_path / "retained").capture(facts)
+        captured = _recorder(tmp_path / "retained").capture_declared_failure(facts)
 
         assert captured is not None
         assert not (captured.directory / RECORDING_COPY_FILENAME).exists()
@@ -504,14 +675,24 @@ class TestRecordingCopyRobustness:
         assert identity["recording_present"] is False
         assert identity["composer_state"]["state"] == "undetermined"
 
-    def test_no_partial_artifact_is_left_under_the_retained_name(
+    def test_unreadable_recording_still_retains_identity_and_idle_trace(
         self, tmp_path: Path
     ) -> None:
-        captured = _recorder(tmp_path / "retained").capture(
-            _facts(tmp_path, recording=_stranded_recording(tmp_path))
+        """A corrupt recording must not cost us the other two artifacts."""
+        bogus = tmp_path / "recording-is-a-directory.jsonl"
+        bogus.mkdir()
+
+        captured = _recorder(tmp_path / "retained").capture_declared_failure(
+            _facts(tmp_path, recording=bogus)
         )
 
         assert captured is not None
+        assert (captured.directory / IDLE_TRACE_FILENAME).exists()
+        identity = json.loads(
+            (captured.directory / RUN_IDENTITY_FILENAME).read_text(encoding="utf-8")
+        )
+        assert identity["recording_copy_error"] is not None
+        assert identity["composer_state"]["state"] == "undetermined"
         assert not list(captured.directory.glob("*.part"))
 
 
@@ -523,42 +704,295 @@ class TestCaptureNeverRaisesIntoTheFailurePath:
         blocked.write_text("this is a file, not a directory", encoding="utf-8")
 
         with caplog.at_level("ERROR"):
-            captured = _recorder(blocked).capture(
+            captured = _recorder(blocked).capture_declared_failure(
                 _facts(tmp_path, recording=_stranded_recording(tmp_path))
             )
 
         assert captured is None
         assert "kill-evidence" in caplog.text
 
-    def test_unreadable_recording_still_retains_identity_and_idle_trace(
-        self, tmp_path: Path
-    ) -> None:
-        """A corrupt recording must not cost us the other two artifacts."""
-        # A directory where a recording file is expected: exists() succeeds but
-        # every read raises.
-        bogus = tmp_path / "recording-is-a-directory.jsonl"
-        bogus.mkdir()
-
-        captured = _recorder(tmp_path / "retained").capture(
-            _facts(tmp_path, recording=bogus)
-        )
-
-        assert captured is not None
-        assert (captured.directory / IDLE_TRACE_FILENAME).exists()
-        identity = json.loads(
-            (captured.directory / RUN_IDENTITY_FILENAME).read_text(encoding="utf-8")
-        )
-        assert identity["recording_copy_error"] is not None
-        assert identity["composer_state"]["state"] == "undetermined"
-        assert "classification failed" in identity["composer_state"]["evidence_snippet"]
-        assert not list(captured.directory.glob("*.part"))
-
     def test_a_broken_clock_cannot_mask_the_round_failure(self, tmp_path: Path) -> None:
         def _explode() -> datetime:
             raise RuntimeError("clock exploded")
 
-        recorder = ExchangeKillEvidenceRecorder(tmp_path / "retained", clock=_explode)
+        recorder = ExchangeKillEvidenceRecorder(
+            resolve_root=lambda _worktree: tmp_path / "retained", clock=_explode
+        )
 
-        assert recorder.capture(
-            _facts(tmp_path, recording=_stranded_recording(tmp_path))
-        ) is None
+        assert (
+            recorder.capture_declared_failure(
+                _facts(tmp_path, recording=_stranded_recording(tmp_path))
+            )
+            is None
+        )
+
+
+# ---------------------------------------------------------------------------
+# In-flight registry and the outer kill path
+# ---------------------------------------------------------------------------
+
+
+class TestInFlightRounds:
+    """#7141 finding 2: the round that never got to declare its own failure."""
+
+    def test_a_registered_round_is_visible_until_it_finishes(
+        self, tmp_path: Path
+    ) -> None:
+        recorder = _recorder(tmp_path / "retained")
+        identity = _identity(tmp_path, recording=_stranded_recording(tmp_path))
+
+        ticket = recorder.round_started(identity)
+        assert recorder.in_flight_for(7128) == (identity,)
+
+        recorder.round_finished(ticket)
+        assert recorder.in_flight_for(7128) == ()
+
+    def test_round_finished_is_idempotent(self, tmp_path: Path) -> None:
+        recorder = _recorder(tmp_path / "retained")
+        ticket = recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        recorder.round_finished(ticket)
+        recorder.round_finished(ticket)
+
+        assert recorder.in_flight_for(7128) == ()
+
+    def test_teardown_captures_every_in_flight_round_for_the_issue(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "retained"
+        recorder = _recorder(root)
+        recording = _stranded_recording(tmp_path)
+        recorder.round_started(_identity(tmp_path, recording=recording, role="coder"))
+        recorder.round_started(
+            _identity(tmp_path, recording=recording, role="reviewer")
+        )
+        recorder.round_started(
+            _identity(tmp_path, recording=recording, issue_number=9999)
+        )
+
+        captured = recorder.capture_abandoned_rounds(7128, reason="deadline exceeded")
+
+        assert len(captured) == 2
+        roles = {
+            json.loads((path / RUN_IDENTITY_FILENAME).read_text(encoding="utf-8"))[
+                "role"
+            ]
+            for path in captured
+        }
+        assert roles == {"coder", "reviewer"}
+
+    def test_abandoned_capture_records_the_typed_reason_and_cause(
+        self, tmp_path: Path
+    ) -> None:
+        recorder = _recorder(tmp_path / "retained")
+        recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        captured = recorder.capture_abandoned_rounds(
+            7128, reason="supervisor deadline exceeded"
+        )
+
+        identity = json.loads(
+            (captured[0] / RUN_IDENTITY_FILENAME).read_text(encoding="utf-8")
+        )
+        assert identity["failure_reason"] == "abandoned_by_teardown"
+        assert "supervisor deadline exceeded" in identity["error"]
+
+    def test_a_wedged_round_contributes_its_live_idle_trajectory(
+        self, tmp_path: Path
+    ) -> None:
+        """For a stuck worker the frozen bytes_drained series IS the diagnosis."""
+        recorder = _recorder(tmp_path / "retained", monotonic=lambda: 900.0)
+        ticket = recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+        detector = RoundIdleDetector(
+            window_seconds=None,
+            deadline_seconds=7200.0,
+            poll_interval_seconds=0.1,
+            round_started_at=0.0,
+            activity_since=0.0,
+            recording_bytes=0,
+        )
+        detector.observe(1.0, drained=42, recording_bytes=42)
+        detector.observe(600.0, drained=0, recording_bytes=42)
+        ticket.attach_detector(detector)
+
+        captured = recorder.capture_abandoned_rounds(7128, reason="deadline")
+
+        payload = json.loads(
+            (captured[0] / IDLE_TRACE_FILENAME).read_text(encoding="utf-8")
+        )
+        assert payload["idle_trace"]["bytes_drained_total"] == 42
+        assert payload["idle_trace"]["idle_for_seconds"] == 899.0
+        assert payload["idle_trace_unavailable"] is None
+
+    def test_a_round_with_no_detector_yet_says_why_the_trace_is_missing(
+        self, tmp_path: Path
+    ) -> None:
+        recorder = _recorder(tmp_path / "retained")
+        recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        captured = recorder.capture_abandoned_rounds(7128, reason="deadline")
+
+        payload = json.loads(
+            (captured[0] / IDLE_TRACE_FILENAME).read_text(encoding="utf-8")
+        )
+        assert payload["idle_trace"] is None
+        assert "no idle detector existed" in payload["idle_trace_unavailable"]
+
+    def test_capture_is_single_shot_per_round(self, tmp_path: Path) -> None:
+        """A second teardown must not re-capture a round already retained."""
+        recorder = _recorder(tmp_path / "retained")
+        recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        first = recorder.capture_abandoned_rounds(7128, reason="deadline")
+        second = recorder.capture_abandoned_rounds(7128, reason="deadline again")
+
+        assert len(first) == 1
+        assert second == ()
+
+    def test_no_in_flight_rounds_is_a_quiet_no_op(self, tmp_path: Path) -> None:
+        recorder = _recorder(tmp_path / "retained")
+
+        assert recorder.capture_abandoned_rounds(7128, reason="deadline") == ()
+
+    def test_teardown_capture_never_raises(self, tmp_path: Path) -> None:
+        blocked = tmp_path / "blocked"
+        blocked.write_text("not a directory", encoding="utf-8")
+        recorder = _recorder(blocked)
+        recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        assert recorder.capture_abandoned_rounds(7128, reason="deadline") == ()
+
+    def test_registry_is_safe_under_concurrent_rounds(self, tmp_path: Path) -> None:
+        recorder = _recorder(tmp_path / "retained")
+        recording = _stranded_recording(tmp_path)
+        barrier = threading.Barrier(8)
+        errors: list[BaseException] = []
+
+        def _churn(index: int) -> None:
+            try:
+                barrier.wait(timeout=5)
+                for _ in range(20):
+                    ticket = recorder.round_started(
+                        _identity(
+                            tmp_path, recording=recording, issue_number=1000 + index
+                        )
+                    )
+                    recorder.round_finished(ticket)
+            except BaseException as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_churn, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert errors == []
+        assert recorder.in_flight_for(1000) == ()
+
+
+class TestConcurrentCaptures:
+    """Staging + rename + index append must hold up under real contention.
+
+    The capture path grew a hidden staging directory, an atomic rename, and a
+    self-healing index append (#7141 finding 3); all three are new places for
+    concurrent captures to collide.
+    """
+
+    def test_64_concurrent_captures_get_distinct_directories(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "retained"
+        recorder = _recorder(root)
+        recording = _stranded_recording(tmp_path)
+        barrier = threading.Barrier(64)
+        results: list[Path] = []
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def _capture() -> None:
+            try:
+                barrier.wait(timeout=30)
+                captured = recorder.capture_declared_failure(
+                    _facts(tmp_path, recording=recording)
+                )
+                assert captured is not None
+                with lock:
+                    results.append(captured.directory)
+            except BaseException as exc:  # pragma: no cover - reported below
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=_capture) for _ in range(64)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        assert errors == []
+        assert len(results) == 64
+        assert len(set(results)) == 64, "captures collided on one directory"
+        for directory in results:
+            assert (directory / RUN_IDENTITY_FILENAME).exists()
+
+    def test_64_concurrent_captures_leave_a_parseable_index(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "retained"
+        recorder = _recorder(root)
+        recording = _stranded_recording(tmp_path)
+        barrier = threading.Barrier(64)
+        errors: list[BaseException] = []
+
+        def _capture() -> None:
+            try:
+                barrier.wait(timeout=30)
+                recorder.capture_declared_failure(_facts(tmp_path, recording=recording))
+            except BaseException as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_capture) for _ in range(64)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        assert errors == []
+        lines = (root / INDEX_FILENAME).read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 64
+        for line in lines:
+            assert json.loads(line)["kind"] == "exchange_kill_evidence"
+
+    def test_no_staging_directories_survive_concurrent_captures(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "retained"
+        recorder = _recorder(root)
+        recording = _stranded_recording(tmp_path)
+        threads = [
+            threading.Thread(
+                target=lambda: recorder.capture_declared_failure(
+                    _facts(tmp_path, recording=recording)
+                )
+            )
+            for _ in range(16)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        leftovers = [entry.name for entry in root.iterdir() if entry.name.startswith(".")]
+        assert leftovers == []

@@ -7392,6 +7392,9 @@ class TestRetainedKillEvidence:
         from issue_orchestrator.domain.review_exchange_failures import (
             RoundFailureReason,
         )
+        from issue_orchestrator.execution.exchange_kill_evidence import (
+            ExchangeKillEvidenceRecorder,
+        )
         from issue_orchestrator.execution.persistent_round_failures import (
             PersistentRoundTimeoutError,
         )
@@ -7450,6 +7453,9 @@ class TestRetainedKillEvidence:
             max_no_progress=2,
             require_validation=False,
             before_reviewer_round=_paint_reviewer_screen,
+            # The real resolver: proves the retained root is derived from the
+            # linked worktree's shared git dir, outside the worktree itself.
+            kill_evidence=ExchangeKillEvidenceRecorder(),
             events=sink,
             event_context=EventContext(),
         )

@@ -53,7 +53,8 @@ class ComposerStateVerdict:
     matched_marker: str | None
     evidence_snippet: str
     scanned_events: int
-    scanned_chars: int
+    scanned_rows: int
+    replayed_from_start: bool
     prompt_marker_present: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -62,7 +63,8 @@ class ComposerStateVerdict:
             "matched_marker": self.matched_marker,
             "evidence_snippet": self.evidence_snippet,
             "scanned_events": self.scanned_events,
-            "scanned_chars": self.scanned_chars,
+            "scanned_rows": self.scanned_rows,
+            "replayed_from_start": self.replayed_from_start,
             "prompt_marker_present": self.prompt_marker_present,
         }
 
@@ -74,7 +76,8 @@ def undetermined_composer_state(detail: str) -> ComposerStateVerdict:
         matched_marker=None,
         evidence_snippet=detail,
         scanned_events=0,
-        scanned_chars=0,
+        scanned_rows=0,
+        replayed_from_start=False,
         prompt_marker_present=False,
     )
 
@@ -206,22 +209,36 @@ class RoundIdleDetector:
         The newest points matter most for forensics, so the ring drops from
         the front. ``samples_dropped`` keeps the snapshot honest about it.
         """
-        sample = IdleSample(
-            elapsed_seconds=_rounded(self.elapsed(current)),
-            poll_iterations=self.poll_iterations,
-            bytes_drained_total=self.bytes_drained_total,
-            idle_for_seconds=_rounded(self.idle_for(current)),
-            recording_bytes=self.recording_bytes,
-        )
+        sample = self._build_sample(current)
         self._samples.append(sample)
         while len(self._samples) > self.max_samples:
             self._samples.pop(0)
             self.samples_dropped += 1
         return sample
 
+    def _build_sample(self, current: float) -> IdleSample:
+        return IdleSample(
+            elapsed_seconds=_rounded(self.elapsed(current)),
+            poll_iterations=self.poll_iterations,
+            bytes_drained_total=self.bytes_drained_total,
+            idle_for_seconds=_rounded(self.idle_for(current)),
+            recording_bytes=self.recording_bytes,
+        )
+
     def snapshot(self, current: float) -> RoundIdleTrace:
-        """Freeze the detector's state, adding a final sample at ``current``."""
-        self.record_sample(current)
+        """Freeze the detector's state, adding a final sample at ``current``.
+
+        Deliberately **non-mutating**: the round runner owns this object from
+        its worker thread, and the supervisor's teardown path reads it from
+        another thread to retain the trajectory of a round that is still
+        wedged. A snapshot that appended to the sample ring would be a
+        cross-thread write on someone else's object. The returned trace is
+        identical either way — the final sample is synthesised into the
+        returned tuple instead of into internal state.
+        """
+        final = self._build_sample(current)
+        samples = (*self._samples, final)
+        overflow = max(0, len(samples) - self.max_samples)
         return RoundIdleTrace(
             window_seconds=self.window_seconds,
             deadline_seconds=self.deadline_seconds,
@@ -231,6 +248,6 @@ class RoundIdleDetector:
             poll_iterations=self.poll_iterations,
             bytes_drained_total=self.bytes_drained_total,
             recording_bytes=self.recording_bytes,
-            samples=tuple(self._samples),
-            samples_dropped=self.samples_dropped,
+            samples=samples[overflow:],
+            samples_dropped=self.samples_dropped + overflow,
         )

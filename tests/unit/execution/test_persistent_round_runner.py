@@ -720,6 +720,54 @@ class TestPersistentSessionFailureModes:
         assert trace.bytes_drained_total == 12
         assert trace.elapsed_seconds >= 2.0
 
+    def test_invalid_response_failure_carries_the_idle_trace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """#7141 finding 4: this was the one raise site without a trace."""
+        from issue_orchestrator.execution import persistent_round_runner as prr
+        class _Proc:
+            pid = 777
+            _polls = 0
+
+            def poll(self) -> int | None:
+                _Proc._polls += 1
+                return 3 if _Proc._polls > 1 else None
+
+        monkeypatch.setattr(
+            prr, "_submit_prompt_with_enter",
+            lambda _s, payload, **_k: (len(payload) + 1, None),
+        )
+        monkeypatch.setattr(prr, "_drain_pty_output", lambda _s: 5)
+        response_file = tmp_path / "response.json"
+        session = prr.PersistentSession(proc=_Proc(), master_fd=99)  # type: ignore[arg-type]
+
+        clock_value = {"t": 0.0}
+
+        def _now() -> float:
+            return clock_value["t"]
+
+        def _sleep(seconds: float) -> None:
+            clock_value["t"] += seconds
+            # send_round clears a stale response file before prompting, so the
+            # agent's invalid JSON has to land after that.
+            response_file.write_text("{not json", encoding="utf-8")
+
+        with pytest.raises(PersistentRoundError) as exc_info:
+            send_round(
+                session,
+                prompt="p",
+                response_file=response_file,
+                timeout_seconds=30.0,
+                poll_interval_seconds=0.5,
+                now=_now,
+                sleep=_sleep,
+            )
+
+        assert persistent_round_failure_reason(exc_info.value) == "invalid_response"
+        assert persistent_round_idle_trace(exc_info.value) is not None
+
     def test_prompt_activity_resets_not_accepted_idle_window(
         self,
         monkeypatch: pytest.MonkeyPatch,
