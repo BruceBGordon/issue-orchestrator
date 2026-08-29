@@ -44,6 +44,8 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 
+from issue_orchestrator.infra.process_table import ps_command, ps_env
+
 from tests.process_group_run import (
     ProcessGroupUnsupportedError,
     await_exit_without_reaping,
@@ -235,16 +237,13 @@ def _marked_pids(marker: str) -> tuple[int, ...]:
     at the interpreter path and the sweep reaped nothing while reporting
     success. A width the environment can choose is a width this cannot use.
     """
-    env = {**os.environ}
-    env.pop("COLUMNS", None)
-    env.pop("LINES", None)
     result = subprocess.run(
-        ["ps", "-ww", "-U", str(os.getuid()), "-o", "pid,command"],
+        ps_command("-U", str(os.getuid()), "-o", "pid,command"),
         capture_output=True,
         text=True,
         check=True,
         timeout=_PS_TIMEOUT_SECONDS,
-        env=env,
+        env=ps_env(),
     )
     own_pid = os.getpid()
     pids: list[int] = []

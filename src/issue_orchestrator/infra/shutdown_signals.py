@@ -36,6 +36,8 @@ import subprocess
 import threading
 from typing import Callable
 
+from .process_table import ps_command, ps_env
+
 logger = logging.getLogger(__name__)
 
 # Signals that mean "shut down". SIGTERM is what supervisors/`kill` send;
@@ -106,12 +108,11 @@ def describe_sender(pid: int) -> str:
         return "unknown (not reported)"
     try:
         result = subprocess.run(
-            # -ww: procps truncates COMMAND to $COLUMNS even into a pipe,
-            # which would silently shorten the attribution this returns.
-            ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            ps_command("-p", str(pid), "-o", "command="),
             capture_output=True,
             text=True,
             timeout=2,
+            env=ps_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return "(sender lookup failed)"

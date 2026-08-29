@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from issue_orchestrator.infra.process_table import ps_command, ps_env
+
 
 logger = logging.getLogger(__name__)
 
@@ -73,13 +75,13 @@ def kill_stale_e2e_orchestrators(
     """
     try:
         ps_result = run(
-            # -ww: without it procps truncates COMMAND to $COLUMNS even
-            # into a pipe, and the substring match below decides what to
-            # KILL. A truncated table quietly matches nothing (#7142).
-            ["ps", "ax", "-ww", "-o", "pid=,command="],
+            # The substring match below decides what to KILL, so a truncated
+            # table would quietly match nothing (#7142).
+            ps_command("-A", "-o", "pid=,command="),
             capture_output=True,
             text=True,
             check=False,
+            env=ps_env(),
         )
     except PermissionError as exc:
         logger.info("[E2E CLEANUP] Skipping ps scan (permission denied): %s", exc)

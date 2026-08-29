@@ -5,6 +5,8 @@ from __future__ import annotations
 import subprocess
 from typing import Any
 
+from issue_orchestrator.infra.process_table import ps_command
+
 from tests.e2e._stale_orchestrator_cleanup import (
     is_e2e_orchestrator_start_command,
     kill_stale_e2e_orchestrators,
@@ -131,7 +133,7 @@ def test_kill_cleanup_only_kills_selected_processes() -> None:
 
     def fake_run(args: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
         calls.append(args)
-        if args[:2] == ["ps", "ax"]:
+        if args[:2] == ps_command()[:2]:
             return subprocess.CompletedProcess(args, 0, stdout=ps_output, stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
@@ -143,6 +145,6 @@ def test_kill_cleanup_only_kills_selected_processes() -> None:
 
     assert killed == 1
     assert calls == [
-        ["ps", "ax", "-ww", "-o", "pid=,command="],
+        ps_command("-A", "-o", "pid=,command="),
         ["kill", "301"],
     ]

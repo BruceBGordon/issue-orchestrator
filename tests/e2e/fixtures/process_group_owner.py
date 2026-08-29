@@ -8,6 +8,8 @@ import signal
 import subprocess
 import time
 
+from issue_orchestrator.infra.process_table import ps_command, ps_env
+
 logger = logging.getLogger(__name__)
 
 OWNED_GROUP_STOP_TIMEOUT_SECONDS = 5
@@ -27,10 +29,11 @@ class ProcessGroupOwner:
         """Capture groups before the root dies and descendants are reparented."""
         try:
             result = subprocess.run(
-                ["ps", "-ax", "-o", "pid=,ppid=,pgid="],
+                ps_command("-ax", "-o", "pid=,ppid=,pgid="),
                 capture_output=True,
                 text=True,
                 check=True,
+                env=ps_env(),
             )
         except (OSError, subprocess.CalledProcessError) as exc:
             raise RuntimeError(

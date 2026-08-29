@@ -30,6 +30,35 @@ from issue_orchestrator.execution.host_load_probe import (
 OWNER = "brucegordon"
 _MODULE = "issue_orchestrator.entrypoints.cli_tools.host_load_preflight"
 
+# Run in a child interpreter: it reports a busy host (so there is something to
+# print), then the scenario breaks stderr in a different way before main().
+_DRIVER_PREAMBLE = """
+import io
+from issue_orchestrator.entrypoints.cli_tools import host_load_preflight as h
+from issue_orchestrator.execution.host_load_probe import HostSnapshot, ProcessRow
+
+h.probe_host = lambda: HostSnapshot(
+    0.0, (ProcessRow(1, 9001, 't', 99.0, '00:42', 42, 'python3 -c pass'),)
+)
+h.current_owner = lambda: 't'
+
+def _wrapper(*, write_fails=False, flush_fails=False):
+    class Raw(io.RawIOBase):
+        def writable(self):
+            return True
+
+        def write(self, b):
+            if write_fails:
+                raise OSError(5, 'write blew up')
+            return len(b)
+
+        def flush(self):
+            if flush_fails:
+                raise OSError(5, 'flush blew up')
+
+    return io.TextIOWrapper(io.BufferedWriter(Raw()))
+"""
+
 
 def _row(
     *,
@@ -237,69 +266,60 @@ class TestOutput:
         assert stream.getvalue() == "[host-preflight] first\n[host-preflight] second\n"
 
     @pytest.mark.parametrize(
-        "failure",
+        ("scenario", "breakage"),
         [
-            pytest.param(BrokenPipeError(32, "Broken pipe"), id="broken-pipe"),
-            pytest.param(OSError(5, "Input/output error"), id="io-error"),
-            pytest.param(ValueError("I/O operation on closed file"), id="closed"),
+            pytest.param(
+                "closed-fd-2",
+                "import os; os.close(2)",
+                id="closed-fd-2",
+            ),
+            pytest.param(
+                "raising-write",
+                "import sys; sys.stderr = _wrapper(write_fails=True)",
+                id="raising-write",
+            ),
+            pytest.param(
+                "raising-final-flush",
+                "import sys; sys.stderr = _wrapper(flush_fails=True)",
+                id="raising-final-flush",
+            ),
         ],
     )
-    def test_a_stream_that_cannot_be_written_does_not_fail_the_gate(
-        self, monkeypatch: pytest.MonkeyPatch, failure: Exception
+    def test_output_failure_never_costs_the_gate_its_exit_code(
+        self, scenario: str, breakage: str
     ) -> None:
-        """The last path out of the always-exit-0 contract.
+        """Real subprocesses, because the exit code is the thing under test.
 
-        The probe reports failure through a typed error and the caller prints
-        it; a *printing* failure has nowhere left to report to. Raising here
-        would fail the gate over the diagnostic meant to protect it.
+        A fake stream inside this process can show that ``emit`` returns; it
+        cannot show what CPython does with a still-broken stream during
+        interpreter shutdown, which is where the 120s come from — and it was a
+        mock-stream test that let the ``closed-fd-2`` regression through.
         """
+        driver = _DRIVER_PREAMBLE + breakage + "\nh.main()\n"
 
-        class RefusingStream(io.StringIO):
-            def write(self, s: str) -> int:
-                raise failure
-
-        monkeypatch.setattr(f"{_MODULE}.sys.platform", "darwin")
-        monkeypatch.setattr(
-            f"{_MODULE}.probe_host", lambda: _snapshot(0.0, _burner(41600))
+        completed = subprocess.run(
+            [sys.executable, "-c", driver],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
         )
-        monkeypatch.setattr(f"{_MODULE}.current_owner", lambda: OWNER)
-        monkeypatch.setattr(f"{_MODULE}.sys.stderr", RefusingStream())
 
-        main()  # must simply return
-
-    def test_a_flush_that_fails_does_not_fail_the_gate(self) -> None:
-        class UnflushableStream(io.StringIO):
-            def flush(self) -> None:
-                raise BrokenPipeError(32, "Broken pipe")
-
-        emit(UnflushableStream(), ("something worth saying",))
+        assert completed.returncode == 0, (
+            f"{scenario}: the preflight failed the gate because it could not "
+            f"print (exit {completed.returncode}); stderr={completed.stderr!r}"
+        )
 
     def test_a_real_hung_up_reader_still_exits_zero(self) -> None:
-        """A fake stream cannot show this one.
-
-        Containing the write leaves the unwritten bytes in the buffer, and
-        CPython flushes the std streams again during shutdown — outside any
-        handler, reported as "Exception ignored", exit 120. Only a real
-        process with a real broken descriptor exercises that path.
-        """
-        driver = (
-            "from issue_orchestrator.entrypoints.cli_tools "
-            "import host_load_preflight as h;"
-            "from issue_orchestrator.execution.host_load_probe "
-            "import HostSnapshot, ProcessRow;"
-            "h.probe_host = lambda: HostSnapshot(0.0, (ProcessRow("
-            "1, 9001, 't', 99.0, '00:42', 42, 'python3 -c pass'),));"
-            "h.current_owner = lambda: 't';"
-            "h.main()"
-        )
+        """The reader closes the pipe before the report is written."""
         process = subprocess.Popen(
-            [sys.executable, "-c", driver],
+            [sys.executable, "-c", _DRIVER_PREAMBLE + "h.main()\n"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
         try:
             assert process.stderr is not None
-            process.stderr.close()  # the reader hangs up before anything is read
+            process.stderr.close()
 
             assert process.wait(timeout=60) == 0, (
                 "the preflight failed the gate because it could not print"

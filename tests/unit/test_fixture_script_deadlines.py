@@ -34,6 +34,7 @@ import re
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -198,15 +199,12 @@ LIFETIME_ALLOWLIST: frozenset[tuple[str, str]] = frozenset()
 # a value is either statically knowable or it is not, and pretending otherwise
 # would make this scan lie about its coverage.
 #
-# ``time.sleep``/``signal.alarm`` are matched only inside string constants,
-# which is what makes them precise: Python source inside a string literal is
-# there to be executed somewhere else. The same call in ordinary test code is
-# an AST node, not a string, and is correctly ignored -- a harness waiting on
-# its own child is not a fixture lifetime.
-_SCRIPT_PATTERNS = (
-    ("time.sleep", re.compile(r"\btime\.sleep\(\s*([0-9]+(?:\.[0-9]+)?)\s*\)")),
-    ("signal.alarm", re.compile(r"\bsignal\.alarm\(\s*([0-9]+(?:\.[0-9]+)?)\s*\)")),
-)
+# These calls count only inside string constants, which is what makes them
+# precise: Python source inside a string literal is there to be executed
+# somewhere else. The same call in ordinary test code is an AST node, not a
+# string, and is correctly ignored — a harness waiting on its own child is not
+# a fixture lifetime.
+_SCRIPT_CALLS = ("time.sleep", "signal.alarm")
 # The declared knobs that are threaded into a spawned script's argv.
 _LIFETIME_CONSTANT_RE = re.compile(r"(LIFETIME|MAX)_SECONDS$")
 # Cheap gate so the scan parses ~7% of the tree instead of all of it.
@@ -218,6 +216,16 @@ _SCAN_HINTS = ("time.sleep(", "signal.alarm(", "LIFETIME_SECONDS", "MAX_SECONDS"
 #     test data; scanning that shape would report it as an hour-long fixture.
 #   * ``time.sleep(<expression>)`` -- the two in this tree take their value from
 #     argv, and the constants that supply it are discovered by the rule above.
+
+# Docstrings are prose that happens to sit in a string constant. A module whose
+# only content is a docstring mentioning ``time.sleep(7200)`` is documentation,
+# not a two-hour fixture, and reporting it would teach people to silence this.
+_DOCSTRING_HOLDERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+
+# A quoted run inside a command line: `python -c 'import time; time.sleep(30)'`.
+_QUOTED_RUN_RE = re.compile(r"""(['\"])(.*?)\1""", re.DOTALL)
+# The script argument of a ``python -c <script>`` command line.
+_DASH_C_RE = re.compile(r"-c\s+(.*)", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -246,19 +254,111 @@ def discover_fixture_lifetimes(tree: Path) -> tuple[DiscoveredLifetime, ...]:
         if not any(hint in text for hint in _SCAN_HINTS):
             continue
         relative = str(path.relative_to(tree))
-        for node in ast.walk(ast.parse(text, filename=str(path))):
+        module = ast.parse(text, filename=str(path))
+        docstrings = _docstring_constants(module)
+        for node in ast.walk(module):
+            if id(node) in docstrings:
+                continue
             found.extend(_lifetimes_in_node(node, relative))
     return tuple(found)
+
+
+def _docstring_constants(module: ast.Module) -> set[int]:
+    """The ids of every docstring constant: module, class and function."""
+    ids: set[int] = set()
+    for node in ast.walk(module):
+        if not isinstance(node, _DOCSTRING_HOLDERS):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            ids.add(id(first.value))
+    return ids
+
+
+def _dotted_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return f"{node.value.id}.{node.attr}"
+    return None
+
+
+def _candidate_sources(text: str) -> list[str]:
+    """The ways a spawned script hides inside one string constant.
+
+    Three shapes, all present in this tree:
+
+    * the string is the script — ``"import time\\ntime.sleep(30)\\n"``;
+    * the string is an indented block waiting for ``textwrap.dedent``;
+    * the string is a *command line* with the script quoted inside it, which is
+      what an f-string fragment like ``" -c 'import time; time.sleep(30)'"``
+      leaves behind once the placeholders are gone.
+
+    Prose survives none of these: a sentence does not parse, dedenting a
+    sentence does not parse, and the quoted runs inside a sentence are words.
+    """
+    candidates = [text, textwrap.dedent(text)]
+    candidates.extend(match.group(2) for match in _QUOTED_RUN_RE.finditer(text))
+    # ``-c`` takes the script as its argument, whatever quoting survived the
+    # f-string that built the command line. Cheaper and more reliable than
+    # trying to re-pair escaped quotes.
+    candidates.extend(
+        match.group(1).strip("\"' ") for match in _DASH_C_RE.finditer(text)
+    )
+    return candidates
+
+
+def _lifetimes_in_script(source: str) -> list[tuple[str, float]]:
+    """Durations a spawned script *executes*, not ones its text mentions.
+
+    The string has to parse as Python and the call has to be a real ``Call``
+    node with a literal first argument. Prose does not parse, and text that
+    happens to parse still has to be code rather than a sentence about code.
+
+    The first candidate that parses wins, and the rest are not consulted. If
+    the string is valid Python then that is what it is, and the quoted runs
+    inside it are its own literals — a docstring in a generated file is
+    documentation there too, and looking inside it would re-admit exactly the
+    prose this excludes.
+    """
+    for candidate in _candidate_sources(source):
+        tree = _parsed(candidate)
+        if tree is not None:
+            return _lifetimes_in_tree(tree)
+    return []
+
+
+def _parsed(source: str) -> ast.Module | None:
+    try:
+        return ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+
+
+def _lifetimes_in_tree(tree: ast.Module) -> list[tuple[str, float]]:
+    found: list[tuple[str, float]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        if _dotted_name(node.func) not in _SCRIPT_CALLS:
+            continue
+        argument = node.args[0]
+        if not isinstance(argument, ast.Constant):
+            continue
+        value = argument.value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        found.append((f"{_dotted_name(node.func)}({value})", float(value)))
+    return found
 
 
 def _lifetimes_in_node(node: ast.AST, relative: str) -> list[DiscoveredLifetime]:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return [
-            DiscoveredLifetime(
-                relative, node.lineno, match.group(0), float(match.group(1))
-            )
-            for _, pattern in _SCRIPT_PATTERNS
-            for match in pattern.finditer(node.value)
+            DiscoveredLifetime(relative, node.lineno, source, seconds)
+            for source, seconds in _lifetimes_in_script(node.value)
         ]
     if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
         return []
@@ -314,6 +414,47 @@ def test_the_scan_finds_the_fixtures_this_tree_is_known_to_have() -> None:
     assert len(discovered) >= 20, f"scan looks broken: only {len(discovered)} sites"
 
 
+def test_documentation_is_not_a_fixture(tmp_path: Path) -> None:
+    """Prose about a long sleep is not a long sleep.
+
+    A module whose only content is a docstring mentioning ``time.sleep(7200)``
+    used to fail the budget — teaching people that the way past this test is to
+    stop writing things down.
+    """
+    (tmp_path / "doc_only.py").write_text(
+        '"""Notes about fixture hygiene.\n\n'
+        "We used to write time.sleep(7200) here, which was the whole problem.\n"
+        '"""\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "nested_docs.py").write_text(
+        "class Thing:\n"
+        '    """A class docstring mentioning time.sleep(9000)."""\n\n'
+        "    def method(self):\n"
+        '        """A method docstring mentioning signal.alarm(9999)."""\n'
+        "        return 1\n",
+        encoding="utf-8",
+    )
+    # A docstring whose text is *itself* valid Python — a snippet with no
+    # prose around it. Only the structural docstring rule can exclude this
+    # one; the "must parse as code" rule happily accepts it.
+    (tmp_path / "code_shaped_doc.py").write_text(
+        '"""time.sleep(7200)"""\n\n\nclass Thing:\n'
+        '    """signal.alarm(9000)"""\n',
+        encoding="utf-8",
+    )
+    # Same number, in a string that is actually spawned.
+    (tmp_path / "real_script.py").write_text(
+        'SCRIPT = "import time\\ntime.sleep(7200)\\n"\n', encoding="utf-8"
+    )
+
+    discovered = discover_fixture_lifetimes(tmp_path)
+
+    assert [(item.path, item.seconds) for item in discovered] == [
+        ("real_script.py", 7200.0)
+    ], "documentation was mistaken for a fixture, or the real script was missed"
+
+
 def test_the_scanner_recognises_every_shape_it_claims(tmp_path: Path) -> None:
     """Prove each pattern on synthetic source, including the decoys.
 
@@ -325,6 +466,10 @@ def test_the_scanner_recognises_every_shape_it_claims(tmp_path: Path) -> None:
         'OTHER_TIMEOUT_SECONDS = 99999.0\n'
         'SCRIPT = "import time\\ntime.sleep(42)\\n"\n'
         'ALARMED = "import signal\\nsignal.alarm(7)\\n"\n'
+        # An indented block waiting for textwrap.dedent, and a command line
+        # with the script quoted inside it: both real shapes in this tree.
+        'INDENTED = \'\'\'\n    import time\n    time.sleep(64)\n\'\'\'\n'
+        'COMMAND = f"{EXE} -c \\"import time; time.sleep(81)\\""\n'
         'def harness():\n'
         '    import time\n'
         '    time.sleep(0.25)\n',
@@ -336,6 +481,8 @@ def test_the_scanner_recognises_every_shape_it_claims(tmp_path: Path) -> None:
     assert ("SPAWN_LIFETIME_SECONDS", 12.5) in found
     assert ("time.sleep(42)", 42.0) in found
     assert ("signal.alarm(7)", 7.0) in found
+    assert ("time.sleep(64)", 64.0) in found, "an indented script block was missed"
+    assert ("time.sleep(81)", 81.0) in found, "a quoted -c script was missed"
     assert not any(source == "OTHER_TIMEOUT_SECONDS" for source, _ in found), (
         "a plain timeout is not a fixture lifetime"
     )

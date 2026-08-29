@@ -20,6 +20,7 @@ This module owns the policy; ``execution/host_load_probe`` owns the sampling.
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import sys
@@ -183,31 +184,61 @@ def emit(stream: TextIO, lines: tuple[str, ...]) -> None:
 
 
 def _abandon(stream: TextIO) -> None:
-    """Point a failed stream's descriptor at devnull.
+    """Leave a failed stream somewhere harmless before the interpreter exits.
 
     Catching the write is not enough on its own: the unwritten bytes stay in
     the wrapper's buffer, and CPython flushes the std streams again during
     interpreter shutdown, outside any handler this module can install. That
     second failure is reported as "Exception ignored" and exits **120** — the
-    gate lost to its own diagnostic after all. Redirecting the descriptor (the
-    idiom the standard library documents for ``BrokenPipeError``) leaves that
-    final flush somewhere harmless to land.
+    gate lost to its own diagnostic after all.
 
-    A stream with no real descriptor -- a ``StringIO`` under test -- has no
-    shutdown flush to survive, so there is nothing to do.
+    Two kinds of broken stream, so two repairs. One with a descriptor is
+    redirected to devnull, the idiom the standard library documents for
+    ``BrokenPipeError``. One without a descriptor cannot be redirected, so if
+    it is ``sys.stderr`` it is replaced outright: the shutdown flush follows
+    the current binding, and the discarded object's own finaliser complains
+    into the void without changing the exit status.
     """
-    try:
-        descriptor = stream.fileno()
-    except (OSError, ValueError):
+    descriptor = _descriptor_of(stream)
+    if descriptor is not None:
+        _redirect_to_devnull(descriptor)
         return
+    if stream is sys.stderr:
+        # Deliberately never closed: it must outlive this call and absorb the
+        # shutdown flush. The process is about to exit.
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+
+def _descriptor_of(stream: TextIO) -> int | None:
+    """The stream's descriptor, or ``None`` when it has no real one."""
+    try:
+        return stream.fileno()
+    except (OSError, ValueError, io.UnsupportedOperation):
+        return None
+
+
+def _redirect_to_devnull(descriptor: int) -> None:
+    """Make ``descriptor`` a writable devnull, whatever state it was in.
+
+    ``dup2`` and not close-then-open: it replaces the target atomically and
+    never leaves the descriptor briefly unallocated.
+
+    The equality guard is the whole subtlety. When the descriptor was *already
+    closed*, ``os.open`` returns the lowest free number, which is that same
+    descriptor — devnull is then already exactly where it needs to be, and the
+    tidy-up close would re-open the hole this is repairing. Closing what we did
+    not effectively open is how the first version of this exited 120.
+    """
     try:
         devnull = os.open(os.devnull, os.O_WRONLY)
     except OSError:
         return
+    if devnull == descriptor:
+        return
     try:
         os.dup2(devnull, descriptor)
     except OSError:
-        return
+        pass
     finally:
         os.close(devnull)
 

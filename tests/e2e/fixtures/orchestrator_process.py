@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 
 import yaml
 
+from issue_orchestrator.infra.process_table import ps_command, ps_env
+
 from .inflight_tracker import control_api_headers, trigger_refresh
 from .process_group_owner import OWNED_GROUP_STOP_TIMEOUT_SECONDS, ProcessGroupOwner
 
@@ -506,11 +508,11 @@ class OrchestratorProcess:
             return
         try:
             result = subprocess.run(
-                # -ww: see tests/e2e/_stale_orchestrator_cleanup (#7142).
-                ["ps", "-ax", "-ww", "-o", "pid=,command="],
+                ps_command("-ax", "-o", "pid=,command="),
                 capture_output=True,
                 text=True,
                 check=False,
+                env=ps_env(),
             )
         except OSError:
             return
