@@ -392,17 +392,27 @@ endef
 # winning against command-line assignments at every make level. The
 # chain: the CLI invocation (a replaced LANE_VERDICT could answer
 # 'cached' for every lane), its interpreter, the declared variable
-# set, the override collection, and the worktree (snapshotted from
-# CURDIR at parse so a redirected CURDIR cannot re-aim the store).
-# Deliberately NOT overridden: $(PYTHON) is the whole build's
-# interpreter knob with legitimate overrides (tests, worktrees) far
-# beyond this layer; replacing it cannot selectively forge verdicts
-# without visibly breaking every other lane invocation, and the
-# absolutized copy below is pinned. Shell-level state (verdict_on,
-# vrc, status, target) is untouchable by make assignments.
-override LANE_VERDICT_PYTHON = $(if $(findstring /,$(PYTHON)),$(abspath $(PYTHON)),$(PYTHON))
+# set, the override collection, and the worktree (derived from the
+# shell, see the derivation audit below). Shell-level state
+# (verdict_on, vrc, status, target) is untouchable by make
+# assignments.
+# DERIVATION AUDIT (round 5): every value the enforcement chain
+# trusts bottoms out in override-pinned variables, SHELL OUTPUT, the
+# $(origin) builtin, or literals - never a command-line-assignable
+# name. The worktree comes from the shell (make cannot override the
+# process's cwd; CURDIR it CAN override, and a decoy CURDIR re-aimed
+# the store at a cache nobody validated). The layer's interpreter
+# derives from the pinned worktree's canonical venv, NOT $(PYTHON):
+# a decoy $(PYTHON) is exactly positioned to lie selectively to the
+# layer's own invocations while the venv path either IS the real
+# interpreter or fails loudly (127) - fail-fast, no follow-the-build
+# indirection. Documented exclusion: $(GMAKE) is outside this layer's
+# ownership - a decoy make forges the SUITE record through the
+# pre-existing PublishGate exit-code trust and prevents per-lane
+# verdicts from being consulted at all; it cannot mint one.
+override LANE_VERDICT_WORKTREE := $(shell pwd)
+override LANE_VERDICT_PYTHON := $(LANE_VERDICT_WORKTREE)/.venv/bin/python
 override LANE_VERDICT = $(LANE_VERDICT_PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_verdict
-override LANE_VERDICT_WORKTREE := $(CURDIR)
 # The layer's COMPLETE variable set. Engagement requires EVERY one of
 # these to be environment-origin (undefined is fine - absence is
 # handled separately); one override-origin variable anywhere refuses

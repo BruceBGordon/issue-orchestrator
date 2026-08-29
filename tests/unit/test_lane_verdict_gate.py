@@ -109,6 +109,12 @@ def _fake_repo(tmp_path: Path) -> tuple[Path, str]:
         check=True,
         env=environment,
     )
+    # The verdict layer's interpreter derives from the worktree's
+    # canonical venv (round 5); fake repos symlink the real one, and
+    # _commit_all later commits the symlink so eligibility stays clean.
+    venv_bin = repo / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(REPO_ROOT / ".venv" / "bin" / "python")
     return repo, _head(repo)
 
 
@@ -307,17 +313,17 @@ def test_record_failure_preserves_the_lane_outcome_exactly(
     assert red.returncode != 0
     assert "status=9" in red.stdout, "red lane's own exit status was altered"
 
-    # Break record surgically while check still answers: a shim that
-    # passes everything through except the record subcommand. It lives
-    # OUTSIDE the repo so the worktree stays clean for eligibility.
-    shim = tmp_path / "flaky-python.sh"
-    shim.write_text(
-        "#!/bin/sh\n"
-        'for a in "$@"; do [ "$a" = record ] && exit 127; done\n'
-        f'exec {real_python} "$@"\n'
-    )
-    shim.chmod(0o755)
-    green = run("green-lane", str(shim))
+    # Break record while check still answers (round 5 reworked this:
+    # $(PYTHON) can no longer reach the layer, so the fault comes from
+    # the store itself): an unwritable lanes root fails recording after
+    # a clean miss.
+    store_root = repo / ".issue-orchestrator" / "validation" / "lanes"
+    store_root.mkdir(parents=True)
+    store_root.chmod(0o555)
+    try:
+        green = run("green-lane", real_python)
+    finally:
+        store_root.chmod(0o755)
     assert green.returncode == 0, (
         "a green lane must stay green when recording fails:\n"
         + green.stdout
@@ -327,14 +333,14 @@ def test_record_failure_preserves_the_lane_outcome_exactly(
     assert "status=0" in green.stdout
     assert "could not record" in green.stderr
     assert "green-lane" in green.stderr
-    lanes_root = repo / ".issue-orchestrator" / "validation" / "lanes"
-    assert not list(lanes_root.glob(f"{sha}/green-lane.json")), (
+    assert not list(store_root.glob("*/green-lane.json")), (
         "no verdict may be left behind by a failed recording"
     )
-    # And the next run re-runs (nothing was cached).
+    # And the next run re-runs (nothing was cached) and records now.
     rerun = run("green-lane", real_python)
     assert rerun.returncode == 0
     assert "RAN-GREEN" in rerun.stdout
+    assert "recorded-green" in rerun.stdout
 
 
 def test_unwritable_store_warns_and_lane_stays_green(tmp_path: Path) -> None:
@@ -707,6 +713,121 @@ def test_blanking_the_override_collection_cannot_bypass(
     first = _helper_override_run(repo, sha, "LANE_VERDICT_OVERRIDDEN=")
     second = _helper_override_run(repo, sha, "LANE_VERDICT_OVERRIDDEN=")
     _assert_layer_refused(first, second, repo, naming="LANE_VERDICT_LANES")
+
+
+def test_decoy_interpreter_cannot_forge_verdicts(tmp_path: Path) -> None:
+    """Round-5 finding 1: LANE_VERDICT_PYTHON was pinned but DERIVED
+    from command-line-overridable $(PYTHON) - a decoy interpreter
+    answering exit 0 forged 'cached' for every lane. The layer's
+    interpreter now derives from the pinned worktree's canonical venv;
+    $(PYTHON) may steer the rest of the build, never the verdict
+    layer."""
+    repo, _ = _fake_repo(tmp_path)
+    (repo / "extra.mk").write_text(
+        "ok-lane:\n\t$(call TIMED_RUN,ok-lane,echo RAN-OK)\n"
+    )
+    sha = _commit_all(repo)
+    decoy = tmp_path / "decoy-python"
+    decoy.write_text("#!/bin/sh\nexit 0\n")
+    decoy.chmod(0o755)
+    make = shutil.which("gmake") or "make"
+    result = subprocess.run(
+        [
+            make,
+            "-f",
+            str(REPO_ROOT / "Makefile"),
+            "-f",
+            "extra.mk",
+            f"PYTHON={decoy}",
+            "ok-lane",
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env={
+            **_scrubbed_environment(),
+            "LANE_VERDICT_SHA": sha,
+            "LANE_VERDICT_LANES": "ok-lane",
+            "PYTHONPATH": str(REPO_ROOT / "src"),
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RAN-OK" in result.stdout, (
+        "a decoy $(PYTHON) forged a cached skip - the lane never ran:\n"
+        + result.stdout
+    )
+    assert "recorded-green" in result.stdout
+    lanes_root = repo / ".issue-orchestrator" / "validation" / "lanes"
+    assert list(lanes_root.glob(f"{sha}/ok-lane.json")), (
+        "the verdict was not recorded through the real layer"
+    )
+
+
+def test_decoy_curdir_cannot_reaim_the_store(tmp_path: Path) -> None:
+    """Round-5 finding 2: LANE_VERDICT_WORKTREE snapshotted CURDIR,
+    which make accepts from the command line - a decoy CURDIR aimed
+    the layer at a pre-seeded store nobody validated and it silently
+    cached-green skipped. The worktree now derives from the shell
+    ($(shell pwd)), which make cannot override; the decoy is ignored
+    and the real (empty) store is consulted."""
+    repo, _ = _fake_repo(tmp_path)
+    (repo / "extra.mk").write_text(
+        "ok-lane:\n\t$(call TIMED_RUN,ok-lane,echo RAN-OK)\n"
+    )
+    sha = _commit_all(repo)
+    # The decoy: a clone at the SAME sha with a pre-seeded green.
+    decoy = tmp_path / "decoy"
+    subprocess.run(
+        ["git", "clone", "-q", str(repo), str(decoy)],
+        check=True,
+        env=_scrubbed_environment(),
+    )
+    seeded = decoy / ".issue-orchestrator" / "validation" / "lanes" / sha
+    seeded.mkdir(parents=True)
+    import json as _json
+
+    (seeded / "ok-lane.json").write_text(
+        _json.dumps(
+            {
+                "target": "ok-lane",
+                "tree_sha": sha,
+                "exit_code": 0,
+                "recorded_at": "2026-01-01T00:00:00+00:00",
+            }
+        )
+    )
+    make = shutil.which("gmake") or "make"
+    result = subprocess.run(
+        [
+            make,
+            "-f",
+            str(REPO_ROOT / "Makefile"),
+            "-f",
+            "extra.mk",
+            f"PYTHON={REPO_ROOT / '.venv' / 'bin' / 'python'}",
+            "ok-lane",
+            f"CURDIR={decoy}",
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env={
+            **_scrubbed_environment(),
+            "LANE_VERDICT_SHA": sha,
+            "LANE_VERDICT_LANES": "ok-lane",
+            "PYTHONPATH": str(REPO_ROOT / "src"),
+        },
+    )
+    assert "cached-green" not in result.stdout, (
+        "a decoy CURDIR re-aimed the layer at a store nobody "
+        "validated:\n" + result.stdout
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RAN-OK" in result.stdout
+    real_store = repo / ".issue-orchestrator" / "validation" / "lanes"
+    assert list(real_store.glob(f"{sha}/ok-lane.json")), (
+        "the real worktree's store was not the one consulted"
+    )
 
 
 def test_untracked_state_disengages_the_cache_both_ways(
