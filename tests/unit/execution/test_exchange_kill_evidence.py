@@ -1562,3 +1562,127 @@ class TestUnmodelledStateCannotForgeAMarker:
         path = _recording(tmp_path / "decsc.jsonl", (footer.encode("utf-8"),))
 
         assert classify_composer_state(path).state is ComposerState.COMPOSER_STRANDED
+
+
+class TestStateReachedOutsideTheParserDoesNotForgeAVerdict:
+    """#7141 round 9: two ways a trusted verdict could still be wrong.
+
+    Both are channels the round-8 enumeration named but did not cover — a
+    private-prefixed CSI final that fell out of the mode dispatcher, and
+    resize, which reaches the screen without passing through the parser at all.
+    """
+
+    @staticmethod
+    def _mixed(path: Path, events: Iterable[dict[str, object]]) -> Path:
+        rows: list[dict[str, object]] = [
+            {
+                "schema_version": 1,
+                "event_type": "resize",
+                "offset_ms": 0,
+                "rows": 40,
+                "cols": 120,
+            }
+        ]
+        for index, event in enumerate(events, start=1):
+            row = {"schema_version": 1, "offset_ms": index * 10, **event}
+            rows.append(row)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        return path
+
+    @classmethod
+    def _output(cls, data: bytes) -> dict[str, object]:
+        return {
+            "event_type": "output",
+            "data_b64": base64.b64encode(data).decode("ascii"),
+        }
+
+    def test_a_private_erase_that_clears_the_screen_refuses_a_verdict(
+        self, tmp_path: Path
+    ) -> None:
+        """DECSED wipes the footer; replaying it as a no-op forged 'stranded'."""
+        chunk = (
+            b"\x1b[34;2H  \xe2\x8f\xb5\xe2\x8f\xb5 tab to queue message"
+            b"\x1b[1;1H\x1b[?2J"
+        )
+        path = _recording(tmp_path / "decsed.jsonl", (chunk,))
+
+        verdict = classify_composer_state(path)
+
+        assert verdict.state is ComposerState.UNDETERMINED
+        assert "?2J" in verdict.evidence_snippet
+
+    def test_a_private_line_erase_refuses_a_verdict(self, tmp_path: Path) -> None:
+        chunk = b"\x1b[34;2H  tab to queue message\x1b[34;4H\x1b[?K"
+        path = _recording(tmp_path / "decsel.jsonl", (chunk,))
+
+        assert classify_composer_state(path).state is ComposerState.UNDETERMINED
+
+    def test_the_keyboard_query_real_recordings_emit_still_yields_a_verdict(
+        self, tmp_path: Path
+    ) -> None:
+        """``CSI ?u`` appears in live recordings; refusing it would gut this."""
+        chunk = b"\x1b[?u\x1b[34;2H  tab to queue message"
+        path = _recording(tmp_path / "kitty.jsonl", (chunk,))
+
+        assert classify_composer_state(path).state is ComposerState.COMPOSER_STRANDED
+
+    def test_a_widened_screen_reproduces_the_split_the_terminal_shows(
+        self, tmp_path: Path
+    ) -> None:
+        """Parked at the old edge, then widened.
+
+        Measured: the terminal discharges the pending wrap, so the footer
+        starts at the *old* column and runs off the new edge — the marker is
+        split across two rows and genuinely is not readable on screen. The
+        previous model kept the wrap standing, moved the footer to a fresh row
+        and read the marker whole, which is a trusted verdict from a screen
+        that never existed.
+        """
+        path = self._mixed(
+            tmp_path / "grow.jsonl",
+            (
+                self._output(b"\x1b[34;1H" + b"X" * 120),
+                {"event_type": "resize", "rows": 40, "cols": 125},
+                self._output(b"  tab to queue message"),
+            ),
+        )
+
+        verdict = classify_composer_state(path)
+
+        assert verdict.state is ComposerState.UNDETERMINED
+
+    def test_a_restored_cursor_uses_the_column_the_resize_clamped_it_to(
+        self, tmp_path: Path
+    ) -> None:
+        """Save at 120, shrink, grow, restore: the marker stays on one row."""
+        path = self._mixed(
+            tmp_path / "clamp.jsonl",
+            (
+                self._output(b"\x1b[34;121H\x1b7"),
+                {"event_type": "resize", "rows": 40, "cols": 5},
+                {"event_type": "resize", "rows": 40, "cols": 125},
+                self._output(b"\x1b8  tab to queue message"),
+            ),
+        )
+
+        verdict = classify_composer_state(path)
+
+        assert verdict.state is ComposerState.COMPOSER_STRANDED
+
+    def test_a_shrink_that_would_reflow_the_screen_refuses_a_verdict(
+        self, tmp_path: Path
+    ) -> None:
+        """The terminal rewraps; this model does not, so it declines to guess."""
+        path = self._mixed(
+            tmp_path / "reflow.jsonl",
+            (
+                self._output(b"\x1b[34;1H  tab to queue message"),
+                {"event_type": "resize", "rows": 40, "cols": 10},
+            ),
+        )
+
+        assert classify_composer_state(path).state is ComposerState.UNDETERMINED

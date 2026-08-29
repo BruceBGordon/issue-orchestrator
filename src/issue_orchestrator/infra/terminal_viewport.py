@@ -38,10 +38,10 @@ excluded by construction.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Callable, ClassVar
 
 from .xterm_widths import EMPTY_CLUSTER, cluster_advance
+from .terminal_resize import ResizePlan, plan_resize
 from .terminal_protocol import (
     _ASCII_CHARSET,
     _DECAWM,
@@ -50,6 +50,8 @@ from .terminal_protocol import (
     _IGNORED_CSI_FINALS,
     _IGNORED_CSI_INTERMEDIATES,
     _IGNORED_ESCAPE_MARKERS,
+    _IGNORED_PRIVATE_FINALS,
+    RenderedScreen,
     _IGNORED_PRIVATE_MODES,
     _INERT_ANSI_RESETS,
     _C1_CSI,
@@ -80,21 +82,6 @@ from .terminal_recording import MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS
 DEFAULT_ROWS = 40
 DEFAULT_COLS = 120
 _CsiTable = dict[str, "Callable[[TerminalViewport, list[int]], None]"]
-
-
-@dataclass(frozen=True)
-class RenderedScreen:
-    """The reconstructed viewport plus the honesty flags that qualify it."""
-
-    rows: tuple[str, ...]
-    written_rows: tuple[str, ...]
-    cursor_row: int
-    cursor_col: int
-    fed_bytes: int
-
-    @property
-    def written_row_count(self) -> int:
-        return len(self.written_rows)
 
 
 class TerminalViewport:
@@ -143,29 +130,53 @@ class TerminalViewport:
     # -- public -----------------------------------------------------------
 
     def resize(self, *, rows: int, cols: int) -> None:
-        """Apply a recorded resize event, preserving what is already on screen."""
+        """Apply a recorded resize event, reconciling the state it touches.
+
+        The measured semantics — and why a reflowing column shrink is refused
+        rather than guessed — live in :mod:`.terminal_resize`.
+        """
         if rows < 1 or cols < 1:
             return
-        rows = min(rows, MAX_TERMINAL_ROWS)
-        cols = min(cols, MAX_TERMINAL_COLS)
-        old_grid, old_written, old_extent = self._grid, self._written, self._extent
-        old_widths = self._widths
-        self._rows, self._cols = rows, cols
+        plan = plan_resize(
+            rows=min(rows, MAX_TERMINAL_ROWS),
+            cols=min(cols, MAX_TERMINAL_COLS),
+            current_rows=self._rows,
+            current_cols=self._cols,
+            cursor_row=self._row,
+            cursor_col=self._col,
+            saved=self._saved,
+            written_extents=self._extent,
+        )
+        if plan is None:
+            return
+        if plan.refusal is not None:
+            self._refuse(plan.refusal)
+        self._reshape(plan)
+
+    def _reshape(self, plan: ResizePlan) -> None:
+        """Move the grid and the cursor state onto the planned geometry."""
+        keep = plan.rows_dropped_from_top
+        old_grid = self._grid[keep:]
+        old_written = self._written[keep:]
+        old_extent = self._extent[keep:]
+        old_widths = self._widths[keep:]
+        self._rows, self._cols = plan.rows, plan.cols
         self._grid = self._blank_grid()
-        self._widths = [[1] * cols for _ in range(rows)]
-        self._written = [False] * rows
-        self._extent = [0] * rows
-        for index in range(min(len(old_grid), rows)):
-            row = old_grid[index][:cols]
+        self._widths = [[1] * plan.cols for _ in range(plan.rows)]
+        self._written = [False] * plan.rows
+        self._extent = [0] * plan.rows
+        for index in range(min(len(old_grid), plan.rows)):
+            row = old_grid[index][: plan.cols]
             self._grid[index][: len(row)] = row
-            widths = old_widths[index][:cols]
+            widths = old_widths[index][: plan.cols]
             self._widths[index][: len(widths)] = widths
             self._written[index] = old_written[index]
-            self._extent[index] = min(old_extent[index], cols)
+            self._extent[index] = min(old_extent[index], plan.cols)
         self._scroll_top = 0
-        self._scroll_bottom = rows - 1
-        self._row = min(self._row, rows - 1)
-        self._col = min(self._col, cols - 1)
+        self._scroll_bottom = plan.rows - 1
+        self._row, self._col = plan.cursor_row, plan.cursor_col
+        self._parked = False
+        self._saved = plan.saved
 
     def feed(self, data: bytes) -> None:
         """Apply a chunk of raw PTY bytes.
@@ -578,7 +589,14 @@ class TerminalViewport:
             this model did not reproduce.
         """
         if final not in ("h", "l"):
-            # A query such as DECRQM reports state; it never sets any.
+            if final in _IGNORED_PRIVATE_FINALS:
+                # Queries and keyboard-protocol reports; measured inert.
+                return
+            # Anything else behind this prefix is a sequence in its own right —
+            # DECSED erases the display, DECSEL erases the line — and the
+            # refusal floor has to cover them too, or it is exactly one prefix
+            # wide (#7141 round 9).
+            self._refuse(f"CSI ?{params_raw}{final}")
             return
         enable = final == "h"
         for raw in params_raw.split(";"):
@@ -665,10 +683,7 @@ class TerminalViewport:
         self._resolve(ColumnOperation.ERASE)
         mode = params[0] if params else 0
         start, stop = self._erase_span(mode)
-        for column in range(start, stop):
-            self._grid[self._row][column] = BLANK
-            self._widths[self._row][column] = 1
-        self._written[self._row] = True
+        self._blank_span(start, stop)
         if stop >= self._cols:
             # Erasing to the end of the line untouches those cells again.
             self._extent[self._row] = min(self._extent[self._row], start)
@@ -683,11 +698,7 @@ class TerminalViewport:
     def _erase_characters(self, params: list[int]) -> None:
         """ECH. Blanks cells from the cursor without moving it."""
         self._resolve(ColumnOperation.ERASE)
-        stop = min(self._cols, self._col + amount(params))
-        for column in range(self._col, stop):
-            self._grid[self._row][column] = BLANK
-            self._widths[self._row][column] = 1
-        self._written[self._row] = True
+        self._blank_span(self._col, min(self._cols, self._col + amount(params)))
 
     def _erase_in_display(self, params: list[int]) -> None:
         self._resolve(ColumnOperation.ERASE)
@@ -701,6 +712,13 @@ class TerminalViewport:
             return
         self._blank_rows(range(self._row + 1, self._rows))
         self._erase_in_line([0])
+
+    def _blank_span(self, start: int, stop: int) -> None:
+        """Blank cells on the cursor's row without moving it."""
+        for column in range(start, stop):
+            self._grid[self._row][column] = BLANK
+            self._widths[self._row][column] = 1
+        self._written[self._row] = True
 
     def _blank_rows(self, indexes: range) -> None:
         for index in indexes:

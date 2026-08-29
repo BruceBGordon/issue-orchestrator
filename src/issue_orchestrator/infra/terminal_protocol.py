@@ -85,6 +85,11 @@ _IGNORED_CSI_FINALS = frozenset({"m", "c", "n"})
 #: ``<intermediate><final>`` pairs measured inert. DECSCUSR is 45k of the
 #: sequences in one real recording and changes nothing on the grid.
 _IGNORED_CSI_INTERMEDIATES = frozenset({" q", "$p"})
+#: Private-prefixed CSI finals other than h/l that are measured inert. ``u`` is
+#: the keyboard-protocol query real recordings emit; ``c`` and ``n`` are device
+#: and status reports. Every other private final — DECSED ``?J`` and DECSEL
+#: ``?K`` among them — moves the grid and is refused.
+_IGNORED_PRIVATE_FINALS = frozenset({"u", "c", "n"})
 #: ANSI modes whose *reset* selects the default this model already reproduces.
 _INERT_ANSI_RESETS = frozenset({4})
 
@@ -192,6 +197,24 @@ class SavedCursor:
 
 #: ``ESC <marker>`` handlers. Anything absent from here and from
 #: ``_IGNORED_ESCAPE_MARKERS`` is refused rather than silently dropped.
+
+
+@dataclass(frozen=True)
+class RenderedScreen:
+    """The reconstructed viewport plus the honesty flags that qualify it.
+
+    Lives beside :func:`render_row`, which produces its rows.
+    """
+
+    rows: tuple[str, ...]
+    written_rows: tuple[str, ...]
+    cursor_row: int
+    cursor_col: int
+    fed_bytes: int
+
+    @property
+    def written_row_count(self) -> int:
+        return len(self.written_rows)
 
 
 def render_row(cells: list[str], widths: list[int], extent: int) -> str:

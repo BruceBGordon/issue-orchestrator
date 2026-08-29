@@ -11,6 +11,7 @@
 //   node tools/measure_xterm_widths.js autowrap    # DECAWM on/off + pending wrap
 //   node tools/measure_xterm_widths.js pending     # parked-cursor resolution table
 //   node tools/measure_xterm_widths.js state       # every reachable state channel
+//   node tools/measure_xterm_widths.js resize      # the out-of-parser channel
 //
 // Emit-only: it prints JSON for a human (or a test author) to read. Nothing
 // imports it at runtime.
@@ -363,6 +364,90 @@ async function measureState() {
     console.log(JSON.stringify(out, null, 2));
 }
 
+// Resize is the one channel that reaches the screen from outside the parser,
+// so it gets its own family. Each probe is a sequence of writes and resizes;
+// the interesting questions are what happens to a pending wrap, to the saved
+// cursor, and to rows when the screen shrinks.
+function resizeProbes() {
+    const ESC = '\u001b';
+    const FILL = 'abcdefghij';
+    const steps = {
+        parked_then_grow: [10, 4, [FILL, [15, 4], 'Z']],
+        parked_then_shrink: [10, 4, [FILL, [5, 4], 'Z']],
+        parked_then_same_size: [10, 4, [FILL, [10, 4], 'Z']],
+        saved_then_shrink_then_grow: [10, 4, [`${ESC}[1;9H${ESC}7`, [3, 4], [12, 4], `${ESC}8Z`]],
+        saved_then_grow: [10, 4, [`${ESC}[1;9H${ESC}7`, [20, 4], `${ESC}8Z`]],
+        saved_then_shrink: [10, 4, [`${ESC}[1;9H${ESC}7`, [5, 4], `${ESC}8Z`]],
+        rows_shrink_cursor_at_bottom: [10, 5, ['a\r\nb\r\nc\r\nd\r\ne', [10, 2], 'Z']],
+        rows_shrink_cursor_at_top: [10, 5, ['a\r\nb\r\nc', `${ESC}[1;1H`, [10, 2], 'Z']],
+        rows_grow: [10, 2, ['a\r\nb', [10, 5], 'Z']],
+        both_dimensions: [10, 4, ['abcdefghij\r\nsecond', [6, 2], 'Z']],
+        wide_glyph_across_shrink: [10, 3, ['ab\u6771cd', [4, 3], 'Z']],
+        scroll_region_across_resize: [10, 5, [`${ESC}[2;4r`, 'x', [10, 3], 'a\nb\nc\nd']],
+        // Does the saved ROW travel with the rows a shrink drops from the top?
+        saved_row_across_row_shrink: [
+            10, 5,
+            ['a\r\nb\r\nc\r\nd', `${ESC}7`, 'e', [10, 2], `${ESC}8Z`],
+        ],
+        saved_row_below_a_row_shrink: [
+            10, 5,
+            [`${ESC}[5;3H${ESC}7${ESC}[1;1H`, 'top', [10, 2], `${ESC}8Z`],
+        ],
+        // Discriminates clamping the saved row from shifting it with the
+        // rows a shrink drops: clamp lands on row 2, shift lands on row 1.
+        saved_row_shift_versus_clamp: [
+            10, 5,
+            ['a\r\nb\r\nc\r\nd\r\ne', `${ESC}[4;1H${ESC}7${ESC}[5;1H`, [10, 3], `${ESC}8Z`],
+        ],
+        // The reported footer case, at the widths it was reported with.
+        parked_120_grow_125_footer: [120, 3, ['X'.repeat(120), [125, 3], 'tab to queue message']],
+        saved_120_shrink_grow_footer: [
+            120, 3,
+            [`${ESC}[1;121H${ESC}7`, [5, 3], [125, 3], `${ESC}8`, 'tab to queue message'],
+        ],
+    };
+    const encoder = new TextEncoder();
+    const probes = {};
+    for (const [name, [cols, rows, sequence]] of Object.entries(steps)) {
+        probes[`resize_${name}`] = {
+            cols, rows,
+            steps: sequence.map((step) =>
+                Array.isArray(step)
+                    ? { resize: { cols: step[0], rows: step[1] } }
+                    : { write: Array.from(encoder.encode(step)) },
+            ),
+        };
+    }
+    return probes;
+}
+
+async function measureResize() {
+    const out = {};
+    for (const [name, probe] of Object.entries(resizeProbes())) {
+        const term = new Terminal({ cols: probe.cols, rows: probe.rows, allowProposedApi: true });
+        let rows = probe.rows;
+        for (const step of probe.steps) {
+            if (step.resize) {
+                term.resize(step.resize.cols, step.resize.rows);
+                rows = step.resize.rows;
+            } else {
+                await write(term, new Uint8Array(step.write));
+            }
+        }
+        const buffer = term.buffer.active;
+        out[name] = {
+            cols: probe.cols,
+            rows: probe.rows,
+            steps: probe.steps,
+            cursorX: buffer.cursorX,
+            cursorY: buffer.cursorY,
+            finalRows: rows,
+            screen: readViewport(buffer, rows),
+        };
+    }
+    console.log(JSON.stringify(out, null, 2));
+}
+
 const mode = process.argv[2] || 'screens';
 const MODES = {
     widths: measureWidths,
@@ -371,6 +456,7 @@ const MODES = {
     autowrap: measureAutowrap,
     pending: measurePendingWrap,
     state: measureState,
+    resize: measureResize,
 };
 (MODES[mode] || measureScreens)().catch((error) => {
     console.error(error);

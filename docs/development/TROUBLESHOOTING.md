@@ -205,10 +205,24 @@ short, or a grid-affecting terminal mode the viewport does not model — yields
 `undetermined` rather than a guess. Every channel the parser can reach —
 private modes, ANSI modes, charset designation, tab stops, the saved cursor,
 every CSI and escape — is either modelled against a measurement, on a
-measured-inert allowlist, or refused by name; nothing is silently dropped.
-Autowrap (DECAWM), the saved cursor (`ESC 7`/`ESC 8`), reverse index (`ESC M`)
-and both resets (`ESC c`, `CSI !p`) *are* modelled, because real recordings use
-them. A reset restores the terminal but never clears a refusal: whatever the
+measured-inert allowlist, or refused by name; nothing is silently dropped. The
+exhaustiveness tests walk the byte space itself, over the full prefix × final
+product (`?`, `>`, `=`, `<` against every final) and every escape marker from
+`0x20`, so a sequence that reaches no handler fails a test rather than
+rendering as a no-op. Autowrap (DECAWM), the saved cursor (`ESC 7`/`ESC 8`),
+reverse index (`ESC M`) and both resets (`ESC c`, `CSI !p`) *are* modelled,
+because real recordings use them.
+
+`resize` is the one channel that arrives without passing through the parser, so
+it is measured and classified the same way (`… measure_xterm_widths.js resize`,
+reconciled by `infra/terminal_resize.py`). A real change of dimensions
+discharges a pending wrap, reconciles the saved cursor permanently — its row
+travels with any rows a shrink drops from the top, then both coordinates are
+clamped — and keeps the cursor visible on a row shrink; a same-size resize does
+nothing at all. A column shrink that would push written content past the new
+edge is *refused*, because the terminal rewraps there and the viewport carries
+no line-continuation state; real recordings only ever hold one resize, emitted
+before any output, so nothing is reflowed in practice. A reset restores the terminal but never clears a refusal: whatever the
 unmodelled channel already did to the reconstructed rows cannot be undone. `matched_marker` names
 the affordance that decided it and `evidence_snippet` is the screen row it came
 from — check them before acting on the classification. `replayed_from_start:
