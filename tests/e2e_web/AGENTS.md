@@ -85,7 +85,9 @@ Failing browser tests write a trace, a screenshot, and a console/network log to
 playwright show-trace .issue-orchestrator/diagnostics/e2e-web/<nodeid>/trace.zip
 ```
 
-This is on by default for the whole lane (`pytest_configure` in `conftest.py` flips pytest-playwright's `--tracing`/`--screenshot` to their failure-only modes); passing either flag explicitly still wins.
+This is on by default for the whole lane: `pytest_configure` in `conftest.py` moves pytest-playwright's `--tracing`/`--screenshot` to their failure-only modes, but **only when you did not supply them**. Supplied-ness is read from the token stream pytest parsed (ini `addopts`, `PYTEST_ADDOPTS`, argv), never from the resolved value — both options *default* to `off`, so `--tracing=off` and "no `--tracing`" are indistinguishable by value.
+
+`--tracing=off --screenshot=off` therefore means exactly that: nothing is written, not even the console sidecar. The two options resolve independently.
 
 ## Running
 

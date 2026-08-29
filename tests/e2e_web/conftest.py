@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import argparse
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta
+import os
 import re
+import shlex
 import socket
 import time
 from threading import Thread
+from typing import Final
 from unittest.mock import MagicMock
 
 import pytest
@@ -55,6 +59,115 @@ from tests.fixtures.web_contract_mocks import MockOrchestratorForWeb
 _UNSAFE_PATH_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 _MAX_EVENT_LINES = 500
 
+@dataclass(frozen=True, slots=True)
+class ArtifactOption:
+    """One pytest-playwright artifact switch this lane has an opinion about.
+
+    ``flag`` is the CLI spelling the owning plugin registers for ``dest``;
+    ``test_declared_flags_match_the_live_parser`` pins that mapping against
+    a real parse so a rename cannot pass silently.
+    """
+
+    flag: str
+    failure_only: str
+    capturing: frozenset[str]
+
+
+ARTIFACT_OPTIONS: Final[Mapping[str, ArtifactOption]] = {
+    "tracing": ArtifactOption(
+        flag="--tracing",
+        failure_only="retain-on-failure",
+        capturing=frozenset({"on", "retain-on-failure"}),
+    ),
+    "screenshot": ArtifactOption(
+        flag="--screenshot",
+        failure_only="only-on-failure",
+        capturing=frozenset({"on", "only-on-failure"}),
+    ),
+}
+
+_UNSUPPLIED: Final = object()
+
+
+def registered_artifact_dests(config: pytest.Config) -> frozenset[str]:
+    """Which artifact options this pytest run actually has.
+
+    ``-p no:playwright`` leaves them unregistered: there is then nothing to
+    supply and nothing to default. ``Config.getoption`` answers this on the
+    public API — it returns the sentinel rather than raising for an option
+    it does not know.
+    """
+    return frozenset(
+        dest
+        for dest in ARTIFACT_OPTIONS
+        if config.getoption(dest, default=_UNSUPPLIED) is not _UNSUPPLIED
+    )
+
+
+def effective_pytest_args(config: pytest.Config) -> tuple[str, ...]:
+    """Every token pytest parsed options out of, from all supply channels.
+
+    ``Config.parse`` reads options from three places — the ``addopts`` ini
+    key, the ``PYTEST_ADDOPTS`` environment variable, and the invocation
+    argv — and merges them before parsing. Supplied-ness has to be judged
+    against that same union; the parsed *value* cannot answer it, because an
+    operator who explicitly asks for the default value is indistinguishable
+    from one who asked for nothing.
+    """
+    return (
+        *config.getini("addopts"),
+        *shlex.split(os.environ.get("PYTEST_ADDOPTS", "")),
+        *config.invocation_params.args,
+    )
+
+
+def supplied_option_dests(args: Sequence[str]) -> frozenset[str]:
+    """Which artifact options the operator actually spelled out in ``args``.
+
+    Re-parses the token stream with a probe parser whose defaults are a
+    private sentinel, so "seen" and "absent" stay distinguishable no matter
+    what value was given — which is the whole point, since the value an
+    operator asks for may equal the default. ``--opt value`` and
+    ``--opt=value`` parse identically to pytest because argparse is doing
+    the parsing.
+
+    A token that merely *looks* like one of these options (say, ``-k
+    --tracing``) counts as supplied. That errs toward leaving the operator's
+    configuration alone, which is the safe direction.
+    """
+    probe = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    for dest, spec in ARTIFACT_OPTIONS.items():
+        probe.add_argument(spec.flag, dest=dest, default=_UNSUPPLIED)
+    namespace, _ = probe.parse_known_args(list(args))
+    return frozenset(
+        dest for dest in ARTIFACT_OPTIONS if getattr(namespace, dest) is not _UNSUPPLIED
+    )
+
+
+def apply_failure_only_artifact_defaults(
+    option: argparse.Namespace,
+    *,
+    supplied: frozenset[str],
+    registered: frozenset[str],
+) -> None:
+    """Move registered-but-unsupplied artifact options to failure-only mode."""
+    for dest, spec in ARTIFACT_OPTIONS.items():
+        if dest in supplied or dest not in registered:
+            continue
+        setattr(option, dest, spec.failure_only)
+
+
+def captures_failure_evidence(option: argparse.Namespace) -> bool:
+    """Whether the resolved policy retains anything when a test fails.
+
+    False means every artifact is off, so this lane writes nothing at all —
+    including its own console sidecar.
+    """
+    return any(
+        getattr(option, dest, "off") in spec.capturing
+        for dest, spec in ARTIFACT_OPTIONS.items()
+    )
+
 
 def pytest_configure(config: pytest.Config) -> None:
     """Default the browser lane to failure-only Playwright artifacts.
@@ -62,13 +175,19 @@ def pytest_configure(config: pytest.Config) -> None:
     Set here rather than in the Makefile so a bare
     ``pytest tests/e2e_web/...`` captures the same evidence the gate does —
     the reproduction loop for a browser flake is exactly that bare
-    invocation. An explicit ``--tracing`` / ``--screenshot`` on the command
-    line still wins.
+    invocation.
+
+    Only *unsupplied* options are defaulted. ``--tracing=off`` and "no
+    ``--tracing`` at all" both leave ``config.option.tracing == "off"``, so
+    supplied-ness is resolved from the token stream the option came from,
+    never from the value it ended up with — an operator who explicitly turns
+    an artifact off must not have it resolved back on.
     """
-    if getattr(config.option, "tracing", None) == "off":
-        config.option.tracing = "retain-on-failure"
-    if getattr(config.option, "screenshot", None) == "off":
-        config.option.screenshot = "only-on-failure"
+    apply_failure_only_artifact_defaults(
+        config.option,
+        supplied=supplied_option_dests(effective_pytest_args(config)),
+        registered=registered_artifact_dests(config),
+    )
 
 
 def browser_evidence_dir(nodeid: str) -> Path:
@@ -108,7 +227,9 @@ def page(page: Page, request: pytest.FixtureRequest) -> Iterator[Page]:
     The Playwright trace already carries console + network, but a flat text
     file is what an agent reading ``.issue-orchestrator/diagnostics`` can
     actually grep. Events are held in memory and only written when the test
-    fails.
+    fails — and only when the resolved artifact policy retains anything at
+    all, so an operator who turned every artifact off gets no files from
+    this lane either.
     """
     events: list[str] = []
 
@@ -120,6 +241,8 @@ def page(page: Page, request: pytest.FixtureRequest) -> Iterator[Page]:
         _record(f"[requestfailed] {request_.method} {request_.url} — {request_.failure}")
 
     def _persist_on_failure() -> None:
+        if not captures_failure_evidence(request.config.option):
+            return
         # ``rep_call`` is set by pytest-playwright's own makereport hook;
         # missing means the test blew up before/around the call phase, which
         # is itself a failure worth keeping evidence for.
