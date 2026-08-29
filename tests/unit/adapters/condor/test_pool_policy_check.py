@@ -438,6 +438,125 @@ def test_any_capacity_value_outside_the_schema_is_drift(
     assert repr(value) in described
 
 
+def _echoing_tools(tmp_path: Path, answers: dict[str, str]) -> CondorTools:
+    """A config tool whose EXACT stdout bytes are dictated per knob.
+
+    The other stub echoes values, so it can never express an answer
+    carrying surrounding whitespace — precisely the shape at issue
+    here. This one writes the bytes verbatim.
+    """
+    binaries = tmp_path / "bin"
+    binaries.mkdir(exist_ok=True)
+    branches = "".join(
+        # %b so the escapes below become real terminators, while the
+        # spaces around a value stay exactly where they were written.
+        f"  {knob}) printf '%b' '{raw}';;\n" for knob, raw in answers.items()
+    )
+    script = (
+        "#!/bin/sh\n"
+        'if [ "$1" = "-config" ]; then\n'
+        "  printf 'Configuration source:\\n\\t/pool/etc/condor_config\\n"
+        "\\t/pool/local/config.d/91-io-load-backoff.conf\\n"
+        "\\t/pool/local/config.d/92-io-pool-capacity.conf\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        'case "$1" in\n'
+        f"{branches}"
+        '  *) echo "Not defined: $1" >&2; exit 1;;\n'
+        "esac\n"
+    )
+    for name in ("condor_submit", "condor_rm", "condor_q", "condor_config_val"):
+        tool = binaries / name
+        tool.write_text(script if name == "condor_config_val" else "#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+    return CondorTools(
+        submit=binaries / "condor_submit",
+        remove=binaries / "condor_rm",
+        query=binaries / "condor_q",
+        config_query=binaries / "condor_config_val",
+    )
+
+
+def test_surrounding_whitespace_reaches_the_validator_as_data(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's residual on N1 (#7132): an answer of " False "
+    was `.strip()`ed into a schema-valid "False" before validation, so
+    a padded value passed as declared intent. Only the line terminator
+    is transport; the spaces are data and are drift."""
+    report = _inspect(
+        _echoing_tools(
+            tmp_path,
+            {
+                "CONCURRENCY_LIMIT_DEFAULT": "1\\n",
+                "PERIODIC_EXPR_INTERVAL": "5\\n",
+                "IO_INTENT_LOAD_BACKOFF": " False \\n",
+            },
+        )
+    )
+
+    assert _drifted(report) == {"IO_INTENT_LOAD_BACKOFF"}
+    assert _observed(report, "IO_INTENT_LOAD_BACKOFF") == " False "
+    assert "' False '" in report.drifted[0].describe()
+
+
+def test_padded_capacity_reaches_the_validator_as_data(tmp_path: Path) -> None:
+    """The capacity twin: " 150 " must not be laundered into 150."""
+    report = _inspect(
+        _echoing_tools(
+            tmp_path,
+            {
+                "CONCURRENCY_LIMIT_DEFAULT": "1\\n",
+                "PERIODIC_EXPR_INTERVAL": "5\\n",
+                "IO_INTENT_LOAD_BACKOFF": "True\\n",
+                "IO_INTENT_CAPACITY_PERCENT": " 150 \\n",
+            },
+        )
+    )
+
+    assert _drifted(report) == {"IO_INTENT_CAPACITY_PERCENT"}
+    assert _observed(report, "IO_INTENT_CAPACITY_PERCENT") == " 150 "
+
+
+def test_only_the_line_terminator_is_removed_from_a_normal_answer(
+    tmp_path: Path,
+) -> None:
+    """The other half of the same rule: a well-formed answer still
+    parses. Stripping too little would reject every real pool, which
+    is why this is asserted beside the case above rather than
+    trusted."""
+    report = _inspect(
+        _echoing_tools(
+            tmp_path,
+            {
+                "CONCURRENCY_LIMIT_DEFAULT": "1\\n",
+                "PERIODIC_EXPR_INTERVAL": "5\\n",
+                "IO_INTENT_LOAD_BACKOFF": "True\\n",
+                "IO_INTENT_CAPACITY_PERCENT": "150\\n",
+            },
+        )
+    )
+
+    assert report.drifted == ()
+    assert _observed(report, "CONCURRENCY_LIMIT_DEFAULT") == "1"
+
+
+def test_a_crlf_terminated_answer_parses(tmp_path: Path) -> None:
+    report = _inspect(
+        _echoing_tools(
+            tmp_path,
+            {
+                "CONCURRENCY_LIMIT_DEFAULT": "1\\r\\n",
+                "PERIODIC_EXPR_INTERVAL": "5\\r\\n",
+                "IO_INTENT_LOAD_BACKOFF": "True\\r\\n",
+                "IO_INTENT_CAPACITY_PERCENT": "150\\r\\n",
+            },
+        )
+    )
+
+    assert report.drifted == ()
+
+
 def test_malformed_intent_suppresses_the_file_judgements_it_governs(
     tmp_path: Path,
 ) -> None:

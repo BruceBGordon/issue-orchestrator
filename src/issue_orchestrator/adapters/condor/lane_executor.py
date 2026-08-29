@@ -57,6 +57,10 @@ _ADMISSION_TIMEOUT_SECONDS = 600.0
 # caller having to source the pool's environment first.
 PERSONAL_POOL_HOME_ENVIRONMENT_VARIABLE = "ISSUE_ORCHESTRATOR_CONDOR_HOME"
 _DEFAULT_PERSONAL_POOL_HOME = Path.home() / ".local/share/issue-orchestrator/condor"
+# The scheduler's per-process macro override prefix: `_CONDOR_<KNOB>`
+# in the environment overrides <KNOB> for that process only. Never for
+# the daemons, which is why this package refuses to read through one.
+_MACRO_OVERRIDE_PREFIX = "_CONDOR_"
 _TOOL_EXECUTABLES = (
     ("submit", "condor_submit"),
     ("remove", "condor_rm"),
@@ -168,8 +172,23 @@ class CondorTools:
         it for ordinary answers as well as failures. Only an
         invocation that never produced one (missing binary, hung tool)
         is a backend fault.
+
+        Per-process macro overrides are scrubbed from the environment.
+        ``_CONDOR_<KNOB>`` makes one process see a different value for
+        <KNOB> than the pool's configuration holds — and the DAEMONS
+        never see it at all. Letting it through would let an ambient
+        export decide what the policy check believes the pool carries
+        (masking real drift, or manufacturing fake drift) while the
+        pool ran something else entirely; on the submit path it would
+        let the same export quietly change how lanes are submitted.
+        Every tool this package runs reads the POOL, not the caller
+        (residual on N1, #7132 review).
         """
-        environment = dict(os.environ)
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(_MACRO_OVERRIDE_PREFIX)
+        }
         if self.pool_config is not None:
             environment["CONDOR_CONFIG"] = str(self.pool_config)
         try:

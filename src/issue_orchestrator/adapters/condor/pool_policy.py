@@ -97,6 +97,8 @@ _INSTALLED = "installed"
 _ABSENT = "absent"
 
 _UNDEFINED_PREFIX = "Not defined:"
+# Transport, not data: the only bytes a value read may lose.
+_LINE_TERMINATORS = "\r\n"
 _REMEDY = (
     "re-run `scripts/condor-personal.sh up` with the "
     "IO_CONDOR_LOAD_BACKOFF / IO_POOL_CAPACITY_PERCENT opt-ins you intend "
@@ -207,7 +209,14 @@ class CondorPoolPolicyCheck:
         """
         completed = self._tools.invoke((str(self._tools.config_query), knob))
         if completed.returncode == 0:
-            return completed.stdout.strip()
+            # ONLY the line terminator comes off. The tool ends its
+            # answer with a newline and that newline is transport;
+            # every other byte it printed is DATA. A `.strip()` here
+            # deleted surrounding spaces, which laundered a " False "
+            # into a schema-valid "False" before the validator could
+            # see it (residual on N1, #7132 review). Whitespace that
+            # the tool actually reported is drift, not formatting.
+            return completed.stdout.rstrip(_LINE_TERMINATORS)
         diagnostic = (completed.stderr.strip() or completed.stdout.strip()) or (
             "no diagnostic"
         )
