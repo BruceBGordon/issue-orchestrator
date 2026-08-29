@@ -147,9 +147,10 @@ EOF
 #   1. Key on owner load, never total load: SUSPEND over total LoadAvg
 #      would trip on the gate's own lane fan and oscillate against its
 #      own reflection.
-#   2. Only lanes that declared themselves suspendable may freeze - a
-#      live provider exchange frozen mid-turn thaws into a manufactured
-#      provider-outage failure.
+#   2. Only lanes whose declared classification permits it may freeze:
+#      "anywhere" always, "cooperative" only at self-advertised safe
+#      points, "never" never - a live provider exchange frozen mid-turn
+#      thaws into a manufactured provider-outage failure.
 #   3. The compiled lane deadline subtracts CumulativeSuspensionTime,
 #      so frozen time never burns a lane's budget (submit_compiler.py
 #      owns that half of the contract).
@@ -168,10 +169,24 @@ write_load_backoff_config() {
   # the same host (B1, #7118 review — verified live: two busy dynamic
   # slots on one 18-core host advertised LoadAvg 3.16 and 0.0 while
   # TotalLoadAvg was 3.16).
+  # Eligibility is the job's own three-valued classification —
+  # "anywhere" lanes freeze whenever the owner needs the machine;
+  # "never" lanes, and any job predating the classification
+  # vocabulary, match nothing (=?= keeps every undefined state on the
+  # not-frozen side). "cooperative" is deliberately NOT eligible yet:
+  # the intended gate (the job's own chirped SafeToSuspend) was
+  # DISPROVEN live on 2026-08-29 — runtime set_job_attr reaches the
+  # schedd's ad (verified via condor_q) but never the startd copy that
+  # evaluates SUSPEND: a chirping cooperative job ran unfrozen for
+  # 180s of over-threshold owner load while an anywhere control froze
+  # in 15s. Until a startd-visible channel is proven (#7139),
+  # cooperative behaves exactly like never here, and the lane-side
+  # plumbing (owner, transport, plugin) ships dormant-but-exercised.
   cat > "${config_dir}/91-io-load-backoff.conf" <<EOF
 OwnerLoadAvg = (TotalLoadAvg - TotalCondorLoadAvg)
-WANT_SUSPEND = (TARGET.SuspendableLane =?= True)
-SUSPEND = (\$(OwnerLoadAvg) > ${IO_CONDOR_SUSPEND_LOAD:-5.0}) && (TARGET.SuspendableLane =?= True)
+LaneEligibleToFreeze = (TARGET.SuspendableLane =?= "anywhere")
+WANT_SUSPEND = \$(LaneEligibleToFreeze)
+SUSPEND = (\$(OwnerLoadAvg) > ${IO_CONDOR_SUSPEND_LOAD:-5.0}) && \$(LaneEligibleToFreeze)
 CONTINUE = (\$(OwnerLoadAvg) < ${IO_CONDOR_CONTINUE_LOAD:-2.0})
 EOF
 }

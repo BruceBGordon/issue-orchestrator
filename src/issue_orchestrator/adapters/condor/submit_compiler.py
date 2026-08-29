@@ -12,7 +12,11 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
-from ...domain.lane_execution import LaneCommand, LaneResources
+from ...domain.lane_execution import (
+    LaneCommand,
+    LaneResources,
+    LaneSuspendability,
+)
 
 # Grace between the scheduler's soft kill and its hard kill when a job
 # is removed (deadline or cancellation). Mirrors the direct backend's
@@ -95,16 +99,33 @@ def compile_submit_description(
         "periodic_remove = (JobStatus == 2) && "
         "((time() - JobCurrentStartDate - (CumulativeSuspensionTime ?: 0)) "
         f"> {timeout})",
-        # Load-backoff eligibility is declared per lane, both ways
-        # explicitly — policy-by-absence would let a new live lane
-        # silently opt into freezing.
-        f"+SuspendableLane = {'True' if resources.suspendable else 'False'}",
+        # Load-backoff eligibility is declared per lane, all three
+        # classifications explicitly — policy-by-absence would let a
+        # new live lane silently opt into freezing. The value is the
+        # classification name itself so the pool's suspension policy
+        # can gate each class differently; an older policy comparing
+        # against a boolean sees a string, matches nothing, and
+        # freezes nothing — degradation lands on the fail-safe side.
+        f'+SuspendableLane = "{resources.suspendability.value}"',
         # The pool is shared by every worktree of every repo on the
         # machine (concurrent gates are normal, not an anomaly), so
         # each job names its submitter. Without this, attributing a
         # job means digging through Iwd paths after the fact.
         f'+LaneSubmitter = "{submitter}"',
     ]
+    if resources.suspendability is LaneSuspendability.COOPERATIVE:
+        # A cooperative lane starts UNSAFE and advertises safe windows
+        # via chirp (WantIOProxy is the starter-side prerequisite).
+        # NOTE: the pool's suspension policy currently holds
+        # cooperative CLOSED — never freeze-eligible — because runtime
+        # chirp updates provably reach only the schedd's ad, not the
+        # startd copy that evaluates SUSPEND (disproven live
+        # 2026-08-29; #7139 tracks a startd-visible channel). The
+        # attributes ship anyway so the lane-side contract is
+        # exercised end-to-end and #7139 can open eligibility without
+        # touching jobs.
+        lines.append("+SafeToSuspend = False")
+        lines.append("+WantIOProxy = True")
     if resources.priority > 0:
         lines.append(f"priority = {resources.priority}")
     if resources.exclusive:

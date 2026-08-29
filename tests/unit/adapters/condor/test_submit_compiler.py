@@ -13,6 +13,7 @@ from issue_orchestrator.domain.lane_execution import (
     LaneCommand,
     LaneDeadline,
     LaneResources,
+    LaneSuspendability,
     LaneWorkKey,
 )
 
@@ -180,23 +181,64 @@ def test_deadline_charges_executing_time_never_frozen_time(tmp_path: Path) -> No
     )
 
 
-def test_suspendability_is_declared_explicitly_both_ways(tmp_path: Path) -> None:
-    """The attribute is always present, True or False — and the
-    unclassified default serializes as False: an undeclared lane is
-    never eligible for freezing (fail-safe, A1 #7118 review)."""
+def test_suspendability_is_declared_explicitly_all_three_ways(
+    tmp_path: Path,
+) -> None:
+    """The attribute is always present and carries the classification
+    name itself — and the unclassified default serializes as "never":
+    an undeclared lane is not eligible for freezing (fail-safe, A1
+    #7118 review; three-valued per #7124)."""
     default = compile_submit_description(
         _command(("/bin/true",)),
         LaneResources(request_cpus=1),
         tmp_path,
     )
-    assert "+SuspendableLane = False" in default.text
+    assert '+SuspendableLane = "never"' in default.text
 
     hermetic = compile_submit_description(
         _command(("/bin/true",)),
-        LaneResources(request_cpus=1, suspendable=True),
+        LaneResources(
+            request_cpus=1, suspendability=LaneSuspendability.ANYWHERE
+        ),
         tmp_path,
     )
-    assert "+SuspendableLane = True" in hermetic.text
+    assert '+SuspendableLane = "anywhere"' in hermetic.text
+
+    cooperative = compile_submit_description(
+        _command(("/bin/true",)),
+        LaneResources(
+            request_cpus=1, suspendability=LaneSuspendability.COOPERATIVE
+        ),
+        tmp_path,
+    )
+    assert '+SuspendableLane = "cooperative"' in cooperative.text
+
+
+def test_cooperative_lanes_start_unsafe_with_the_chirp_prerequisite(
+    tmp_path: Path,
+) -> None:
+    """A cooperative lane starts UNSAFE (SafeToSuspend = False) so an
+    advertisement that never arrives degrades to never-frozen, and
+    WantIOProxy is enabled so condor_chirp can reach the job ad. The
+    other classifications carry neither line."""
+    cooperative = compile_submit_description(
+        _command(("/bin/true",)),
+        LaneResources(
+            request_cpus=1, suspendability=LaneSuspendability.COOPERATIVE
+        ),
+        tmp_path,
+    )
+    assert "+SafeToSuspend = False" in cooperative.text
+    assert "+WantIOProxy = True" in cooperative.text
+
+    for other in (LaneSuspendability.NEVER, LaneSuspendability.ANYWHERE):
+        compiled = compile_submit_description(
+            _command(("/bin/true",)),
+            LaneResources(request_cpus=1, suspendability=other),
+            tmp_path,
+        )
+        assert "SafeToSuspend" not in compiled.text
+        assert "WantIOProxy" not in compiled.text
 
 
 def test_work_key_is_the_batch_name(tmp_path: Path) -> None:

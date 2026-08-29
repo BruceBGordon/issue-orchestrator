@@ -351,16 +351,33 @@ def test_load_backoff_disable_removes_the_previous_policy(tmp_path: Path) -> Non
     assert not (tmp_path / "91-io-load-backoff.conf").exists()
 
 
-def test_load_backoff_freezes_only_lanes_that_declared_it_safe(
+def test_load_backoff_freezes_only_anywhere_lanes_for_now(
     tmp_path: Path,
 ) -> None:
-    """A live provider exchange frozen mid-turn thaws into a
-    manufactured provider-outage failure; only lanes carrying
-    SuspendableLane = True may freeze."""
+    """Three-valued vocabulary, two-valued eligibility (B2, #7134):
+    only "anywhere" is freeze-eligible. "cooperative" is deliberately
+    CLOSED - its intended chirp gate was disproven live (runtime
+    set_job_attr reaches the schedd ad, never the startd copy that
+    evaluates SUSPEND; see #7139) - so the policy must not reference
+    SafeToSuspend at all until a startd-visible channel exists, and
+    "never" plus every pre-migration boolean job matches nothing
+    (=?= semantics). Eligibility has one owner expression consumed by
+    both WANT_SUSPEND and SUSPEND."""
     _write_lane_config(tmp_path, IO_CONDOR_LOAD_BACKOFF="1")
     generated = (tmp_path / "91-io-load-backoff.conf").read_text()
-    assert generated.count("TARGET.SuspendableLane =?= True") == 2
-    assert "WANT_SUSPEND = (TARGET.SuspendableLane =?= True)" in generated
+    assert (
+        'LaneEligibleToFreeze = (TARGET.SuspendableLane =?= "anywhere")'
+        in generated
+    )
+    assert "WANT_SUSPEND = $(LaneEligibleToFreeze)" in generated
+    assert generated.count("$(LaneEligibleToFreeze)") == 2
+    assert "SafeToSuspend" not in generated, (
+        "the disproven chirp gate leaked back into the policy - "
+        "reopen only with the startd-visible channel proven (#7139)"
+    )
+    assert "cooperative" not in generated, (
+        "cooperative eligibility must stay closed until #7139"
+    )
 
 
 def test_load_backoff_thresholds_are_overridable(tmp_path: Path) -> None:

@@ -286,7 +286,7 @@ def test_every_condor_lane_resolves_declared_scheduling_facts(
     for work_key in work_keys:
         declaration = load_lane_declaration(REPO_ROOT, work_key)
         assert declaration.memory_mb >= 1
-        assert isinstance(declaration.suspendable, bool)
+        assert declaration.suspendability in ("never", "anywhere", "cooperative")
 
 
 def test_slice_recipe_captures_durations_and_guards_an_empty_selection(

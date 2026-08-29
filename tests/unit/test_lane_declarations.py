@@ -39,7 +39,7 @@ lanes:
   test-unit:
     request_cpus: 8
     memory_mb: 6144
-    suspendable: true
+    suspendability: anywhere
 """
 
 
@@ -48,7 +48,7 @@ def test_valid_declaration_loads(tmp_path: Path) -> None:
     declaration = load_lane_declaration(tmp_path, "test-unit")
     assert declaration.request_cpus == 8
     assert declaration.memory_mb == 6144
-    assert declaration.suspendable is True
+    assert declaration.suspendability == "anywhere"
     assert declaration.exclusive == ()
 
 
@@ -78,7 +78,7 @@ def test_suspendability_must_be_declared_explicitly(tmp_path: Path) -> None:
         tmp_path,
         "lanes:\n  test-unit:\n    request_cpus: 8\n    memory_mb: 6144\n",
     )
-    with pytest.raises(LaneDeclarationError, match="suspendable"):
+    with pytest.raises(LaneDeclarationError, match="suspendability"):
         load_lane_declaration(tmp_path, "test-unit")
 
 
@@ -87,10 +87,16 @@ def test_field_types_are_strict_never_coerced(tmp_path: Path) -> None:
     and 1 to True — a YAML typo could silently under-request one CPU
     or flip suspension policy. Every coercion is a loud error."""
     coercion_typos = (
-        "request_cpus: true\n    memory_mb: 6144\n    suspendable: true",
-        'request_cpus: "8"\n    memory_mb: 6144\n    suspendable: true',
-        'request_cpus: 8\n    memory_mb: "1024"\n    suspendable: true',
-        "request_cpus: 8\n    memory_mb: 6144\n    suspendable: 1",
+        "request_cpus: true\n    memory_mb: 6144\n    suspendability: anywhere",
+        'request_cpus: "8"\n    memory_mb: 6144\n    suspendability: anywhere',
+        'request_cpus: 8\n    memory_mb: "1024"\n    suspendability: anywhere',
+        # Pre-#7124 booleans are a loud migration error, never a
+        # guessed mapping — and so is any string outside the three
+        # classifications.
+        "request_cpus: 8\n    memory_mb: 6144\n    suspendability: true",
+        "request_cpus: 8\n    memory_mb: 6144\n    suspendability: false",
+        "request_cpus: 8\n    memory_mb: 6144\n    suspendability: 1",
+        "request_cpus: 8\n    memory_mb: 6144\n    suspendability: sometimes",
     )
     for body in coercion_typos:
         _write_lanes(tmp_path, f"lanes:\n  test-unit:\n    {body}\n")
@@ -106,7 +112,7 @@ def test_memory_budget_must_be_declared(tmp_path: Path) -> None:
     OOM-killed — so the field is required, never defaulted."""
     _write_lanes(
         tmp_path,
-        "lanes:\n  test-unit:\n    request_cpus: 8\n    suspendable: true\n",
+        "lanes:\n  test-unit:\n    request_cpus: 8\n    suspendability: anywhere\n",
     )
     with pytest.raises(LaneDeclarationError, match="memory_mb"):
         load_lane_declaration(tmp_path, "test-unit")
@@ -118,7 +124,7 @@ def test_unknown_fields_are_rejected(tmp_path: Path) -> None:
         tmp_path,
         (
             "lanes:\n  test-unit:\n    request_cpus: 8\n    memory_mb: 6144\n"
-            "    suspendable: true\n    priority: 50\n"
+            "    suspendability: anywhere\n    priority: 50\n"
         ),
     )
     with pytest.raises(LaneDeclarationError, match="schema validation"):
@@ -129,7 +135,7 @@ def test_nonsense_values_are_rejected(tmp_path: Path) -> None:
     _write_lanes(
         tmp_path,
         "lanes:\n  test-unit:\n    request_cpus: 0\n    memory_mb: 6144\n"
-        "    suspendable: true\n",
+        "    suspendability: anywhere\n",
     )
     with pytest.raises(LaneDeclarationError, match="schema validation"):
         load_lane_declaration(tmp_path, "test-unit")

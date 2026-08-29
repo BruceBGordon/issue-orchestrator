@@ -100,6 +100,10 @@ rules:
       # lane contracts.
       - src/issue_orchestrator/adapters/condor/**
       - src/issue_orchestrator/execution/lane_backends.py
+      # The cooperative-yield pytest plugin is a composition root like
+      # lane_run: its sole scheduler reference is resolving the chirp
+      # yield-signal adapter.
+      - src/issue_orchestrator/entrypoints/pytest_cooperative_yield.py
 
   - id: ui_openapi_routes
     type: ui_openapi_routes
