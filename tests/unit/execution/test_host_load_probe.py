@@ -7,6 +7,8 @@ would only pass on a machine already in trouble.
 
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from issue_orchestrator.execution.host_load_probe import (
@@ -15,6 +17,7 @@ from issue_orchestrator.execution.host_load_probe import (
     parse_elapsed_seconds,
     parse_idle_percent,
     parse_process_rows,
+    probe_host,
 )
 
 _TOP_OUTPUT = """Processes: 765 total, 6 running, 759 sleeping, 7597 threads
@@ -67,6 +70,39 @@ class TestIdlePercent:
         with pytest.raises(HostProbeError, match="CPU usage"):
             parse_idle_percent("top: command produced nothing useful\n")
 
+    def test_a_comma_decimal_locale_refuses_to_parse_instead_of_reading_clean(
+        self,
+    ) -> None:
+        """The dangerous failure: a wedged host reading as nearly idle.
+
+        Under a comma-decimal locale a loose number pattern captures the tail
+        of ``49,90% idle`` as ``90`` — 90% idle on a host with 49.9% left. The
+        env pin should stop this arriving; refusing to parse it is the backstop
+        that keeps the silent-clean reading impossible either way.
+        """
+        comma_output = "CPU usage: 25,00% user, 25,10% sys, 49,90% idle \n"
+
+        with pytest.raises(HostProbeError, match="CPU usage"):
+            parse_idle_percent(comma_output)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "CPU usage: 1.00% user, 2.00% sys, .% idle \n",
+            "CPU usage: 1.00% user, 2.00% sys, .5% idle \n",
+            "CPU usage: 1.00% user, 2.00% sys, % idle \n",
+            "CPU usage: 1.00% user, 2.00% sys, nan% idle \n",
+        ],
+    )
+    def test_malformed_numbers_are_refused(self, line: str) -> None:
+        with pytest.raises(HostProbeError, match="CPU usage"):
+            parse_idle_percent(line)
+
+    @pytest.mark.parametrize("idle", ["150.00", "101"])
+    def test_a_reading_outside_0_100_is_not_a_percentage(self, idle: str) -> None:
+        with pytest.raises(HostProbeError, match="not a percentage"):
+            parse_idle_percent(f"CPU usage: 1.00% user, 2.00% sys, {idle}% idle \n")
+
 
 class TestElapsedField:
     @pytest.mark.parametrize(
@@ -81,8 +117,22 @@ class TestElapsedField:
     def test_supported_formats(self, elapsed: str, seconds: int) -> None:
         assert parse_elapsed_seconds(elapsed) == seconds
 
-    @pytest.mark.parametrize("elapsed", ["yesterday", "12", ""])
+    @pytest.mark.parametrize(
+        "elapsed",
+        [
+            "yesterday",
+            "12",
+            "",
+            "1:2:3:4",
+            "03-11:48",  # ps never prints a day field without hh:mm:ss
+            "-1:00",
+            "11:99:38",  # sexagesimal by construction
+            "11:48:99",
+            "99999999-00:00:00",
+        ],
+    )
     def test_unparseable_field_is_an_error(self, elapsed: str) -> None:
+        """Never a raw ``ValueError``: the CLI above must still exit 0."""
         with pytest.raises(HostProbeError):
             parse_elapsed_seconds(elapsed)
 
@@ -97,3 +147,79 @@ class TestProcessRows:
             parse_process_rows(
                 "  PID  PPID USER              %CPU     ELAPSED COMMAND\n1 0 root\n"
             )
+
+    @pytest.mark.parametrize(
+        ("row", "match"),
+        [
+            ("nine 0 root 1.9 00:56 /sbin/launchd", "unparseable ps PID"),
+            ("-7 0 root 1.9 00:56 /sbin/launchd", "negative ps PID"),
+            ("1 nine root 1.9 00:56 /sbin/launchd", "unparseable ps PPID"),
+            ("1 0 root nine 00:56 /sbin/launchd", "unparseable ps %CPU"),
+            ("1 0 root -3.0 00:56 /sbin/launchd", "out-of-range ps %CPU"),
+            ("1 0 root nan 00:56 /sbin/launchd", "out-of-range ps %CPU"),
+            ("1 0 root inf 00:56 /sbin/launchd", "out-of-range ps %CPU"),
+            ("1 0 root 1.9 later /sbin/launchd", "unparseable ps ETIME"),
+        ],
+    )
+    def test_malformed_values_stay_inside_the_typed_boundary(
+        self, row: str, match: str
+    ) -> None:
+        """Every conversion failure leaves as ``HostProbeError``, never raw.
+
+        ``float`` happily returns ``nan`` and ``inf``; neither is a percentage.
+        """
+        with pytest.raises(HostProbeError, match=match):
+            parse_process_rows(
+                f"  PID  PPID USER              %CPU     ELAPSED COMMAND\n{row}\n"
+            )
+
+
+class TestProbeExecution:
+    """The subprocess boundary: locale pinning and decoding."""
+
+    def test_probes_run_under_a_pinned_c_locale(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fix for comma decimals is at the source, not in the regex."""
+        seen: list[dict[str, str]] = []
+
+        def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            seen.append(env)
+            stdout = _TOP_OUTPUT if args[0] == "top" else _PS_OUTPUT
+            return subprocess.CompletedProcess(args, 0, stdout.encode(), b"")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        probe_host()
+
+        assert len(seen) == 2, "both probes must be pinned, not just top"
+        for env in seen:
+            assert env["LC_ALL"] == "C"
+            assert env["LANG"] == "C"
+            assert "PATH" in env, "the pin must extend the environment, not replace it"
+
+    def test_undecodable_output_is_a_probe_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A process with non-UTF-8 argv must not raise UnicodeDecodeError."""
+
+        def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.CompletedProcess(args, 0, b"\xff\xfe not utf-8", b"")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        with pytest.raises(HostProbeError, match="undecodable output"):
+            probe_host()
+
+    def test_a_probe_that_cannot_run_is_a_probe_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            raise FileNotFoundError(args[0])
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        with pytest.raises(HostProbeError, match="could not be run"):
+            probe_host()

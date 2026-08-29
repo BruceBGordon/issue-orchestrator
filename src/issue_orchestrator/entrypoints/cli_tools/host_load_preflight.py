@@ -20,8 +20,6 @@ This module owns the policy; ``execution/host_load_probe`` owns the sampling.
 
 from __future__ import annotations
 
-import os
-import pwd
 import re
 import sys
 from typing import TextIO
@@ -30,6 +28,7 @@ from ...execution.host_load_probe import (
     HostProbeError,
     HostSnapshot,
     ProcessRow,
+    current_owner,
     probe_host,
 )
 
@@ -171,8 +170,11 @@ def emit(stream: TextIO, lines: tuple[str, ...]) -> None:
 def main() -> None:
     """Report host load, then get out of the way.
 
-    Always exits 0. The only degradation this tolerates is a probe that cannot
-    run, and it says so on one line rather than falling silent.
+    Always exits 0. The only degradation this tolerates is a host that cannot
+    be sampled, and it says so on one line rather than falling silent. Every
+    way that can fail -- spawn, exit status, decode, parse, range, passwd
+    lookup -- arrives here as ``HostProbeError``, so the single typed handler
+    is the whole contract and no blanket ``except`` is needed to keep it.
     """
     if sys.platform != "darwin":
         emit(
@@ -185,10 +187,11 @@ def main() -> None:
         return
     try:
         snapshot = probe_host()
+        owner = current_owner()
     except HostProbeError as exc:
         emit(sys.stderr, (f"host probe unavailable: {exc}",))
         return
-    emit(sys.stderr, report_lines(snapshot, owner=pwd.getpwuid(os.getuid()).pw_name))
+    emit(sys.stderr, report_lines(snapshot, owner=owner))
 
 
 if __name__ == "__main__":

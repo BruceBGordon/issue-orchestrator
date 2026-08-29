@@ -282,7 +282,7 @@ class TestOutput:
             f"{_MODULE}.probe_host",
             lambda: _snapshot(0.0, _burner(41600)),
         )
-        monkeypatch.setattr(f"{_MODULE}.pwd.getpwuid", lambda _uid: _FakePasswd())
+        monkeypatch.setattr(f"{_MODULE}.current_owner", lambda: OWNER)
 
         main()
 
@@ -291,6 +291,18 @@ class TestOutput:
         assert "[host-preflight] BUSY HOST" in captured.err
         assert "41600" in captured.err
 
+    def test_an_unresolvable_owner_does_not_break_the_gate(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Owner lookup is a host fact too, and fails the same typed way."""
+        monkeypatch.setattr(f"{_MODULE}.sys.platform", "darwin")
+        monkeypatch.setattr(f"{_MODULE}.probe_host", lambda: _snapshot(94.0))
 
-class _FakePasswd:
-    pw_name = OWNER
+        def explode() -> str:
+            raise HostProbeError("no passwd entry for uid 1000")
+
+        monkeypatch.setattr(f"{_MODULE}.current_owner", explode)
+
+        main()
+
+        assert "host probe unavailable" in capsys.readouterr().err

@@ -38,6 +38,30 @@ pytestmark = [
 # escaped burner cannot become someone else's unexplained gate.
 _LOAD_SPIKE_MAX_SECONDS = 240.0
 
+# Ceiling on the setsid escapee, which no group signal can reach. Must outlast
+# this test's ~260s observation path; must not outlast the day.
+_ESCAPE_LIFETIME_SECONDS = 600.0
+
+# A double-forked, setsid-detached grandchild: what agent jobs spawn, and what
+# ADR-0001 says macOS cannot contain. Because nothing can signal it as a group,
+# its own deadline (argv[2]) is the last line of defence when the harness that
+# was going to sweep it dies first (#7142). Module scope so
+# tests/unit/test_fixture_script_deadlines can prove that deadline holds.
+_ESCAPE_SCRIPT = (
+    "import os, sys, time\n"
+    "deadline = time.monotonic() + float(sys.argv[2])\n"
+    "if os.fork() == 0:\n"
+    "    os.setsid()\n"
+    "    if os.fork() == 0:\n"
+    "        open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+    "        while time.monotonic() < deadline:\n"
+    "            time.sleep(0.5)\n"
+    "        os._exit(0)\n"
+    "    os._exit(0)\n"
+    "while time.monotonic() < deadline:\n"
+    "    time.sleep(0.5)\n"
+)
+
 
 class TestCondorLaneExecutorContract(LaneExecutorContract):
     def build_executor(self) -> LaneExecutor:
@@ -116,16 +140,6 @@ def test_detached_session_escape_states_the_platform_boundary(
     import time
 
     marker = tmp_path / "grandchild.pid"
-    escape = (
-        "import os, sys, time\n"
-        "if os.fork() == 0:\n"
-        "    os.setsid()\n"
-        "    if os.fork() == 0:\n"
-        "        open(sys.argv[1], 'w').write(str(os.getpid()))\n"
-        "        time.sleep(3600)\n"
-        "    os._exit(0)\n"
-        "time.sleep(3600)\n"
-    )
     executor = CondorLaneExecutor(CondorTools.resolve())
     import threading
 
@@ -136,7 +150,13 @@ def test_detached_session_escape_states_the_platform_boundary(
             executor.run(
                 LaneCommand(
                     work_key=LaneWorkKey("contract.session-escape"),
-                    arguments=(sys.executable, "-c", escape, str(marker)),
+                    arguments=(
+                        sys.executable,
+                        "-c",
+                        _ESCAPE_SCRIPT,
+                        str(marker),
+                        str(_ESCAPE_LIFETIME_SECONDS),
+                    ),
                     working_directory=tmp_path,
                     deadline=LaneDeadline(20.0),
                 ),

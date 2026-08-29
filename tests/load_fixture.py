@@ -35,6 +35,7 @@ signalling and the no-reap-before-kill ordering this module reuses.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import signal
 import subprocess
@@ -106,9 +107,14 @@ def cpu_load(*, workers: int, max_lifetime_seconds: float) -> Iterator[tuple[int
         )
     if workers < 1:
         raise ValueError(f"workers must be at least 1, got {workers}")
-    if max_lifetime_seconds <= 0:
+    # Finiteness first, and not as a formality: ``inf`` and ``nan`` both slip
+    # past ``<= 0`` (``nan`` compares false against everything), and an
+    # inf-lifetime burner is exactly the immortal `while True: pass` this
+    # helper exists to make unspawnable. It survives a SIGKILLed harness.
+    if not math.isfinite(max_lifetime_seconds) or max_lifetime_seconds <= 0:
         raise ValueError(
-            f"max_lifetime_seconds must be positive, got {max_lifetime_seconds}"
+            "max_lifetime_seconds must be a positive finite number, got "
+            f"{max_lifetime_seconds!r}"
         )
 
     processes: list[subprocess.Popen[bytes]] = []

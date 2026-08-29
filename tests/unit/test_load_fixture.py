@@ -163,6 +163,26 @@ class TestCpuLoad:
             with cpu_load(workers=workers, max_lifetime_seconds=lifetime):
                 pytest.fail("load must not be spawned at all")
 
+    @pytest.mark.parametrize(
+        "lifetime",
+        [
+            pytest.param(float("inf"), id="inf"),
+            pytest.param(float("-inf"), id="-inf"),
+            pytest.param(float("nan"), id="nan"),
+        ],
+    )
+    def test_refuses_a_lifetime_that_is_not_a_number_of_seconds(
+        self, lifetime: float
+    ) -> None:
+        """``inf`` and ``nan`` both slip past ``<= 0``.
+
+        An inf-lifetime burner is a `while True: pass` with extra steps: it
+        outlives a SIGKILLed harness, which is the whole failure mode.
+        """
+        with pytest.raises(ValueError, match="positive finite"):
+            with cpu_load(workers=1, max_lifetime_seconds=lifetime):
+                pytest.fail("load must not be spawned at all")
+
 
 class TestReapProcessGroups:
     def test_a_term_immune_child_is_dead_after_the_helper_returns(

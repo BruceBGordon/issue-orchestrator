@@ -27,17 +27,29 @@ from issue_orchestrator.domain.lane_execution import (
 from issue_orchestrator.ports.lane_executor import LaneExecutor
 from tests.load_fixture import reap_marked_processes
 
+# Ignoring SIGTERM is the point of this fixture; being immortal is not
+# (#7142). Both processes hold their own deadline, taken before the fork so
+# they share one absolute expiry, and it is the only thing that still applies
+# when the harness supervising them is SIGKILLed.
+#
+# 300s is chosen against the observation window, not against comfort: the lane
+# deadline below is 5s and the survival check waits up to 30s after it, so this
+# clock cannot end the tree before the backend's kill duty has been observed —
+# it can only stop the tree outliving the machine's next few gates.
+_TREE_LIFETIME_SECONDS = 300.0
 _TREE_SCRIPT = """
 import os, signal, sys, time
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
+deadline = time.monotonic() + float(sys.argv[2])
 child = os.fork()
 if child == 0:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     from pathlib import Path
     Path(sys.argv[1]).write_text(str(os.getpid()))
-    while True:
+    while time.monotonic() < deadline:
         time.sleep(0.5)
-while True:
+    os._exit(0)
+while time.monotonic() < deadline:
     time.sleep(0.5)
 """
 
@@ -254,7 +266,13 @@ class LaneExecutorContract:
             outcome = self.build_executor().run(
                 _command(
                     "contract.deadline",
-                    (sys.executable, "-c", _TREE_SCRIPT, str(grandchild_pid_path)),
+                    (
+                        sys.executable,
+                        "-c",
+                        _TREE_SCRIPT,
+                        str(grandchild_pid_path),
+                        str(_TREE_LIFETIME_SECONDS),
+                    ),
                     tmp_path,
                     5.0,
                 ),
