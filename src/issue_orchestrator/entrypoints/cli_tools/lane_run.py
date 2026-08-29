@@ -1,9 +1,9 @@
 # pyright: strict
 """Run one validation lane through the LaneExecutor port.
 
-This is the composition root for lane execution: it selects the backend
-(direct subprocess by default; the scheduler backend when explicitly
-opted in), builds the typed lane command, and translates the closed
+Backend selection itself is owned by ``execution.lane_backends`` (one
+mapping serves this and the gate's policy preflight). This entrypoint
+builds the typed lane command, runs it, and translates the closed
 outcome back into a process exit code for make.
 
 Exit codes: the lane's own exit code on completion; 124 on deadline;
@@ -21,10 +21,6 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from ...adapters.direct_lane_executor import (
-    DirectLaneExecutor,
-    DirectLaneTerminationPolicy,
-)
 from ...adapters.json_lane_runtime_history import (
     JsonLaneRuntimeHistory,
     LaneRuntimeHistoryError,
@@ -43,6 +39,12 @@ from ...domain.lane_execution import (
     LaneTimedOut,
     LaneWorkKey,
 )
+from ...execution.lane_backends import (
+    BACKEND_ENVIRONMENT_VARIABLE,
+    BACKEND_NAMES,
+    DIRECT_BACKEND,
+    build_lane_executor,
+)
 from ...infra.lane_declarations import (
     LaneDeclaration,
     LaneDeclarationError,
@@ -54,15 +56,10 @@ from ...ports.lane_dispatch_journal import (
     LaneDispatchJournalError,
     LaneDispatchRecord,
 )
-from ...ports.lane_executor import LaneExecutor
 from ...ports.lane_runtime_history import LaneRuntimeHistory
 
-BACKEND_ENVIRONMENT_VARIABLE = "ISSUE_ORCHESTRATOR_LANE_EXECUTOR"
-_DIRECT_BACKEND = "direct"
-_CONDOR_BACKEND = "condor"
 _UNAVAILABLE_EXIT_CODE = 78
 _BACKEND_FAULT_EXIT_CODE = 70
-_DIRECT_GRACEFUL_SHUTDOWN_SECONDS = 10.0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -81,7 +78,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parse_arguments(raw[:separator])
     arguments.command = command
     try:
-        executor = _build_executor(arguments.backend)
+        executor = build_lane_executor(str(arguments.backend))
         history = _build_history()
         journal = _build_journal()
         work_key = LaneWorkKey(str(arguments.work_key))
@@ -195,11 +192,11 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     # no second configuration surface can drift from the first.
     parser.add_argument(
         "--backend",
-        choices=(_DIRECT_BACKEND, _CONDOR_BACKEND),
-        default=os.environ.get(BACKEND_ENVIRONMENT_VARIABLE, _DIRECT_BACKEND),
+        choices=BACKEND_NAMES,
+        default=os.environ.get(BACKEND_ENVIRONMENT_VARIABLE, DIRECT_BACKEND),
         help=(
             "Execution backend; defaults to "
-            f"${BACKEND_ENVIRONMENT_VARIABLE} or '{_DIRECT_BACKEND}'."
+            f"${BACKEND_ENVIRONMENT_VARIABLE} or '{DIRECT_BACKEND}'."
         ),
     )
     return parser.parse_args(argv)
@@ -245,18 +242,6 @@ class _InertLaneRuntimeHistory:
     def learned_priority(self, work_key: LaneWorkKey) -> int:
         del work_key
         return 0
-
-
-def _build_executor(backend: str) -> LaneExecutor:
-    if backend == _DIRECT_BACKEND:
-        return DirectLaneExecutor(
-            DirectLaneTerminationPolicy(_DIRECT_GRACEFUL_SHUTDOWN_SECONDS)
-        )
-    if backend == _CONDOR_BACKEND:
-        from ...adapters.condor import CondorLaneExecutor, CondorTools
-
-        return CondorLaneExecutor(CondorTools.resolve())
-    raise LaneExecutorUnavailableError(f"unknown lane backend {backend!r}")
 
 
 def _build_command(arguments: argparse.Namespace) -> LaneCommand:

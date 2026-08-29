@@ -57,26 +57,54 @@ _ADMISSION_TIMEOUT_SECONDS = 600.0
 # caller having to source the pool's environment first.
 PERSONAL_POOL_HOME_ENVIRONMENT_VARIABLE = "ISSUE_ORCHESTRATOR_CONDOR_HOME"
 _DEFAULT_PERSONAL_POOL_HOME = Path.home() / ".local/share/issue-orchestrator/condor"
+# The scheduler's per-process macro override prefix: `_CONDOR_<KNOB>`
+# in the environment overrides <KNOB> for that process only, never for
+# the daemons. Scrubbed on the configuration-READ path (an answer about
+# the pool must come from the pool) and deliberately preserved on the
+# submit path (`getenv = true` carries it to the lane).
+#
+# The scheduler matches this prefix CASE-INSENSITIVELY while POSIX
+# environments are case-SENSITIVE, so `_condor_X` and `_CoNdOr_X` are
+# distinct variables that the tool nonetheless honours identically
+# (verified live: all four casings injected). Matching must therefore
+# be case-insensitive too, or the scrub is a lowercase bypass away
+# from useless (round 4, #7132 review).
+_MACRO_OVERRIDE_PREFIX = "_CONDOR_"
+
+
+def _is_macro_override(name: str) -> bool:
+    return name.upper().startswith(_MACRO_OVERRIDE_PREFIX)
 _TOOL_EXECUTABLES = (
     ("submit", "condor_submit"),
     ("remove", "condor_rm"),
     ("query", "condor_q"),
+    ("config_query", "condor_config_val"),
 )
 
 
 @dataclass(frozen=True, slots=True)
 class CondorTools:
-    """Absolute paths to the scheduler's command-line tools.
+    """Absolute paths to the scheduler's command-line tools, and the
+    single boundary through which this package invokes them.
 
     ``pool_config`` is the configuration file the tools must use; it is
     ``None`` for a system installation whose ambient configuration is
     already correct, and set when the tools come from the personal-pool
-    install, whose configuration lives beside its binaries.
+    install, whose configuration lives beside its binaries. Because
+    every tool invocation must run under that configuration, invocation
+    belongs here rather than in each caller: :meth:`invoke` is the only
+    way this package runs a scheduler tool, so a caller cannot
+    accidentally read a different pool than the one lanes are submitted
+    to.
+
+    ``config_query`` reads the pool's effective configuration and is
+    what the policy self-check consults.
     """
 
     submit: Path
     remove: Path
     query: Path
+    config_query: Path
     pool_config: Path | None = None
 
     def __post_init__(self) -> None:
@@ -84,6 +112,7 @@ class CondorTools:
             ("submit", self.submit),
             ("remove", self.remove),
             ("query", self.query),
+            ("config_query", self.config_query),
         ):
             if not isinstance(cast(object, value), Path) or not value.is_absolute():
                 raise ValueError(f"CondorTools.{field_name} must be an absolute Path")
@@ -146,6 +175,74 @@ class CondorTools:
         if override:
             return Path(override)
         return _DEFAULT_PERSONAL_POOL_HOME
+
+    def invoke(
+        self, arguments: tuple[str, ...]
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one scheduler tool against this pool, bounded in time.
+
+        The caller's environment is passed through, deliberately. The
+        submit description sets ``getenv = true``, so the environment
+        this process hands to ``condor_submit`` is the environment the
+        LANE ITSELF inherits — carrying it faithfully is the contract,
+        not an oversight, and quietly deleting a category of variables
+        from it would surprise whoever set them.
+
+        A non-zero return code is the caller's to interpret — tools use
+        it for ordinary answers as well as failures. Only an
+        invocation that never produced one (missing binary, hung tool)
+        is a backend fault.
+        """
+        return self._run(arguments, scrub_macro_overrides=False)
+
+    def read_configuration(
+        self, *query: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Ask the pool what its own configuration says.
+
+        Deliberately asymmetric with :meth:`invoke`, and the asymmetry
+        is the point. ``_CONDOR_<KNOB>`` overrides <KNOB> for one
+        process and is invisible to the DAEMONS, so an answer read
+        through one describes the caller's environment rather than the
+        pool — an ambient export could mask real drift (verified: the
+        tool answers "Not defined" for a knob the pool genuinely sets
+        wrong) or manufacture fake drift. A question asked ABOUT the
+        pool must be answered BY the pool, so overrides are scrubbed
+        here and only here (residual on N1, #7132 review).
+
+        Taking the query rather than a full argv is part of the same
+        guarantee: this path always runs the configuration tool, and
+        no submission can be routed through it by mistake.
+        """
+        return self._run(
+            (str(self.config_query), *query), scrub_macro_overrides=True
+        )
+
+    def _run(
+        self, arguments: tuple[str, ...], *, scrub_macro_overrides: bool
+    ) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        if scrub_macro_overrides:
+            environment = {
+                key: value
+                for key, value in environment.items()
+                if not _is_macro_override(key)
+            }
+        if self.pool_config is not None:
+            environment["CONDOR_CONFIG"] = str(self.pool_config)
+        try:
+            return subprocess.run(
+                arguments,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_TOOL_TIMEOUT_SECONDS,
+                env=environment,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise LaneExecutorError(
+                f"scheduler tool invocation failed: {arguments[0]}: {error!r}"
+            ) from error
 
 
 class CondorLaneExecutor:
@@ -327,7 +424,7 @@ class CondorLaneExecutor:
             ) from error
 
     def _submit(self, submit_path: Path) -> str:
-        completed = self._run_tool(
+        completed = self._tools.invoke(
             (str(self._tools.submit), "-terse", str(submit_path))
         )
         if completed.returncode != 0:
@@ -344,38 +441,18 @@ class CondorLaneExecutor:
 
     def _remove(self, job_id: str) -> None:
         try:
-            self._run_tool((str(self._tools.remove), job_id))
+            self._tools.invoke((str(self._tools.remove), job_id))
         except LaneExecutorError:
             # Best-effort during unwinding; the primary error wins.
             return
 
     def _require_reachable_scheduler(self) -> None:
-        completed = self._run_tool((str(self._tools.query), "-limit", "1"))
+        completed = self._tools.invoke((str(self._tools.query), "-limit", "1"))
         if completed.returncode != 0:
             raise LaneExecutorUnavailableError(
                 "the scheduler is installed but not reachable: "
                 f"{completed.stderr.strip() or completed.stdout.strip()}"
             )
-
-    def _run_tool(
-        self, arguments: tuple[str, ...]
-    ) -> subprocess.CompletedProcess[str]:
-        environment = dict(os.environ)
-        if self._tools.pool_config is not None:
-            environment["CONDOR_CONFIG"] = str(self._tools.pool_config)
-        try:
-            return subprocess.run(
-                arguments,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=_TOOL_TIMEOUT_SECONDS,
-                env=environment,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise LaneExecutorError(
-                f"scheduler tool invocation failed: {arguments[0]}: {error!r}"
-            ) from error
 
 
 class _OutputStreamer:

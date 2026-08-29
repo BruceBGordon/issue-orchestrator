@@ -19,6 +19,7 @@ from ..domain.lane_execution import (
     LaneCommand,
     LaneCompleted,
     LaneOutcome,
+    LanePolicyReport,
     LaneResources,
     LaneTimedOut,
 )
@@ -105,3 +106,23 @@ def _signal_group(group_id: int, signal_number: signal.Signals) -> None:
         os.killpg(group_id, signal_number)
     except ProcessLookupError:
         return
+
+
+class DirectLanePolicyCheck:
+    """The direct backend's policy self-check: nothing to assert.
+
+    Lanes run as children of the caller in the caller's own
+    environment. There is no external configuration that could have
+    drifted since the lane contracts were written, so the report is
+    empty BY CONSTRUCTION — a truthful "no invariants" answer rather
+    than a skip. That is what lets the gate's preflight step be
+    unconditional and mode-agnostic instead of branching on the
+    backend.
+    """
+
+    def inspect(self) -> LanePolicyReport:
+        return LanePolicyReport(
+            source="direct subprocess execution (this process's environment)",
+            remedy="not applicable: this backend has no external policy",
+            invariants=(),
+        )

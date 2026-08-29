@@ -37,7 +37,14 @@ FLAT_FAN_LANES = (
 )
 
 # Names whose collision-sensitivity has already bitten once.
-COLLISION_SENSITIVE_NAMES = (*FLAT_FAN_LANES, "FORCE", "ensure-uv")
+COLLISION_SENSITIVE_NAMES = (*FLAT_FAN_LANES, "FORCE", "ensure-uv", "lane-preflight")
+
+# How the gate's pool-policy self-check appears in a dry run: the make
+# target the gate invokes, and the module that target runs. The target
+# name alone - never "<make binary> lane-preflight", which differs
+# between gmake and make hosts.
+PREFLIGHT_TARGET = "lane-preflight"
+PREFLIGHT_MODULE = "cli_tools.lane_preflight"
 
 
 def _scrubbed_environment() -> dict[str, str]:
@@ -118,6 +125,66 @@ def test_direct_mode_keeps_the_sequential_vscode_tail(tmp_path: Path) -> None:
     _plant_collisions(tmp_path)
     tail = _dry_run(tmp_path, "validate-pr-raw", "LANE_EXECUTOR=direct")
     assert tail.count("test-vscode") == 1, tail
+
+
+def test_condor_gate_preflights_pool_policy_exactly_once(tmp_path: Path) -> None:
+    """Once per GATE, never once per lane.
+
+    The fan dispatches fifteen lanes; a per-lane check would ask the
+    same question fifteen times and still not stop the gate any
+    earlier. One invocation at the gate's head is the whole mechanism —
+    if this count ever rises, the check has leaked into the lanes."""
+    _plant_collisions(tmp_path)
+    gate = _dry_run(tmp_path, "_validate-pr-impl", "LANE_EXECUTOR=condor")
+    assert gate.count(PREFLIGHT_TARGET) == 1, (
+        "the condor gate must preflight pool policy exactly once\n"
+        f"{gate[:2000]}"
+    )
+
+
+def test_preflight_precedes_the_lane_fan(tmp_path: Path) -> None:
+    """A drifted pool must stop the gate BEFORE work is dispatched;
+    diagnosing it from fifteen degraded lanes afterwards is the failure
+    this check exists to prevent."""
+    _plant_collisions(tmp_path)
+    gate = _dry_run(tmp_path, "_validate-pr-impl", "LANE_EXECUTOR=condor")
+    assert PREFLIGHT_TARGET in gate, gate[:2000]
+    assert "_validate-pr-flat-impl" in gate, "dry run has no fan - probe broken"
+    assert gate.index(PREFLIGHT_TARGET) < gate.index("_validate-pr-flat-impl"), (
+        gate[:2000]
+    )
+
+
+def test_a_lane_never_runs_its_own_preflight(tmp_path: Path) -> None:
+    """The lane recipes are identical in both modes and know nothing
+    about pool policy; only the gate does."""
+    _plant_collisions(tmp_path)
+    for lane in (*FLAT_FAN_LANES, "_validate-pr-flat-impl"):
+        expansion = _dry_run(tmp_path, lane, "LANE_EXECUTOR=condor")
+        assert PREFLIGHT_MODULE not in expansion, (
+            f"lane {lane!r} pays for the pool-policy check itself"
+        )
+        assert PREFLIGHT_TARGET not in expansion, (
+            f"lane {lane!r} pays for the pool-policy check itself"
+        )
+
+
+def test_direct_mode_pays_nothing_for_the_pool_preflight(tmp_path: Path) -> None:
+    _plant_collisions(tmp_path)
+    gate = _dry_run(tmp_path, "_validate-pr-impl", "LANE_EXECUTOR=direct")
+    assert PREFLIGHT_TARGET not in gate, gate[:2000]
+
+
+def test_preflight_target_selects_the_backend_the_lanes_will_use(
+    tmp_path: Path,
+) -> None:
+    """One owner for the check, and it cannot preflight one backend
+    while the lanes run another."""
+    _plant_collisions(tmp_path)
+    for mode in ("direct", "condor"):
+        expansion = _dry_run(tmp_path, "lane-preflight", f"LANE_EXECUTOR={mode}")
+        assert expansion.count(PREFLIGHT_MODULE) == 1, expansion[:2000]
+        assert f"--backend {mode}" in expansion, expansion[:2000]
 
 
 def test_repo_tree_contains_no_target_named_debris() -> None:

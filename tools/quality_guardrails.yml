@@ -94,8 +94,12 @@ rules:
     include:
       - src/issue_orchestrator/**/*.py
     exclude:
+      # The adapter package IS the anti-corruption layer, and backend
+      # selection has exactly one owner that must name what it selects.
+      # Every other module — entrypoints included — speaks only the
+      # lane contracts.
       - src/issue_orchestrator/adapters/condor/**
-      - src/issue_orchestrator/entrypoints/cli_tools/lane_run.py
+      - src/issue_orchestrator/execution/lane_backends.py
 
   - id: ui_openapi_routes
     type: ui_openapi_routes

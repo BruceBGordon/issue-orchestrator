@@ -13,7 +13,7 @@ from issue_orchestrator.adapters.condor.lane_executor import (
 )
 from issue_orchestrator.domain.lane_execution import LaneExecutorUnavailableError
 
-_TOOL_NAMES = ("condor_submit", "condor_rm", "condor_q")
+_TOOL_NAMES = ("condor_submit", "condor_rm", "condor_q", "condor_config_val")
 
 
 def _write_tools(binaries: Path) -> None:
@@ -43,7 +43,27 @@ def test_path_installation_wins_and_needs_no_pool_config(
     tools = CondorTools.resolve()
 
     assert tools.submit == (on_path / "condor_submit").resolve()
+    assert tools.config_query == (on_path / "condor_config_val").resolve()
     assert tools.pool_config is None
+
+
+def test_a_partial_installation_is_not_a_pool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every tool the adapter uses must resolve together, config query
+    included: half an installation would resolve and then fail at the
+    first policy read, which is exactly the silent-degradation shape
+    the opt-in backend refuses."""
+    partial = tmp_path / "partial-bin"
+    _write_tools(partial)
+    (partial / "condor_config_val").unlink()
+    monkeypatch.setenv("PATH", str(partial))
+    monkeypatch.setenv(
+        PERSONAL_POOL_HOME_ENVIRONMENT_VARIABLE, str(tmp_path / "missing")
+    )
+
+    with pytest.raises(LaneExecutorUnavailableError, match="opt-in"):
+        CondorTools.resolve()
 
 
 def test_personal_install_resolves_with_its_pool_config(

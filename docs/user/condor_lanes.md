@@ -90,6 +90,82 @@ runs a probe job in a fresh submitter-owned directory — readiness means
 identity configuration and hold reason instead of leaving you nine
 held lanes later.
 
+## Pool-policy self-check (runs at the head of every gate)
+
+`up` verifies the pool the moment it starts it. Nothing verified it
+again afterwards — and a pool is long-lived: files get hand-edited,
+packages get reinstalled, an experiment gets left behind. A pool that
+has lost one of the three settings above keeps accepting work and keeps
+reporting lanes as completed, so the damage (exclusives that no longer
+exclude, deadline overruns that surface as "backend unresponsive",
+lanes held on their own working directory) shows up as flaky lanes
+rather than as a configuration problem.
+
+`make validate-pr LANE_EXECUTOR=condor` therefore preflights the pool
+**once per gate**, before the lane fan:
+
+```bash
+make lane-preflight LANE_EXECUTOR=condor   # the same check, by hand
+```
+
+```
+[lane-preflight] condor: 5 required setting(s) hold — …/etc/condor_config
+```
+
+It asserts the three settings above plus the two opt-in policy files
+(below), exits **78** naming every drifted knob at once (no
+warn-and-continue: a drifted pool stops the gate before a single lane
+is dispatched), and exits 70 if the pool cannot be read at all — a
+pool that will not answer is never reported as healthy. Cost is six
+`condor_config_val` reads, about one second on the Rosetta macOS pool,
+which is why the gate can afford it unconditionally and why it runs
+once rather than once per lane.
+
+Direct mode runs lanes in your own environment and has no external
+policy, so the same target reports an empty invariant set and exits 0.
+
+### Policy intent, and why `up` records it
+
+The two opt-in policy files are asserted **present if and only if they
+were intended** — and intent is something the pool has to remember.
+`IO_CONDOR_LOAD_BACKOFF` and `IO_POOL_CAPACITY_PERCENT` are read once,
+at `up` time, by the installer process. Nothing else used to record
+that they were set, which left a pool that deliberately opted out
+indistinguishable from one whose policy file had been deleted by hand:
+the check passed on both.
+
+So `up` now writes `90-io-policy-intent.conf` alongside the policies
+themselves:
+
+```
+IO_INTENT_LOAD_BACKOFF = True          # or False
+IO_INTENT_CAPACITY_PERCENT = 150       # omitted entirely when unset
+```
+
+It rides the identical staging/install/reconcile path as the files it
+describes and is read over the same `condor_config_val` channel, so it
+cannot be installed out of step with them. `IO_INTENT_LOAD_BACKOFF` is
+written in *both* states deliberately: its presence is what proves a
+pool has an intent record at all.
+
+The record is validated against exactly that schema, because the
+config tool returns macro values **verbatim** — it canonicalizes
+nothing, so `true`, `Bogus` and `007` all reach the check as written.
+The sentinel must be literally `True` or `False`, and the dial must be
+absent or a positive integer with no leading zeros. Anything else did
+not come from `up`; it came from a hand-edit, and it is drift naming
+the macro and its value. There is deliberately no case or leading-zero
+tolerance: `007` is a value whose meaning depends on who parses it,
+and the pool was never sized with it.
+
+**A pool started before this existed reads as a legacy pool and fails
+preflight**, naming `IO_INTENT_LOAD_BACKOFF` with an empty value. That
+is intentional — on such a pool "opted out" and "removed by hand" are
+the same observation, so it cannot be judged and must not be trusted.
+Fix it by re-running `scripts/condor-personal.sh up` with the opt-ins
+the pool should carry. That restarts the startd, so do it **between**
+gates, never during one.
+
 ## Which parameters belong to which mode
 
 The concurrency controls are three separate layers; each parameter
@@ -208,8 +284,16 @@ normal.
   `event_classifier.py` translates job event logs inbound into typed
   lifecycle states. Scheduler vocabulary is forbidden outside this
   package by the `semgrep_condor_vocabulary` guardrail.
-- `entrypoints/cli_tools/lane_run.py` — the composition root the
-  Makefile invokes; selects the backend.
+- `execution/lane_backends.py` — the backend registry: one entry per
+  backend carrying BOTH factories (executor and policy check), with the
+  selectable names derived from it. A backend cannot be runnable
+  without also being checkable.
+- `ports/lane_policy_check.py` + `adapters/condor/pool_policy.py` —
+  the pool-policy self-check (above).
+- `entrypoints/cli_tools/lane_run.py` — the per-lane entrypoint the
+  Makefile invokes; `entrypoints/cli_tools/lane_preflight.py` — the
+  once-per-gate policy preflight. Both resolve their backend through
+  the registry.
 
 Interactive agent sessions (PTY) are out of scope for this backend —
 see issue #7112. Multi-machine pools are a follow-on; everything here

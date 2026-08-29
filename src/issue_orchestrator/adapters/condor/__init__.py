@@ -9,5 +9,6 @@ are the only language that crosses the port.
 """
 
 from .lane_executor import CondorLaneExecutor, CondorTools
+from .pool_policy import CondorPoolPolicyCheck
 
-__all__ = ["CondorLaneExecutor", "CondorTools"]
+__all__ = ["CondorLaneExecutor", "CondorPoolPolicyCheck", "CondorTools"]
