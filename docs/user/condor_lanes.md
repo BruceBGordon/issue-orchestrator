@@ -402,6 +402,26 @@ global history. Collection is best-effort by construction: it runs while
 a lane is already failing, so a pool without the knob costs the ClassAd
 and a stderr line, never the lane's own result.
 
+**That knob is a loaded gun, and the pool helper treats it as one.** A
+*missing* per-job history directory is safe — condor logs `must point to
+a valid directory; disabling per-job history output` and carries on. A
+directory the scheduler cannot *write* is not: it EXCEPTs the schedd
+(`error 13 (Permission denied) opening per-job history file`,
+`classadHistory.cpp:262`), and the master then restarts a schedd that
+immediately re-EXCEPTs on the same queued job, forever. So:
+
+- `scripts/condor-personal.sh up` creates the directory mode **1777**
+  (sticky, world-writable) rather than guessing which uid the daemons
+  run as — the submitting user on the tarball pools, `condor` on a
+  system install. It then *verifies* world-writability and writes the
+  `PER_JOB_HISTORY_DIR` knob into a managed optional config
+  (`93-io-per-job-history.conf`) **only** if that check passed, removing
+  a previously written one otherwise.
+- The worst case is therefore per-job accounting silently off, never a
+  dead pool. `condor-personal.sh up` prints why when it turns off.
+- The execenv image makes the same guarantee at build time, and the
+  build fails if the directory is not world-writable.
+
 ## Architecture
 
 - `domain/lane_execution.py` — the typed contracts (the only vocabulary

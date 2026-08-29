@@ -40,15 +40,6 @@ JOB_START_COUNT = 100
 CLAIM_WORKLIFE = 3600
 PERIODIC_EXPR_INTERVAL = 5
 CONCURRENCY_LIMIT_DEFAULT = 1
-# Per-job accounting (#7127). When a job leaves the queue the schedd
-# writes its COMPLETE final ClassAd to <dir>/history.<cluster>.<proc>.
-# The lane runner collects that file into a failed lane's retained
-# diagnostics, so the full accounting - exit status, peak memory, CPU
-# usage, slot, hold reason, every timestamp - survives WITH the run
-# directory instead of only inside a rotating global history file that
-# nothing correlates back to the lane. Configuration and collection
-# only: no new accounting code anywhere.
-PER_JOB_HISTORY_DIR = $(SPOOL)/per-job-history
 # Lane compatibility, required on EVERY pool this helper manages (not
 # just ones it builds the role for): condor bind-mounts job scratch
 # over /tmp by default on Linux, so a lane whose working directory
@@ -185,35 +176,99 @@ CONTINUE = (\$(OwnerLoadAvg) < ${IO_CONDOR_CONTINUE_LOAD:-2.0})
 EOF
 }
 
-# The schedd writes the per-job ClassAds itself, so the directory must
-# exist and be writable by whoever runs it - the submitting user on the
-# tarball pools, the condor user on a system install. Condor does not
-# create it, and a missing directory disables per-job accounting
-# silently, so this runs at every `up` and is never assumed.
-ensure_per_job_history_dir() {
-  local spool history owner
-  spool=$(condor_config_val SPOOL 2>/dev/null || echo "")
+# Per-job accounting (#7127): the schedd writes each finished job's
+# COMPLETE final ClassAd to <PER_JOB_HISTORY_DIR>/history.<cluster>.<proc>,
+# which the lane runner collects into a failed lane's retained
+# diagnostics.
+#
+# THE KNOB IS A LOADED GUN, and this is why the directory work below
+# looks paranoid. An unwritable per-job history directory does not
+# degrade the feature - it EXCEPTs the schedd:
+#
+#   ERROR "error 13 (Permission denied) opening per-job history file
+#   for job 1.0" at line 262 in file ./src/condor_utils/classadHistory.cpp
+#
+# and the master then restarts a schedd that immediately re-EXCEPTs on
+# the same queued job, forever (observed on all three Linux CI pools,
+# PR #7135). A MISSING directory, by contrast, is safe: condor logs
+# "must point to a valid directory; disabling per-job history output"
+# and carries on. So the invariant this code exists to hold is:
+#
+#   either the directory does not exist, or ANY uid can write it.
+#
+# Mode 1777 is how that is guaranteed without guessing which uid the
+# daemons run as - the submitting user on the tarball pools, `condor` on
+# a system install, something else in a container. Guessing that
+# identity is exactly what broke: the previous attempt copied the
+# spool's owner with `stat -f '%Su'`, which is BSD syntax that GNU
+# coreutils reads as --file-system, so the substitution captured a
+# filesystem dump AND the owner and chown rejected it. The sticky bit
+# keeps the directory safe for multiple uids, and the pool is a single
+# trusted local user by design (ADR-0009/0013).
+PER_JOB_HISTORY_CONFIG_NAME="93-io-per-job-history.conf"
+
+# Prepare the directory and echo its path; nonzero when it could not be
+# made unconditionally writable, in which case NO knob may be written.
+prepare_per_job_history_dir() {
+  local spool history
+  spool=$(condor_config_val SPOOL 2>/dev/null || true)
   if [ -z "$spool" ]; then
     echo "condor-personal: SPOOL is unset; per-job accounting is off" >&2
-    return 0
+    return 1
   fi
   history="$spool/per-job-history"
-  if [ -d "$history" ]; then
+  # Create if absent, then force the mode UNCONDITIONALLY: a directory
+  # left behind by the earlier broken attempt (root-owned, 0755) must be
+  # repaired rather than inherited, and `install -d`'s behaviour on an
+  # existing directory differs between coreutils and BSD - so neither
+  # step assumes anything about the other.
+  [ -d "$history" ] \
+    || mkdir -p "$history" 2>/dev/null \
+    || sudo mkdir -p "$history" 2>/dev/null \
+    || true
+  chmod 1777 "$history" 2>/dev/null \
+    || sudo chmod 1777 "$history" 2>/dev/null \
+    || true
+  # Verify the invariant instead of assuming the command that should
+  # have established it worked.
+  if ! world_writable_dir "$history"; then
+    echo "condor-personal: $history is not writable by every uid; per-job accounting is off (a directory the schedd cannot write would crash it)" >&2
+    return 1
+  fi
+  echo "$history"
+}
+
+# The portable "is this world-writable?" question: `find -perm -0002`
+# asks the filesystem instead of parsing a mode string, and needs no
+# guess about which uid the daemons use. Escalated the same way the
+# creation was, because a spool directory this user cannot even
+# TRAVERSE (a system install's /var/spool/condor may be condor-only)
+# would otherwise report a perfectly good directory as unusable.
+world_writable_dir() {
+  local target="$1"
+  if [ -n "$(find "$target" -maxdepth 0 -perm -0002 2>/dev/null)" ]; then
     return 0
   fi
-  if mkdir -p "$history" 2>/dev/null; then
+  if [ -n "$(sudo find "$target" -maxdepth 0 -perm -0002 2>/dev/null)" ]; then
     return 0
   fi
-  # Accounting is a diagnostic aid, not a precondition for running
-  # lanes: a pool whose spool we cannot write loses the ClassAds, not
-  # `up`.
-  owner=$(stat -f '%Su' "$spool" 2>/dev/null || stat -c '%U' "$spool" 2>/dev/null || echo "")
-  if ! sudo mkdir -p "$history" 2>/dev/null; then
-    echo "condor-personal: could not create $history; per-job accounting is off" >&2
-    return 0
-  fi
-  if [ -n "$owner" ]; then
-    sudo chown "$owner" "$history" || true
+  return 1
+}
+
+# Write the knob ONLY for a directory we just proved writable; remove a
+# previously written one otherwise. Same symmetric lifecycle as the
+# other opt-in policies, and the reason a preparation failure can only
+# ever cost the ClassAds, never the pool.
+write_per_job_history_config() {
+  local config_dir="$1" history
+  if history=$(prepare_per_job_history_dir); then
+    cat > "${config_dir}/${PER_JOB_HISTORY_CONFIG_NAME}" <<EOF
+# Per-job accounting (#7127). Absolute, not \$(SPOOL)-relative: this is
+# the directory scripts/condor-personal.sh verified writable.
+PER_JOB_HISTORY_DIR = ${history}
+EOF
+  else
+    rm -f "${config_dir}/${PER_JOB_HISTORY_CONFIG_NAME}"
   fi
 }
 
@@ -223,7 +278,7 @@ ensure_per_job_history_dir() {
 # `up`. The install boundary owns that reconciliation (B2, #7118
 # review): a managed file not present in staging is removed from the
 # destination.
-MANAGED_OPTIONAL_CONFIGS="91-io-load-backoff.conf 92-io-pool-capacity.conf"
+MANAGED_OPTIONAL_CONFIGS="91-io-load-backoff.conf 92-io-pool-capacity.conf 93-io-per-job-history.conf"
 
 install_staged_configs() {
   local staging="$1" destination="$2" runner=""
@@ -314,6 +369,8 @@ darwin_install() {
   } >> "$POOL_HOME/$TARBALL_DIR_NAME/local/config.d/90-issue-orchestrator-lanes.conf"
   export CONDOR_CONFIG="$POOL_HOME/$TARBALL_DIR_NAME/etc/condor_config"
   export PATH="$POOL_HOME/$TARBALL_DIR_NAME/bin:$POOL_HOME/$TARBALL_DIR_NAME/sbin:$PATH"
+  # After the exports, so condor_config_val answers for THIS pool.
+  write_per_job_history_config "$POOL_HOME/$TARBALL_DIR_NAME/local/config.d"
 }
 
 # LOCAL_CONFIG_DIR may be a comma-separated LIST (Ubuntu 24.04 returns
@@ -442,6 +499,9 @@ linux_configure() {
   fi
   staging=$(mktemp -d)
   write_lane_config "$staging"
+  # Staged before install, so the knob and the directory it names are
+  # installed together or not at all.
+  write_per_job_history_config "$staging"
   ambient_daemons=$(condor_config_val DAEMON_LIST 2>/dev/null || echo "")
   if ambient_needs_personal_role "$ambient_daemons"; then
     write_personal_role_config "$staging"
@@ -495,7 +555,6 @@ case "${1:-}" in
     else
       linux_configure
     fi
-    ensure_per_job_history_dir
     if condor_status -total >/dev/null 2>&1; then
       echo "condor-personal: pool already running; applying configuration"
       condor_reconfig >/dev/null 2>&1 || true

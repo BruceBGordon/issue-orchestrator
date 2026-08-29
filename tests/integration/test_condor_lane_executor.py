@@ -370,10 +370,12 @@ def test_failed_lane_retains_the_pools_own_per_job_accounting(
 
     configured = _run_pool_tool("condor_config_val", "PER_JOB_HISTORY_DIR")
     assert configured.returncode == 0 and configured.stdout.strip(), (
-        "this pool sets no PER_JOB_HISTORY_DIR; restart it with "
-        "scripts/condor-personal.sh up so per-job accounting is written "
-        f"(condor_config_val said: {configured.stdout.strip()!r} "
-        f"{configured.stderr.strip()!r})"
+        "this pool sets no PER_JOB_HISTORY_DIR. The helper writes it only "
+        "for a directory it proved world-writable first (an unwritable one "
+        "EXCEPTs the schedd, PR #7135), so re-run "
+        "scripts/condor-personal.sh up and read its stderr for the reason "
+        f"it turned accounting off (condor_config_val said: "
+        f"{configured.stdout.strip()!r} {configured.stderr.strip()!r})"
     )
 
     pattern = str(Path(_tempfile.gettempdir()) / "lane-contract.accounting*")

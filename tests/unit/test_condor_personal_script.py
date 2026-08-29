@@ -208,12 +208,15 @@ def test_lane_config_always_disables_scratch_over_tmp(tmp_path: Path) -> None:
     assert "CONCURRENCY_LIMIT_DEFAULT = 1" in generated
 
 
-def test_lane_config_always_enables_per_job_accounting(tmp_path: Path) -> None:
-    """#7127: per-job accounting is CONFIGURATION, and it rides the
-    always-applied lane config so every pool this helper manages drops
-    each finished job's final ClassAd where the lane runner collects
-    it. The path is expressed as $(SPOOL)/... so condor expands it to
-    the schedd's own spool wherever the pool lives."""
+def test_lane_config_never_states_per_job_accounting_unconditionally(
+    tmp_path: Path,
+) -> None:
+    """The knob must NOT ride the always-applied lane config (PR #7135).
+
+    An unwritable PER_JOB_HISTORY_DIR does not disable the feature, it
+    EXCEPTs the schedd into a restart loop, so the knob may only ever be
+    stated for a directory this script proved writable first. Anything
+    that puts it back in the unconditional config re-arms that gun."""
     result = subprocess.run(
         [
             "bash",
@@ -227,26 +230,39 @@ def test_lane_config_always_enables_per_job_accounting(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     generated = (tmp_path / "90-issue-orchestrator-lanes.conf").read_text()
-    assert "PER_JOB_HISTORY_DIR = $(SPOOL)/per-job-history" in generated
+    assert "PER_JOB_HISTORY_DIR" not in generated
 
 
-def _ensure_history_dir(
-    tmp_path: Path, spool_value: str
+def _per_job_history_config(
+    tmp_path: Path, spool_value: str, config_dir: Path
 ) -> subprocess.CompletedProcess[str]:
-    """Run ensure_per_job_history_dir against a stubbed config reader."""
+    """Run write_per_job_history_config against stubbed tools.
+
+    ``sudo`` is stubbed as a plain passthrough so the privilege
+    fallbacks are exercised deterministically: with a real sudo these
+    assertions would depend on whether the host grants passwordless
+    root (it does on CI runners and does not on a developer laptop),
+    which is exactly the kind of environment-dependent test that hides
+    the behaviour it claims to pin.
+    """
     import os
 
     stubs = tmp_path / "stub-bin"
     stubs.mkdir(exist_ok=True)
     reader = stubs / "condor_config_val"
-    reader.write_text(f"#!/bin/bash\necho '{spool_value}'\n")
+    reader.write_text(f"#!/bin/bash\nprintf '%s\\n' '{spool_value}'\n")
     reader.chmod(0o755)
+    unprivileged_sudo = stubs / "sudo"
+    unprivileged_sudo.write_text('#!/bin/bash\nexec "$@"\n')
+    unprivileged_sudo.chmod(0o755)
     return subprocess.run(
         [
             "bash",
             "-c",
             f'export PATH="{stubs}:$PATH"; '
-            f'source "{SCRIPT}" && ensure_per_job_history_dir',
+            f'source "{SCRIPT}" && write_per_job_history_config "$1"',
+            "_",
+            str(config_dir),
         ],
         capture_output=True,
         text=True,
@@ -254,31 +270,162 @@ def _ensure_history_dir(
     )
 
 
-def test_per_job_history_dir_is_created_because_condor_never_creates_it(
-    tmp_path: Path,
-) -> None:
-    """A missing directory disables per-job accounting SILENTLY, so the
-    helper creates it at every `up` rather than assuming it exists."""
+_CONFIG_NAME = "93-io-per-job-history.conf"
+
+
+def test_per_job_history_dir_is_created_world_writable(tmp_path: Path) -> None:
+    """Condor never creates the directory, and the daemons may run as
+    any uid (the submitting user on a tarball pool, `condor` on a system
+    install). Mode 1777 makes writability true without guessing which -
+    guessing is what crashed all three Linux pools in PR #7135."""
     spool = tmp_path / "spool"
     spool.mkdir()
-    result = _ensure_history_dir(tmp_path, str(spool))
+    config_dir = tmp_path / "config.d"
+    config_dir.mkdir()
+
+    result = _per_job_history_config(tmp_path, str(spool), config_dir)
     assert result.returncode == 0, result.stderr
-    assert (spool / "per-job-history").is_dir()
+
+    history = spool / "per-job-history"
+    assert history.is_dir()
+    mode = history.stat().st_mode & 0o7777
+    assert mode == 0o1777, oct(mode)
+    assert (config_dir / _CONFIG_NAME).read_text().rstrip().endswith(
+        f"PER_JOB_HISTORY_DIR = {history}"
+    )
 
 
-def test_creating_the_history_dir_is_idempotent(tmp_path: Path) -> None:
+def test_an_existing_wrong_moded_directory_is_repaired(tmp_path: Path) -> None:
+    """A directory left behind by the broken first attempt (root-owned,
+    0755) must be REPAIRED, not inherited: skipping when it already
+    exists is what would keep a poisoned pool poisoned."""
     spool = tmp_path / "spool"
-    (spool / "per-job-history").mkdir(parents=True)
-    assert _ensure_history_dir(tmp_path, str(spool)).returncode == 0
-    assert (spool / "per-job-history").is_dir()
+    history = spool / "per-job-history"
+    history.mkdir(parents=True, mode=0o755)
+    config_dir = tmp_path / "config.d"
+    config_dir.mkdir()
+
+    result = _per_job_history_config(tmp_path, str(spool), config_dir)
+    assert result.returncode == 0, result.stderr
+    assert history.stat().st_mode & 0o7777 == 0o1777
+    assert (config_dir / _CONFIG_NAME).exists()
 
 
-def test_unset_spool_says_so_instead_of_failing_the_pool(tmp_path: Path) -> None:
+def test_an_unpreparable_directory_writes_no_knob_at_all(tmp_path: Path) -> None:
+    """The fail-safe: if the directory cannot be made writable, the pool
+    must come up with per-job accounting simply OFF. Stating the knob
+    anyway is the difference between losing the ClassAds and losing the
+    schedd.
+
+    SPOOL is a regular file here, so creating a directory beneath it is
+    ENOTDIR for root as well - the impossibility does not depend on who
+    runs the suite."""
+    spool = tmp_path / "spool-is-a-file"
+    spool.write_text("not a directory\n")
+    config_dir = tmp_path / "config.d"
+    config_dir.mkdir()
+
+    result = _per_job_history_config(tmp_path, str(spool), config_dir)
+    assert result.returncode == 0, result.stderr
+    assert not (config_dir / _CONFIG_NAME).exists()
+    assert "per-job accounting is off" in result.stderr
+
+
+def test_verification_escalates_like_the_creation_did(tmp_path: Path) -> None:
+    """A system install's spool may be traversable only by condor and
+    root. The writability check must escalate the same way the creation
+    did, or a perfectly good directory reads as unusable and accounting
+    is switched off on exactly the pools that need it.
+
+    The sudo stub stands in for real root: it can see what the caller
+    cannot, so this exercises the escalation branch end to end without
+    the suite needing privilege."""
+    import os
+
+    spool = tmp_path / "spool"
+    history = spool / "per-job-history"
+    history.mkdir(parents=True)
+    history.chmod(0o1777)
+    config_dir = tmp_path / "config.d"
+    config_dir.mkdir()
+
+    stubs = tmp_path / "stub-bin"
+    stubs.mkdir(exist_ok=True)
+    reader = stubs / "condor_config_val"
+    reader.write_text(f"#!/bin/bash\nprintf '%s\\n' '{spool}'\n")
+    reader.chmod(0o755)
+    privileged_sudo = stubs / "sudo"
+    privileged_sudo.write_text(
+        "#!/bin/bash\n"
+        f"chmod u+x '{spool}'\n"
+        'test -n "$*" && "$@"\n'
+        "status=$?\n"
+        f"chmod u-x '{spool}'\n"
+        "exit $status\n"
+    )
+    privileged_sudo.chmod(0o755)
+
+    # Owner loses traverse: the direct check cannot reach the directory.
+    spool.chmod(0o600)
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'export PATH="{stubs}:$PATH"; '
+                f'source "{SCRIPT}" && write_per_job_history_config "$1"',
+                "_",
+                str(config_dir),
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ},
+        )
+    finally:
+        spool.chmod(0o755)
+
+    assert result.returncode == 0, result.stderr
+    assert (config_dir / _CONFIG_NAME).read_text().rstrip().endswith(
+        f"PER_JOB_HISTORY_DIR = {history}"
+    ), result.stderr
+
+
+def test_unset_spool_writes_no_knob_and_says_so(tmp_path: Path) -> None:
     """Accounting is a diagnostic aid, not a precondition for running
     lanes: an exotic pool with no SPOOL loses the ClassAds, not `up`."""
-    result = _ensure_history_dir(tmp_path, "")
+    config_dir = tmp_path / "config.d"
+    config_dir.mkdir()
+    result = _per_job_history_config(tmp_path, "", config_dir)
     assert result.returncode == 0, result.stderr
+    assert not (config_dir / _CONFIG_NAME).exists()
     assert "per-job accounting is off" in result.stderr
+
+
+def test_a_previously_written_knob_is_removed_when_preparation_fails(
+    tmp_path: Path,
+) -> None:
+    """Symmetric lifecycle, same invariant as the backoff and capacity
+    policies: a stale knob pointing at a directory nobody verified this
+    run is exactly the configuration that crashes the schedd."""
+    config_dir = tmp_path / "config.d"
+    config_dir.mkdir()
+    (config_dir / _CONFIG_NAME).write_text("PER_JOB_HISTORY_DIR = /gone\n")
+    result = _per_job_history_config(tmp_path, "", config_dir)
+    assert result.returncode == 0, result.stderr
+    assert not (config_dir / _CONFIG_NAME).exists()
+
+
+def test_the_knob_file_is_reconciled_by_the_install_boundary() -> None:
+    """The Linux path COPIES staged files, which cannot delete, so the
+    knob must be in the managed-optional set or a stale one survives
+    every later install."""
+    result = subprocess.run(
+        ["bash", "-c", f'source "{SCRIPT}" && echo "$MANAGED_OPTIONAL_CONFIGS"'],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _CONFIG_NAME in result.stdout
 
 
 def _write_lane_config(tmp_path: Path, **env: str) -> None:
