@@ -94,3 +94,17 @@ def test_record_is_idempotent_and_leaves_no_debris(tmp_path: Path) -> None:
     sha_dir = tmp_path / LANE_VERDICTS_RELATIVE / SHA_A
     assert [p.name for p in sha_dir.iterdir()] == ["test-unit.json"]
     assert read_green(tmp_path, SHA_A, "test-unit") is not None
+
+
+def test_unwritable_store_is_a_translated_store_fault(tmp_path: Path) -> None:
+    """Round-1 finding 3: directory creation lives inside the OSError
+    translation — a 0555 store surfaces as LaneVerdictError, never a
+    raw PermissionError traceback."""
+    root = tmp_path / LANE_VERDICTS_RELATIVE
+    root.mkdir(parents=True)
+    root.chmod(0o555)
+    try:
+        with pytest.raises(LaneVerdictError, match="could not be recorded"):
+            record_green(tmp_path, SHA_A, "test-unit")
+    finally:
+        root.chmod(0o755)

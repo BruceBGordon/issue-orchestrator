@@ -45,6 +45,9 @@ def gate_environment(
     monkeypatch.setattr(
         lane_verdict_module, "_current_head", lambda worktree: SHA
     )
+    monkeypatch.setattr(
+        lane_verdict_module, "_cache_blocking_paths", lambda worktree: []
+    )
     return tmp_path
 
 
@@ -163,3 +166,45 @@ def test_bad_worktree_argument_is_a_configuration_error(
         )
         == 78
     )
+
+
+def test_blocking_worktree_state_disengages_check_and_record(
+    gate_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Round-1 finding 2 at the policy layer: any path the dirty-policy
+    owner reports (beyond runtime-managed state) disengages both sides
+    — the cached green is not trusted, and nothing new is minted."""
+    record_green(gate_environment, SHA, "test-unit")
+    monkeypatch.setattr(
+        lane_verdict_module,
+        "_cache_blocking_paths",
+        lambda worktree: ["novel-input.txt"],
+    )
+    assert _check(gate_environment, "test-unit") == 3
+    assert _record(gate_environment, "typecheck", 0) == 0
+    out = capsys.readouterr().out
+    assert out.count("cache disengaged") == 2
+    assert "novel-input.txt" in out
+    # Nothing was minted while disengaged.
+    monkeypatch.setattr(
+        lane_verdict_module, "_cache_blocking_paths", lambda worktree: []
+    )
+    assert _check(gate_environment, "typecheck") == 3
+
+
+def test_dirty_enumeration_failure_fails_closed(
+    gate_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The owner's None contract: enumeration failure is never
+    cleanliness — the cache disengages exactly as if blocked."""
+    record_green(gate_environment, SHA, "test-unit")
+    monkeypatch.setattr(
+        lane_verdict_module, "_cache_blocking_paths", lambda worktree: None
+    )
+    assert _check(gate_environment, "test-unit") == 3
+    assert _record(gate_environment, "test-unit", 0) == 0
+    assert "enumeration failed" in capsys.readouterr().out

@@ -238,11 +238,15 @@ def _wrapped_command(recipe_line: str) -> str:
     assertions against the whole recipe line match the envelope
     instead of the command — that false-positived twice in one night —
     so probes must cut out the wrapped command first. The anchor is
-    the command group TIMED_RUN itself expands: `{ <cmd>; }; status=$?`.
+    the scrubbed subshell TIMED_RUN expands:
+    `( unset LANE_VERDICT_SHA LANE_VERDICT_LANES; <cmd> ); status=$?`.
     """
     import re as _re
 
-    found = _re.search(r"\{ (.*?); \}; status=\$\?", recipe_line)
+    found = _re.search(
+        r"\( unset LANE_VERDICT_SHA LANE_VERDICT_LANES; (.*?) \); status=\$\?",
+        recipe_line,
+    )
     assert found, f"not a TIMED_RUN recipe line: {recipe_line[:200]}"
     return found.group(1)
 

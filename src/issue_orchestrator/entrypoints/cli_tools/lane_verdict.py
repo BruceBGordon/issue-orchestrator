@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Sequence
 
 from ...execution import GitWorkingCopy
+from ...infra.runtime_artifacts import filter_runtime_managed_dirty_paths
 from ...infra.lane_verdicts import (
     LaneVerdictError,
     read_green,
@@ -79,6 +80,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         # membership in the gate's own lane list is what makes a target
         # cacheable at all.
         return _RUN_EXIT_CODE if arguments.command == "check" else 0
+    blocking = _cache_blocking_paths(worktree)
+    if blocking is None or blocking:
+        # HEAD alone is not the identity of what a lane consumed: the
+        # gate's tracked-mode dirty guard admits untracked files, so
+        # any remaining dirty/untracked path (beyond runtime-managed
+        # state, per the EXISTING dirty-policy owner) disengages the
+        # cache BOTH ways — nothing trusted, nothing minted. A failed
+        # enumeration disengages too (fail closed). Over-inclusion is
+        # the fail-safe direction; there is no file-kind exemption.
+        detail = (
+            "dirty-state enumeration failed"
+            if blocking is None
+            else f"{len(blocking)} path(s) beyond runtime-managed state "
+            f"(e.g. {blocking[0]})"
+        )
+        print(
+            f"[lane-verdict] cache disengaged for {target}: worktree has "
+            f"{detail}"
+        )
+        return _RUN_EXIT_CODE if arguments.command == "check" else 0
     moved = _tree_moved(worktree, tree_sha)
     if moved is not None:
         print(f"lane-verdict: {moved}", file=sys.stderr)
@@ -102,6 +123,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     except LaneVerdictError as error:
         print(f"lane-verdict: {error}", file=sys.stderr)
         return _FAULT_EXIT_CODE
+
+
+def _cache_blocking_paths(worktree: Path) -> list[str] | None:
+    """Worktree state that makes caching ineligible (test seam).
+
+    Delegates to the existing dirty-policy owner: every dirty or
+    untracked path ("all" mode), filtered of runtime-managed metadata.
+    ``None`` mirrors the owner's fail-closed contract: enumeration
+    failure must never be mistaken for cleanliness.
+    """
+    dirty = GitWorkingCopy().list_dirty_files(worktree, "all")
+    if dirty is None:
+        return None
+    return filter_runtime_managed_dirty_paths(dirty, worktree)
 
 
 def _tree_moved(worktree: Path, tree_sha: str) -> str | None:

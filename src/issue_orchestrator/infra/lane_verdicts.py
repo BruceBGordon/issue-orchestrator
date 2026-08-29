@@ -136,7 +136,6 @@ def record_green(worktree: Path, tree_sha: str, target: str) -> LaneVerdict:
     """
     tree_sha, target = _validated(tree_sha, target)
     sha_directory = _sha_directory(worktree, tree_sha)
-    sha_directory.mkdir(parents=True, exist_ok=True)
     verdict = LaneVerdict(
         target=target,
         tree_sha=tree_sha,
@@ -151,18 +150,24 @@ def record_green(worktree: Path, tree_sha: str, target: str) -> LaneVerdict:
         },
         sort_keys=True,
     )
-    descriptor, temp_name = tempfile.mkstemp(
-        dir=sha_directory, prefix=f".{target}.", suffix=".part"
-    )
+    temp_name: str | None = None
     try:
+        # Directory creation and the temp file live INSIDE the
+        # translation: an unwritable store (0555) is a store fault the
+        # caller handles, never a raw traceback (round-1 finding 3).
+        sha_directory.mkdir(parents=True, exist_ok=True)
+        descriptor, temp_name = tempfile.mkstemp(
+            dir=sha_directory, prefix=f".{target}.", suffix=".part"
+        )
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(payload + "\n")
         os.replace(temp_name, sha_directory / f"{target}.json")
     except OSError as error:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
         raise LaneVerdictError(
             f"lane verdict could not be recorded: {target} at {tree_sha}: "
             f"{error}"

@@ -322,9 +322,14 @@ PYTEST_TIMINGS ?= --durations=$(PYTEST_DURATIONS) --durations-min=$(PYTEST_DURAT
 # gate phase exports LANE_VERDICT_SHA/LANE_VERDICT_LANES: check exit
 # 0 = cached green, skip; 3 = run; anything else = real error and the
 # lane fails with it (a corrupt store is never green). The wrapper
-# NEVER alters a red lane's own exit status: record is attempted only
-# for green lanes, and a record-invocation failure becomes a labeled
-# STORE FAULT (70), never an adopted arbitrary code. The guard uses
+# NEVER alters a lane's own outcome: record is attempted only for
+# green lanes and is best-effort - a failed recording warns loudly,
+# leaves no verdict, and preserves the lane's status exactly. The
+# wrapped command runs in a subshell with the verdict environment
+# UNSET: only this outer wrapper owns consulting and recording - a
+# nested make (the scheduler lane's inner direct invocation) must
+# never mint a green the outer lane's postconditions haven't earned.
+# The guard uses
 # -z (not -n) so recipe text stays free of " -n ", which the phase
 # tests read as an xdist width marker.
 define TIMED_RUN
@@ -343,13 +348,12 @@ define TIMED_RUN
 	elif [ $$vrc -ne 3 ]; then \
 		status=$$vrc; \
 	else \
-		{ $(2); }; \
+		( unset LANE_VERDICT_SHA LANE_VERDICT_LANES; $(2) ); \
 		status=$$?; \
 		if [ -z "$$LANE_VERDICT_SHA" ] || [ $$status -ne 0 ]; then \
 			:; \
 		elif ! $(LANE_VERDICT) record --worktree "$(CURDIR)" --target "$$target" --exit-status $$status; then \
-			echo "[lane-verdict] STORE FAULT recording $$target - failing the gate as a store fault, not a lane failure" >&2; \
-			status=70; \
+			echo "[lane-verdict] warning: could not record green for $$target (store at $(CURDIR)) - no verdict left, lane outcome preserved" >&2; \
 		fi; \
 	fi; \
 	end=$$(date +%s); \

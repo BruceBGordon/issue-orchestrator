@@ -109,22 +109,46 @@ def _fake_repo(tmp_path: Path) -> tuple[Path, str]:
         check=True,
         env=environment,
     )
-    sha = subprocess.run(
+    return repo, _head(repo)
+
+
+def _head(repo: Path) -> str:
+    return subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=repo,
         capture_output=True,
         text=True,
         check=True,
     ).stdout.strip()
-    return repo, sha
+
+
+def _commit_all(repo: Path) -> str:
+    """Commit everything in the fake repo: cache eligibility rightly
+    disengages on untracked state, so test scaffolding must be
+    committed to exercise the engaged paths."""
+    environment = {
+        **_scrubbed_environment(),
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=environment)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "scaffolding"],
+        cwd=repo,
+        check=True,
+        env=environment,
+    )
+    return _head(repo)
 
 
 def test_fail_one_rerun_one_then_all_cached(tmp_path: Path) -> None:
     """The whole prize, end to end with real make and the real CLI:
     a gate re-run after one lane's transient failure re-runs ONLY that
     lane, and a third run re-runs nothing."""
-    repo, sha = _fake_repo(tmp_path)
-    marker = repo / "flaky-should-fail"
+    repo, _ = _fake_repo(tmp_path)
+    marker = tmp_path / "flaky-should-fail"
     marker.write_text("")
     extra = repo / "extra.mk"
     extra.write_text(
@@ -132,8 +156,9 @@ def test_fail_one_rerun_one_then_all_cached(tmp_path: Path) -> None:
         "\t$(call TIMED_RUN,ok-lane,echo RAN-OK)\n"
         "flaky-lane:\n"
         "\t$(call TIMED_RUN,flaky-lane,"
-        "test ! -f flaky-should-fail && echo RAN-FLAKY)\n"
+        f"test ! -f {marker} && echo RAN-FLAKY)\n"
     )
+    sha = _commit_all(repo)
     python = str(REPO_ROOT / ".venv" / "bin" / "python")
 
     def gate_run() -> subprocess.CompletedProcess[str]:
@@ -187,8 +212,9 @@ def test_cd_ing_multiline_recipe_records_and_caches(tmp_path: Path) -> None:
     wrapper adopted that as the lane's status, failing a GREEN lane.
     The wrapper must be cwd-immune: worktree passed explicitly,
     interpreter absolutized."""
-    repo, sha = _fake_repo(tmp_path)
+    repo, _ = _fake_repo(tmp_path)
     (repo / "subdir").mkdir()
+    (repo / "subdir" / ".keep").write_text("")
     extra = repo / "extra.mk"
     extra.write_text(
         "cd-lane:\n"
@@ -198,6 +224,7 @@ def test_cd_ing_multiline_recipe_records_and_caches(tmp_path: Path) -> None:
         "\tfi && \\\n"
         "\tcd subdir && echo RAN-CD)\n"
     )
+    sha = _commit_all(repo)
     python = str(REPO_ROOT / ".venv" / "bin" / "python")
     make = shutil.which("gmake") or "make"
 
@@ -233,14 +260,16 @@ def test_cd_ing_multiline_recipe_records_and_caches(tmp_path: Path) -> None:
     assert "cached-green" in second.stdout
 
 
-def test_record_failure_is_a_labeled_store_fault_and_red_stays_red(
+def test_record_failure_preserves_the_lane_outcome_exactly(
     tmp_path: Path,
 ) -> None:
-    """Outcome safety, both directions: a red lane keeps its OWN exit
-    status (record is not even attempted), and a green lane whose
-    record invocation fails becomes a LABELED store fault (70) — never
-    an adopted arbitrary code masquerading as the lane's failure."""
-    repo, sha = _fake_repo(tmp_path)
+    """Recording is best-effort AROUND the lane (round-1 finding 3):
+    a red lane keeps its OWN exit status (record is not attempted),
+    and a green lane whose record fails STAYS GREEN — a loud warning
+    names the lane, NO verdict is left, and the next run re-runs
+    instead of trusting anything. The wrapper never converts a lane's
+    outcome into a store code."""
+    repo, _ = _fake_repo(tmp_path)
     extra = repo / "extra.mk"
     extra.write_text(
         "red-lane:\n"
@@ -248,11 +277,10 @@ def test_record_failure_is_a_labeled_store_fault_and_red_stays_red(
         "green-lane:\n"
         "\t$(call TIMED_RUN,green-lane,echo RAN-GREEN)\n"
     )
+    sha = _commit_all(repo)
     make = shutil.which("gmake") or "make"
 
-    def run(
-        target: str, python: str
-    ) -> subprocess.CompletedProcess[str]:
+    def run(target: str, python: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 make,
@@ -279,12 +307,10 @@ def test_record_failure_is_a_labeled_store_fault_and_red_stays_red(
     assert red.returncode != 0
     assert "status=9" in red.stdout, "red lane's own exit status was altered"
 
-    # A python that dies for record but not for check is hard to fake;
-    # a wholly-broken interpreter exercises the same store-fault arm
-    # via the CHECK path being unreachable... so break record surgically:
-    # the check path must succeed (miss) first — use a wrapper script
-    # that passes 'check' through and fails 'record'.
-    shim = repo / "flaky-python.sh"
+    # Break record surgically while check still answers: a shim that
+    # passes everything through except the record subcommand. It lives
+    # OUTSIDE the repo so the worktree stays clean for eligibility.
+    shim = tmp_path / "flaky-python.sh"
     shim.write_text(
         "#!/bin/sh\n"
         'for a in "$@"; do [ "$a" = record ] && exit 127; done\n'
@@ -292,9 +318,190 @@ def test_record_failure_is_a_labeled_store_fault_and_red_stays_red(
     )
     shim.chmod(0o755)
     green = run("green-lane", str(shim))
-    assert green.returncode != 0
-    assert "STORE FAULT" in green.stderr
-    assert "status=70" in green.stdout, (
-        "record failure must be the labeled 70, not an adopted code:\n"
+    assert green.returncode == 0, (
+        "a green lane must stay green when recording fails:\n"
         + green.stdout
+        + green.stderr
+    )
+    assert "RAN-GREEN" in green.stdout
+    assert "status=0" in green.stdout
+    assert "could not record" in green.stderr
+    assert "green-lane" in green.stderr
+    lanes_root = repo / ".issue-orchestrator" / "validation" / "lanes"
+    assert not list(lanes_root.glob(f"{sha}/green-lane.json")), (
+        "no verdict may be left behind by a failed recording"
+    )
+    # And the next run re-runs (nothing was cached).
+    rerun = run("green-lane", real_python)
+    assert rerun.returncode == 0
+    assert "RAN-GREEN" in rerun.stdout
+
+
+def test_unwritable_store_warns_and_lane_stays_green(tmp_path: Path) -> None:
+    """Round-1 finding 3's exact repro: a 0555 store directory must
+    not flip a successful lane — warn loudly, leave no verdict,
+    preserve status 0."""
+    repo, _ = _fake_repo(tmp_path)
+    extra = repo / "extra.mk"
+    extra.write_text(
+        "green-lane:\n"
+        "\t$(call TIMED_RUN,green-lane,echo RAN-GREEN)\n"
+    )
+    sha = _commit_all(repo)
+    store_parent = repo / ".issue-orchestrator" / "validation" / "lanes"
+    store_parent.mkdir(parents=True)
+    store_parent.chmod(0o555)
+    make = shutil.which("gmake") or "make"
+    try:
+        result = subprocess.run(
+            [
+                make,
+                "-f",
+                str(REPO_ROOT / "Makefile"),
+                "-f",
+                "extra.mk",
+                f"PYTHON={REPO_ROOT / '.venv' / 'bin' / 'python'}",
+                "green-lane",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            env={
+                **_scrubbed_environment(),
+                "LANE_VERDICT_SHA": sha,
+                "LANE_VERDICT_LANES": "green-lane",
+                "PYTHONPATH": str(REPO_ROOT / "src"),
+            },
+        )
+    finally:
+        store_parent.chmod(0o755)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RAN-GREEN" in result.stdout and "status=0" in result.stdout
+    assert "could not record" in result.stderr
+    assert not list(store_parent.glob(f"{sha}/*.json"))
+
+
+def test_nested_direct_make_never_consults_or_records(tmp_path: Path) -> None:
+    """Round-1 finding 1: the scheduler lane's nested direct make
+    inherits the gate environment, so its INNER TIMED_RUN recorded a
+    green the OUTER lane had not earned — lane-run's own
+    postconditions (journal, history) can still fail after the inner
+    make succeeds, and the next gate then skipped on that phantom
+    green. One execution owner: only the OUTER wrapper may consult or
+    record; the wrapped command runs with the verdict environment
+    scrubbed."""
+    repo, _ = _fake_repo(tmp_path)
+    extra = repo / "extra.mk"
+    extra.write_text(
+        "outer-lane:\n"
+        "\t$(call TIMED_RUN,outer-lane,"
+        f"$(GMAKE) -f {REPO_ROOT / 'Makefile'} -f extra.mk "
+        "PYTHON=$(PYTHON) inner-step && exit 7)\n"
+        "inner-step:\n"
+        "\t$(call TIMED_RUN,inner-step,echo INNER-RAN)\n"
+    )
+    sha = _commit_all(repo)
+    make = shutil.which("gmake") or "make"
+
+    def run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                make,
+                "-f",
+                str(REPO_ROOT / "Makefile"),
+                "-f",
+                "extra.mk",
+                f"PYTHON={REPO_ROOT / '.venv' / 'bin' / 'python'}",
+                "outer-lane",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            env={
+                **_scrubbed_environment(),
+                "LANE_VERDICT_SHA": sha,
+                # Both names are members: the inner target must be kept
+                # out by the environment scrub, not by membership luck.
+                "LANE_VERDICT_LANES": "outer-lane inner-step",
+                "PYTHONPATH": str(REPO_ROOT / "src"),
+            },
+        )
+
+    first = run()
+    assert first.returncode != 0
+    assert "INNER-RAN" in first.stdout
+    assert "recorded-green" not in first.stdout, (
+        "a nested make minted a verdict the outer lane never earned:\n"
+        + first.stdout
+    )
+    lanes_root = repo / ".issue-orchestrator" / "validation" / "lanes"
+    assert not list(lanes_root.glob("*/*.json"))
+    second = run()
+    assert "cached-green" not in second.stdout
+    assert "INNER-RAN" in second.stdout, "the failed lane must re-run fully"
+
+
+def test_untracked_state_disengages_the_cache_both_ways(
+    tmp_path: Path,
+) -> None:
+    """Round-1 finding 2: HEAD alone is not the identity of what a
+    lane consumed — the gate's tracked-mode dirty guard admits
+    untracked files, so a new test file or config changes behavior
+    under an unchanged key. Eligibility comes from the EXISTING
+    dirty-policy owner (list_dirty_files("all") filtered of
+    runtime-managed paths): any remaining path disengages BOTH
+    recording and skipping, loudly. Over-inclusion is the fail-safe
+    direction; no file-kind classification."""
+    repo, _ = _fake_repo(tmp_path)
+    extra = repo / "extra.mk"
+    extra.write_text(
+        "ok-lane:\n"
+        "\t$(call TIMED_RUN,ok-lane,echo RAN-OK)\n"
+    )
+    sha = _commit_all(repo)
+    make = shutil.which("gmake") or "make"
+
+    def run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                make,
+                "-f",
+                str(REPO_ROOT / "Makefile"),
+                "-f",
+                "extra.mk",
+                f"PYTHON={REPO_ROOT / '.venv' / 'bin' / 'python'}",
+                "ok-lane",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            env={
+                **_scrubbed_environment(),
+                "LANE_VERDICT_SHA": sha,
+                "LANE_VERDICT_LANES": "ok-lane",
+                "PYTHONPATH": str(REPO_ROOT / "src"),
+            },
+        )
+
+    clean = run()
+    assert clean.returncode == 0
+    assert "recorded-green" in clean.stdout
+
+    # An untracked consumed input appears: the cached green may no
+    # longer be trusted, and nothing new may be minted.
+    (repo / "novel-input.txt").write_text("changes behavior")
+    dirty = run()
+    assert dirty.returncode == 0
+    assert "RAN-OK" in dirty.stdout, "stale green was trusted over new state"
+    assert "cached-green" not in dirty.stdout
+    assert "cache disengaged" in dirty.stdout + dirty.stderr
+
+    # Runtime-managed untracked state (the store itself, diagnostics)
+    # must NOT disengage: the filter is the existing owner's.
+    (repo / "novel-input.txt").unlink()
+    engaged_again = run()
+    assert engaged_again.returncode == 0
+    assert "cached-green" in engaged_again.stdout, (
+        "runtime-managed paths (the verdict store) wrongly disengage:\n"
+        + engaged_again.stdout
     )
