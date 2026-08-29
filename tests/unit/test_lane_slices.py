@@ -10,6 +10,7 @@ path point the slicer at a fixture repository.
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -325,19 +326,27 @@ def test_verify_rejects_a_node_split_file_missing_from_a_slice() -> None:
 # --- the live gate ------------------------------------------------------------
 
 
-def test_check_mode_passes_on_the_live_integration_glob() -> None:
-    """End to end on the real file list — and deliberately without an
-    epoch, so running the unit suite never pins anything in the shared
-    store (a pin is durable, and this run has no gate behind it)."""
+def test_check_mode_passes_on_the_live_integration_glob(tmp_path: Path) -> None:
+    """End to end on the REAL file list, as a script, through the real
+    store path — but against an isolated repository, so a unit-suite
+    run neither pins into the shared store nor inherits a pin that
+    could later age out and refuse itself."""
+    isolated = tmp_path / "repo"
+    (isolated / "scripts").mkdir(parents=True)
+    (isolated / ".git").mkdir()
+    script = isolated / "scripts" / "lane_slices.py"
+    script.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
     live = sorted(str(p) for p in (REPO_ROOT / "tests/integration").glob("test_*.py"))
     completed = subprocess.run(
         (
             sys.executable,
-            str(SCRIPT),
+            str(script),
             "--group",
             "1",
             "--of",
             "3",
+            "--epoch",
+            "live-glob-check",
             "--check",
             *live,
         ),
@@ -347,18 +356,31 @@ def test_check_mode_passes_on_the_live_integration_glob() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
-def test_check_mode_never_pins_an_epoch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verification must leave no trace in the shared store. Pinning is
-    durable and refusals are permanent, so a check run that pinned
-    would eventually fail itself once its own pin aged out."""
+def test_check_mode_goes_through_the_real_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verification must exercise the same owner path as a real run,
+    weights included. A --check that partitioned on stand-in weights
+    would be verifying a partition no gate ever gets, so it pins its
+    epoch exactly as slice one does."""
     (tmp_path / ".git").mkdir()
     monkeypatch.setattr(lane_slices, "REPO_ROOT", tmp_path)
+    open_file_duration_history(tmp_path).record_success({"tests/x/test_a.py": 9.0})
     monkeypatch.setattr(
-        sys, "argv", ["lane_slices.py", "--group", "1", "--of", "2", "--check",
-                      "tests/x/test_a.py", "tests/x/test_b.py"]
+        sys,
+        "argv",
+        [
+            "lane_slices.py", "--group", "1", "--of", "2",
+            "--epoch", "accepted-check", "--check",
+            "tests/x/test_a.py", "tests/x/test_b.py",
+        ],
     )
     assert lane_slices.main() == 0
-    assert not list(tmp_path.rglob("pinned-*.json"))
+    pins = list(tmp_path.rglob("pinned-accepted-check.json"))
+    assert pins, "check mode must pin through the real store, not bypass it"
+    assert json.loads(pins[0].read_text(encoding="utf-8"))["weights"] == {
+        "tests/x/test_a.py": 9.0
+    }
 
 
 def test_the_baked_constants_are_gone() -> None:

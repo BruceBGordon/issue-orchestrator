@@ -40,8 +40,9 @@ Usage:
 
 `--check` prints nothing and exits 0 after verifying the partition
 properties (used by the unit tests and available to guardrails). It
-does not consult the weight store: coverage holds for any weights, and
-a verification run should not pin an epoch it has no gate for.
+goes through the same store path as a real run — a verification that
+skipped the weights would not be verifying the partition the gate
+actually gets.
 """
 
 from __future__ import annotations
@@ -93,10 +94,8 @@ def main() -> int:
     parser.add_argument("--of", type=int, required=True)
     parser.add_argument(
         "--epoch",
-        help=(
-            "Gate-run stamp; every slice of one gate must pass the same one. "
-            "Required unless --check."
-        ),
+        required=True,
+        help="Gate-run stamp; every slice of one gate must pass the same one.",
     )
     parser.add_argument("--check", action="store_true")
     parser.add_argument("files", nargs="+")
@@ -104,17 +103,10 @@ def main() -> int:
     if arguments.of < 1 or not (1 <= arguments.group <= arguments.of):
         parser.error("--group must be within 1..--of")
     files = sorted(dict.fromkeys(arguments.files))
-    if arguments.check:
-        # Coverage is a structural property of the partition and holds
-        # for ANY weights, so verification neither reads nor publishes
-        # them. Keeping --check off the shared store matters: pinning
-        # an epoch is a durable act, and a verification run has no gate
-        # behind it to justify one.
-        build_plan(files, arguments.of, {}).verify(files)
-        return 0
-    if not arguments.epoch:
-        parser.error("--epoch is required unless --check")
     plan = build_plan(files, arguments.of, pinned_weights(arguments.epoch))
+    if arguments.check:
+        plan.verify(files)
+        return 0
     print(" ".join(slice_targets(plan, arguments.group, arguments.of)))
     return 0
 

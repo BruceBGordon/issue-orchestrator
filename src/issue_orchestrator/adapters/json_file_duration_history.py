@@ -192,6 +192,10 @@ class JsonFileDurationHistory:
         pinned_path = self._pinned_path(epoch)
         published = self._read_pinned(pinned_path)
         if published is not None:
+            # A snapshot the ledger does not know about is one prune
+            # away from becoming a silent recompute, so record it
+            # before handing it out rather than after.
+            self._ensure_ledgered(epoch, pinned_path)
             return published
         with self._locked():
             # Re-read inside the lock: a sibling slice of the same gate
@@ -199,6 +203,7 @@ class JsonFileDurationHistory:
             # whole point of the pin is that it wins for everyone.
             published = self._read_pinned(pinned_path)
             if published is not None:
+                self._ensure_ledgered(epoch, pinned_path)
                 return published
             document = self._read_document()
             if epoch in document.pinned_epochs:
@@ -212,29 +217,73 @@ class JsonFileDurationHistory:
                     "run some tests twice and others not at all. Re-run the "
                     "gate so every slice shares a fresh epoch."
                 )
-            weights = {
-                path: statistics.median(window)
-                for path, window in document.durations.items()
-                if window
-            }
-            published_at = round(time.time(), 3)
-            # The pin lands BEFORE the ledger entry. Crashing between
-            # the two leaves a pin nobody has recorded, which readers
-            # simply use; the reverse order would leave a ledger entry
-            # with no pin and fail a gate that never got its weights.
-            self._write_json(
-                pinned_path,
-                {
-                    _WEIGHTS_FIELD: weights,
-                    # The pin's own account of its age, so retention
-                    # never has to trust a filesystem timestamp.
-                    _PUBLISHED_AT_FIELD: published_at,
-                },
-            )
-            document.pinned_epochs[epoch] = published_at
+            return self._publish(epoch, pinned_path, document)
+
+    def _publish(
+        self, epoch: str, pinned_path: Path, document: _StoreDocument
+    ) -> Mapping[str, float]:
+        """Pin this epoch's weights, ledger first.
+
+        The order is the safety property, not an implementation
+        detail. The ledger entry is made durable BEFORE the snapshot
+        becomes observable, so the only state a death between the two
+        writes can leave is a remembered epoch with no snapshot — which
+        the next reader turns into a loud refusal.
+
+        The reverse order leaves the dangerous state: a snapshot no
+        ledger records. A consumer adopts it, retention later reclaims
+        it (the ledger never knew the epoch), and the reader after that
+        recomputes silently — precisely the outcome
+        :class:`PinnedEpochExpiredError` exists to make impossible.
+        Failing a crashed gate loudly is the cheaper mistake, and this
+        store's whole stance is that a loud failure beats wrong weights.
+        """
+        weights = {
+            path: statistics.median(window)
+            for path, window in document.durations.items()
+            if window
+        }
+        published_at = round(time.time(), 3)
+        document.pinned_epochs[epoch] = published_at
+        self._write_document(document)
+        self._write_json(
+            pinned_path,
+            {
+                _WEIGHTS_FIELD: weights,
+                # The pin's own account of its age, so retention never
+                # has to trust a filesystem timestamp.
+                _PUBLISHED_AT_FIELD: published_at,
+            },
+        )
+        self._prune_pinned()
+        return weights
+
+    def _ensure_ledgered(self, epoch: str, pinned_path: Path) -> None:
+        """Durably record an epoch whose snapshot exists unrecorded.
+
+        Two things leave one: a store written before the ledger
+        existed, and — until the ordering above shipped — a publish
+        that died between its writes. Repairing on the way past is what
+        stops such a snapshot from decaying into a silent recompute
+        once retention reclaims it.
+        """
+        if epoch in self._read_document().pinned_epochs:
+            return
+        with self._locked():
+            document = self._read_document()
+            if epoch in document.pinned_epochs:
+                return
+            document.pinned_epochs[epoch] = self._pin_publish_time(pinned_path)
             self._write_document(document)
-            self._prune_pinned()
-            return weights
+
+    def _pin_publish_time(self, pinned_path: Path) -> float:
+        """The best honest date for a snapshot being ledgered late."""
+        dated = classify_pin_date(pinned_path, time.time())
+        if type(dated) is StampedPin:
+            return dated.published_at
+        if type(dated) is LegacyUnstampedPin:
+            return dated.modified_at
+        return round(time.time(), 3)
 
     def _locked(self) -> "_DirectoryLock":
         self._directory.mkdir(parents=True, exist_ok=True)
@@ -393,9 +442,15 @@ class JsonFileDurationHistory:
                 written = os.write(handle, encoded)
                 if written != len(encoded):
                     raise OSError(f"short write: {written} of {len(encoded)} bytes")
+                # Durable before observable: the ledger is only a
+                # safety net if it survives the power cut that made it
+                # necessary, and os.replace orders visibility, not
+                # persistence.
+                os.fsync(handle)
             finally:
                 os.close(handle)
             os.replace(temporary, path)
+            _fsync_directory(path.parent)
             temporary = None
         except OSError as error:
             raise FileDurationHistoryError(
@@ -566,6 +621,15 @@ class InertFileDurationHistory:
     def pinned_weights(self, epoch: str) -> Mapping[str, float]:
         del epoch
         return {}
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Persist the rename itself, not just the bytes it points at."""
+    handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(handle)
+    finally:
+        os.close(handle)
 
 
 def _validated(durations: Mapping[str, float]) -> dict[str, float]:

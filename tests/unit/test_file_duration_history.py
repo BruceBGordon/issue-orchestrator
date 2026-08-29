@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.adapters import json_file_duration_history as adapter
 from issue_orchestrator.adapters.json_file_duration_history import (
     FileDurationHistoryError,
     InertFileDurationHistory,
@@ -530,6 +531,98 @@ def test_a_store_written_before_the_ledger_existed_still_works(
     the field existed, and the first pin starts one."""
     write_history(tmp_path, json.dumps({"durations": {"tests/x/test_a.py": [4.0]}}))
     assert store(tmp_path).pinned_weights("first") == {"tests/x/test_a.py": 4.0}
+
+
+# --- the two writes of a publish, and dying between them ----------------------
+
+
+def replace_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the order in which files become observable."""
+    order: list[str] = []
+    real = adapter.os.replace
+
+    def spy(source: object, destination: object) -> None:
+        order.append(Path(str(destination)).name)
+        real(source, destination)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(adapter.os, "replace", spy)
+    return order
+
+
+def test_the_ledger_lands_before_the_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordering IS the safety property. Publishing the snapshot
+    first opens a window in which it exists and no ledger records it —
+    a consumer adopts it, retention later reclaims it, and the reader
+    after that recomputes silently."""
+    order = replace_spy(monkeypatch)
+    store(tmp_path).pinned_weights("ordered-gate")
+    assert order.index("history.json") < order.index("pinned-ordered-gate.json"), (
+        f"ledger must be durable before the snapshot is observable: {order}"
+    )
+
+
+def test_a_publish_that_dies_before_its_snapshot_refuses_afterwards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fault injection at the second write. What survives is a
+    remembered epoch with no snapshot, and the next reader must treat
+    that as the loud failure — never as a fresh epoch to recompute."""
+    history = store(tmp_path)
+    history.record_success({"tests/x/test_a.py": 5.0})
+    real = adapter.os.replace
+
+    def die_on_the_snapshot(source: object, destination: object) -> None:
+        if Path(str(destination)).name.startswith("pinned-"):
+            raise OSError("simulated death before the snapshot landed")
+        real(source, destination)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(adapter.os, "replace", die_on_the_snapshot)
+    with pytest.raises(FileDurationHistoryError):
+        history.pinned_weights("dying-gate")
+    monkeypatch.setattr(adapter.os, "replace", real)
+
+    assert not pin_path(tmp_path, "dying-gate").exists()
+    history.record_success({"tests/x/test_b.py": 900.0})
+    with pytest.raises(PinnedEpochExpiredError):
+        history.pinned_weights("dying-gate")
+
+
+def test_an_unledgered_snapshot_cannot_decay_into_a_silent_recompute(
+    tmp_path: Path,
+) -> None:
+    """The artifact the old ordering left behind — and the one a store
+    written before the ledger existed is full of: a snapshot no ledger
+    records. Consuming it must repair the ledger, so that when
+    retention later reclaims the snapshot the epoch is still refused
+    rather than quietly recomputed."""
+    history = store(tmp_path)
+    history.record_success({"tests/x/test_a.py": 5.0})
+    write_pin(
+        tmp_path,
+        "crashed-gate",
+        json.dumps(
+            {"weights": {"tests/x/test_a.py": 5.0}, "published_at": time.time()}
+        ),
+    )
+
+    assert history.pinned_weights("crashed-gate") == {"tests/x/test_a.py": 5.0}
+
+    pin_path(tmp_path, "crashed-gate").unlink()
+    history.record_success({"tests/x/test_b.py": 900.0})
+    with pytest.raises(PinnedEpochExpiredError):
+        history.pinned_weights("crashed-gate")
+
+
+def test_repairing_the_ledger_needs_no_second_visit(tmp_path: Path) -> None:
+    """The repair is durable, so a snapshot adopted by one process is
+    protected for every later one — each slice is its own process."""
+    write_pin(tmp_path, "legacy-gate", json.dumps({"weights": {}}))
+    store(tmp_path).pinned_weights("legacy-gate")
+    pin_path(tmp_path, "legacy-gate").unlink()
+    with pytest.raises(PinnedEpochExpiredError):
+        store(tmp_path).pinned_weights("legacy-gate")
 
 
 # --- corrupt state is loud ----------------------------------------------------

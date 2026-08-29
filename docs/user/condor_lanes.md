@@ -219,7 +219,11 @@ constant to go stale in the source.
   slice to ask publishes `pinned-<epoch>.json` and every other slice of
   that gate is answered from it.
 - **A snapshot is never recomputed.** The store records every epoch it
-  has pinned. If a slice asks for an epoch whose snapshot has since
+  has pinned, and that record is made durable *before* the snapshot
+  itself becomes observable. Dying between the two writes can therefore
+  only leave a remembered epoch with no snapshot — which fails loudly —
+  never a snapshot no ledger knows about, which would be adopted, later
+  pruned, and then silently recomputed. If a slice asks for an epoch whose snapshot has since
   been reclaimed — a lane's deadline excludes time it spent suspended,
   so a frozen slice can legitimately return days later — the store
   **refuses**, naming the epoch and the remedy, and the lane fails.
