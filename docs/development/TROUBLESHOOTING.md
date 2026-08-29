@@ -202,11 +202,14 @@ screen the session viewer draws. Regenerate the measurements behind that with
 reconstruction untrustworthy — a half-written recording, an unparseable row, an
 undecodable payload, an implausible `resize`, a replay the capture budget cut
 short, or a grid-affecting terminal mode the viewport does not model — yields
-`undetermined` rather than a guess. Autowrap (DECAWM) *is* modelled, because
-TUIs toggle it constantly and a footer's row depends on it — as do the resets
-that restore it (`ESC c`, `CSI !p`). A reset restores the terminal but never
-clears a refusal: whatever the unmodelled mode already did to the reconstructed
-rows cannot be undone. `matched_marker` names
+`undetermined` rather than a guess. Every channel the parser can reach —
+private modes, ANSI modes, charset designation, tab stops, the saved cursor,
+every CSI and escape — is either modelled against a measurement, on a
+measured-inert allowlist, or refused by name; nothing is silently dropped.
+Autowrap (DECAWM), the saved cursor (`ESC 7`/`ESC 8`), reverse index (`ESC M`)
+and both resets (`ESC c`, `CSI !p`) *are* modelled, because real recordings use
+them. A reset restores the terminal but never clears a refusal: whatever the
+unmodelled channel already did to the reconstructed rows cannot be undone. `matched_marker` names
 the affordance that decided it and `evidence_snippet` is the screen row it came
 from — check them before acting on the classification. `replayed_from_start:
 false` means only a trailing window of the recording was replayed; the verdict

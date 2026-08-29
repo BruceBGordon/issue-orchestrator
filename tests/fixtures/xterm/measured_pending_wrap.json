@@ -1464,6 +1464,136 @@
       ""
     ]
   },
+  "pending_restore_cursor": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      55,
+      27,
+      91,
+      49,
+      59,
+      49,
+      72,
+      27,
+      56,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_restore_cursor": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      55,
+      27,
+      91,
+      49,
+      59,
+      49,
+      72,
+      27,
+      56,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_reverse_index": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      77,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "         Z",
+      "abcdefghij",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_reverse_index": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      77,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "         Z",
+      "abcdefghij",
+      "",
+      ""
+    ]
+  },
   "pending_autowrap_off": {
     "cols": 10,
     "bytes": [

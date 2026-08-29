@@ -1518,3 +1518,47 @@ class TestResetRestoresTerminalDefaults:
         path = _recording(tmp_path / "decstr.jsonl", (stream.encode("utf-8"),), cols=120)
 
         assert classify_composer_state(path).state is ComposerState.COMPOSER_STRANDED
+
+
+class TestUnmodelledStateCannotForgeAMarker:
+    """#7141 round 8: the forgeries that live outside CSI ? private modes."""
+
+    def test_insert_mode_refuses_rather_than_reading_a_shifted_row(
+        self, tmp_path: Path
+    ) -> None:
+        """SM 4 shifts a row's contents; overwriting instead invented a marker."""
+        footer = "\u001b[34;2H\u001b[K  tab to queue message\u001b[34;3H\u001b[4hX"
+        path = _recording(tmp_path / "irm.jsonl", (footer.encode("utf-8"),))
+
+        verdict = classify_composer_state(path)
+
+        assert verdict.state is ComposerState.UNDETERMINED
+        assert "CSI 4h" in verdict.evidence_snippet
+
+    def test_clearing_tab_stops_refuses(self, tmp_path: Path) -> None:
+        """TBC 3 moves where a tab lands, and tab stops are not modelled."""
+        footer = "\u001b[3g\u001b[34;2H\u001b[K  tab to queue message"
+        path = _recording(tmp_path / "tbc.jsonl", (footer.encode("utf-8"),))
+
+        assert classify_composer_state(path).state is ComposerState.UNDETERMINED
+
+    def test_a_line_drawing_charset_refuses(self, tmp_path: Path) -> None:
+        footer = "\u001b(0\u001b[34;2H\u001b[K  tab to queue message"
+        path = _recording(tmp_path / "charset.jsonl", (footer.encode("utf-8"),))
+
+        assert classify_composer_state(path).state is ComposerState.UNDETERMINED
+
+    def test_a_reverse_index_is_modelled_not_refused(self, tmp_path: Path) -> None:
+        """ESC M appears 343 times in one real recording; refusing would gut this."""
+        footer = "\u001b[34;2H\u001b[K  tab to queue message\u001bM"
+        path = _recording(tmp_path / "ri.jsonl", (footer.encode("utf-8"),))
+
+        assert classify_composer_state(path).state is ComposerState.COMPOSER_STRANDED
+
+    def test_a_saved_and_restored_cursor_is_modelled_not_refused(
+        self, tmp_path: Path
+    ) -> None:
+        footer = "\u001b[34;2H\u001b7\u001b[K  tab to queue message\u001b8"
+        path = _recording(tmp_path / "decsc.jsonl", (footer.encode("utf-8"),))
+
+        assert classify_composer_state(path).state is ComposerState.COMPOSER_STRANDED

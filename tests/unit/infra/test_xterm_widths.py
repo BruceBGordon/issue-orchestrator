@@ -313,7 +313,7 @@ class TestUnmodelledModesAreRefused:
 
         view.feed(f"\x1b[{mode}".encode("utf-8"))
 
-        assert view.unmodelled_modes == [mode]
+        assert view.unmodelled_state == [mode]
 
     @pytest.mark.parametrize("mode", [25, 2026, 2004, 1004, 2031, 1000, 1006, 12])
     def test_a_measured_inert_mode_is_ignored(self, mode: int) -> None:
@@ -322,28 +322,28 @@ class TestUnmodelledModesAreRefused:
 
         view.feed(f"\x1b[?{mode}h\x1b[?{mode}l".encode("utf-8"))
 
-        assert view.unmodelled_modes == []
+        assert view.unmodelled_state == []
 
     def test_an_unknown_mode_is_refused_rather_than_assumed_harmless(self) -> None:
         view = TerminalViewport(rows=3, cols=10)
 
         view.feed(b"\x1b[?31337h")
 
-        assert view.unmodelled_modes == ["?31337h"]
+        assert view.unmodelled_state == ["?31337h"]
 
     def test_decawm_is_modelled_not_refused(self) -> None:
         view = TerminalViewport(rows=3, cols=10)
 
         view.feed(b"\x1b[?7l\x1b[?7h")
 
-        assert view.unmodelled_modes == []
+        assert view.unmodelled_state == []
 
     def test_a_query_does_not_count_as_setting_a_mode(self) -> None:
         view = TerminalViewport(rows=3, cols=10)
 
         view.feed(b"\x1b[?6$p")
 
-        assert view.unmodelled_modes == []
+        assert view.unmodelled_state == []
 
     def test_the_replay_surfaces_the_refusal(self, tmp_path: Path) -> None:
         from issue_orchestrator.infra.terminal_replay import replay_terminal_recording
@@ -360,4 +360,4 @@ class TestUnmodelledModesAreRefused:
             encoding="utf-8",
         )
 
-        assert replay_terminal_recording(path).unmodelled_modes == ("?6h",)
+        assert replay_terminal_recording(path).unmodelled_state == ("?6h",)

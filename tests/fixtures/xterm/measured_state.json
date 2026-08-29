@@ -1,0 +1,611 @@
+{
+  "state_decsc_parked_then_restore": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      55,
+      13,
+      88,
+      27,
+      56,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "XbcdefghiZ",
+      "",
+      ""
+    ]
+  },
+  "state_decsc_midrow": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      27,
+      55,
+      13,
+      88,
+      89,
+      27,
+      56,
+      90
+    ],
+    "cursorX": 4,
+    "cursorY": 0,
+    "rows": [
+      "XYcZ",
+      "",
+      ""
+    ]
+  },
+  "state_decsc_saves_row": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      51,
+      59,
+      53,
+      72,
+      27,
+      55,
+      27,
+      91,
+      49,
+      59,
+      49,
+      72,
+      27,
+      56,
+      90
+    ],
+    "cursorX": 5,
+    "cursorY": 2,
+    "rows": [
+      "",
+      "",
+      "    Z",
+      ""
+    ]
+  },
+  "state_decrc_without_decsc": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      50,
+      59,
+      51,
+      72,
+      27,
+      56,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "Z",
+      "",
+      "",
+      ""
+    ]
+  },
+  "state_ris_clears_saved_cursor": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      51,
+      59,
+      53,
+      72,
+      27,
+      55,
+      27,
+      99,
+      27,
+      56,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "Z",
+      "",
+      "",
+      ""
+    ]
+  },
+  "state_decstr_clears_saved_cursor": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      51,
+      59,
+      53,
+      72,
+      27,
+      55,
+      27,
+      91,
+      33,
+      112,
+      27,
+      56,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "Z",
+      "",
+      "",
+      ""
+    ]
+  },
+  "state_scosc_scorc": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      51,
+      59,
+      53,
+      72,
+      27,
+      91,
+      115,
+      27,
+      91,
+      49,
+      59,
+      49,
+      72,
+      27,
+      91,
+      117,
+      90
+    ],
+    "cursorX": 5,
+    "cursorY": 2,
+    "rows": [
+      "",
+      "",
+      "    Z",
+      ""
+    ]
+  },
+  "state_scorc_without_scosc": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      50,
+      59,
+      51,
+      72,
+      27,
+      91,
+      117,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "Z",
+      "",
+      "",
+      ""
+    ]
+  },
+  "state_reverse_index_midscreen": {
+    "cols": 10,
+    "bytes": [
+      114,
+      48,
+      13,
+      10,
+      114,
+      49,
+      13,
+      10,
+      114,
+      50,
+      27,
+      77,
+      88
+    ],
+    "cursorX": 3,
+    "cursorY": 1,
+    "rows": [
+      "r0",
+      "r1X",
+      "r2",
+      "",
+      ""
+    ]
+  },
+  "state_reverse_index_at_top": {
+    "cols": 10,
+    "bytes": [
+      114,
+      48,
+      13,
+      10,
+      114,
+      49,
+      27,
+      91,
+      49,
+      59,
+      49,
+      72,
+      27,
+      77,
+      88
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "X",
+      "r0",
+      "r1",
+      ""
+    ]
+  },
+  "state_reverse_index_parked": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      77,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "         Z",
+      "abcdefghij",
+      "",
+      ""
+    ]
+  },
+  "state_escape_index": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      27,
+      68,
+      88
+    ],
+    "cursorX": 3,
+    "cursorY": 1,
+    "rows": [
+      "ab",
+      "  X",
+      "",
+      ""
+    ]
+  },
+  "state_escape_next_line": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      27,
+      69,
+      88
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "ab",
+      "X",
+      "",
+      ""
+    ]
+  },
+  "state_ascii_designation_is_inert": {
+    "cols": 10,
+    "bytes": [
+      27,
+      40,
+      66,
+      113,
+      113,
+      113
+    ],
+    "cursorX": 3,
+    "cursorY": 0,
+    "rows": [
+      "qqq",
+      "",
+      ""
+    ]
+  },
+  "state_shift_in_is_inert": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      15,
+      99,
+      100
+    ],
+    "cursorX": 4,
+    "cursorY": 0,
+    "rows": [
+      "abcd",
+      "",
+      ""
+    ]
+  },
+  "state_cursor_style_is_inert": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      27,
+      91,
+      52,
+      32,
+      113,
+      99,
+      100
+    ],
+    "cursorX": 4,
+    "cursorY": 0,
+    "rows": [
+      "abcd",
+      "",
+      ""
+    ]
+  },
+  "state_sgr_is_inert": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      27,
+      91,
+      48,
+      109,
+      99,
+      100
+    ],
+    "cursorX": 4,
+    "cursorY": 0,
+    "rows": [
+      "abcd",
+      "",
+      ""
+    ]
+  },
+  "state_device_attributes_is_inert": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      27,
+      91,
+      99,
+      99,
+      100
+    ],
+    "cursorX": 4,
+    "cursorY": 0,
+    "rows": [
+      "abcd",
+      "",
+      ""
+    ]
+  },
+  "state_keypad_mode_is_inert": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      27,
+      61,
+      99,
+      100,
+      27,
+      62
+    ],
+    "cursorX": 4,
+    "cursorY": 0,
+    "rows": [
+      "abcd",
+      "",
+      ""
+    ]
+  },
+  "state_reset_mode_four_is_inert": {
+    "cols": 40,
+    "bytes": [
+      116,
+      97,
+      98,
+      32,
+      116,
+      111,
+      32,
+      113,
+      117,
+      101,
+      117,
+      101,
+      32,
+      109,
+      101,
+      115,
+      115,
+      97,
+      103,
+      101,
+      27,
+      91,
+      49,
+      59,
+      50,
+      72,
+      27,
+      91,
+      52,
+      108,
+      88
+    ],
+    "cursorX": 2,
+    "cursorY": 0,
+    "rows": [
+      "tXb to queue message",
+      "",
+      ""
+    ]
+  },
+  "state_insert_mode_shifts_the_row": {
+    "cols": 40,
+    "bytes": [
+      116,
+      97,
+      98,
+      32,
+      116,
+      111,
+      32,
+      113,
+      117,
+      101,
+      117,
+      101,
+      32,
+      109,
+      101,
+      115,
+      115,
+      97,
+      103,
+      101,
+      27,
+      91,
+      49,
+      59,
+      50,
+      72,
+      27,
+      91,
+      52,
+      104,
+      88
+    ],
+    "cursorX": 2,
+    "cursorY": 0,
+    "rows": [
+      "tXab to queue message",
+      "",
+      ""
+    ]
+  },
+  "state_clear_all_tab_stops": {
+    "cols": 20,
+    "bytes": [
+      27,
+      91,
+      51,
+      103,
+      97,
+      98,
+      9,
+      88
+    ],
+    "cursorX": 20,
+    "cursorY": 0,
+    "rows": [
+      "ab                 X",
+      "",
+      ""
+    ]
+  },
+  "state_set_tab_stop": {
+    "cols": 20,
+    "bytes": [
+      97,
+      98,
+      99,
+      27,
+      72,
+      13,
+      9,
+      88
+    ],
+    "cursorX": 4,
+    "cursorY": 0,
+    "rows": [
+      "abcX",
+      "",
+      ""
+    ]
+  },
+  "state_line_drawing_charset": {
+    "cols": 10,
+    "bytes": [
+      27,
+      40,
+      48,
+      113,
+      113,
+      113
+    ],
+    "cursorX": 3,
+    "cursorY": 0,
+    "rows": [
+      "───",
+      "",
+      ""
+    ]
+  },
+  "state_shift_out_selects_g1": {
+    "cols": 10,
+    "bytes": [
+      27,
+      41,
+      48,
+      97,
+      98,
+      14,
+      113,
+      113
+    ],
+    "cursorX": 4,
+    "cursorY": 0,
+    "rows": [
+      "ab──",
+      "",
+      ""
+    ]
+  }
+}

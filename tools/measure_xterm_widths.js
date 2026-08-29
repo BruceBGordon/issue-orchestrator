@@ -10,6 +10,7 @@
 //   node tools/measure_xterm_widths.js controls    # C1 (U+0080-U+009F) behaviour
 //   node tools/measure_xterm_widths.js autowrap    # DECAWM on/off + pending wrap
 //   node tools/measure_xterm_widths.js pending     # parked-cursor resolution table
+//   node tools/measure_xterm_widths.js state       # every reachable state channel
 //
 // Emit-only: it prints JSON for a human (or a test author) to read. Nothing
 // imports it at runtime.
@@ -260,6 +261,8 @@ function pendingWrapProbes() {
         scroll_up: `${ESC}[S`,
         scroll_down: `${ESC}[T`,
         set_scroll_region: `${ESC}[2;3r`,
+        restore_cursor: `${ESC}7${ESC}[1;1H${ESC}8`,
+        reverse_index: `${ESC}M`,
         autowrap_off: `${ESC}[?7l`,
         autowrap_on: `${ESC}[?7h`,
         select_graphic_rendition: `${ESC}[0m`,
@@ -301,6 +304,65 @@ async function measurePendingWrap() {
     console.log(JSON.stringify(out, null, 2));
 }
 
+// Every state channel the parser can reach, measured so each one can be
+// modelled, ignored or refused on evidence rather than on reading.
+function stateProbes() {
+    const ESC = '\u001b';
+    const SI = '\u000f';
+    const SO = '\u000e';
+    const texts = {
+        decsc_parked_then_restore: [10, 3, `abcdefghij${ESC}7\rX${ESC}8Z`],
+        decsc_midrow: [10, 3, `abc${ESC}7\rXY${ESC}8Z`],
+        decsc_saves_row: [10, 4, `${ESC}[3;5H${ESC}7${ESC}[1;1H${ESC}8Z`],
+        decrc_without_decsc: [10, 4, `${ESC}[2;3H${ESC}8Z`],
+        ris_clears_saved_cursor: [10, 4, `${ESC}[3;5H${ESC}7${ESC}c${ESC}8Z`],
+        decstr_clears_saved_cursor: [10, 4, `${ESC}[3;5H${ESC}7${ESC}[!p${ESC}8Z`],
+        scosc_scorc: [10, 4, `${ESC}[3;5H${ESC}[s${ESC}[1;1H${ESC}[uZ`],
+        scorc_without_scosc: [10, 4, `${ESC}[2;3H${ESC}[uZ`],
+        reverse_index_midscreen: [10, 5, `r0\r\nr1\r\nr2${ESC}MX`],
+        reverse_index_at_top: [10, 4, `r0\r\nr1${ESC}[1;1H${ESC}MX`],
+        reverse_index_parked: [10, 4, `abcdefghij${ESC}MZ`],
+        escape_index: [10, 4, `ab${ESC}DX`],
+        escape_next_line: [10, 4, `ab${ESC}EX`],
+        ascii_designation_is_inert: [10, 3, `${ESC}(Bqqq`],
+        shift_in_is_inert: [10, 3, `ab${SI}cd`],
+        cursor_style_is_inert: [10, 3, `ab${ESC}[4 qcd`],
+        sgr_is_inert: [10, 3, `ab${ESC}[0mcd`],
+        device_attributes_is_inert: [10, 3, `ab${ESC}[ccd`],
+        keypad_mode_is_inert: [10, 3, `ab${ESC}=cd${ESC}>`],
+        reset_mode_four_is_inert: [40, 3, `tab to queue message${ESC}[1;2H${ESC}[4lX`],
+        // Refused channels, measured so the refusal is evidence-backed.
+        insert_mode_shifts_the_row: [40, 3, `tab to queue message${ESC}[1;2H${ESC}[4hX`],
+        clear_all_tab_stops: [20, 3, `${ESC}[3gab\tX`],
+        set_tab_stop: [20, 3, `abc${ESC}H\r\tX`],
+        line_drawing_charset: [10, 3, `${ESC}(0qqq`],
+        shift_out_selects_g1: [10, 3, `${ESC})0ab${SO}qq`],
+    };
+    const encoder = new TextEncoder();
+    const probes = {};
+    for (const [name, [cols, rows, text]] of Object.entries(texts)) {
+        probes[`state_${name}`] = { cols, rows, bytes: Array.from(encoder.encode(text)) };
+    }
+    return probes;
+}
+
+async function measureState() {
+    const out = {};
+    for (const [name, probe] of Object.entries(stateProbes())) {
+        const term = new Terminal({ cols: probe.cols, rows: probe.rows, allowProposedApi: true });
+        await write(term, new Uint8Array(probe.bytes));
+        const buffer = term.buffer.active;
+        out[name] = {
+            cols: probe.cols,
+            bytes: probe.bytes,
+            cursorX: buffer.cursorX,
+            cursorY: buffer.cursorY,
+            rows: readViewport(buffer, probe.rows),
+        };
+    }
+    console.log(JSON.stringify(out, null, 2));
+}
+
 const mode = process.argv[2] || 'screens';
 const MODES = {
     widths: measureWidths,
@@ -308,6 +370,7 @@ const MODES = {
     controls: measureControls,
     autowrap: measureAutowrap,
     pending: measurePendingWrap,
+    state: measureState,
 };
 (MODES[mode] || measureScreens)().catch((error) => {
     console.error(error);

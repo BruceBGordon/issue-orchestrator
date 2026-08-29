@@ -46,6 +46,8 @@ class ColumnOperation(enum.Enum):
     SET_SCROLL_REGION = "set_scroll_region"
     SOFT_RESET = "soft_reset"
     FULL_RESET = "full_reset"
+    RESTORE_CURSOR = "restore_cursor"
+    REVERSE_INDEX = "reverse_index"
     OTHER_SEQUENCE = "other_sequence"
 
 
@@ -82,6 +84,8 @@ PENDING_WRAP_RESOLUTION: Mapping[ColumnOperation, PendingWrapResolution] = {
     ColumnOperation.SET_SCROLL_REGION: PendingWrapResolution.REPLACE,
     ColumnOperation.SOFT_RESET: PendingWrapResolution.PRESERVE,
     ColumnOperation.FULL_RESET: PendingWrapResolution.REPLACE,
+    ColumnOperation.RESTORE_CURSOR: PendingWrapResolution.REPLACE,
+    ColumnOperation.REVERSE_INDEX: PendingWrapResolution.CLAMP,
     ColumnOperation.OTHER_SEQUENCE: PendingWrapResolution.PRESERVE,
 }
 
@@ -107,13 +111,27 @@ MEASURED_PROBE: Mapping[ColumnOperation, str] = {
     ColumnOperation.SET_SCROLL_REGION: "pending_set_scroll_region",
     ColumnOperation.SOFT_RESET: "pending_soft_reset",
     ColumnOperation.FULL_RESET: "pending_full_reset",
+    ColumnOperation.RESTORE_CURSOR: "pending_restore_cursor",
+    ColumnOperation.REVERSE_INDEX: "pending_reverse_index",
     ColumnOperation.OTHER_SEQUENCE: "pending_select_graphic_rendition",
 }
 
 
-def is_parked(column: int, columns: int) -> bool:
-    """Whether the cursor sits past the last column, awaiting a wrap."""
-    return column >= columns
+def clears_parked_state(operation: ColumnOperation) -> bool:
+    """Whether this operation ends a pending wrap.
+
+    ``CLAMP`` and ``REPLACE`` both put the cursor somewhere definite, so the
+    promise that the next glyph starts a new row is discharged. ``PRESERVE``
+    leaves it standing and ``WRAP`` is the printing path keeping it.
+
+    Parked-ness is a state bit, not ``column >= columns``. Inferring it from
+    the column is wrong the moment something restores a column without the
+    promise attached — which is exactly what DECRC does (#7141 round 8).
+    """
+    return PENDING_WRAP_RESOLUTION[operation] in (
+        PendingWrapResolution.CLAMP,
+        PendingWrapResolution.REPLACE,
+    )
 
 
 def resolve_parked_column(

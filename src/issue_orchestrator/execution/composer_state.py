@@ -136,10 +136,10 @@ def classify_composer_state(
             "the replay was abandoned before the recording was fully applied; "
             "refusing to classify a half-reconstructed screen"
         )
-    if replay.unmodelled_modes:
+    if replay.unmodelled_state:
         return undetermined_composer_state(
-            "the recording sets grid-affecting terminal modes this viewport "
-            f"does not model ({', '.join(replay.unmodelled_modes)}); refusing "
+            "the recording uses grid-affecting terminal state this viewport "
+            f"does not model ({', '.join(replay.unmodelled_state)}); refusing "
             "to classify a screen it cannot reproduce"
         )
     if not replay.structurally_complete:

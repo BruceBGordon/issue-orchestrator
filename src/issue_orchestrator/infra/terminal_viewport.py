@@ -42,53 +42,43 @@ from dataclasses import dataclass
 from typing import Callable, ClassVar
 
 from .xterm_widths import EMPTY_CLUSTER, cluster_advance
-from .pending_wrap import ColumnOperation, resolve_parked_column
+from .terminal_protocol import (
+    _ASCII_CHARSET,
+    _DECAWM,
+    _DEVICE_QUERY_PREFIXES,
+    _ESCAPE_CHARSET_DESIGNATORS,
+    _IGNORED_CSI_FINALS,
+    _IGNORED_CSI_INTERMEDIATES,
+    _IGNORED_ESCAPE_MARKERS,
+    _IGNORED_PRIVATE_MODES,
+    _INERT_ANSI_RESETS,
+    _C1_CSI,
+    _C1_END,
+    _C1_IND,
+    _C1_NEL,
+    _C1_START,
+    _C1_STRING_INTRODUCERS,
+    _ESCAPE_STRING_INTRODUCERS,
+    BLANK,
+    SavedCursor,
+    render_row,
+    _ESC,
+    _TAB_WIDTH,
+    amount,
+    decode_utf8,
+    numeric_params,
+    scan_string_sequence,
+    split_csi,
+)
+from .pending_wrap import (
+    ColumnOperation,
+    clears_parked_state,
+    resolve_parked_column,
+)
 from .terminal_recording import MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS
 
 DEFAULT_ROWS = 40
 DEFAULT_COLS = 120
-_MAX_ROWS = MAX_TERMINAL_ROWS
-_MAX_COLS = MAX_TERMINAL_COLS
-_BLANK = " "
-#: DECAWM. Modelled, because it decides whether a long line wraps.
-_DECAWM = 7
-#: Private modes measured to leave the character grid untouched. Anything not
-#: listed is refused rather than assumed harmless — see
-#: ``TerminalViewport._dispatch_private_mode``. Extend it by measuring, with
-#: ``tools/measure_xterm_widths.js modes``.
-_IGNORED_PRIVATE_MODES: frozenset[int] = frozenset(
-    {
-        1,     # DECCKM, cursor key format
-        5,     # DECSCNM, reverse video
-        8,     # DECARM, auto-repeat
-        9,     # X10 mouse reporting
-        12,    # cursor blink
-        25,    # DECTCEM, cursor visibility
-        40,    # allow 80/132 switching
-        66,    # DECNKM, numeric keypad
-        1000,  # VT200 mouse reporting
-        1002,  # button-event mouse tracking
-        1004,  # focus reporting
-        1006,  # SGR mouse encoding
-        2004,  # bracketed paste
-        2026,  # synchronised output
-        2031,  # colour-scheme change notification
-    }
-)
-
-_C1_START = 0x80
-_C1_END = 0x9F
-_C1_IND = 0x84
-_C1_NEL = 0x85
-_C1_CSI = 0x9B
-#: C1 introducers that open a string sequence: DCS, SOS, OSC, PM, APC.
-_C1_STRING_INTRODUCERS = frozenset({0x90, 0x98, 0x9D, 0x9E, 0x9F})
-#: The same five as two-byte escapes: ESC P, ESC X, ESC ], ESC ^, ESC _.
-_ESCAPE_STRING_INTRODUCERS = frozenset({0x50, 0x58, 0x5D, 0x5E, 0x5F})
-_TAB_WIDTH = 8
-
-_ESC = 0x1B
-_BEL = 0x07
 _CsiTable = dict[str, "Callable[[TerminalViewport, list[int]], None]"]
 
 
@@ -118,8 +108,8 @@ class TerminalViewport:
     def __init__(self, *, rows: int = DEFAULT_ROWS, cols: int = DEFAULT_COLS) -> None:
         if rows < 1 or cols < 1:
             raise ValueError("viewport geometry must be positive")
-        self._rows = min(rows, _MAX_ROWS)
-        self._cols = min(cols, _MAX_COLS)
+        self._rows = min(rows, MAX_TERMINAL_ROWS)
+        self._cols = min(cols, MAX_TERMINAL_COLS)
         self._grid: list[list[str]] = self._blank_grid()
         # Per-cell width, the way the terminal stores it: 2 marks a wide glyph
         # that owns the following column, 0 marks that follower. Rendering
@@ -136,11 +126,15 @@ class TerminalViewport:
         self._extent: list[int] = [0] * self._rows
         self._row = 0
         self._col = 0
-        self._saved: tuple[int, int] = (0, 0)
+        self._saved = SavedCursor()
         self._cluster = EMPTY_CLUSTER
         self._autowrap = True
-        #: Grid-affecting private modes this model does not reproduce.
-        self.unmodelled_modes: list[str] = []
+        # Pending wrap is a state bit, not an out-of-range column: DECRC
+        # restores a column without the promise attached, so inferring one from
+        # the other reproduces a screen the terminal does not draw.
+        self._parked = False
+        #: Grid-affecting state channels this model does not reproduce.
+        self.unmodelled_state: list[str] = []
         self._scroll_top = 0
         self._scroll_bottom = self._rows - 1
         self._fed = 0
@@ -152,8 +146,8 @@ class TerminalViewport:
         """Apply a recorded resize event, preserving what is already on screen."""
         if rows < 1 or cols < 1:
             return
-        rows = min(rows, _MAX_ROWS)
-        cols = min(cols, _MAX_COLS)
+        rows = min(rows, MAX_TERMINAL_ROWS)
+        cols = min(cols, MAX_TERMINAL_COLS)
         old_grid, old_written, old_extent = self._grid, self._written, self._extent
         old_widths = self._widths
         self._rows, self._cols = rows, cols
@@ -199,7 +193,7 @@ class TerminalViewport:
                 index += consumed
                 continue
             if byte >= 0x80:
-                char, consumed = _decode_utf8(buffer, index, size)
+                char, consumed = decode_utf8(buffer, index, size)
                 if consumed == 0:
                     # Genuinely truncated at the chunk edge — hold it over.
                     self._pending = buffer[index:]
@@ -238,7 +232,7 @@ class TerminalViewport:
     def render(self) -> RenderedScreen:
         """Freeze the current screen. Non-mutating; safe to call repeatedly."""
         rows = tuple(
-            _render_row(row, widths, extent)
+            render_row(row, widths, extent)
             for row, widths, extent in zip(self._grid, self._widths, self._extent)
         )
         written = tuple(
@@ -255,10 +249,15 @@ class TerminalViewport:
     # -- character handling -----------------------------------------------
 
     def _blank_grid(self) -> list[list[str]]:
-        return [[_BLANK] * self._cols for _ in range(self._rows)]
+        return [[BLANK] * self._cols for _ in range(self._rows)]
 
     def _apply_control(self, byte: int) -> None:
-        """Apply one single-byte ASCII control character."""
+        """Apply one single-byte ASCII control character.
+
+        SO and SI need no refusal of their own: they select G1 or G0, and
+        designating either as anything but ASCII is refused where the
+        designation happens, so a shift can only ever land on ASCII here.
+        """
         if byte == 0x0D:  # CR
             self._resolve(ColumnOperation.CARRIAGE_RETURN)
             self._col = 0
@@ -289,7 +288,7 @@ class TerminalViewport:
         if cells <= 0:
             self._attach_combining(char)
             return
-        if self._col + cells > self._cols:
+        if self._parked or self._col + cells > self._cols:
             self._resolve(
                 ColumnOperation.PRINT_WRAPPING
                 if self._autowrap
@@ -308,6 +307,7 @@ class TerminalViewport:
                 # cursor is allowed past the right edge, because that is what
                 # xterm does on a screen too narrow for the glyph.
                 self._col = 0
+                self._parked = False
                 self._line_feed()
         if self._col < self._cols:
             self._break_wide_pair_at(self._col)
@@ -316,13 +316,14 @@ class TerminalViewport:
             # A wide glyph owns the next column; the follower carries width 0
             # so rendering knows to skip it.
             if cells > 1 and self._col + 1 < self._cols:
-                self._grid[self._row][self._col + 1] = _BLANK
+                self._grid[self._row][self._col + 1] = BLANK
                 self._widths[self._row][self._col + 1] = 0
             self._written[self._row] = True
             self._extent[self._row] = max(
                 self._extent[self._row], min(self._col + cells, self._cols)
             )
         self._col += cells
+        self._parked = self._col >= self._cols
 
     def _break_wide_pair_at(self, column: int) -> None:
         """Split any wide glyph this write lands on, as the terminal does.
@@ -333,11 +334,11 @@ class TerminalViewport:
         overflows into a follower mid-run stays invisible instead.
         """
         if self._run_start and column > 0 and self._widths[self._row][column - 1] == 2:
-            self._grid[self._row][column - 1] = _BLANK
+            self._grid[self._row][column - 1] = BLANK
             self._widths[self._row][column - 1] = 1
         self._run_start = False
         if self._widths[self._row][column] == 2 and column + 1 < self._cols:
-            self._grid[self._row][column + 1] = _BLANK
+            self._grid[self._row][column + 1] = BLANK
             self._widths[self._row][column + 1] = 1
 
     def _attach_combining(self, char: str) -> None:
@@ -348,13 +349,15 @@ class TerminalViewport:
         cell = self._grid[self._row][column]
         # Nothing to decorate yet: replace the blank rather than trailing the
         # mark behind a space that was never printed.
-        self._grid[self._row][column] = char if cell == _BLANK else cell + char
+        self._grid[self._row][column] = char if cell == BLANK else cell + char
         self._written[self._row] = True
         self._extent[self._row] = max(self._extent[self._row], column + 1)
 
     def _resolve(self, operation: ColumnOperation) -> None:
-        """Apply this operation's parked-column resolution from the table."""
+        """Apply this operation's parked-state resolution from the table."""
         self._col = resolve_parked_column(self._col, self._cols, operation)
+        if clears_parked_state(operation):
+            self._parked = False
 
     def _line_feed(self) -> None:
         if self._row == self._scroll_bottom:
@@ -369,7 +372,7 @@ class TerminalViewport:
             del self._widths[top]
             del self._written[top]
             del self._extent[top]
-            self._grid.insert(bottom, [_BLANK] * self._cols)
+            self._grid.insert(bottom, [BLANK] * self._cols)
             self._widths.insert(bottom, [1] * self._cols)
             # A row scrolled into view is blank *because this replay scrolled
             # it*, so it is authoritative, not unknown history.
@@ -377,6 +380,10 @@ class TerminalViewport:
             self._extent.insert(bottom, 0)
 
     # -- escape handling ---------------------------------------------------
+
+    def _refuse(self, channel: str) -> None:
+        """Record a state channel this model does not reproduce."""
+        self.unmodelled_state.append(channel)
 
     def _apply_c1(self, codepoint: int, buffer: bytes, payload: int) -> int | None:
         """Apply a C1 control, returning where parsing resumes.
@@ -400,7 +407,7 @@ class TerminalViewport:
         if codepoint == _C1_CSI:
             return self._scan_csi(buffer, payload)
         if codepoint in _C1_STRING_INTRODUCERS:
-            return _scan_string_sequence(buffer, payload)
+            return scan_string_sequence(buffer, payload)
         return payload
 
     def _apply_escape(self, buffer: bytes, start: int) -> int | None:
@@ -412,18 +419,72 @@ class TerminalViewport:
             end = self._scan_csi(buffer, start + 2)
             return None if end is None else end - start
         if marker in _ESCAPE_STRING_INTRODUCERS:  # OSC / DCS / SOS / PM / APC
-            end = _scan_string_sequence(buffer, start + 2)
+            end = scan_string_sequence(buffer, start + 2)
             return None if end is None else end - start
-        if marker == 0x37:  # ESC 7 save cursor
-            self._saved = (self._row, self._col)
+        if marker in _ESCAPE_CHARSET_DESIGNATORS:
+            return self._designate_charset(buffer, start)
+        handler = self._ESCAPE_HANDLERS.get(marker)
+        if handler is not None:
+            handler(self)
             return 2
-        if marker == 0x38:  # ESC 8 restore cursor
-            self._row, self._col = self._saved
+        if marker in _IGNORED_ESCAPE_MARKERS:
             return 2
-        if marker == 0x63:  # ESC c full reset
-            self._reset()
-            return 2
+        # Refuse by default: an escape nobody enumerated may carry state this
+        # model neither reproduces nor knows it is missing.
+        self._refuse(f"ESC {chr(marker)}")
         return 2
+
+    def _designate_charset(self, buffer: bytes, start: int) -> int | None:
+        """``ESC ( B`` and friends. Only the ASCII set is reproduced."""
+        if start + 2 >= len(buffer):
+            return None
+        designation = chr(buffer[start + 2])
+        if designation != _ASCII_CHARSET:
+            # A line-drawing or national set changes what every subsequent
+            # byte renders as; refusing is cheaper than a translation table
+            # real recordings never exercise.
+            self._refuse(f"ESC {chr(buffer[start + 1])}{designation}")
+        return 3
+
+    def _save_cursor(self) -> None:
+        """DECSC. Measured: saves row, column and charset, never the wrap.
+
+        The saved column is the clamped one, so restoring never brings back a
+        pending wrap — which is why a restored column-10 cursor does not wrap
+        the next glyph (#7141 round 8).
+        """
+        self._saved = SavedCursor(
+            row=self._row, column=min(self._col, self._cols - 1)
+        )
+
+    def _restore_cursor(self) -> None:
+        """DECRC. Restores position without the pending-wrap promise."""
+        self._resolve(ColumnOperation.RESTORE_CURSOR)
+        self._row = min(self._saved.row, self._rows - 1)
+        self._col = min(self._saved.column, self._cols - 1)
+
+    def _reverse_index(self) -> None:
+        """ESC M. Measured: up one row, scrolling the region down at the top.
+
+        Real recordings emit this 343 times in a single session; ignoring it
+        silently mislaid every one of them.
+        """
+        self._resolve(ColumnOperation.REVERSE_INDEX)
+        if self._row == self._scroll_top:
+            self._scroll_down_csi([1])
+            return
+        self._row = max(0, self._row - 1)
+
+    def _index(self) -> None:
+        """ESC D, the escape spelling of IND."""
+        self._resolve(ColumnOperation.LINE_FEED)
+        self._line_feed()
+
+    def _next_line(self) -> None:
+        """ESC E, the escape spelling of NEL."""
+        self._resolve(ColumnOperation.NEXT_LINE)
+        self._col = 0
+        self._line_feed()
 
     def _scan_csi(self, buffer: bytes, payload: int) -> int | None:
         """Apply a CSI whose parameters start at ``payload``; return its end.
@@ -445,17 +506,55 @@ class TerminalViewport:
         return index + 1
 
     def _dispatch_csi(self, final: str, params_raw: str) -> None:
-        if final == "p" and params_raw == "!":
+        parameters, intermediates = split_csi(params_raw)
+        if intermediates:
+            # An intermediate byte selects a different sequence entirely:
+            # DECSCUSR is ``CSI <space> q``, not ``CSI q``, and DECSTR is
+            # ``CSI ! p``, not ``CSI p``.
+            self._dispatch_csi_with_intermediates(intermediates, final)
+            return
+        if parameters.startswith("?"):
+            self._dispatch_private_mode(final, parameters[1:])
+            return
+        if parameters[:1] in _DEVICE_QUERY_PREFIXES:
+            # ``CSI >``, ``CSI =`` and ``CSI <`` introduce device queries
+            # (XTVERSION, secondary/tertiary DA). Measured inert: they report
+            # state rather than changing it.
+            return
+        params = numeric_params(parameters)
+        handler = self._CSI_HANDLERS.get(final)
+        if handler is not None:
+            handler(self, params)
+            return
+        if final in _IGNORED_CSI_FINALS:
+            return
+        if final in ("h", "l"):
+            self._dispatch_ansi_mode(final, params)
+            return
+        self._refuse(f"CSI {params_raw}{final}")
+
+    def _dispatch_csi_with_intermediates(
+        self, intermediates: str, final: str
+    ) -> None:
+        sequence = f"{intermediates}{final}"
+        if sequence == "!p":
             self._soft_reset()
             return
-        if params_raw.startswith("?"):
-            self._dispatch_private_mode(final, params_raw[1:])
+        if sequence in _IGNORED_CSI_INTERMEDIATES:
             return
-        params = _numeric_params(params_raw)
-        handler = self._CSI_HANDLERS.get(final)
-        if handler is None:
-            return
-        handler(self, params)
+        self._refuse(f"CSI {sequence}")
+
+    def _dispatch_ansi_mode(self, final: str, params: list[int]) -> None:
+        """SM/RM. Insert mode shifts a row's contents, so it is not ignorable.
+
+        Real recordings contain no ANSI mode setting at all, so refusing costs
+        nothing; ``RM 4`` is allowed because it selects the default this model
+        already reproduces, and was measured inert.
+        """
+        for mode in params:
+            if final == "l" and mode in _INERT_ANSI_RESETS:
+                continue
+            self._refuse(f"CSI {mode}{final}")
 
     def _dispatch_private_mode(self, final: str, params_raw: str) -> None:
         """Apply, ignore, or refuse a private mode.
@@ -493,27 +592,34 @@ class TerminalViewport:
                 continue
             if mode in _IGNORED_PRIVATE_MODES:
                 continue
-            self.unmodelled_modes.append(f"?{mode}{final}")
+            self._refuse(f"?{mode}{final}")
 
     def _soft_reset(self) -> None:
         """DECSTR. Measured: restores autowrap and the scroll region only.
 
         It leaves the screen, the cursor and a parked column exactly where they
-        were — which is what separates it from RIS.
+        were — which is what separates it from RIS. It does *also* clear the
+        saved cursor and the charset designation, which the round-7 reading of
+        this reset missed; the charset half needs no code because a non-ASCII
+        designation is refused before it can be reset.
         """
         self._resolve(ColumnOperation.SOFT_RESET)
         self._autowrap = True
         self._scroll_top, self._scroll_bottom = 0, self._rows - 1
+        self._saved = SavedCursor()
 
     def _reset(self) -> None:
         """RIS. Measured: everything back to defaults, autowrap included.
 
         Leaving autowrap off across a reset rendered a screen the terminal does
-        not draw, with no refusal to flag it (#7141 round 7).
+        not draw, with no refusal to flag it (#7141 round 7). The saved cursor
+        goes with it — measured in round 8, which is what the round-7 claim
+        missed.
         """
         self._resolve(ColumnOperation.FULL_RESET)
         self._autowrap = True
         self._run_start = True
+        self._saved = SavedCursor()
         self._grid = self._blank_grid()
         self._widths = [[1] * self._cols for _ in range(self._rows)]
         self._written = [True] * self._rows
@@ -533,34 +639,34 @@ class TerminalViewport:
 
     def _cursor_up(self, params: list[int]) -> None:
         self._resolve(ColumnOperation.CURSOR_RELATIVE)
-        self._row = max(0, self._row - _amount(params))
+        self._row = max(0, self._row - amount(params))
 
     def _cursor_down(self, params: list[int]) -> None:
         self._resolve(ColumnOperation.CURSOR_RELATIVE)
-        self._row = min(self._rows - 1, self._row + _amount(params))
+        self._row = min(self._rows - 1, self._row + amount(params))
 
     def _cursor_forward(self, params: list[int]) -> None:
         self._resolve(ColumnOperation.CURSOR_RELATIVE)
-        self._col = min(self._cols - 1, self._col + _amount(params))
+        self._col = min(self._cols - 1, self._col + amount(params))
 
     def _cursor_back(self, params: list[int]) -> None:
         self._resolve(ColumnOperation.CURSOR_RELATIVE)
-        self._col = max(0, self._col - _amount(params))
+        self._col = max(0, self._col - amount(params))
 
     def _column_absolute(self, params: list[int]) -> None:
         self._resolve(ColumnOperation.CURSOR_COLUMN_ABSOLUTE)
-        self._col = max(0, min(self._cols - 1, _amount(params) - 1))
+        self._col = max(0, min(self._cols - 1, amount(params) - 1))
 
     def _row_absolute(self, params: list[int]) -> None:
         self._resolve(ColumnOperation.CURSOR_ROW_ABSOLUTE)
-        self._row = max(0, min(self._rows - 1, _amount(params) - 1))
+        self._row = max(0, min(self._rows - 1, amount(params) - 1))
 
     def _erase_in_line(self, params: list[int]) -> None:
         self._resolve(ColumnOperation.ERASE)
         mode = params[0] if params else 0
         start, stop = self._erase_span(mode)
         for column in range(start, stop):
-            self._grid[self._row][column] = _BLANK
+            self._grid[self._row][column] = BLANK
             self._widths[self._row][column] = 1
         self._written[self._row] = True
         if stop >= self._cols:
@@ -573,6 +679,15 @@ class TerminalViewport:
         if mode == 2:
             return 0, self._cols
         return self._col, self._cols
+
+    def _erase_characters(self, params: list[int]) -> None:
+        """ECH. Blanks cells from the cursor without moving it."""
+        self._resolve(ColumnOperation.ERASE)
+        stop = min(self._cols, self._col + amount(params))
+        for column in range(self._col, stop):
+            self._grid[self._row][column] = BLANK
+            self._widths[self._row][column] = 1
+        self._written[self._row] = True
 
     def _erase_in_display(self, params: list[int]) -> None:
         self._resolve(ColumnOperation.ERASE)
@@ -589,7 +704,7 @@ class TerminalViewport:
 
     def _blank_rows(self, indexes: range) -> None:
         for index in indexes:
-            self._grid[index] = [_BLANK] * self._cols
+            self._grid[index] = [BLANK] * self._cols
             self._widths[index] = [1] * self._cols
             self._written[index] = True
             self._extent[index] = 0
@@ -608,24 +723,45 @@ class TerminalViewport:
 
     def _scroll_up_csi(self, params: list[int]) -> None:
         self._resolve(ColumnOperation.SCROLL)
-        self._scroll_up(_amount(params))
+        self._scroll_up(amount(params))
 
     def _scroll_down_csi(self, params: list[int]) -> None:
         self._resolve(ColumnOperation.SCROLL)
         top, bottom = self._scroll_top, self._scroll_bottom
-        for _ in range(_amount(params)):
+        for _ in range(amount(params)):
             del self._grid[bottom]
             del self._widths[bottom]
             del self._written[bottom]
             del self._extent[bottom]
-            self._grid.insert(top, [_BLANK] * self._cols)
+            self._grid.insert(top, [BLANK] * self._cols)
             self._widths.insert(top, [1] * self._cols)
             self._written.insert(top, True)
             self._extent.insert(top, 0)
 
     # Defined inside the class body so the handlers are plain names here
     # rather than private attribute access on the class from outside.
+    def _save_cursor_csi(self, params: list[int]) -> None:
+        del params
+        self._save_cursor()
+
+    def _restore_cursor_csi(self, params: list[int]) -> None:
+        del params
+        self._restore_cursor()
+
+    # Defined inside the class body so the handlers are plain names here
+    # rather than private attribute access on the class from outside.
+    _ESCAPE_HANDLERS: ClassVar[dict[int, Callable[["TerminalViewport"], None]]] = {
+        0x37: _save_cursor,     # ESC 7  DECSC
+        0x38: _restore_cursor,  # ESC 8  DECRC
+        0x44: _index,           # ESC D  IND
+        0x45: _next_line,       # ESC E  NEL
+        0x4D: _reverse_index,   # ESC M  RI
+        0x63: _reset,           # ESC c  RIS
+    }
+
     _CSI_HANDLERS: ClassVar[_CsiTable] = {
+        "s": _save_cursor_csi,
+        "u": _restore_cursor_csi,
         "H": _cup,
         "f": _cup,
         "A": _cursor_up,
@@ -635,112 +771,9 @@ class TerminalViewport:
         "G": _column_absolute,
         "d": _row_absolute,
         "K": _erase_in_line,
+        "X": _erase_characters,
         "J": _erase_in_display,
         "r": _set_scroll_region,
         "S": _scroll_up_csi,
         "T": _scroll_down_csi,
     }
-
-
-def _render_row(cells: list[str], widths: list[int], extent: int) -> str:
-    """Render one row the way the terminal presents it.
-
-    A wide glyph covers the following column, so whatever sits in that
-    follower cell is never shown — which is exactly how a character that
-    overflowed into it stays invisible.
-    """
-    rendered: list[str] = []
-    column = 0
-    while column < extent:
-        width = widths[column]
-        if width == 0:
-            column += 1
-            continue
-        rendered.append(cells[column] or _BLANK)
-        column += max(1, width)
-    return "".join(rendered)
-
-
-def _amount(params: list[int]) -> int:
-    return max(1, params[0] if params else 1)
-
-
-def _numeric_params(raw: str) -> list[int]:
-    values: list[int] = []
-    for part in raw.split(";"):
-        stripped = part.strip()
-        values.append(int(stripped) if stripped.isdigit() else 0)
-    return values
-
-
-def _decode_utf8(buffer: bytes, index: int, size: int) -> tuple[str, int]:
-    """Decode one UTF-8 character at ``index``; return ``(char, consumed)``.
-
-    ``consumed == 0`` means the sequence is genuinely truncated at the end of
-    the chunk and the caller should hold the bytes over. An empty ``char`` with
-    a non-zero ``consumed`` means the bytes are undecodable and the terminal
-    drops them — measured: xterm's decoder emits nothing at all for an invalid
-    byte, so substituting a replacement character would shift every column
-    after it.
-
-    A declared byte count is not enough on its own: every byte after the lead
-    must be a continuation (0x80-0xBF). A lead that announces three bytes and
-    is followed by ``\x1b[`` is *corrupt*, not incomplete — consuming those two
-    bytes on its word swallows the escape sequence, and a swallowed screen
-    clear leaves an erased footer searchable, which is a false
-    ``composer_stranded`` verdict (#7141 round 2).
-    """
-    lead = buffer[index]
-    width = _utf8_width(lead)
-    if width == 1:
-        return "", 1
-    end = index + width
-    for offset in range(index + 1, min(end, size)):
-        if not _is_continuation(buffer[offset]):
-            # Corrupt, not truncated: drop the lead and re-read the next byte.
-            return "", 1
-    if end > size:
-        return "", 0
-    decoded = buffer[index:end].decode("utf-8", errors="ignore")[:1]
-    return decoded, width
-
-
-def _is_continuation(byte: int) -> bool:
-    return 0x80 <= byte <= 0xBF
-
-
-def _utf8_width(lead: int) -> int:
-    """Bytes in the UTF-8 sequence this lead byte starts.
-
-    Invalid leads (0xC0/0xC1 overlongs, 0xF5-0xFF, and stray continuation
-    bytes) are width 1 so one bad byte becomes one replacement character
-    instead of swallowing the bytes that follow it.
-    """
-    if 0xF0 <= lead <= 0xF4:
-        return 4
-    if 0xE0 <= lead <= 0xEF:
-        return 3
-    if 0xC2 <= lead <= 0xDF:
-        return 2
-    return 1
-
-
-def _scan_string_sequence(buffer: bytes, payload: int) -> int | None:
-    """End of an OSC/DCS/SOS/PM/APC string whose body starts at ``payload``.
-
-    ``None`` when unterminated, which leaves the bytes pending and therefore
-    unrendered — the same visible result as the terminal sitting in the string
-    state waiting for a terminator that never comes.
-    """
-    index = payload
-    size = len(buffer)
-    while index < size:
-        byte = buffer[index]
-        if byte == _BEL:
-            return index + 1
-        if byte == _ESC and index + 1 < size and buffer[index + 1] == 0x5C:
-            return index + 2
-        if byte == _ESC and index + 1 >= size:
-            return None
-        index += 1
-    return None

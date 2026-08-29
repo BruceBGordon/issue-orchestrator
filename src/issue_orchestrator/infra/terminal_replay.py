@@ -47,9 +47,9 @@ class RecordingReplay:
     replayed_from_start: bool
     structurally_complete: bool
     abandoned: bool = False
-    #: Grid-affecting private modes the recording used that the viewport does
+    #: Grid-affecting state channels the recording used that the viewport does
     #: not model. Non-empty means the reconstruction cannot be trusted.
-    unmodelled_modes: tuple[str, ...] = ()
+    unmodelled_state: tuple[str, ...] = ()
 
 
 def replay_terminal_recording(
@@ -113,7 +113,7 @@ def replay_terminal_recording(
         replayed_from_start=replayed_from_start,
         structurally_complete=complete,
         abandoned=abandoned,
-        unmodelled_modes=tuple(dict.fromkeys(viewport.unmodelled_modes)),
+        unmodelled_state=tuple(dict.fromkeys(viewport.unmodelled_state)),
     )
 
 

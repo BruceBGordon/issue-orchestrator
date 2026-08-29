@@ -25,7 +25,7 @@ from issue_orchestrator.infra.pending_wrap import (
     PENDING_WRAP_RESOLUTION,
     ColumnOperation,
     PendingWrapResolution,
-    is_parked,
+    clears_parked_state,
     resolve_parked_column,
 )
 from issue_orchestrator.infra.terminal_viewport import TerminalViewport
@@ -109,12 +109,29 @@ class TestEachRowResolvesAsMeasured:
         assert resolve_parked_column(4, 10, operation) == 4
 
 
-class TestParkedPredicate:
-    def test_the_last_column_is_not_parked(self) -> None:
-        assert not is_parked(9, 10)
+class TestParkedStateIsABit:
+    """Parked-ness is state, not an out-of-range column (#7141 round 8)."""
 
-    def test_one_past_the_last_column_is_parked(self) -> None:
-        assert is_parked(10, 10)
+    @pytest.mark.parametrize("operation", list(ColumnOperation))
+    def test_clamp_and_replace_discharge_the_promise(
+        self, operation: ColumnOperation
+    ) -> None:
+        resolution = PENDING_WRAP_RESOLUTION[operation]
+        expected = resolution in (
+            PendingWrapResolution.CLAMP,
+            PendingWrapResolution.REPLACE,
+        )
+
+        assert clears_parked_state(operation) is expected
+
+    def test_a_restored_column_is_not_parked(self) -> None:
+        """DECRC puts the cursor back without the pending wrap."""
+        view = TerminalViewport(rows=3, cols=10)
+
+        view.feed(b"abcdefghij\x1b7\rX\x1b8Z")
+
+        assert view.render().rows[0] == "XbcdefghiZ"
+        assert view.render().cursor_col == 10
 
 
 class TestEachRowMatchesTheBundledTerminal:
@@ -208,11 +225,11 @@ class TestResetDoesNotLaunderARefusal:
 
         view.feed(b"\x1b[?1049h\x1bctext")
 
-        assert view.unmodelled_modes == ["?1049h"]
+        assert view.unmodelled_state == ["?1049h"]
 
     def test_a_soft_reset_keeps_an_earlier_refusal(self) -> None:
         view = TerminalViewport(rows=3, cols=10)
 
         view.feed(b"\x1b[?6h\x1b[!ptext")
 
-        assert view.unmodelled_modes == ["?6h"]
+        assert view.unmodelled_state == ["?6h"]
