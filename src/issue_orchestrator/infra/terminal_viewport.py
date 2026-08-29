@@ -41,11 +41,11 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, ClassVar
 
+from .xterm_widths import EMPTY_CLUSTER, cluster_advance
 from .terminal_recording import (
     MAX_TERMINAL_COLS,
     MAX_TERMINAL_ROWS,
@@ -58,9 +58,6 @@ _MAX_ROWS = MAX_TERMINAL_ROWS
 _MAX_COLS = MAX_TERMINAL_COLS
 _BLANK = " "
 _REPLACEMENT = "\ufffd"
-_ZWJ = "\u200d"
-# Marks, format characters and variation selectors never claim a cell.
-_ZERO_WIDTH_CATEGORIES = frozenset({"Mn", "Me", "Cf"})
 _TAB_WIDTH = 8
 
 _ESC = 0x1B
@@ -101,7 +98,7 @@ class TerminalViewport:
         self._row = 0
         self._col = 0
         self._saved: tuple[int, int] = (0, 0)
-        self._join_pending = False
+        self._cluster = EMPTY_CLUSTER
         self._scroll_top = 0
         self._scroll_bottom = self._rows - 1
         self._fed = 0
@@ -147,6 +144,9 @@ class TerminalViewport:
                     # Incomplete sequence at the end of the chunk.
                     self._pending = buffer[index:]
                     return
+                # Measured: any escape sequence breaks the cluster too, even
+                # one that does not move the cursor.
+                self._cluster = EMPTY_CLUSTER
                 index += consumed
                 continue
             if byte >= 0x80:
@@ -158,7 +158,15 @@ class TerminalViewport:
                 self._print(char)
                 index += consumed
                 continue
-            self._apply_control_byte(byte)
+            if byte < 0x20 or byte == 0x7F:
+                # Measured against the bundled xterm: a control byte breaks the
+                # grapheme cluster, so a combining mark after CR/LF/BS takes a
+                # cell of its own instead of joining what came before.
+                self._cluster = EMPTY_CLUSTER
+                self._apply_control(byte)
+                index += 1
+                continue
+            self._print(chr(byte))
             index += 1
 
     def render(self) -> RenderedScreen:
@@ -180,8 +188,8 @@ class TerminalViewport:
     def _blank_grid(self) -> list[list[str]]:
         return [[_BLANK] * self._cols for _ in range(self._rows)]
 
-    def _apply_control_byte(self, byte: int) -> None:
-        """Apply one single-byte ASCII control character or printable."""
+    def _apply_control(self, byte: int) -> None:
+        """Apply one single-byte ASCII control character."""
         if byte == 0x0D:  # CR
             self._col = 0
             return
@@ -194,39 +202,37 @@ class TerminalViewport:
         if byte == 0x09:  # HT
             self._col = min(self._cols - 1, (self._col // _TAB_WIDTH + 1) * _TAB_WIDTH)
             return
-        if byte < 0x20 or byte == 0x7F:
-            return
-        self._print(chr(byte))
 
     def _print(self, char: str) -> None:
-        # A ZWJ binds what follows into the grapheme already on screen, so the
-        # joined character claims no cells of its own. The bundled xterm the
-        # session viewer runs draws 👨‍👩‍👧‍👦 as ONE glyph; counting its parts
-        # separately pushed everything after it along the row and wrapped a
-        # footer mid-word, costing a real stranded-composer catch
-        # (#7141 round 3).
-        joined = self._join_pending
-        self._join_pending = char == _ZWJ
-        # A grid narrower than the glyph cannot represent it; clamping keeps
-        # the write in bounds instead of running off the end of the row.
-        cells = 0 if joined else min(_char_cells(char), self._cols)
-        if cells == 0:
+        # Cell width and cluster joining come from the bundled xterm's own
+        # model (``infra.xterm_widths``), not from a wcwidth-shaped guess: the
+        # viewer renders emoji one cell wide and joins only zero-width
+        # codepoints, so a four-emoji ZWJ family is four cells. Modelling it as
+        # two put a footer on a row xterm wraps (#7141 round 4).
+        cells, self._cluster = cluster_advance(ord(char), self._cluster)
+        if cells <= 0:
             self._attach_combining(char)
             return
-        if self._col + cells > self._cols:
+        # Wrap only when there is somewhere to wrap from: a glyph wider than
+        # the whole row still gets drawn where it stands, and the cursor is
+        # allowed past the right edge, because that is what xterm does on a
+        # screen too narrow for the glyph.
+        if self._col + cells > self._cols and self._col > 0:
             self._col = 0
             self._line_feed()
-        self._grid[self._row][self._col] = char
-        # A wide glyph owns its trailing cell too; the empty string keeps the
-        # rendered row the right length without printing a second glyph.
-        for offset in range(1, cells):
-            self._grid[self._row][self._col + offset] = ""
-        self._written[self._row] = True
+        if self._col < self._cols:
+            self._grid[self._row][self._col] = char
+            # A wide glyph owns its trailing cell too; the empty string keeps
+            # the rendered row the right length without a second glyph.
+            for offset in range(1, cells):
+                if self._col + offset < self._cols:
+                    self._grid[self._row][self._col + offset] = ""
+            self._written[self._row] = True
         self._col += cells
 
     def _attach_combining(self, char: str) -> None:
         """Decorate the last written cell rather than consuming a new one."""
-        column = max(0, self._col - 1)
+        column = min(max(0, self._col - 1), self._cols - 1)
         while column > 0 and self._grid[self._row][column] == "":
             column -= 1
         cell = self._grid[self._row][column]
@@ -303,7 +309,7 @@ class TerminalViewport:
         self._grid = self._blank_grid()
         self._written = [True] * self._rows
         self._row = self._col = 0
-        self._join_pending = False
+        self._cluster = EMPTY_CLUSTER
         self._scroll_top, self._scroll_bottom = 0, self._rows - 1
 
     # -- CSI operations ----------------------------------------------------
@@ -458,25 +464,6 @@ def _utf8_width(lead: int) -> int:
     if 0xC2 <= lead <= 0xDF:
         return 2
     return 1
-
-
-def _char_cells(char: str) -> int:
-    """Screen cells this character occupies, ignoring cluster joining.
-
-    wcwidth semantics, narrowed to what a grid needs: East Asian Wide and
-    Fullwidth forms take two cells; combining marks, variation selectors and
-    format characters (including ZWJ) take none and decorate the cell already
-    written. Getting this wrong desynchronises every subsequent cursor address
-    on the row, so a later erase clears the wrong columns and leaves a footer
-    behind (#7141 round 2).
-
-    Cluster joining is the caller's job — see ``TerminalViewport._print``.
-    """
-    if char == _ZWJ or unicodedata.category(char) in _ZERO_WIDTH_CATEGORIES:
-        return 0
-    if unicodedata.combining(char):
-        return 0
-    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
 
 
 def _string_sequence_length(buffer: bytes, start: int) -> int | None:

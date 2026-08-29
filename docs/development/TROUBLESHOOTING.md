@@ -194,7 +194,11 @@ agent never engaged with the prompt. Combine that with `composer_stranded` and
 you are looking at the PR #6484 injection/settle family, not a provider stall.
 
 `composer_state` is read off the **rendered final viewport**, not the raw byte
-history, so an erased footer cannot support a verdict. Anything that makes the
+history, so an erased footer cannot support a verdict. That viewport reproduces
+the *bundled* xterm's screen — including its width model, under which an emoji
+is one cell and a ZWJ family is four — so the screen a verdict rests on is the
+screen the session viewer draws. Regenerate the measurements behind that with
+`node tools/measure_xterm_widths.js`. Anything that makes the
 reconstruction untrustworthy — a half-written recording, an unparseable row, an
 undecodable payload, an implausible `resize`, or a replay the capture budget cut
 short — yields `undetermined` rather than a guess. `matched_marker` names

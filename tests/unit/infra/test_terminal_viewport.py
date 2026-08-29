@@ -469,33 +469,54 @@ class TestMalformedResizeRows:
 
 
 class TestGraphemeClusters:
-    """#7141 round 3 finding 2: match the bundled terminal's grapheme model."""
+    """#7141 round 4 finding 2: the model is the bundled xterm's, measured.
 
-    def test_a_zwj_family_emoji_is_one_grapheme_of_two_cells(self) -> None:
+    Round 3 theorised that a ZWJ family renders as one two-cell glyph. The
+    vendored xterm — which is what the viewer actually draws with — gives it
+    FOUR: it ships the UnicodeV6 provider, where an emoji is one cell and only
+    a *zero-width* codepoint joins the cluster before it. Every number below
+    came out of that terminal; see tests/unit/infra/test_xterm_widths.py for
+    the fixture replay and tools/measure_xterm_widths.js for the rig.
+    """
+
+    FAMILY = "\U0001F468\u200d\U0001F469\u200d\U0001F467\u200d\U0001F466"
+
+    def test_a_zwj_family_emoji_measures_four_cells(self) -> None:
         view = _viewport(rows=3, cols=30)
 
-        view.feed("abc".encode("utf-8"))
-        view.feed("\U0001F468‍\U0001F469‍\U0001F467‍\U0001F466".encode())
+        view.feed(b"abc")
+        view.feed(self.FAMILY.encode())
         view.feed(b"|")
 
-        # 3 ASCII + 2 for the whole family cluster, so the bar sits at column 5.
-        assert view.render().cursor_col == 6
+        # 3 ASCII + 4 for the family + 1 for the bar.
+        assert view.render().cursor_col == 8
         assert view.render().rows[0].endswith("|")
 
-    def test_the_reviewer_probe_lands_the_cursor_at_column_25(self) -> None:
+    def test_the_reviewer_probe_lands_the_cursor_at_column_27(self) -> None:
         view = _viewport(rows=3, cols=30)
 
         view.feed(b"x" * 23)
-        view.feed("\U0001F468‍\U0001F469‍\U0001F467‍\U0001F466".encode())
+        view.feed(self.FAMILY.encode())
 
-        assert view.render().cursor_col == 25
+        assert view.render().cursor_col == 27
 
-    def test_a_zwj_cluster_does_not_wrap_a_following_footer(self) -> None:
-        """Naive per-codepoint widths made the family 11 cells and split the row."""
+    def test_the_family_wraps_a_footer_exactly_where_xterm_does(self) -> None:
+        """xterm splits 'messa'/'ge' here; a two-cell model kept one row."""
+        view = _viewport(rows=4, cols=30)
+
+        view.feed(b"x" * 8)
+        view.feed(self.FAMILY.encode())
+        view.feed(b"tab to queue message")
+
+        rendered = view.render().rows
+        assert rendered[0].endswith("tab to queue messa")
+        assert rendered[1] == "ge"
+
+    def test_a_footer_that_fits_is_left_on_one_row(self) -> None:
         view = _viewport(rows=4, cols=30)
 
         view.feed(b"ab ")
-        view.feed("\U0001F468‍\U0001F469‍\U0001F467‍\U0001F466".encode())
+        view.feed(self.FAMILY.encode())
         view.feed(b"tab to queue message")
 
         assert "tab to queue message" in view.render().rows[0]
@@ -503,9 +524,38 @@ class TestGraphemeClusters:
     def test_a_variation_selector_does_not_advance(self) -> None:
         view = _viewport(rows=3, cols=10)
 
-        view.feed("⚠️!".encode("utf-8"))
+        view.feed("\u26a0\ufe0f!".encode("utf-8"))
 
         assert view.render().rows[0].endswith("!")
+        assert view.render().cursor_col == 2
+
+    def test_a_control_character_breaks_the_cluster(self) -> None:
+        """Measured: after CR a combining mark takes a cell instead of joining."""
+        joined = _viewport(rows=3, cols=10)
+        joined.feed("A\u0301".encode("utf-8"))
+
+        broken = _viewport(rows=3, cols=10)
+        broken.feed("A\r\u0301".encode("utf-8"))
+
+        assert joined.render().cursor_col == 1
+        assert broken.render().cursor_col == 1
+        assert joined.render().rows[0] == "A\u0301"
+
+    def test_an_escape_sequence_breaks_the_cluster(self) -> None:
+        """Measured: even an erase that never moves the cursor breaks it."""
+        view = _viewport(rows=3, cols=10)
+
+        view.feed("A\u001b[K\u0301".encode("utf-8"))
+
+        assert view.render().cursor_col == 2
+
+    def test_a_cluster_survives_a_chunk_boundary(self) -> None:
+        view = _viewport(rows=3, cols=10)
+
+        view.feed("\U0001F468".encode())
+        view.feed("\u200d".encode())
+        view.feed("\U0001F469".encode())
+
         assert view.render().cursor_col == 2
 
 

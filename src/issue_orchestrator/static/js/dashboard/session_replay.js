@@ -512,13 +512,30 @@ function resolveSessionReplayInitialGeometry(payload, events) {
     return null;
 }
 
+// Mirrors infra/terminal_recording.screen_dimension EXACTLY. The backend has
+// one owner deciding what a trustworthy resize row carries; this is the third
+// call site of that policy and the only one in another language, so it cannot
+// import the owner and must restate it. The bounds are pinned against the
+// Python constants by tests/unit/test_terminal_recording.py, which fails if
+// either side moves (#7141 round 4).
+//
+// Number() coercion was the hole: bool is not a number but Number(true) is 1,
+// so {rows: true} sized the viewer's terminal to a single row. Exact typeof
+// checking rejects that; the range bound rejects zero, negative and absurd.
+const SESSION_REPLAY_MAX_ROWS = 500;
+const SESSION_REPLAY_MAX_COLS = 1000;
+
+function sessionReplayScreenDimension(value, limit) {
+    if (typeof value !== 'number' || !Number.isInteger(value)) return null;
+    if (value < 1 || value > limit) return null;
+    return value;
+}
+
 function normalizeSessionReplayGeometry(candidate) {
     if (!candidate || typeof candidate !== 'object') return null;
-    const rows = Number(candidate.rows);
-    const cols = Number(candidate.cols);
-    if (!Number.isInteger(rows) || !Number.isInteger(cols) || rows <= 0 || cols <= 0) {
-        return null;
-    }
+    const rows = sessionReplayScreenDimension(candidate.rows, SESSION_REPLAY_MAX_ROWS);
+    const cols = sessionReplayScreenDimension(candidate.cols, SESSION_REPLAY_MAX_COLS);
+    if (rows === null || cols === null) return null;
     return { rows, cols };
 }
 
@@ -606,9 +623,16 @@ function replaySessionToIndex(targetIndex) {
 
 function applyTerminalRecordingEvent(event) {
     if (!sessionReplayState || !sessionReplayState.terminal || !event || typeof event !== 'object') return;
-    if (event.event_type === 'resize' && Number.isInteger(event.cols) && Number.isInteger(event.rows)) {
-        sessionReplayState.initialGeometry = { rows: event.rows, cols: event.cols };
-        sessionReplayState.terminal.resize(event.cols, event.rows);
+    if (event.event_type === 'resize') {
+        // Same validator as the initial-geometry fallback: an untrustworthy
+        // resize is treated as absent (skipped) rather than clamped, matching
+        // the Python owner's reject-not-clamp contract. Passing a zero or
+        // negative straight to xterm is how a malformed row reshaped the
+        // viewer mid-playback (#7141 round 4).
+        const geometry = normalizeSessionReplayGeometry(event);
+        if (!geometry) return;
+        sessionReplayState.initialGeometry = geometry;
+        sessionReplayState.terminal.resize(geometry.cols, geometry.rows);
         return;
     }
     if (event.event_type !== 'output' || !event.data_b64) {
