@@ -25,12 +25,15 @@ from typing import Callable
 
 import pytest
 
-from issue_orchestrator.execution.persistent_round_runner import (
+from issue_orchestrator.execution.persistent_round_failures import (
     PersistentRoundError,
     PersistentRoundTimeoutError,
+    persistent_round_failure_reason,
+    persistent_round_idle_trace,
+)
+from issue_orchestrator.execution.persistent_round_runner import (
     close_persistent_session,
     open_persistent_session,
-    persistent_round_failure_reason,
     send_round,
 )
 from issue_orchestrator.execution.recording_contract import recording_event_count
@@ -623,6 +626,147 @@ class TestPersistentSessionFailureModes:
             )
 
         assert persistent_round_failure_reason(exc_info.value) == "prompt_not_accepted"
+
+    def test_round_failure_carries_the_idle_detector_trace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """#7128: idle facts leave the runner as data, not as log text.
+
+        Kill-evidence capture writes ``idle-trace.json`` from this object, so
+        the window config and the frozen ``bytes_drained`` trajectory have to
+        travel on the exception rather than only into a warning line.
+        """
+        from issue_orchestrator.execution import persistent_round_runner as prr
+
+        class _Proc:
+            pid = 324
+
+            def poll(self) -> None:
+                return None
+
+        monkeypatch.setattr(
+            prr,
+            "_submit_prompt_with_enter",
+            lambda _session, payload, **_kwargs: (len(payload) + 1, None),
+        )
+        monkeypatch.setattr(prr, "_drain_pty_output", lambda _session: 0)
+        session = prr.PersistentSession(proc=_Proc(), master_fd=99)  # type: ignore[arg-type]
+        clock = _FakeClock()
+
+        with pytest.raises(PersistentRoundTimeoutError) as exc_info:
+            send_round(
+                session,
+                prompt="review round 3",
+                response_file=tmp_path / "response.json",
+                timeout_seconds=600.0,
+                prompt_acceptance_idle_seconds=60.0,
+                poll_interval_seconds=0.25,
+                now=clock.now,
+                sleep=clock.make_sleeper(),
+            )
+
+        trace = persistent_round_idle_trace(exc_info.value)
+        assert trace is not None
+        assert trace.window_seconds == 60.0
+        assert trace.deadline_seconds == 600.0
+        assert trace.poll_interval_seconds == 0.25
+        assert trace.poll_iterations > 1
+        # Nothing was ever drained: the signature of a prompt the agent
+        # never engaged with.
+        assert trace.bytes_drained_total == 0
+        assert trace.idle_for_seconds >= 60.0
+        assert trace.samples
+        assert trace.samples[-1].bytes_drained_total == 0
+
+    def test_deadline_timeout_also_carries_an_idle_trace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from issue_orchestrator.execution import persistent_round_runner as prr
+
+        class _Proc:
+            pid = 325
+
+            def poll(self) -> None:
+                return None
+
+        monkeypatch.setattr(
+            prr,
+            "_submit_prompt_with_enter",
+            lambda _session, payload, **_kwargs: (len(payload) + 1, None),
+        )
+        monkeypatch.setattr(prr, "_drain_pty_output", lambda _session: 3)
+        session = prr.PersistentSession(proc=_Proc(), master_fd=99)  # type: ignore[arg-type]
+        clock = _FakeClock()
+
+        with pytest.raises(PersistentRoundTimeoutError) as exc_info:
+            send_round(
+                session,
+                prompt="review round 4",
+                response_file=tmp_path / "response.json",
+                timeout_seconds=2.0,
+                prompt_acceptance_idle_seconds=None,
+                poll_interval_seconds=0.5,
+                now=clock.now,
+                sleep=clock.make_sleeper(),
+            )
+
+        trace = persistent_round_idle_trace(exc_info.value)
+        assert trace is not None
+        assert trace.window_seconds is None
+        assert trace.bytes_drained_total == 12
+        assert trace.elapsed_seconds >= 2.0
+
+    def test_invalid_response_failure_carries_the_idle_trace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """#7141 finding 4: this was the one raise site without a trace."""
+        from issue_orchestrator.execution import persistent_round_runner as prr
+        class _Proc:
+            pid = 777
+            _polls = 0
+
+            def poll(self) -> int | None:
+                _Proc._polls += 1
+                return 3 if _Proc._polls > 1 else None
+
+        monkeypatch.setattr(
+            prr, "_submit_prompt_with_enter",
+            lambda _s, payload, **_k: (len(payload) + 1, None),
+        )
+        monkeypatch.setattr(prr, "_drain_pty_output", lambda _s: 5)
+        response_file = tmp_path / "response.json"
+        session = prr.PersistentSession(proc=_Proc(), master_fd=99)  # type: ignore[arg-type]
+
+        clock_value = {"t": 0.0}
+
+        def _now() -> float:
+            return clock_value["t"]
+
+        def _sleep(seconds: float) -> None:
+            clock_value["t"] += seconds
+            # send_round clears a stale response file before prompting, so the
+            # agent's invalid JSON has to land after that.
+            response_file.write_text("{not json", encoding="utf-8")
+
+        with pytest.raises(PersistentRoundError) as exc_info:
+            send_round(
+                session,
+                prompt="p",
+                response_file=response_file,
+                timeout_seconds=30.0,
+                poll_interval_seconds=0.5,
+                now=_now,
+                sleep=_sleep,
+            )
+
+        assert persistent_round_failure_reason(exc_info.value) == "invalid_response"
+        assert persistent_round_idle_trace(exc_info.value) is not None
 
     def test_prompt_activity_resets_not_accepted_idle_window(
         self,

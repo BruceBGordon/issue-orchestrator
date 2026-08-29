@@ -105,18 +105,33 @@ from ..ports import (
 )
 from ..ports.session_output import SessionOutput
 from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
+from .exchange_kill_evidence import (
+    CapturedKillEvidence,
+    ExchangeKillEvidenceRecorder,
+    RoundIdentity,
+    RoundTicket,
+)
 from .persistent_exchange_pair_registry_inmemory import (
     InMemoryPersistentExchangePairRegistry,
     PersistentExchangePair,
 )
 from . import persistent_pair_contract as _pair_contract
-from .persistent_round_runner import (
+from .persistent_exchange_slice_mirror import (
+    RoleSliceMirror as _RoleSliceMirror,
+    attach_slice_mirror as _attach_slice_mirror,
+    detach_slice_mirror as _detach_slice_mirror,
+    prepare_session_slice as _prepare_session_slice,
+)
+from .persistent_round_failures import (
     PersistentRoundError,
     PersistentRoundTimeoutError,
+    persistent_round_failure_reason,
+    persistent_round_idle_trace,
+)
+from .persistent_round_runner import (
     PersistentSession,
     close_persistent_session,
     open_persistent_session,
-    persistent_round_failure_reason,
     send_round,
 )
 from .persistent_role_prompt_policy import (
@@ -179,146 +194,6 @@ def review_exchange_supervisor_timeout_seconds(
         coder_timeout_seconds * coder_attempts_per_round
     )
     return float(per_round * rounds + grace_seconds)
-
-
-@dataclass
-class _RoleSliceMirror:
-    """Translate pair-recording event indices into per-session slice indices.
-
-    The slice file at ``<run_dir>/<role>/terminal-recording.jsonl`` is
-    written **continuously** by the role's
-    ``MirroredTerminalRecordingWriter`` — registered at exchange start
-    via ``add_mirror_recording`` and removed at exchange end. The
-    timeline viewer therefore sees agent output update in near real time
-    rather than waiting for a chapter boundary to flush.
-
-    What this dataclass owns is the **offset translation** between the
-    pair recording (long-lived, accumulates across every exchange the
-    pair handles) and the slice (per-exchange, freshly attached). Its
-    ``slice_base`` is the pair recording's event count *at exchange
-    start* — the first event the slice will mirror. Chapter sidecars
-    store ``pair_event_idx - slice_base`` so the viewer can scrub the
-    manifest-pointed slice directly. Without that translation, a cached
-    pair on exchange 2 would record chapter offsets in the hundreds
-    while the slice file holds dozens of events and the web replay
-    route's ``all_events[offset:]`` would return an empty window.
-    """
-
-    pair_recording: Path
-    session_slice: Path
-    slice_base: int
-
-    def pair_to_slice_offset(self, pair_event_idx: int) -> int:
-        """Translate a pair-recording event index into a slice-local index.
-
-        The slice file is written as a strict subset of the pair
-        recording starting at ``slice_base``; the slice's event N
-        corresponds to pair event ``slice_base + N``. Chapter sidecars
-        store these slice-local offsets so the viewer can scrub the
-        manifest-pointed slice directly.
-
-        Raises ``ValueError`` when ``pair_event_idx < slice_base``.
-        Chapter recording happens during the exchange, after slice
-        attach; an index from before exchange start is a wrong-source
-        bug (caller fed an index from a different recording) and
-        masking it with a clamp would silently return wrong content.
-        """
-        if pair_event_idx < self.slice_base:
-            raise ValueError(
-                f"pair_event_idx={pair_event_idx} is below "
-                f"slice_base={self.slice_base}; chapter offsets must "
-                "be sampled after the slice mirror is attached at "
-                "exchange start. A negative slice index would index "
-                "past the start of the slice and silently return "
-                "content from prior exchanges.",
-            )
-        return pair_event_idx - self.slice_base
-
-
-def _attach_slice_mirror(
-    session: PersistentSession,
-    slice_path: Path,
-) -> None:
-    """Register a per-session slice with the role's PTY writer.
-
-    Fails loudly. The slice mirror is load-bearing for the per-session
-    timeline contract — without it the viewer reads an empty slice
-    file from the manifest while the agent's output continues to flow
-    only into the pair recording, recreating the exact "I can't see
-    what the reviewer is doing" symptom this PR is supposed to fix.
-    Failures here propagate up to ``run_persistent_session_exchange``'s
-    top-level handler, which emits ``REVIEW_EXCHANGE_FAILED`` and
-    re-raises so the orchestrator's loop bound (PR #6267) can govern
-    retries / escalation rather than the silent empty-timeline mode.
-
-    ``log_writer is None`` is a production invariant violation: every
-    role session opened by ``open_persistent_session`` carries a real
-    ``MirroredTerminalRecordingWriter``. Test fixtures that construct
-    sessions directly must wire a writer too — not doing so would mean
-    the test was getting a free pass on the live-mirror invariant.
-    """
-    writer = session.log_writer
-    if writer is None:
-        raise RuntimeError(
-            f"PersistentSession has no log_writer; cannot attach "
-            f"per-session slice mirror at {slice_path}. Production "
-            "sessions always carry a writer; this indicates either a "
-            "regression in open_persistent_session or a test fixture "
-            "that bypassed the writer wiring.",
-        )
-    # ``seed_resize=False`` keeps the slice indexing aligned with the
-    # offset translator: the first slice event corresponds to the
-    # first pair event written *after* exchange start, with no
-    # synthetic leading event to throw off ``pair_to_slice_offset``.
-    writer.add_mirror_recording(slice_path, seed_resize=False)
-
-
-def _detach_slice_mirror(
-    session: PersistentSession,
-    slice_path: Path,
-) -> None:
-    """Stop mirroring writes to the per-session slice path.
-
-    Called from a ``finally`` block, so any exception here would
-    obscure the exception that put us in the finally — log and
-    continue rather than mask the real failure. The flip side of
-    ``_attach_slice_mirror``'s fail-fast: if attach succeeded, detach
-    almost never fails (the writer's path map is in-process state),
-    and if detach somehow fails the worst case is the next exchange
-    seeing tail bytes from this exchange in its slice — caught by
-    ``test_slice_detaches_at_exchange_end_no_leak_to_next_exchange``.
-    """
-    writer = session.log_writer
-    if writer is None:
-        # The attach helper would have raised before we got here, so
-        # reaching this branch means someone called detach without
-        # ever calling attach. Tolerate so a partial-construction
-        # cleanup path stays simple.
-        return
-    try:
-        writer.remove_mirror_recording(slice_path)
-    except (OSError, ValueError):
-        logger.exception(
-            "Failed to detach per-session slice mirror at %s during "
-            "exchange teardown; subsequent writes from this writer "
-            "may continue to target the slice file. Logging and "
-            "continuing — raising here would mask the original "
-            "exception that triggered the finally block.",
-            slice_path,
-        )
-
-
-def _prepare_session_slice(slice_path: Path) -> None:
-    """Create the per-session slice directory and seed an empty file.
-
-    Pre-creating an empty file keeps the timeline viewer's recording
-    lookup (``ManifestAccessor.get_review_exchange_recording``) from
-    404'ing while a hung exchange is mid-round and no slice events
-    have been mirrored yet. ``allow_empty=False`` callers still see
-    "empty" as a recoverable condition rather than "missing".
-    """
-    slice_path.parent.mkdir(parents=True, exist_ok=True)
-    slice_path.touch(exist_ok=True)
 
 
 def _release_pair_after_no_completion(
@@ -414,6 +289,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     turn_mailbox: "TurnMailbox | None" = None,
     response_channels: ReviewExchangeResponseChannels | None = None,
     coder_prompt_addendum: str | None = None,
+    kill_evidence: ExchangeKillEvidenceRecorder | None = None,
 ) -> ReviewExchangeOutcome:
     """Run the coder↔reviewer exchange against a registry-owned persistent pair.
 
@@ -784,6 +660,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                 coder_mirror=coder_mirror,
                 reviewer_mirror=reviewer_mirror,
                 turn_mailbox=turn_mailbox,
+                kill_evidence=kill_evidence,
                 response_channels=effective_response_channels,
                 coder_prompt_addendum=coder_prompt_addendum,
             ),
@@ -958,6 +835,15 @@ class _RoleSessionOwner:
     spec: _RoleSessionSpec
     slice_path: Path
     completed_turns_on_current_process: int = 0
+
+    @property
+    def worktree(self) -> Path:
+        """The checkout this role's process runs in.
+
+        Exposed so collaborators (kill-evidence capture) can ask the owner for
+        the role's checkout instead of reaching through its launch spec.
+        """
+        return self.spec.worktree
 
     def attach_slice_mirror(self) -> None:
         _attach_slice_mirror(self._current_session(), self.slice_path)
@@ -1668,6 +1554,7 @@ class _DriveRoundsCommand:
     reviewer_mirror: _RoleSliceMirror
     coder_prompt_addendum: str | None = None
     turn_mailbox: "TurnMailbox | None" = None
+    kill_evidence: ExchangeKillEvidenceRecorder | None = None
     response_channels: ReviewExchangeResponseChannels = field(
         default_factory=ReviewExchangeResponseChannels
     )
@@ -1707,6 +1594,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
     coder_mirror = command.coder_mirror
     reviewer_mirror = command.reviewer_mirror
     turn_mailbox = command.turn_mailbox
+    kill_evidence = command.kill_evidence
     response_channels = command.response_channels
 
     no_progress_count = 0
@@ -1841,6 +1729,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
                 emit=emit,
                 mirror=reviewer_mirror,
                 turn_mailbox=turn_mailbox,
+                kill_evidence=kill_evidence,
                 response_channel=reviewer_response_channel,
             )
         )
@@ -2017,6 +1906,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
                 emit=emit,
                 mirror=coder_mirror,
                 turn_mailbox=turn_mailbox,
+                kill_evidence=kill_evidence,
                 response_channel=coder_response_channel,
             )
         )
@@ -2057,6 +1947,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
                 emit=emit,
                 coder_mirror=coder_mirror,
                 turn_mailbox=turn_mailbox,
+                kill_evidence=kill_evidence,
                 response_channel=coder_response_channel,
             )
         )
@@ -2134,6 +2025,7 @@ class _CoderProtocolCommand:
     emit: Callable[[EventName, dict[str, Any]], None]
     coder_mirror: _RoleSliceMirror
     turn_mailbox: "TurnMailbox | None" = None
+    kill_evidence: ExchangeKillEvidenceRecorder | None = None
     response_channel: ResponseChannel = "mailbox"
 
 
@@ -2274,6 +2166,7 @@ def _enforce_coder_protocol(
                 emit=emit,
                 mirror=coder_mirror,
                 turn_mailbox=turn_mailbox,
+                kill_evidence=command.kill_evidence,
                 response_channel=command.response_channel,
             )
         )
@@ -2333,6 +2226,86 @@ class _RoleRoundCommand:
     turn_mailbox: "TurnMailbox | None" = None
     response_channel: ResponseChannel = "mailbox"
     respawn_retries: int = 0
+    kill_evidence: ExchangeKillEvidenceRecorder | None = None
+
+
+def _round_identity(
+    command: _RoleRoundCommand,
+    session: PersistentSession,
+) -> RoundIdentity:
+    """Where this round's evidence lives, in the one shape the owner takes."""
+    attempt = command.turn_started.scope.attempt_index.value
+    return RoundIdentity(
+        issue_number=command.issue_number,
+        role=command.role.value,
+        round_index=command.cycle_index,
+        attempt_index=attempt,
+        respawn_retries=command.respawn_retries,
+        session_name=command.session_name,
+        exchange_run_id=command.exchange_run_id,
+        agent_pid=session.proc.pid,
+        recording_path=command.recording_path,
+        run_dir=command.run_dir,
+        exchange_dir=command.exchange_dir,
+        worktree=command.owner.worktree,
+        response_file=command.workspace.response_file,
+        # The turn tag from ``build_prompt_inbox_notice``: short enough to
+        # survive terminal wrapping, unique per turn.
+        prompt_marker=f"round={command.cycle_index} attempt={attempt}",
+    )
+
+
+def _register_round(
+    recorder: ExchangeKillEvidenceRecorder | None,
+    identity: RoundIdentity,
+) -> RoundTicket | None:
+    """Announce the round as in flight so a teardown can retain it.
+
+    Registration happens at round *start*, not at failure: a supervisor
+    wall-clock deadline kills a wedged worker that never reaches the failure
+    branch below, and without a registration there is nothing for the teardown
+    to find (#7141 finding 2).
+    """
+    return None if recorder is None else recorder.round_started(identity)
+
+
+def _finish_round(
+    recorder: ExchangeKillEvidenceRecorder | None,
+    ticket: RoundTicket | None,
+) -> None:
+    """Clear the in-flight registration. Idempotent."""
+    if recorder is not None and ticket is not None:
+        recorder.round_finished(ticket)
+
+
+def _capture_round_kill_evidence(
+    command: _RoleRoundCommand,
+    ticket: RoundTicket | None,
+    error: BaseException,
+    failure_reason: str,
+) -> CapturedKillEvidence | None:
+    """Copy this round's kill evidence into retained diagnostics (#7128).
+
+    The terminal recording lives in a home that self-deletes — pytest tmp
+    rotation under the async E2E runner, worktree teardown otherwise — so the
+    copy has to happen at declaration time, from the one place that knows both
+    the volatile paths and the run identity. Returns ``None`` when no recorder
+    was wired or the capture itself failed; the caller reports the round
+    failure either way, because diagnostics must never mask it.
+
+    ``ticket`` is the arbitration token: if the exchange teardown already
+    captured this round, claiming it here fails and the capture is skipped
+    rather than writing a second, evidence-poor copy over the good one.
+    """
+    recorder = command.kill_evidence
+    if recorder is None or ticket is None:
+        return None
+    return recorder.capture_declared_failure(
+        ticket,
+        failure_reason=failure_reason,
+        error_text=str(error),
+        idle_trace=persistent_round_idle_trace(error),
+    )
 
 
 def _send_role_round(command: _RoleRoundCommand) -> ReviewExchangeResponse | None:
@@ -2410,6 +2383,8 @@ def _send_role_round(command: _RoleRoundCommand) -> ReviewExchangeResponse | Non
             return mailbox.try_take(mailbox_key)
 
         response_reader = _read_from_mailbox
+    identity = _round_identity(command, session)
+    ticket = _register_round(command.kill_evidence, identity)
     try:
         parsed = send_round(
             session,
@@ -2422,6 +2397,7 @@ def _send_role_round(command: _RoleRoundCommand) -> ReviewExchangeResponse | Non
             # of unattributed silence).
             role_label=f"{role_value}@round-{cycle_index}",
             response_reader=response_reader,
+            on_idle_detector=None if ticket is None else ticket.attach_detector,
         )
     except (PersistentRoundTimeoutError, PersistentRoundError) as exc:
         # Release the slot before respawn/return so a straggling delivery
@@ -2431,10 +2407,19 @@ def _send_role_round(command: _RoleRoundCommand) -> ReviewExchangeResponse | Non
             assert turn_mailbox is not None
             turn_mailbox.close(mailbox_key)
         failure_reason = persistent_round_failure_reason(exc)
+        # Retain the kill evidence HERE, not after the respawn branch below:
+        # prompt_not_accepted is respawn-retryable, so a capture placed after
+        # that branch would miss the very failure this exists for, and the
+        # respawn's fresh output would already have polluted the recording tail.
+        # Claiming the ticket IS the deregistration: the capture below either
+        # takes this round (and the respawn retry then registers a fresh
+        # attempt) or finds a teardown already took it and does nothing.
+        captured = _capture_round_kill_evidence(command, ticket, exc, failure_reason)
+        composer_state = None if captured is None else captured.composer.state.value
         logger.warning(
             "[REVIEW_EXCHANGE] %s round failed issue=%s session_name=%s "
             "round_index=%d attempt_index=%d failure_reason=%s pid=%d response_file=%s "
-            "recording_path=%s error=%s",
+            "recording_path=%s composer_state=%s kill_evidence_dir=%s error=%s",
             role_value,
             issue_number,
             session_name,
@@ -2444,6 +2429,8 @@ def _send_role_round(command: _RoleRoundCommand) -> ReviewExchangeResponse | Non
             session.proc.pid,
             workspace.response_file,
             recording_path,
+            composer_state,
+            None if captured is None else captured.directory,
             exc,
         )
         # The role process is dead/unusable (e.g. a one-shot reviewer that
@@ -2529,12 +2516,18 @@ def _send_role_round(command: _RoleRoundCommand) -> ReviewExchangeResponse | Non
                 "attempt_index": attempt_index,
                 "role": role_value,
                 "failure_reason": failure_reason,
+                "composer_state": composer_state,
                 "reason": "no_completion",
                 "detail": str(exc),
                 "artifact_refs": _event_artifact_refs(completed.artifact_refs()),
             },
         )
         return None
+
+    finally:
+        # Idempotent; covers the success path and any escape this function
+        # does not catch.
+        _finish_round(command.kill_evidence, ticket)
 
     # Verdict received: release the slot so any duplicate/straggling delivery
     # for this turn is rejected rather than buffered for the next turn.

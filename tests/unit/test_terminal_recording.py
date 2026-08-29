@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
 
 from issue_orchestrator.infra.terminal_recording import (
+    MAX_TERMINAL_COLS,
+    MAX_TERMINAL_ROWS,
     MirroredTerminalRecordingWriter,
     TerminalRecordingWriter,
     append_output_event,
@@ -346,3 +349,71 @@ def test_remove_mirror_recording_stops_fan_out(tmp_path) -> None:
             writer.remove_mirror_recording(recording_path)
     finally:
         writer.close()
+
+
+def test_first_terminal_geometry_rejects_untrustworthy_dimensions(tmp_path) -> None:
+    """``bool`` is an ``int`` subclass, so ``rows: true`` sized the viewer to 1."""
+    import json
+
+    recording_path = tmp_path / "terminal-recording.jsonl"
+    rows = [
+        {"schema_version": 1, "event_type": "resize", "offset_ms": 0,
+         "rows": True, "cols": 120},
+        {"schema_version": 1, "event_type": "resize", "offset_ms": 1,
+         "rows": 0, "cols": 120},
+        {"schema_version": 1, "event_type": "resize", "offset_ms": 2,
+         "rows": 40, "cols": -3},
+        {"schema_version": 1, "event_type": "resize", "offset_ms": 3,
+         "rows": 40, "cols": 10_000_000},
+        {"schema_version": 1, "event_type": "resize", "offset_ms": 4,
+         "rows": 40, "cols": 120},
+    ]
+    recording_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    assert first_terminal_geometry(recording_path) == (40, 120)
+
+
+class TestGeometryBoundsAgreeAcrossTheLanguageBoundary:
+    """The browser viewer restates this policy; pin it so the two cannot drift.
+
+    ``screen_dimension`` is the one owner deciding what a trustworthy ``resize``
+    row carries, and the Python viewport and viewer geometry lookup both call
+    it. The dashboard's replay runs in a browser and cannot import it, so
+    ``session_replay.js`` restates the same rule — which makes the bounds a
+    duplicated constant, and duplicated constants drift. This reads the JS and
+    fails if either side moves (#7141 round 4).
+
+    Semantics are pinned on the JS side by
+    ``tests/js/session_replay_geometry.test.js``; this pins only the numbers.
+    """
+
+    def _session_replay_source(self) -> str:
+        source = (
+            Path(__file__).resolve().parents[2]
+            / "src"
+            / "issue_orchestrator"
+            / "static"
+            / "js"
+            / "dashboard"
+            / "session_replay.js"
+        )
+        return source.read_text(encoding="utf-8")
+
+    def test_the_javascript_row_bound_matches_the_python_owner(self) -> None:
+        assert (
+            f"const SESSION_REPLAY_MAX_ROWS = {MAX_TERMINAL_ROWS};"
+            in self._session_replay_source()
+        )
+
+    def test_the_javascript_column_bound_matches_the_python_owner(self) -> None:
+        assert (
+            f"const SESSION_REPLAY_MAX_COLS = {MAX_TERMINAL_COLS};"
+            in self._session_replay_source()
+        )
+
+    def test_the_javascript_names_its_python_counterpart(self) -> None:
+        """A reader of either side must be able to find the other."""
+        assert "screen_dimension" in self._session_replay_source()

@@ -28,6 +28,7 @@ from threading import RLock
 from typing import Any
 
 from ..ports.persistent_exchange_pair_registry import PersistentExchangePairRegistry
+from .exchange_kill_evidence import ExchangeKillEvidenceRecorder
 from .persistent_round_runner import PersistentSession, close_persistent_session
 
 logger = logging.getLogger(__name__)
@@ -111,11 +112,24 @@ class InMemoryPersistentExchangePairRegistry(PersistentExchangePairRegistry):
         *,
         on_release: Callable[[PersistentExchangePair, str], None] | None = None,
         clock: Callable[[], float] = time.time,
+        kill_evidence: ExchangeKillEvidenceRecorder | None = None,
     ) -> None:
         self._cache: dict[Hashable, PersistentExchangePair] = {}
         self._lock = RLock()
         self._on_release = on_release
         self._clock = clock
+        # This registry destroys the evidence — closing the sessions ends the
+        # recording and the release hook reclaims the reviewer worktree — so it
+        # owns the recorder that has to run first. Owning it here also makes
+        # "one recorder shared by the round loop and the teardown" structural:
+        # the exchange runner reads it back off the registry it already holds,
+        # so the two halves cannot end up wired to different instances.
+        self._kill_evidence = kill_evidence or ExchangeKillEvidenceRecorder()
+
+    @property
+    def kill_evidence(self) -> ExchangeKillEvidenceRecorder:
+        """The kill-evidence owner for pairs this registry manages."""
+        return self._kill_evidence
 
     def acquire(
         self,
@@ -216,6 +230,12 @@ class InMemoryPersistentExchangePairRegistry(PersistentExchangePairRegistry):
         original exception. Errors are still surfaced in the log so
         leaks don't go unnoticed.
         """
+        # BEFORE anything is closed: a round still in flight here is a wedged
+        # worker being killed out from under itself (supervisor wall-clock
+        # deadline, operator cancel, orchestrator shutdown). Its recording dies
+        # with the sessions below, so this is the last moment that evidence
+        # exists (#7141 finding 2). Never raises; see the recorder's docstring.
+        self._kill_evidence.capture_abandoned_rounds(pair.issue_key, reason=reason)
         coder_pid = pair.coder_session.proc.pid
         reviewer_pid = pair.reviewer_session.proc.pid
         logger.info(

@@ -18,6 +18,10 @@ class RoundFailureReason(str, enum.Enum):
     PROMPT_WRITE_FAILED = "prompt_write_failed"
     PROMPT_NOT_ACCEPTED = "prompt_not_accepted"
     ROUND_ERROR = "round_error"
+    #: The round was still in flight when the whole exchange was torn down —
+    #: a supervisor wall-clock deadline or an operator cancellation. The round
+    #: never declared anything itself; the teardown declared it for it.
+    ABANDONED_BY_TEARDOWN = "abandoned_by_teardown"
     UNKNOWN = "unknown"
 
 
@@ -88,6 +92,10 @@ _ROUND_FAILURE_PRESENTATION: dict[RoundFailureReason, RoundFailurePresentation] 
     RoundFailureReason.ROUND_ERROR: RoundFailurePresentation(
         chapter_label="round failed",
         narrative_phrase="round failed",
+    ),
+    RoundFailureReason.ABANDONED_BY_TEARDOWN: RoundFailurePresentation(
+        chapter_label="was abandoned when the exchange was torn down",
+        narrative_phrase="was abandoned when the exchange was torn down",
     ),
     RoundFailureReason.UNKNOWN: RoundFailurePresentation(
         chapter_label="did not complete",

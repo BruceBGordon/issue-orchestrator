@@ -840,10 +840,20 @@ def test_session_replay_renders_phase_chapters_when_present() -> None:
 
 
 def test_session_replay_resize_event_does_not_fit_over_recorded_geometry() -> None:
+    """Replay resizes to the RECORDED geometry, never to the viewport.
+
+    Also pins that the recorded geometry is validated first: playback used to
+    hand any integer — zero, negative, absurd — straight to xterm, which is a
+    third implementation of a policy the backend owns
+    (``infra.terminal_recording.screen_dimension``). See #7141 round 4 and
+    ``tests/js/session_replay_geometry.test.js`` for the behavior tests.
+    """
     js = _read(DASHBOARD_JS)
     body = _function_body(js, "applyTerminalRecordingEvent")
-    assert "sessionReplayState.initialGeometry = { rows: event.rows, cols: event.cols }" in body
-    assert "sessionReplayState.terminal.resize(event.cols, event.rows);" in body
+    assert "normalizeSessionReplayGeometry(event)" in body
+    assert "if (!geometry) return;" in body
+    assert "sessionReplayState.initialGeometry = geometry;" in body
+    assert "sessionReplayState.terminal.resize(geometry.cols, geometry.rows);" in body
     assert "fitSessionReplayTerminal();" not in body
 
 

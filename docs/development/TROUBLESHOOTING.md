@@ -141,6 +141,111 @@ cat $RUN_DIR/validation-errors.txt
 cat $WORKTREE/.issue-orchestrator/sessions/index.json | jq '.runs'
 ```
 
+## Retained Kill Evidence (review-exchange round failures)
+
+Run directories live in homes that disappear — a torn-down agent worktree, or a
+pytest tmp directory the async E2E runner rotates within the hour. When a
+review-exchange round is declared failed (`prompt_not_accepted`, timeout,
+process exit), the evidence is copied *out* of that home at declaration time
+into the repository's retained diagnostics:
+
+```
+<repo-root>/.issue-orchestrator/diagnostics/exchange-kills/
+├── index.jsonl                                # one line per capture, grep-able
+└── <ts>__issue-<n>__<role>__round-R-attempt-A-respawn-K/
+    ├── terminal-recording.jsonl               # copy of the role recording (tail-capped)
+    ├── idle-trace.json                        # window config + bytes_drained trajectory
+    └── run-identity.json                      # branch, HEAD SHA, session, run/exchange dirs
+```
+
+The exchange directory gets a matching
+`round-R-<role>-attempt-A-respawn-K.kill-evidence.json` back-pointer, so the
+cross-reference runs both ways and correlation never needs mtime archaeology.
+
+Two kinds of kill land here:
+
+- `failure_reason` other than `abandoned_by_teardown` — the round declared its
+  own failure (prompt not accepted, timeout, process exit).
+- `failure_reason: abandoned_by_teardown` — the round was *still running* when
+  the pair was released (supervisor wall-clock deadline, operator cancel,
+  orchestrator shutdown). The capture is taken by the pair registry before it
+  closes the sessions. If the wedged round had reached its poll loop the live
+  idle trajectory comes with it; otherwise `idle_trace_unavailable` says why
+  there is none.
+
+```bash
+KILLS=.issue-orchestrator/diagnostics/exchange-kills
+
+# Every capture for one branch, newest last
+jq -c 'select(.branch == "my-branch") | {captured_at, role, failure_reason, composer_state: .composer_state.state, retained_dir}' $KILLS/index.jsonl
+
+# Did the prompt ever submit? composer_stranded = the injected text never left
+# the composer (injection/settle race); composer_emptied = the submit
+# registered and the provider then went silent; undetermined = the recording
+# could not be reconstructed faithfully, so no verdict was guessed.
+jq '.composer_state' $KILLS/<capture>/run-identity.json
+
+# Did the agent produce anything at all after the prompt?
+jq '.idle_trace | {window_seconds, idle_for_seconds, bytes_drained_total}' $KILLS/<capture>/idle-trace.json
+```
+
+A frozen `bytes_drained_total` across the whole `samples` trajectory means the
+agent never engaged with the prompt. Combine that with `composer_stranded` and
+you are looking at the PR #6484 injection/settle family, not a provider stall.
+
+`composer_state` is read off the **rendered final viewport**, not the raw byte
+history, so an erased footer cannot support a verdict. That viewport reproduces
+the *bundled* xterm's screen — including its width model, under which an emoji
+is one cell and a ZWJ family is four — so the screen a verdict rests on is the
+screen the session viewer draws. Regenerate the measurements behind that with
+`node tools/measure_xterm_widths.js`. Anything that makes the
+reconstruction untrustworthy — a half-written recording, an unparseable row, an
+undecodable payload, an implausible `resize`, a replay the capture budget cut
+short, or a grid-affecting terminal mode the viewport does not model — yields
+`undetermined` rather than a guess. Every channel the parser can reach —
+private modes, ANSI modes, charset designation, tab stops, the saved cursor,
+every CSI and escape — is either modelled against a measurement, on a
+measured-inert allowlist, or refused by name; nothing is silently dropped. The
+exhaustiveness tests walk the byte space itself, over the full prefix × final
+product (`?`, `>`, `=`, `<` against every final) and every escape marker from
+`0x20`, so a sequence that reaches no handler fails a test rather than
+rendering as a no-op. Autowrap (DECAWM), the saved cursor (`ESC 7`/`ESC 8`),
+reverse index (`ESC M`) and both resets (`ESC c`, `CSI !p`) *are* modelled,
+because real recordings use them.
+
+`resize` is the one channel that arrives without passing through the parser, so
+it is measured and classified the same way (`… measure_xterm_widths.js resize`,
+reconciled by `infra/terminal_resize.py`). A real change of dimensions
+discharges a pending wrap, reconciles the saved cursor permanently — its row
+travels with any rows a shrink drops from the top, then both coordinates are
+clamped — and keeps the cursor visible on a row shrink; a same-size resize does
+nothing at all. A column shrink that would push written content past the new
+edge is *refused*, because the terminal rewraps there and the viewport carries
+no line-continuation state. Row *growth* is refused too once the screen has
+already lost rows — to a shrink, or to ordinary scrolling — because the
+terminal restores them from scrollback and pushes the live rows down, so a
+replay that appends blank rows instead clears the wrong line on the next erase.
+A full reset empties that history and makes growth faithful again; a soft reset
+does not. Real recordings only ever hold one resize, emitted before any output,
+so neither refusal costs a verdict in practice. A reset restores the terminal but never clears a refusal: whatever the
+unmodelled channel already did to the reconstructed rows cannot be undone. `matched_marker` names
+the affordance that decided it and `evidence_snippet` is the screen row it came
+from — check them before acting on the classification. `replayed_from_start:
+false` means only a trailing window of the recording was replayed; the verdict
+is still sound (only rows the replay wrote are searched) but the screen above
+the footer band may be incomplete. A holding marker outranks a busy marker when
+both are visible: "tab to queue message" is direct evidence of unsent composer
+text, while "esc to interrupt" only says the agent is busy.
+
+`recording_copy_error` is set when the recording could not be copied whole.
+One cause is the capture budget: the teardown capture runs while the pair
+registry holds its lock, so it is bounded by wall clock as well as by size. A
+stalled filesystem shows up as an abandoned stage with a recorded reason (and a
+`capture budget ... exhausted` warning naming the rounds it dropped) rather
+than a teardown that never returns.
+
+Captures accumulate; prune the directory manually when it gets large.
+
 ## Common Issues
 
 ### Dependency Changes Not Reflected Locally

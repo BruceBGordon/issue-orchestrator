@@ -1,0 +1,1975 @@
+{
+  "pending_baseline_no_operation": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_baseline_no_operation": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_carriage_return": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      13,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "Zbcdefghij",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_carriage_return": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      13,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "Zbcdefghij",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_line_feed": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      10,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "         Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_line_feed": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      10,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "         Z",
+      "",
+      ""
+    ]
+  },
+  "pending_vertical_tab": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      11,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "         Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_vertical_tab": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      11,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "         Z",
+      "",
+      ""
+    ]
+  },
+  "pending_form_feed": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      12,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "         Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_form_feed": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      12,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "         Z",
+      "",
+      ""
+    ]
+  },
+  "pending_index_c1": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      194,
+      132,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "         Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_index_c1": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      194,
+      132,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "         Z",
+      "",
+      ""
+    ]
+  },
+  "pending_next_line_c1": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      194,
+      133,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_next_line_c1": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      194,
+      133,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_backspace": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      8,
+      90
+    ],
+    "cursorX": 9,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghZj",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_backspace": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      8,
+      90
+    ],
+    "cursorX": 9,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghZj",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_horizontal_tab": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      9,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_horizontal_tab": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      9,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_cursor_forward": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      67,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_cursor_forward": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      67,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_cursor_back": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      68,
+      90
+    ],
+    "cursorX": 9,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghZj",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_cursor_back": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      68,
+      90
+    ],
+    "cursorX": 9,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghZj",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_cursor_up": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      65,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_cursor_up": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      65,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_cursor_down": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      66,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "         Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_cursor_down": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      66,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "         Z",
+      "",
+      ""
+    ]
+  },
+  "pending_cursor_position": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      49,
+      59,
+      49,
+      72,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "Zbcdefghij",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_cursor_position": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      49,
+      59,
+      49,
+      72,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "Zbcdefghij",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_column_absolute": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      53,
+      71,
+      90
+    ],
+    "cursorX": 5,
+    "cursorY": 0,
+    "rows": [
+      "abcdZfghij",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_column_absolute": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      53,
+      71,
+      90
+    ],
+    "cursorX": 5,
+    "cursorY": 0,
+    "rows": [
+      "abcdZfghij",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_row_absolute": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      50,
+      100,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "         Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_row_absolute": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      50,
+      100,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "         Z",
+      "",
+      ""
+    ]
+  },
+  "pending_erase_in_line_to_end": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      75,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_erase_in_line_to_end": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      75,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_erase_in_line_to_start": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      49,
+      75,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_erase_in_line_to_start": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      49,
+      75,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "         Z",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_erase_in_line_all": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      50,
+      75,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_erase_in_line_all": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      50,
+      75,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "         Z",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_erase_in_display_below": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      74,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_erase_in_display_below": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      74,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_erase_in_display_above": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      49,
+      74,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_erase_in_display_above": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      49,
+      74,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "         Z",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_erase_in_display_all": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      50,
+      74,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_erase_in_display_all": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      50,
+      74,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "         Z",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_scroll_up": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      83,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_scroll_up": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      83,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "         Z",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_scroll_down": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      84,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "",
+      "Zbcdefghij",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_scroll_down": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      84,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "         Z",
+      "abcdefghij",
+      "",
+      ""
+    ]
+  },
+  "pending_set_scroll_region": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      50,
+      59,
+      51,
+      114,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "Zbcdefghij",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_set_scroll_region": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      50,
+      59,
+      51,
+      114,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "Zbcdefghij",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_restore_cursor": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      55,
+      27,
+      91,
+      49,
+      59,
+      49,
+      72,
+      27,
+      56,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_restore_cursor": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      55,
+      27,
+      91,
+      49,
+      59,
+      49,
+      72,
+      27,
+      56,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_reverse_index": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      77,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "         Z",
+      "abcdefghij",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_reverse_index": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      77,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "         Z",
+      "abcdefghij",
+      "",
+      ""
+    ]
+  },
+  "pending_autowrap_off": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      63,
+      55,
+      108,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_autowrap_off": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      63,
+      55,
+      108,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_autowrap_on": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      63,
+      55,
+      104,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_autowrap_on": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      63,
+      55,
+      104,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_select_graphic_rendition": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      48,
+      109,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_select_graphic_rendition": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      48,
+      109,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_operating_system_command": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      93,
+      48,
+      59,
+      116,
+      105,
+      116,
+      108,
+      101,
+      7,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_operating_system_command": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      93,
+      48,
+      59,
+      116,
+      105,
+      116,
+      108,
+      101,
+      7,
+      90
+    ],
+    "cursorX": 10,
+    "cursorY": 0,
+    "rows": [
+      "abcdefghiZ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_full_reset": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      99,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "Z",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_full_reset": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      99,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 0,
+    "rows": [
+      "Z",
+      "",
+      "",
+      ""
+    ]
+  },
+  "pending_soft_reset": {
+    "cols": 10,
+    "bytes": [
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      33,
+      112,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "Z",
+      "",
+      ""
+    ]
+  },
+  "pending_nowrap_soft_reset": {
+    "cols": 10,
+    "bytes": [
+      27,
+      91,
+      63,
+      55,
+      108,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      27,
+      91,
+      33,
+      112,
+      90
+    ],
+    "cursorX": 1,
+    "cursorY": 1,
+    "rows": [
+      "abcdefghij",
+      "Z",
+      "",
+      ""
+    ]
+  }
+}

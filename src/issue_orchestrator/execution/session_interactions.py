@@ -17,8 +17,14 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _SHELL_COMMAND_SEPARATORS = frozenset({"&&", ";", "||"})
 
 
-def _normalize_terminal_text(text: str) -> str:
-    """Collapse terminal control noise into a stable search buffer."""
+def normalize_terminal_text(text: str) -> str:
+    """Collapse terminal control noise into a stable search buffer.
+
+    Public because the review-exchange kill-evidence discriminator matches the
+    same normalized shape (ANSI/OSC stripped, whitespace collapsed, casefolded)
+    against recording tails; both surfaces must agree on what a marker looks
+    like or the same TUI footer would match one and not the other.
+    """
     if not text:
         return ""
     text = _OSC_ESCAPE_RE.sub(" ", text)
@@ -71,7 +77,7 @@ class SessionInteractionHandler:
                 rule=rule,
                 markers=tuple(
                     marker
-                    for marker in (_normalize_terminal_text(item) for item in rule.required_substrings)
+                    for marker in (normalize_terminal_text(item) for item in rule.required_substrings)
                     if marker
                 ),
             )
@@ -90,7 +96,7 @@ class SessionInteractionHandler:
     def on_output(self, data: bytes | str) -> None:
         """Observe PTY output and fire matching rules."""
         text = data.decode("utf-8", errors="ignore") if isinstance(data, bytes) else data
-        normalized = _normalize_terminal_text(text)
+        normalized = normalize_terminal_text(text)
         if not normalized:
             return
 

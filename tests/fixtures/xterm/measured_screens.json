@@ -1,0 +1,153 @@
+{
+  "family_zwj": {
+    "cols": 30,
+    "text": "xxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦",
+    "cursorX": 27,
+    "cursorY": 0,
+    "rows": [
+      "xxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  "family_zwj_alone": {
+    "cols": 30,
+    "text": "👨‍👩‍👧‍👦",
+    "cursorX": 4,
+    "cursorY": 0,
+    "rows": [
+      "👨‍👩‍👧‍👦",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  "couple_zwj": {
+    "cols": 30,
+    "text": "👨‍👩",
+    "cursorX": 2,
+    "cursorY": 0,
+    "rows": [
+      "👨‍👩",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  "emoji_vs16": {
+    "cols": 30,
+    "text": "⚠️!",
+    "cursorX": 2,
+    "cursorY": 0,
+    "rows": [
+      "⚠️!",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  "plain_emoji": {
+    "cols": 30,
+    "text": "😀|",
+    "cursorX": 2,
+    "cursorY": 0,
+    "rows": [
+      "😀|",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  "cjk": {
+    "cols": 30,
+    "text": "東亜|",
+    "cursorX": 5,
+    "cursorY": 0,
+    "rows": [
+      "東亜|",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  "combining": {
+    "cols": 30,
+    "text": "éx",
+    "cursorX": 2,
+    "cursorY": 0,
+    "rows": [
+      "éx",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  "wrap_30": {
+    "cols": 30,
+    "text": "ab 👨‍👩‍👧‍👦tab to queue message",
+    "cursorX": 27,
+    "cursorY": 0,
+    "rows": [
+      "ab 👨‍👩‍👧‍👦tab to queue message",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  "wrap_30_split": {
+    "cols": 30,
+    "text": "xxxxxxxx👨‍👩‍👧‍👦tab to queue message",
+    "cursorX": 2,
+    "cursorY": 1,
+    "rows": [
+      "xxxxxxxx👨‍👩‍👧‍👦tab to queue messa",
+      "ge",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  "wide_wrap": {
+    "cols": 30,
+    "text": "界界界界界界界界界界界界界界界界",
+    "cursorX": 2,
+    "cursorY": 1,
+    "rows": [
+      "界界界界界界界界界界界界界界界",
+      "界",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  "narrow_wide": {
+    "cols": 1,
+    "text": "東亜",
+    "cursorX": 2,
+    "cursorY": 1,
+    "rows": [
+      "東",
+      "亜",
+      ""
+    ]
+  }
+}
