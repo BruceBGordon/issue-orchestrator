@@ -13,10 +13,8 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-from issue_orchestrator.infra.terminal_viewport import (
-    TerminalViewport,
-    replay_terminal_recording,
-)
+from issue_orchestrator.infra.terminal_replay import replay_terminal_recording
+from issue_orchestrator.infra.terminal_viewport import TerminalViewport
 
 
 def _viewport(rows: int = 6, cols: int = 40) -> TerminalViewport:

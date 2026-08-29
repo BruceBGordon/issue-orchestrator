@@ -48,7 +48,9 @@ _STAMP = "20260829T040506Z"
 # ---------------------------------------------------------------------------
 
 
-def _recording(path: Path, chunks: Iterable[bytes], *, resize: bool = True) -> Path:
+def _recording(
+    path: Path, chunks: Iterable[bytes], *, resize: bool = True, cols: int = 120
+) -> Path:
     rows: list[dict[str, object]] = []
     if resize:
         rows.append(
@@ -57,7 +59,7 @@ def _recording(path: Path, chunks: Iterable[bytes], *, resize: bool = True) -> P
                 "event_type": "resize",
                 "offset_ms": 0,
                 "rows": 40,
-                "cols": 120,
+                "cols": cols,
             }
         )
     for index, chunk in enumerate(chunks, start=1):
@@ -1435,3 +1437,50 @@ class TestControlCharactersCannotForgeAMarker:
         assert (
             classify_composer_state(path).state is not ComposerState.COMPOSER_STRANDED
         )
+
+
+class TestTerminalModesCannotForgeAMarker:
+    """#7141 round 6: DECAWM decides whether the footer gets a row of its own."""
+
+    def test_autowrap_off_defeats_a_stranded_verdict(self, tmp_path: Path) -> None:
+        """The reported reproduction: with autowrap off the footer never lands.
+
+        120 X's fill the row and park the cursor; every following character
+        overwrites the last cell, so no rendered row contains the marker. The
+        old model wrapped anyway and read a verdict off a row xterm never drew.
+        """
+        overflow = "\u001b[?7l" + "X" * 120 + "tab to queue message"
+        path = _recording(tmp_path / "nowrap.jsonl", (overflow.encode("utf-8"),),
+                          cols=120)
+
+        verdict = classify_composer_state(path)
+
+        assert verdict.state is not ComposerState.COMPOSER_STRANDED
+
+    def test_autowrap_on_still_finds_the_wrapped_footer(self, tmp_path: Path) -> None:
+        """Control: with wrapping on the footer does get a row, and is found."""
+        overflow = "X" * 120 + "tab to queue message"
+        path = _recording(tmp_path / "wrap.jsonl", (overflow.encode("utf-8"),),
+                          cols=120)
+
+        assert classify_composer_state(path).state is ComposerState.COMPOSER_STRANDED
+
+    def test_an_unmodelled_grid_mode_refuses_a_verdict(self, tmp_path: Path) -> None:
+        """Origin mode moves the grid and is not modelled, so no verdict."""
+        footer = "\u001b[?6h\u001b[34;2H\u001b[K  tab to queue message"
+        path = _recording(tmp_path / "decom.jsonl", (footer.encode("utf-8"),))
+
+        verdict = classify_composer_state(path)
+
+        assert verdict.state is ComposerState.UNDETERMINED
+        assert "?6h" in verdict.evidence_snippet
+
+    def test_the_modes_real_recordings_use_do_not_refuse(self, tmp_path: Path) -> None:
+        """Refusing on cursor-visibility or synchronised output would gut this."""
+        footer = (
+            "\u001b[?25l\u001b[?2026h\u001b[34;2H\u001b[K  tab to queue message"
+            "\u001b[?2026l\u001b[?25h"
+        )
+        path = _recording(tmp_path / "common.jsonl", (footer.encode("utf-8"),))
+
+        assert classify_composer_state(path).state is ComposerState.COMPOSER_STRANDED

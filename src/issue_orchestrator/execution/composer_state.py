@@ -31,7 +31,7 @@ from ..domain.exchange_kill_evidence import (
     ComposerStateVerdict,
     undetermined_composer_state,
 )
-from ..infra.terminal_viewport import RecordingReplay, replay_terminal_recording
+from ..infra.terminal_replay import RecordingReplay, replay_terminal_recording
 from .session_interactions import normalize_terminal_text
 
 # Replay budget. Measured against a real 21 MB Claude reviewer recording: a
@@ -135,6 +135,12 @@ def classify_composer_state(
         return undetermined_composer_state(
             "the replay was abandoned before the recording was fully applied; "
             "refusing to classify a half-reconstructed screen"
+        )
+    if replay.unmodelled_modes:
+        return undetermined_composer_state(
+            "the recording sets grid-affecting terminal modes this viewport "
+            f"does not model ({', '.join(replay.unmodelled_modes)}); refusing "
+            "to classify a screen it cannot reproduce"
         )
     if not replay.structurally_complete:
         return undetermined_composer_state(

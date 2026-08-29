@@ -14,6 +14,7 @@ that makes the discriminator's screen trustworthy.
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -238,3 +239,125 @@ class TestC1ControlsMatchTheBundledTerminal:
             view.feed(b"ab" + bytes([control]) + b"X")
 
             assert view.render().rows[:2] == ("ab", "  X")
+
+
+def _measured_autowrap() -> dict[str, dict[str, object]]:
+    return json.loads((_FIXTURES / "measured_autowrap.json").read_text(encoding="utf-8"))
+
+
+class TestAutowrapMatchesTheBundledTerminal:
+    """#7141 round 6: DECAWM decides whether a long line wraps.
+
+    Regenerate with ``node tools/measure_xterm_widths.js autowrap``. The probes
+    cover both states, every cursor motion that resolves or clears a pending
+    wrap, wide glyphs at the edge, and the reported 120-column reproduction.
+    """
+
+    @pytest.mark.parametrize("probe", sorted(_measured_autowrap()))
+    def test_screen_matches(self, probe: str) -> None:
+        expected = _measured_autowrap()[probe]
+        rows = expected["rows"]
+        assert isinstance(rows, list)
+        assert isinstance(expected["bytes"], list)
+        view = TerminalViewport(rows=len(rows), cols=int(expected["cols"]))
+
+        view.feed(bytes(expected["bytes"]))
+
+        rendered = view.render()
+        assert list(rendered.rows) == rows
+        assert rendered.cursor_col == expected["cursorX"]
+        assert rendered.cursor_row == expected["cursorY"]
+
+    def test_autowrap_off_keeps_a_long_line_on_one_row(self) -> None:
+        view = TerminalViewport(rows=3, cols=10)
+
+        view.feed(b"\x1b[?7labcdefghijkl")
+
+        assert view.render().rows[0] == "abcdefghil"
+        assert view.render().rows[1] == ""
+
+    def test_autowrap_on_is_the_default(self) -> None:
+        view = TerminalViewport(rows=3, cols=10)
+
+        view.feed(b"abcdefghijkl")
+
+        assert view.render().rows[:2] == ("abcdefghij", "kl")
+
+    def test_the_pending_wrap_position_survives_until_something_resolves_it(
+        self,
+    ) -> None:
+        """Filling the row parks the cursor past the edge rather than wrapping."""
+        view = TerminalViewport(rows=3, cols=10)
+
+        view.feed(b"abcdefghij")
+
+        assert view.render().cursor_col == 10
+        assert view.render().cursor_row == 0
+
+    def test_a_wide_glyph_that_cannot_fit_is_skipped_when_autowrap_is_off(
+        self,
+    ) -> None:
+        view = TerminalViewport(rows=3, cols=10)
+
+        view.feed("\x1b[?7labcdefghi\u6771".encode("utf-8"))
+
+        assert view.render().rows[0] == "abcdefghi"
+
+
+class TestUnmodelledModesAreRefused:
+    """The class behind the finding: modes that move the grid but are not modelled."""
+
+    @pytest.mark.parametrize("mode", ["?6h", "?3h", "?1049h", "?47h", "?45h", "?69h"])
+    def test_a_grid_affecting_mode_is_reported(self, mode: str) -> None:
+        view = TerminalViewport(rows=3, cols=10)
+
+        view.feed(f"\x1b[{mode}".encode("utf-8"))
+
+        assert view.unmodelled_modes == [mode]
+
+    @pytest.mark.parametrize("mode", [25, 2026, 2004, 1004, 2031, 1000, 1006, 12])
+    def test_a_measured_inert_mode_is_ignored(self, mode: int) -> None:
+        """These are what real recordings actually contain."""
+        view = TerminalViewport(rows=3, cols=10)
+
+        view.feed(f"\x1b[?{mode}h\x1b[?{mode}l".encode("utf-8"))
+
+        assert view.unmodelled_modes == []
+
+    def test_an_unknown_mode_is_refused_rather_than_assumed_harmless(self) -> None:
+        view = TerminalViewport(rows=3, cols=10)
+
+        view.feed(b"\x1b[?31337h")
+
+        assert view.unmodelled_modes == ["?31337h"]
+
+    def test_decawm_is_modelled_not_refused(self) -> None:
+        view = TerminalViewport(rows=3, cols=10)
+
+        view.feed(b"\x1b[?7l\x1b[?7h")
+
+        assert view.unmodelled_modes == []
+
+    def test_a_query_does_not_count_as_setting_a_mode(self) -> None:
+        view = TerminalViewport(rows=3, cols=10)
+
+        view.feed(b"\x1b[?6$p")
+
+        assert view.unmodelled_modes == []
+
+    def test_the_replay_surfaces_the_refusal(self, tmp_path: Path) -> None:
+        from issue_orchestrator.infra.terminal_replay import replay_terminal_recording
+
+        path = tmp_path / "modes.jsonl"
+        payload = base64.b64encode(b"\x1b[?6htext").decode("ascii")
+        path.write_text(
+            json.dumps(
+                {"schema_version": 1, "event_type": "output", "offset_ms": 0,
+                 "data_b64": payload},
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        assert replay_terminal_recording(path).unmodelled_modes == ("?6h",)

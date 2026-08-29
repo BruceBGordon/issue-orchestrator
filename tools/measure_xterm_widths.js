@@ -8,6 +8,7 @@
 //   node tools/measure_xterm_widths.js widths      # advance per codepoint
 //   node tools/measure_xterm_widths.js screens     # cursor + rows per probe
 //   node tools/measure_xterm_widths.js controls    # C1 (U+0080-U+009F) behaviour
+//   node tools/measure_xterm_widths.js autowrap    # DECAWM on/off + pending wrap
 //
 // Emit-only: it prints JSON for a human (or a test author) to read. Nothing
 // imports it at runtime.
@@ -154,8 +155,83 @@ async function measureControls() {
     console.log(JSON.stringify(out, null, 2));
 }
 
+// DECAWM (CSI ?7 h/l) decides whether a long line wraps, and the last-column
+// "pending wrap" position is a notorious divergence spot between terminals —
+// so it is measured, in both states, against the cursor motions that resolve
+// or clear a pending wrap, and against wide glyphs at the edge.
+function autowrapProbes() {
+    const ESC = '\u001b';
+    const OFF = `${ESC}[?7l`;
+    const ON = `${ESC}[?7h`;
+    const fill = 'abcdefghij'; // exactly 10 columns
+    const texts = {
+        awm_on_overflow: [10, 3, 'abcdefghijkl'],
+        awm_off_overflow: [10, 3, `${OFF}abcdefghijkl`],
+        awm_on_pending_then_cr: [10, 3, `${fill}\rZ`],
+        awm_on_pending_then_bs: [10, 3, `${fill}\bZ`],
+        awm_on_pending_then_cuf: [10, 3, `${fill}${ESC}[CZ`],
+        awm_on_pending_then_lf: [10, 3, `${fill}\nZ`],
+        awm_on_pending_then_cup: [10, 3, `${fill}${ESC}[1;1HZ`],
+        awm_on_pending_then_el: [10, 3, `${fill}${ESC}[KZ`],
+        awm_off_pending_then_cr: [10, 3, `${OFF}${fill}\rZ`],
+        awm_off_pending_then_lf: [10, 3, `${OFF}${fill}\nZ`],
+        awm_off_then_on_midrow: [10, 3, `${OFF}abcdefghijkl${ON}MN`],
+        awm_on_then_off_midrow: [10, 3, `abcdefgh${OFF}ijkl`],
+        awm_on_wide_at_edge: [10, 3, 'abcdefghi\u6771'],
+        awm_off_wide_at_edge: [10, 3, `${OFF}abcdefghi\u6771`],
+        awm_off_wide_fits_then_narrow: [10, 3, `${OFF}abcdefgh\u6771Z`],
+        awm_off_wide_overflow_run: [10, 3, `${OFF}abcdefghi\u6771\u4e9cQ`],
+        awm_on_exact_fill_then_more: [10, 3, `${fill}XY`],
+        awm_off_exact_fill_then_more: [10, 3, `${OFF}${fill}XY`],
+        // The reported reproduction, at the width it was reported with.
+        awm_off_footer_does_not_get_its_own_row: [
+            120, 3, `${OFF}${'X'.repeat(120)}tab to queue message`,
+        ],
+        awm_on_footer_wraps_to_row_one: [
+            120, 3, `${'X'.repeat(120)}tab to queue message`,
+        ],
+        awm_off_scroll_region_interaction: [
+            10, 4, `${ESC}[2;3r${OFF}r0\r\nr1xxxxxxxxxxxx`,
+        ],
+        // Overwriting either half of a wide glyph blanks the other half, but
+        // only when the write starts a fresh print run.
+        wide_overwrite_second_half: [8, 2, `ab\u6771cd${ESC}[1;4HZ`],
+        wide_overwrite_first_half: [8, 2, `ab\u6771cd${ESC}[1;3HZ`],
+        wide_overwrite_same_run: [8, 2, `ab\u6771\bZ`],
+        decstbm_homes_the_cursor: [10, 4, `${ESC}[2;3rHOME`],
+    };
+    const encoder = new TextEncoder();
+    const probes = {};
+    for (const [name, [cols, rows, text]] of Object.entries(texts)) {
+        probes[name] = { cols, rows, bytes: Array.from(encoder.encode(text)) };
+    }
+    return probes;
+}
+
+async function measureAutowrap() {
+    const out = {};
+    for (const [name, probe] of Object.entries(autowrapProbes())) {
+        const term = new Terminal({ cols: probe.cols, rows: probe.rows, allowProposedApi: true });
+        await write(term, new Uint8Array(probe.bytes));
+        const buffer = term.buffer.active;
+        out[name] = {
+            cols: probe.cols,
+            bytes: probe.bytes,
+            cursorX: buffer.cursorX,
+            cursorY: buffer.cursorY,
+            rows: readViewport(buffer, probe.rows),
+        };
+    }
+    console.log(JSON.stringify(out, null, 2));
+}
+
 const mode = process.argv[2] || 'screens';
-const MODES = { widths: measureWidths, screens: measureScreens, controls: measureControls };
+const MODES = {
+    widths: measureWidths,
+    screens: measureScreens,
+    controls: measureControls,
+    autowrap: measureAutowrap,
+};
 (MODES[mode] || measureScreens)().catch((error) => {
     console.error(error);
     process.exit(1);

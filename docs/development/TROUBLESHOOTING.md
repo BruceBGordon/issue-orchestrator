@@ -200,8 +200,10 @@ is one cell and a ZWJ family is four — so the screen a verdict rests on is the
 screen the session viewer draws. Regenerate the measurements behind that with
 `node tools/measure_xterm_widths.js`. Anything that makes the
 reconstruction untrustworthy — a half-written recording, an unparseable row, an
-undecodable payload, an implausible `resize`, or a replay the capture budget cut
-short — yields `undetermined` rather than a guess. `matched_marker` names
+undecodable payload, an implausible `resize`, a replay the capture budget cut
+short, or a grid-affecting terminal mode the viewport does not model — yields
+`undetermined` rather than a guess. Autowrap (DECAWM) *is* modelled, because
+TUIs toggle it constantly and a footer's row depends on it. `matched_marker` names
 the affordance that decided it and `evidence_snippet` is the screen row it came
 from — check them before acting on the classification. `replayed_from_start:
 false` means only a trailing window of the recording was replayed; the verdict

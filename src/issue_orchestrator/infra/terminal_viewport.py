@@ -38,25 +38,43 @@ excluded by construction.
 
 from __future__ import annotations
 
-import base64
-import binascii
-import json
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Callable, ClassVar
+from typing import Callable, ClassVar
 
 from .xterm_widths import EMPTY_CLUSTER, cluster_advance
-from .terminal_recording import (
-    MAX_TERMINAL_COLS,
-    MAX_TERMINAL_ROWS,
-    screen_dimension,
-)
+from .terminal_recording import MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS
 
 DEFAULT_ROWS = 40
 DEFAULT_COLS = 120
 _MAX_ROWS = MAX_TERMINAL_ROWS
 _MAX_COLS = MAX_TERMINAL_COLS
 _BLANK = " "
+#: DECAWM. Modelled, because it decides whether a long line wraps.
+_DECAWM = 7
+#: Private modes measured to leave the character grid untouched. Anything not
+#: listed is refused rather than assumed harmless — see
+#: ``TerminalViewport._dispatch_private_mode``. Extend it by measuring, with
+#: ``tools/measure_xterm_widths.js modes``.
+_IGNORED_PRIVATE_MODES: frozenset[int] = frozenset(
+    {
+        1,     # DECCKM, cursor key format
+        5,     # DECSCNM, reverse video
+        8,     # DECARM, auto-repeat
+        9,     # X10 mouse reporting
+        12,    # cursor blink
+        25,    # DECTCEM, cursor visibility
+        40,    # allow 80/132 switching
+        66,    # DECNKM, numeric keypad
+        1000,  # VT200 mouse reporting
+        1002,  # button-event mouse tracking
+        1004,  # focus reporting
+        1006,  # SGR mouse encoding
+        2004,  # bracketed paste
+        2026,  # synchronised output
+        2031,  # colour-scheme change notification
+    }
+)
+
 _C1_START = 0x80
 _C1_END = 0x9F
 _C1_IND = 0x84
@@ -102,6 +120,14 @@ class TerminalViewport:
         self._rows = min(rows, _MAX_ROWS)
         self._cols = min(cols, _MAX_COLS)
         self._grid: list[list[str]] = self._blank_grid()
+        # Per-cell width, the way the terminal stores it: 2 marks a wide glyph
+        # that owns the following column, 0 marks that follower. Rendering
+        # skips what a wide owner covers, which is why a character written into
+        # a follower can sit in the buffer and never appear on screen.
+        self._widths: list[list[int]] = [[1] * self._cols for _ in range(self._rows)]
+        # A wide owner immediately left of the cursor is blanked once per print
+        # run, not once per character — measured.
+        self._run_start = True
         self._written: list[bool] = [False] * self._rows
         # Cells actually touched on each row. The terminal trims *untouched*
         # trailing cells but keeps a space someone wrote, so a plain rstrip()
@@ -111,6 +137,9 @@ class TerminalViewport:
         self._col = 0
         self._saved: tuple[int, int] = (0, 0)
         self._cluster = EMPTY_CLUSTER
+        self._autowrap = True
+        #: Grid-affecting private modes this model does not reproduce.
+        self.unmodelled_modes: list[str] = []
         self._scroll_top = 0
         self._scroll_bottom = self._rows - 1
         self._fed = 0
@@ -125,13 +154,17 @@ class TerminalViewport:
         rows = min(rows, _MAX_ROWS)
         cols = min(cols, _MAX_COLS)
         old_grid, old_written, old_extent = self._grid, self._written, self._extent
+        old_widths = self._widths
         self._rows, self._cols = rows, cols
         self._grid = self._blank_grid()
+        self._widths = [[1] * cols for _ in range(rows)]
         self._written = [False] * rows
         self._extent = [0] * rows
         for index in range(min(len(old_grid), rows)):
             row = old_grid[index][:cols]
             self._grid[index][: len(row)] = row
+            widths = old_widths[index][:cols]
+            self._widths[index][: len(widths)] = widths
             self._written[index] = old_written[index]
             self._extent[index] = min(old_extent[index], cols)
         self._scroll_top = 0
@@ -161,6 +194,7 @@ class TerminalViewport:
                 # Measured: any escape sequence breaks the cluster too, even
                 # one that does not move the cursor.
                 self._cluster = EMPTY_CLUSTER
+                self._run_start = True
                 index += consumed
                 continue
             if byte >= 0x80:
@@ -178,6 +212,7 @@ class TerminalViewport:
                 codepoint = ord(char)
                 if _C1_START <= codepoint <= _C1_END:
                     self._cluster = EMPTY_CLUSTER
+                    self._run_start = True
                     resumed = self._apply_c1(codepoint, buffer, index + consumed)
                     if resumed is None:
                         self._pending = buffer[index:]
@@ -192,6 +227,7 @@ class TerminalViewport:
                 # grapheme cluster, so a combining mark after CR/LF/BS takes a
                 # cell of its own instead of joining what came before.
                 self._cluster = EMPTY_CLUSTER
+                self._run_start = True
                 self._apply_control(byte)
                 index += 1
                 continue
@@ -201,7 +237,8 @@ class TerminalViewport:
     def render(self) -> RenderedScreen:
         """Freeze the current screen. Non-mutating; safe to call repeatedly."""
         rows = tuple(
-            "".join(row[:extent]) for row, extent in zip(self._grid, self._extent)
+            _render_row(row, widths, extent)
+            for row, widths, extent in zip(self._grid, self._widths, self._extent)
         )
         written = tuple(
             text for text, was_written in zip(rows, self._written) if was_written
@@ -228,7 +265,10 @@ class TerminalViewport:
             self._line_feed()
             return
         if byte == 0x08:  # BS
-            self._col = max(0, self._col - 1)
+            # Measured: a cursor parked past the right edge is pulled back onto
+            # the last column first, so one backspace from there lands two
+            # visual columns left of where it was written.
+            self._col = max(0, min(self._col, self._cols - 1) - 1)
             return
         if byte == 0x09:  # HT
             self._col = min(self._cols - 1, (self._col // _TAB_WIDTH + 1) * _TAB_WIDTH)
@@ -244,25 +284,51 @@ class TerminalViewport:
         if cells <= 0:
             self._attach_combining(char)
             return
-        # Wrap only when there is somewhere to wrap from: a glyph wider than
-        # the whole row still gets drawn where it stands, and the cursor is
-        # allowed past the right edge, because that is what xterm does on a
-        # screen too narrow for the glyph.
-        if self._col + cells > self._cols and self._col > 0:
-            self._col = 0
-            self._line_feed()
+        if self._col + cells > self._cols:
+            if not self._autowrap:
+                # Measured with DECAWM off: a wide glyph that will not fit is
+                # skipped entirely, and a narrow one overwrites the last cell
+                # while the cursor stays parked past the edge.
+                if cells > 1:
+                    return
+                self._col = self._cols - 1
+            elif self._col > 0:
+                # Wrap only when there is somewhere to wrap from: a glyph wider
+                # than the whole row still gets drawn where it stands, and the
+                # cursor is allowed past the right edge, because that is what
+                # xterm does on a screen too narrow for the glyph.
+                self._col = 0
+                self._line_feed()
         if self._col < self._cols:
+            self._break_wide_pair_at(self._col)
             self._grid[self._row][self._col] = char
-            # A wide glyph owns its trailing cell too; the empty string keeps
-            # the rendered row the right length without a second glyph.
-            for offset in range(1, cells):
-                if self._col + offset < self._cols:
-                    self._grid[self._row][self._col + offset] = ""
+            self._widths[self._row][self._col] = cells
+            # A wide glyph owns the next column; the follower carries width 0
+            # so rendering knows to skip it.
+            if cells > 1 and self._col + 1 < self._cols:
+                self._grid[self._row][self._col + 1] = _BLANK
+                self._widths[self._row][self._col + 1] = 0
             self._written[self._row] = True
             self._extent[self._row] = max(
                 self._extent[self._row], min(self._col + cells, self._cols)
             )
         self._col += cells
+
+    def _break_wide_pair_at(self, column: int) -> None:
+        """Split any wide glyph this write lands on, as the terminal does.
+
+        Overwriting either half of a wide glyph leaves a blank where the other
+        half was — measured mid-row. The owner immediately to the left is only
+        repaired at the start of a print run, which is why a character that
+        overflows into a follower mid-run stays invisible instead.
+        """
+        if self._run_start and column > 0 and self._widths[self._row][column - 1] == 2:
+            self._grid[self._row][column - 1] = _BLANK
+            self._widths[self._row][column - 1] = 1
+        self._run_start = False
+        if self._widths[self._row][column] == 2 and column + 1 < self._cols:
+            self._grid[self._row][column + 1] = _BLANK
+            self._widths[self._row][column + 1] = 1
 
     def _attach_combining(self, char: str) -> None:
         """Decorate the last written cell rather than consuming a new one."""
@@ -277,6 +343,9 @@ class TerminalViewport:
         self._extent[self._row] = max(self._extent[self._row], column + 1)
 
     def _line_feed(self) -> None:
+        # Measured: indexing a line pulls a cursor parked past the right edge
+        # (the pending-wrap position) back onto the last column.
+        self._col = min(self._col, self._cols - 1)
         if self._row == self._scroll_bottom:
             self._scroll_up(1)
             return
@@ -286,9 +355,11 @@ class TerminalViewport:
         top, bottom = self._scroll_top, self._scroll_bottom
         for _ in range(count):
             del self._grid[top]
+            del self._widths[top]
             del self._written[top]
             del self._extent[top]
             self._grid.insert(bottom, [_BLANK] * self._cols)
+            self._widths.insert(bottom, [1] * self._cols)
             # A row scrolled into view is blank *because this replay scrolled
             # it*, so it is authoritative, not unknown history.
             self._written.insert(bottom, True)
@@ -362,8 +433,7 @@ class TerminalViewport:
 
     def _dispatch_csi(self, final: str, params_raw: str) -> None:
         if params_raw.startswith("?"):
-            # Private modes (cursor visibility, bracketed paste, synchronised
-            # output). None of them change the character grid.
+            self._dispatch_private_mode(final, params_raw[1:])
             return
         params = _numeric_params(params_raw)
         handler = self._CSI_HANDLERS.get(final)
@@ -371,8 +441,46 @@ class TerminalViewport:
             return
         handler(self, params)
 
+    def _dispatch_private_mode(self, final: str, params_raw: str) -> None:
+        """Apply, ignore, or refuse a private mode.
+
+        The old blanket assumption that ``CSI ?`` never touches the grid was
+        wrong: DECAWM decides whether a long line wraps, so ignoring it drew a
+        footer on a row the terminal does not have (#7141 round 6). Rather than
+        fix that one mode, the set is now enumerated three ways —
+
+        modelled
+            DECAWM, because real TUIs toggle it constantly and refusing on it
+            would leave the discriminator useless.
+        ignored
+            Modes measured to leave the grid untouched (cursor visibility,
+            synchronised output, mouse and paste reporting, ...).
+        refused
+            Everything else, including modes known to move the grid
+            (DECCOLM, DECOM, the alternate buffers) and anything simply not
+            measured. A refusal makes the recording untrustworthy, which
+            surfaces as UNDETERMINED rather than a verdict read off a screen
+            this model did not reproduce.
+        """
+        if final not in ("h", "l"):
+            # A query such as DECRQM reports state; it never sets any.
+            return
+        enable = final == "h"
+        for raw in params_raw.split(";"):
+            stripped = raw.strip()
+            if not stripped.isdigit():
+                continue
+            mode = int(stripped)
+            if mode == _DECAWM:
+                self._autowrap = enable
+                continue
+            if mode in _IGNORED_PRIVATE_MODES:
+                continue
+            self.unmodelled_modes.append(f"?{mode}{final}")
+
     def _reset(self) -> None:
         self._grid = self._blank_grid()
+        self._widths = [[1] * self._cols for _ in range(self._rows)]
         self._written = [True] * self._rows
         self._extent = [0] * self._rows
         self._row = self._col = 0
@@ -410,6 +518,7 @@ class TerminalViewport:
         start, stop = self._erase_span(mode)
         for column in range(start, stop):
             self._grid[self._row][column] = _BLANK
+            self._widths[self._row][column] = 1
         self._written[self._row] = True
         if stop >= self._cols:
             # Erasing to the end of the line untouches those cells again.
@@ -437,6 +546,7 @@ class TerminalViewport:
     def _blank_rows(self, indexes: range) -> None:
         for index in indexes:
             self._grid[index] = [_BLANK] * self._cols
+            self._widths[index] = [1] * self._cols
             self._written[index] = True
             self._extent[index] = 0
 
@@ -446,7 +556,10 @@ class TerminalViewport:
         top_index = max(0, min(self._rows - 1, top - 1))
         bottom_index = max(top_index, min(self._rows - 1, bottom - 1))
         self._scroll_top, self._scroll_bottom = top_index, bottom_index
-        self._row, self._col = top_index, 0
+        # Measured: with origin mode off — the only mode this viewport models,
+        # DECOM being refused — setting the region homes to the screen origin,
+        # not to the top of the region.
+        self._row, self._col = 0, 0
 
     def _scroll_up_csi(self, params: list[int]) -> None:
         self._scroll_up(_amount(params))
@@ -455,9 +568,11 @@ class TerminalViewport:
         top, bottom = self._scroll_top, self._scroll_bottom
         for _ in range(_amount(params)):
             del self._grid[bottom]
+            del self._widths[bottom]
             del self._written[bottom]
             del self._extent[bottom]
             self._grid.insert(top, [_BLANK] * self._cols)
+            self._widths.insert(top, [1] * self._cols)
             self._written.insert(top, True)
             self._extent.insert(top, 0)
 
@@ -478,6 +593,25 @@ class TerminalViewport:
         "S": _scroll_up_csi,
         "T": _scroll_down_csi,
     }
+
+
+def _render_row(cells: list[str], widths: list[int], extent: int) -> str:
+    """Render one row the way the terminal presents it.
+
+    A wide glyph covers the following column, so whatever sits in that
+    follower cell is never shown — which is exactly how a character that
+    overflowed into it stays invisible.
+    """
+    rendered: list[str] = []
+    column = 0
+    while column < extent:
+        width = widths[column]
+        if width == 0:
+            column += 1
+            continue
+        rendered.append(cells[column] or _BLANK)
+        column += max(1, width)
+    return "".join(rendered)
 
 
 def _amount(params: list[int]) -> int:
@@ -563,150 +697,3 @@ def _scan_string_sequence(buffer: bytes, payload: int) -> int | None:
             return None
         index += 1
     return None
-
-
-# ---------------------------------------------------------------------------
-# Recording replay
-# ---------------------------------------------------------------------------
-
-
-DEFAULT_REPLAY_MAX_BYTES = 8 * 1024 * 1024
-DEFAULT_REPLAY_MAX_EVENTS = 200_000
-
-
-@dataclass(frozen=True)
-class RecordingReplay:
-    """A viewport reconstructed from a terminal recording, plus its caveats.
-
-    ``replayed_from_start`` and ``structurally_complete`` are the honesty
-    flags. A caller that must not guess refuses to draw a conclusion unless the
-    stream it replayed was structurally sound, and reads only
-    ``screen.written_rows`` so a partial window cannot leak unknown history.
-    """
-
-    screen: RenderedScreen
-    events_applied: int
-    rows_scanned: int
-    replayed_from_start: bool
-    structurally_complete: bool
-    abandoned: bool = False
-
-
-def replay_terminal_recording(
-    path: Path,
-    *,
-    max_bytes: int = DEFAULT_REPLAY_MAX_BYTES,
-    max_events: int = DEFAULT_REPLAY_MAX_EVENTS,
-    abort: Callable[[], bool] | None = None,
-) -> RecordingReplay:
-    """Reconstruct the final viewport of a ``terminal-recording.jsonl``.
-
-    Replays from the beginning when the file fits in ``max_bytes``; otherwise
-    replays a trailing window of that size, which a repainting TUI refreshes
-    many times over. Either way the result carries the flags a caller needs to
-    decide whether the reconstruction is trustworthy enough to act on.
-
-    ``structurally_complete`` is False when the file ends mid-row (a recording
-    still open for append), when any scanned row fails to parse, or when a row
-    carries an undecodable payload — all of which mean the replay saw something
-    other than the exact byte stream the agent emitted.
-
-    ``abort`` lets a caller working to a deadline stop the replay between
-    events. An abandoned replay sets both ``abandoned`` and (because a
-    half-applied stream is exactly the kind of hole a screen clear hides)
-    ``structurally_complete=False``, so no verdict can rest on it.
-    """
-    blob, replayed_from_start = _read_window(path, max_bytes=max_bytes)
-    complete = blob.endswith(b"\n") or not blob
-    rows = blob.split(b"\n")
-    if not replayed_from_start and rows:
-        # The window almost certainly opens mid-row; that fragment is not a
-        # parse failure, it is simply outside the window.
-        rows = rows[1:]
-    viewport = TerminalViewport()
-    applied = 0
-    scanned = 0
-    abandoned = False
-    for raw_row in rows:
-        if not raw_row.strip():
-            continue
-        if abort is not None and abort():
-            abandoned = True
-            complete = False
-            break
-        scanned += 1
-        if scanned > max_events:
-            complete = False
-            break
-        event = _parse_row(raw_row)
-        if event is None:
-            complete = False
-            continue
-        outcome = _apply_event(viewport, event)
-        applied += outcome.applied
-        if not outcome.sound:
-            complete = False
-    return RecordingReplay(
-        screen=viewport.render(),
-        events_applied=applied,
-        rows_scanned=scanned,
-        replayed_from_start=replayed_from_start,
-        structurally_complete=complete,
-        abandoned=abandoned,
-    )
-
-
-def _read_window(path: Path, *, max_bytes: int) -> tuple[bytes, bool]:
-    with path.open("rb") as handle:
-        handle.seek(0, 2)
-        size = handle.tell()
-        start = max(0, size - max_bytes)
-        handle.seek(start)
-        return handle.read(size - start), start == 0
-
-
-def _parse_row(raw_row: bytes) -> dict[str, Any] | None:
-    try:
-        event = json.loads(raw_row)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    return event if isinstance(event, dict) else None
-
-
-@dataclass(frozen=True)
-class _EventOutcome:
-    """Whether an event reached the screen, and whether it was trustworthy.
-
-    ``sound`` is False when an event that *should* have carried PTY bytes could
-    not be decoded. Skipping it quietly would leave a hole in the reconstructed
-    stream while the replay still claimed to be complete — and a hole is
-    exactly where a screen clear hides (#7141 round 2).
-    """
-
-    applied: int
-    sound: bool
-
-
-_SOUND_NO_OP = _EventOutcome(applied=0, sound=True)
-
-
-def _apply_event(viewport: TerminalViewport, event: dict[str, Any]) -> _EventOutcome:
-    kind = event.get("event_type")
-    if kind == "resize":
-        rows = screen_dimension(event.get("rows"), limit=_MAX_ROWS)
-        cols = screen_dimension(event.get("cols"), limit=_MAX_COLS)
-        if rows is None or cols is None:
-            return _EventOutcome(applied=0, sound=False)
-        viewport.resize(rows=rows, cols=cols)
-        return _SOUND_NO_OP
-    if kind != "output":
-        return _SOUND_NO_OP
-    encoded = event.get("data_b64")
-    if not isinstance(encoded, str):
-        return _EventOutcome(applied=0, sound=False)
-    try:
-        payload = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError):
-        return _EventOutcome(applied=0, sound=False)
-    viewport.feed(payload)
-    return _EventOutcome(applied=1, sound=True)
