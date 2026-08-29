@@ -104,6 +104,18 @@ def _locate_chirp() -> Path | None:
     return None
 
 
+def inside_scheduler_job() -> bool:
+    """Whether this process runs inside a chirp-capable scheduler job.
+
+    The distinction matters at composition (A3, #7134 round two):
+    outside a job, an absent transport is ordinary and inert is
+    correct; INSIDE a job, an unresolvable transport must be fatal —
+    a successor process cannot perform the acknowledged opening False
+    that a predecessor's possible True demands, so it must not run.
+    """
+    return CHIRP_CONFIG_ENVIRONMENT_VARIABLE in os.environ
+
+
 def resolve_lane_yield_transport() -> ChirpYieldTransport | None:
     """The chirp transport inside a chirp-capable job; None elsewhere.
 
@@ -113,7 +125,7 @@ def resolve_lane_yield_transport() -> ChirpYieldTransport | None:
     about — and the owner's opening lower() will then be inert-safe
     only because the submit description already pinned False.
     """
-    if CHIRP_CONFIG_ENVIRONMENT_VARIABLE not in os.environ:
+    if not inside_scheduler_job():
         return None
     chirp = _locate_chirp()
     if chirp is None:

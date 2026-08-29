@@ -114,14 +114,39 @@ def test_xdist_workers_compose_inert_and_never_touch_the_transport(
     assert transport.published == []
 
 
-def test_no_transport_resolves_to_inert(
+def test_no_transport_outside_a_job_resolves_to_inert(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """A developer's local pytest: no job ad exists, inert is correct
+    (A3, #7134 round two — the ONLY legitimate inert case)."""
     monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
     monkeypatch.setattr(
         plugin_module, "resolve_lane_yield_transport", lambda: None
     )
+    monkeypatch.setattr(plugin_module, "inside_scheduler_job", lambda: False)
     exit_code = _run_inner_pytest(
         tmp_path, "def test_one():\n    pass\n", "inert"
     )
     assert exit_code == 0
+
+
+def test_no_transport_inside_a_job_is_fatal_at_configure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A3 (#7134 round two): inside a scheduler job, an unresolvable
+    transport means the acknowledged opening False is impossible — a
+    predecessor's possible True cannot be acknowledged away, so the
+    lane must refuse to run, visibly."""
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setattr(
+        plugin_module, "resolve_lane_yield_transport", lambda: None
+    )
+    monkeypatch.setattr(plugin_module, "inside_scheduler_job", lambda: True)
+    exit_code = _run_inner_pytest(
+        tmp_path, "def test_never_runs():\n    pass\n", "injob"
+    )
+    assert exit_code != 0
+    captured = capsys.readouterr()
+    assert "refuses to run" in captured.out + captured.err

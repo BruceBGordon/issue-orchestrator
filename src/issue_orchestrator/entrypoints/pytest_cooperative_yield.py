@@ -39,8 +39,12 @@ from typing import Generator, Union
 
 import pytest
 
-from ..adapters.condor.chirp_yield_signal import resolve_lane_yield_transport
+from ..adapters.condor.chirp_yield_signal import (
+    inside_scheduler_job,
+    resolve_lane_yield_transport,
+)
 from ..execution.lane_yield import AcknowledgedLaneYield, InertLaneYield
+from ..ports.lane_yield_signal import LaneYieldError
 
 _XDIST_WORKER_ENVIRONMENT_VARIABLE = "PYTEST_XDIST_WORKER"
 _LaneYield = Union[AcknowledgedLaneYield, InertLaneYield]
@@ -49,11 +53,23 @@ _YIELD_KEY = pytest.StashKey[_LaneYield]()
 
 def _compose_lane_yield() -> _LaneYield:
     if _XDIST_WORKER_ENVIRONMENT_VARIABLE in os.environ:
+        # Workers never publish (they share one job ad); under xdist
+        # inside a job, the CONTROLLER process — which has no worker
+        # marker — still owns the acknowledged opening/closing False.
         return InertLaneYield()
     transport = resolve_lane_yield_transport()
-    if transport is None:
-        return InertLaneYield()
-    return AcknowledgedLaneYield(transport)
+    if transport is not None:
+        return AcknowledgedLaneYield(transport)
+    if inside_scheduler_job():
+        # A3 (#7134 round two): inert inside a job would skip the
+        # acknowledged opening False that a predecessor's possible
+        # True demands — this lane must not run at all.
+        raise LaneYieldError(
+            "cooperative lane is inside a scheduler job but its yield "
+            "transport cannot be resolved; the acknowledged opening "
+            "False is impossible, so the lane refuses to run"
+        )
+    return InertLaneYield()
 
 
 def pytest_configure(config: pytest.Config) -> None:
