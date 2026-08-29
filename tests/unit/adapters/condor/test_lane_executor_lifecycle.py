@@ -5,6 +5,7 @@ Hermetic: scheduler tools are shell stubs, no pool required.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import sys
 import tempfile
@@ -219,29 +220,89 @@ def test_an_unexpected_job_identifier_is_never_turned_into_a_read_path(
         shutil.rmtree(directory, ignore_errors=True)
 
 
-class _InterruptOnFirstWait:
+class _WaitsThatRaise:
     """Stands in for the executor module's ``time``.
 
-    A Ctrl-C lands in whatever the executor is waiting on, which for a
-    lane that has not concluded is the poll loop's sleep. Raising there
-    is the interrupt, delivered deterministically — an interval timer
-    would race the submission it has to land after, and widening the
-    timer until the race is rare is the flaky-test band-aid, not a
-    deterministic test. Only the FIRST wait is interrupted, so the
-    collection that follows still gets a working clock.
+    An interrupt lands in whatever the executor is waiting on: the poll
+    loop for a lane that has not concluded, then the collection's own
+    file-wait during cleanup. Raising from the Nth wait delivers one
+    there deterministically — an interval timer races the submission it
+    has to land after, and widening the timer until the race is rare is
+    the flaky-test band-aid, not a deterministic test. Waits past the
+    configured ones behave normally, so whatever follows still has a
+    working clock.
     """
 
-    def __init__(self) -> None:
-        self.interrupted = False
+    def __init__(self, *from_each_wait: BaseException) -> None:
+        self._queued = list(from_each_wait)
 
     def sleep(self, seconds: float) -> None:
-        if not self.interrupted:
-            self.interrupted = True
-            raise KeyboardInterrupt()
+        if self._queued:
+            raise self._queued.pop(0)
         time.sleep(seconds)
 
     def monotonic(self) -> float:
         return time.monotonic()
+
+
+_PENDING_EVENT_LOG = (
+    "000 (007.000.000) 2026-08-29 12:00:00 Job submitted from host: <127.0.0.1>\n"
+    "...\n"
+    "001 (007.000.000) 2026-08-29 12:00:01 Job executing on host: <127.0.0.1>\n"
+    "...\n"
+)
+_CANCELLED_CLASSAD = 'ExitCode = undefined\nRemoveReason = "via condor_rm"\n'
+# An order of magnitude beyond the cancellation budget. The separation
+# is deliberately large in BOTH directions: a correct implementation
+# never waits for this at all (the lookup is killed when the budget
+# ends), so the passing test stays ~2s, while a bound that does not
+# span the lookup is off by twenty seconds rather than by a margin that
+# has to compete with subprocess-spawn jitter on a loaded parallel
+# suite. Widening the tolerance instead would have been the band-aid.
+_SLOW_LOOKUP_SECONDS = 20.0
+
+
+def _cancellable_tools(
+    tmp_path: Path,
+    *,
+    history: Path,
+    removal_writes_classad: bool,
+    lookup_body: str | None = None,
+) -> CondorTools:
+    """A pool whose job never concludes on its own.
+
+    ``removal_writes_classad`` makes condor_rm play the schedd, dropping
+    the ClassAd as the job leaves the queue; without it the collection
+    reaches its own file-wait, which is where a SECOND interrupt lands.
+    """
+    binaries = tmp_path / "bin"
+    removal = "#!/bin/sh\nexit 0\n"
+    if removal_writes_classad:
+        removal = (
+            "#!/bin/sh\n"
+            f"cat > '{history}/history.{_JOB_ID}' <<'AD'\n"
+            f"{_CANCELLED_CLASSAD}AD\n"
+        )
+    _write_stubs(
+        binaries,
+        {
+            "condor_submit": (
+                "#!/bin/sh\n"
+                'log=$(awk -F" = " \'/^log/{print $2}\' "$2")\n'
+                f"cat > \"$log\" <<'EVENTS'\n{_PENDING_EVENT_LOG}EVENTS\n"
+                f"echo '{_JOB_ID}'\n"
+            ),
+            "condor_rm": removal,
+            "condor_q": "#!/bin/sh\nexit 0\n",
+            "condor_config_val": lookup_body or f"#!/bin/sh\necho '{history}'\n",
+        },
+    )
+    return CondorTools(
+        submit=binaries / "condor_submit",
+        remove=binaries / "condor_rm",
+        query=binaries / "condor_q",
+        config_query=binaries / "condor_config_val",
+    )
 
 
 def test_a_cancelled_lane_also_collects_its_per_job_accounting(
@@ -259,43 +320,15 @@ def test_a_cancelled_lane_also_collects_its_per_job_accounting(
     """
     history = tmp_path / "per-job-history"
     history.mkdir()
-    classad = "ExitCode = undefined\nRemoveReason = \"via condor_rm\"\n"
-    binaries = tmp_path / "bin"
-    pending_log = (
-        "000 (007.000.000) 2026-08-29 12:00:00 Job submitted from host: <127.0.0.1>\n"
-        "...\n"
-        "001 (007.000.000) 2026-08-29 12:00:01 Job executing on host: <127.0.0.1>\n"
-        "...\n"
+    tools = _cancellable_tools(
+        tmp_path, history=history, removal_writes_classad=True
     )
-    _write_stubs(
-        binaries,
-        {
-            "condor_submit": (
-                "#!/bin/sh\n"
-                'log=$(awk -F" = " \'/^log/{print $2}\' "$2")\n'
-                f"cat > \"$log\" <<'EVENTS'\n{pending_log}EVENTS\n"
-                f"echo '{_JOB_ID}'\n"
-            ),
-            # The schedd writes the per-job ClassAd when the job leaves
-            # the queue, which a removal is exactly what causes.
-            "condor_rm": (
-                "#!/bin/sh\n"
-                f"cat > '{history}/history.{_JOB_ID}' <<'AD'\n{classad}AD\n"
-            ),
-            "condor_q": "#!/bin/sh\nexit 0\n",
-            "condor_config_val": f"#!/bin/sh\necho '{history}'\n",
-        },
-    )
-    tools = CondorTools(
-        submit=binaries / "condor_submit",
-        remove=binaries / "condor_rm",
-        query=binaries / "condor_q",
-    )
-
     work_key = "lifecycle.cancelled"
     before = set(Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"))
     executor = CondorLaneExecutor(tools)
-    monkeypatch.setattr(lane_executor_module, "time", _InterruptOnFirstWait())
+    monkeypatch.setattr(
+        lane_executor_module, "time", _WaitsThatRaise(KeyboardInterrupt())
+    )
     with pytest.raises(KeyboardInterrupt):
         executor.run(
             LaneCommand(
@@ -310,7 +343,118 @@ def test_a_cancelled_lane_also_collects_its_per_job_accounting(
     retained = set(Path(tempfile.gettempdir()).glob(f"lane-{work_key}*")) - before
     assert retained, "a cancelled lane must retain its diagnostics"
     for directory in retained:
-        assert (directory / "lane.classad").read_text() == classad
+        assert (directory / "lane.classad").read_text() == _CANCELLED_CLASSAD
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_the_cancellation_budget_bounds_the_whole_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 2 finding 1: the budget started only AFTER the scheduler
+    configuration lookup, so that lookup could spend the general tool
+    timeout before a 2s "wait" even began — a 2s bound measured 2.56s
+    against a 2.3s lookup, and would measure 6s+ against this one.
+
+    The lookup uses `exec` so the killed process IS the sleeper: a
+    shell that merely spawns one leaves a grandchild holding the pipe
+    open, which would make even a correct implementation look slow and
+    turn this into a test of subprocess plumbing.
+    """
+    history = tmp_path / "per-job-history"
+    history.mkdir()
+    (history / f"history.{_JOB_ID}").write_text(_CANCELLED_CLASSAD)
+    tools = _cancellable_tools(
+        tmp_path,
+        history=history,
+        removal_writes_classad=False,
+        lookup_body=f"#!/bin/sh\nexec sleep {_SLOW_LOOKUP_SECONDS:.0f}\n",
+    )
+    work_key = "lifecycle.slowlookup"
+    before = set(Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"))
+    executor = CondorLaneExecutor(tools)
+    monkeypatch.setattr(
+        lane_executor_module, "time", _WaitsThatRaise(KeyboardInterrupt())
+    )
+
+    started = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        executor.run(
+            LaneCommand(
+                work_key=LaneWorkKey(work_key),
+                arguments=(sys.executable, "-c", "pass"),
+                working_directory=tmp_path,
+                deadline=LaneDeadline(300.0),
+            ),
+            LaneResources(request_cpus=1),
+        )
+    elapsed = time.monotonic() - started
+
+    # Generous against the budget (four times it, for the process spawns
+    # and scheduler jitter of a loaded parallel suite), still nowhere
+    # near the twenty seconds an unbounded lookup costs.
+    budget = lane_executor_module._CANCELLED_ACCOUNTING_WAIT_SECONDS
+    assert elapsed < budget * 4, (
+        "the cancellation budget did not span the configuration lookup: "
+        f"{elapsed:.2f}s for a {budget:.0f}s budget"
+    )
+    retained = set(Path(tempfile.gettempdir()).glob(f"lane-{work_key}*")) - before
+    assert retained, "a cancelled lane must retain its diagnostics"
+    for directory in retained:
+        # Spending the budget on a stuck lookup costs the ClassAd. That
+        # is the trade the budget exists to make: an interrupted lane
+        # exits promptly, and says what it gave up.
+        assert not (directory / "lane.classad").exists()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    "original",
+    [KeyboardInterrupt("first"), asyncio.CancelledError("cancelled")],
+    ids=["ctrl-c-then-ctrl-c", "cancellation-then-ctrl-c"],
+)
+def test_a_second_interrupt_during_cleanup_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, original: BaseException
+) -> None:
+    """Round 2 finding 2: `except BaseException: pass` around the
+    cancellation-path collection ate a SECOND interrupt, so an operator
+    hammering Ctrl-C during a slow cleanup kept waiting on the cleanup.
+
+    The teardown policy the sampler already uses applies here too: stop
+    signals get out. The first ending is chained rather than discarded,
+    so the record of why the lane was ending survives as __cause__.
+    """
+    history = tmp_path / "per-job-history"
+    history.mkdir()
+    # No ClassAd is ever written, so the collection reaches its own
+    # file-wait - exactly where the second interrupt lands.
+    tools = _cancellable_tools(
+        tmp_path, history=history, removal_writes_classad=False
+    )
+    work_key = "lifecycle.secondinterrupt"
+    executor = CondorLaneExecutor(tools)
+    second = KeyboardInterrupt("second")
+    monkeypatch.setattr(
+        lane_executor_module, "time", _WaitsThatRaise(original, second)
+    )
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        executor.run(
+            LaneCommand(
+                work_key=LaneWorkKey(work_key),
+                arguments=(sys.executable, "-c", "pass"),
+                working_directory=tmp_path,
+                deadline=LaneDeadline(300.0),
+            ),
+            LaneResources(request_cpus=1),
+        )
+
+    assert caught.value is second, (
+        "the second interrupt was swallowed and the first propagated"
+    )
+    assert caught.value.__cause__ is original, (
+        "the original ending vanished instead of being chained"
+    )
+    for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
         shutil.rmtree(directory, ignore_errors=True)
 
 

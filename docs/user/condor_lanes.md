@@ -390,10 +390,11 @@ open. So every row of both
   `SystemExit` — or a signal handler raising one mid-sample — is
   contained and recorded, because the alternative is a probe replacing
   the gate's own exit code. Only teardown signals get out
-  (`KeyboardInterrupt`, `GeneratorExit`, `CancelledError`): the
-  operator's Ctrl-C must win. Rendering the failure is itself contained,
-  so an exception whose `__str__` or `__repr__` raises degrades to its
-  type name instead of escaping.
+  (`KeyboardInterrupt`, `GeneratorExit`, `CancelledError`, listed once
+  in `infra/teardown_signals.py` and shared with the lane executor's
+  cancellation path): the operator's Ctrl-C must win. Rendering the
+  failure is itself contained, so an exception whose `__str__` or
+  `__repr__` raises degrades to its type name instead of escaping.
 - **Concurrency is derivable, not sampled.** A running-job count would
   cost a scheduler subprocess per record; instead, each dispatch row's
   end instant, runtime and queue wait let overlap be reconstructed from
@@ -409,10 +410,23 @@ timestamp travel with the diagnostics instead of staying in a rotating
 global history. Collection runs on **every** path that retains the run
 directory, cancellation included — a lane killed by Ctrl-C is exactly the
 one whose final ClassAd a reader wants, and the removal is what makes it
-appear (it waits a couple of seconds there rather than the usual ten, so
-an interrupt still exits promptly). It is best-effort by construction: it
-runs while a lane is already ending badly, so a pool without the knob
-costs the ClassAd and a stderr line, never the lane's own result.
+appear. It is best-effort by construction: it runs while a lane is
+already ending badly, so a pool without the knob costs the ClassAd and a
+stderr line, never the lane's own result.
+
+Two properties make that safe to do while a lane is being cancelled:
+
+- **One budget spans the whole attempt** (a couple of seconds there
+  rather than the usual ten), configuration lookup included — not a
+  per-stage timeout. A pool whose tools have gone slow cannot spend an
+  interrupted lane's allowance on the lookup and then start waiting;
+  whatever the lookup spends is gone, and a stage with nothing left is
+  skipped. Spending the budget costs the ClassAd, and says so.
+- **A second Ctrl-C wins.** Ordinary collection failures (and
+  `SystemExit`) stay contained so a diagnostic cannot rewrite why the
+  lane ended, but a teardown signal arriving *during* cleanup means the
+  operator is no longer willing to wait for it — it propagates, with the
+  original ending chained as `__cause__` rather than discarded.
 
 **That knob is a loaded gun, and the pool helper treats it as one.** A
 *missing* per-job history directory is safe — condor logs `must point to

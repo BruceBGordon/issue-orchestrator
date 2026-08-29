@@ -42,7 +42,6 @@ derivable from the journal itself at zero runtime cost.
 
 from __future__ import annotations
 
-import asyncio
 import ctypes
 import logging
 import math
@@ -56,6 +55,7 @@ from pathlib import Path
 from typing import Callable
 
 from ..ports.machine_state import MachineState, MachineStateSampler
+from .teardown_signals import TEARDOWN_SIGNALS
 
 logger = logging.getLogger(__name__)
 
@@ -102,17 +102,6 @@ class _HostCpuLoadInfo(ctypes.Structure):
     _fields_ = [("cpu_ticks", ctypes.c_uint * 4)]
 
 
-# Control-flow signals that mean THE CALLER IS BEING TORN DOWN. They are
-# the only things allowed out of the containment below, because
-# containing them would defeat the teardown rather than protect a
-# record: the operator's Ctrl-C must win, and swallowing a cancellation
-# or a generator close silently breaks the caller's own contract.
-# SystemExit is deliberately NOT here — see the boundary docstring.
-_NEVER_CONTAINED: tuple[type[BaseException], ...] = (
-    KeyboardInterrupt,
-    GeneratorExit,
-    asyncio.CancelledError,
-)
 _UNRENDERABLE = "<unrenderable exception>"
 # A hostile or merely enormous exception must not bloat every JSONL row.
 _MAX_PROBE_ERROR_CHARS = 500
@@ -172,8 +161,9 @@ def sample_machine_state_from(
     handler raising one during the sampling window, sailed straight
     through and replaced an ALREADY-DECIDED lane outcome before it could
     be journaled. So this catches ``BaseException`` and re-raises only
-    ``_NEVER_CONTAINED`` — the teardown signals whose whole meaning is
-    "stop, the caller is going away".
+    ``TEARDOWN_SIGNALS`` (``infra/teardown_signals.py``, shared with the
+    lane executor's cancellation path so the two cannot drift) — the
+    signals whose whole meaning is "stop, the caller is going away".
 
     ``SystemExit`` is therefore contained and recorded, including one
     delivered by a signal handler mid-sample. That is a real trade, made
@@ -185,7 +175,7 @@ def sample_machine_state_from(
     """
     try:
         state = acquire().sample()
-    except _NEVER_CONTAINED:
+    except TEARDOWN_SIGNALS:
         raise
     except BaseException as error:
         reason = describe_exception(error)
