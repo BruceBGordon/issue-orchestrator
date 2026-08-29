@@ -36,17 +36,25 @@ import os
 import re
 import statistics
 import tempfile
+import time
 from pathlib import Path
 from typing import Mapping, TextIO, cast
 
 _ROLLING_WINDOW = 5
-_RETAINED_EPOCHS = 10
+# Retention is by AGE, never by count — see _prune_pinned. Gates take
+# minutes; a day is three orders of magnitude of headroom.
+_PIN_RETENTION_SECONDS = 24 * 60 * 60
+# Pins written before the payload carried its own timestamp fall back
+# to mtime, which is not the file's own account of itself, so they are
+# held far longer before anything is assumed about their age.
+_UNSTAMPED_PIN_RETENTION_SECONDS = 7 * _PIN_RETENTION_SECONDS
 _HISTORY_FILENAME = "history.json"
 _LOCK_FILENAME = "history.lock"
 _PINNED_PREFIX = "pinned-"
 _PINNED_SUFFIX = ".json"
 _DURATIONS_FIELD = "durations"
 _WEIGHTS_FIELD = "weights"
+_PUBLISHED_AT_FIELD = "published_at"
 _SAFE_EPOCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
@@ -106,7 +114,15 @@ class JsonFileDurationHistory:
                 for path, window in self._read_history().items()
                 if window
             }
-            self._write_json(pinned_path, {_WEIGHTS_FIELD: weights})
+            self._write_json(
+                pinned_path,
+                {
+                    _WEIGHTS_FIELD: weights,
+                    # The pin's own account of its age, so retention
+                    # never has to trust a filesystem timestamp.
+                    _PUBLISHED_AT_FIELD: round(time.time(), 3),
+                },
+            )
             self._prune_pinned()
             return weights
 
@@ -122,25 +138,72 @@ class JsonFileDurationHistory:
         return self._directory / f"{_PINNED_PREFIX}{epoch}{_PINNED_SUFFIX}"
 
     def _prune_pinned(self) -> None:
-        """Keep the newest few epochs; older ones can have no readers.
+        """Drop only pins no live reader can possibly still want.
 
-        Runs under the lock, and only the epochs beyond the retention
-        window are removed — a gate still asking for one of those has
-        been running for ten gates and has bigger problems.
+        By age, never by count. Counting guesses at liveness, and the
+        guess is wrong exactly when it costs the most: a busy day
+        publishes enough newer epochs to evict a pin whose own gate is
+        still running, that delayed slice republishes from newer
+        history, and its partition disagrees with the one its siblings
+        already ran — so the combined gate silently omits some files
+        and runs others twice (B1, #7133 review; reproduced with
+        eleven concurrent gates). Age cannot make that mistake: gates
+        take minutes, so a pin a day old has no reader, and the store
+        stays bounded because a day holds a finite number of gates.
+
+        Runs under the lock on the publish path only — a reader never
+        deletes — and never raises: an unreadable neighbour must not
+        fail a publish that is otherwise fine.
         """
+        now = time.time()
         try:
-            snapshots = sorted(
-                self._directory.glob(f"{_PINNED_PREFIX}*{_PINNED_SUFFIX}"),
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
+            pins = list(self._directory.glob(f"{_PINNED_PREFIX}*{_PINNED_SUFFIX}"))
         except OSError:
             return
-        for stale in snapshots[_RETAINED_EPOCHS:]:
+        for pin in pins:
+            if not self._is_expired(pin, now):
+                continue
             try:
-                stale.unlink()
+                pin.unlink()
             except OSError:
                 pass
+
+    def _is_expired(self, path: Path, now: float) -> bool:
+        """Whether one pin is old enough that nothing can be reading it.
+
+        Anything unreadable is kept: retention must never delete a pin
+        it could not positively date.
+        """
+        published = self._recorded_publish_time(path)
+        if published is not None:
+            return now - published > _PIN_RETENTION_SECONDS
+        try:
+            return now - path.stat().st_mtime > _UNSTAMPED_PIN_RETENTION_SECONDS
+        except OSError:
+            return False
+
+    def _recorded_publish_time(self, path: Path) -> float | None:
+        """The timestamp the pin recorded for itself, if it has one.
+
+        Authoritative over mtime, which is metadata *about* the file
+        rather than the file's own account: a copy, a restore, or a
+        rsync rewrites it, and a pin that looked older than it is would
+        be evicted early — the very failure age retention exists to
+        prevent. Pins written before this field existed have no such
+        account, so they fall back to mtime under a far longer bound.
+        """
+        try:
+            payload = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        stamp = cast(dict[str, object], payload).get(_PUBLISHED_AT_FIELD)
+        if type(stamp) is int:
+            return float(stamp)
+        if type(stamp) is float and math.isfinite(stamp):
+            return stamp
+        return None
 
     def _read_pinned(self, path: Path) -> dict[str, float] | None:
         payload = self._read_json(path)

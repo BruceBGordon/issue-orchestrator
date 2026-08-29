@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -31,6 +33,30 @@ def store(tmp_path: Path, window: int = 5) -> JsonFileDurationHistory:
 
 def store_directory(tmp_path: Path) -> Path:
     return tmp_path / "store"
+
+
+def pin_path(tmp_path: Path, epoch: str) -> Path:
+    return store_directory(tmp_path) / f"pinned-{epoch}.json"
+
+
+def write_pin(
+    tmp_path: Path, epoch: str, payload: str, age_seconds: float = 0.0
+) -> Path:
+    store_directory(tmp_path).mkdir(exist_ok=True)
+    path = pin_path(tmp_path, epoch)
+    path.write_text(payload, encoding="utf-8")
+    if age_seconds:
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+    return path
+
+
+DAY = 24 * 60 * 60
+
+
+def published(seconds_ago: float) -> str:
+    """A pin payload that dates itself ``seconds_ago`` in the past."""
+    return json.dumps({"weights": {}, "published_at": time.time() - seconds_ago})
 
 
 def write_history(tmp_path: Path, payload: str) -> None:
@@ -136,14 +162,78 @@ def test_the_next_gate_sees_what_the_last_one_taught(tmp_path: Path) -> None:
     }
 
 
-def test_old_pins_are_pruned(tmp_path: Path) -> None:
+def test_a_delayed_slice_still_gets_its_own_gates_pin(tmp_path: Path) -> None:
+    """B1. Retention must not guess liveness. A slice can be admitted
+    long after its siblings — while other gates come and go — and it
+    must still be answered from ITS gate's pin. Evicting by count lets
+    a busy day push a live epoch out; the delayed slice then
+    republishes from newer history and its partition disagrees with the
+    one its siblings already ran, so the combined gate omits some files
+    and runs others twice."""
     history = store(tmp_path)
-    history.record_success({"tests/x/test_a.py": 1.0})
-    for index in range(14):
-        history.pinned_weights(f"epoch-{index:02d}")
-    pins = sorted(path.name for path in store_directory(tmp_path).glob("pinned-*.json"))
-    assert len(pins) == 10
-    assert pins[0] == "pinned-epoch-04.json"
+    history.record_success({"tests/x/test_a.py": 5.0})
+    original = history.pinned_weights("gate-delayed")
+
+    for index in range(12):
+        history.record_success({"tests/x/test_b.py": float(index + 1)})
+        history.pinned_weights(f"gate-{index:02d}")
+
+    assert history.pinned_weights("gate-delayed") == original
+    assert original == {"tests/x/test_a.py": 5.0}
+
+
+def test_a_pin_records_when_it_was_published(tmp_path: Path) -> None:
+    """Retention dates a pin from its own payload, so the pin has to
+    carry the timestamp — mtime is metadata a copy or a restore
+    rewrites, and a pin that looked older than it is would be evicted
+    while its gate was still running."""
+    before = time.time()
+    store(tmp_path).pinned_weights(EPOCH)
+    payload = json.loads(pin_path(tmp_path, EPOCH).read_text(encoding="utf-8"))
+    # The stamp is rounded to milliseconds on the way out, so allow for
+    # that rounding rather than asserting a strict half-open window.
+    assert before - 0.001 <= payload["published_at"] <= time.time() + 0.001
+
+
+def test_pins_past_the_retention_bound_are_pruned_on_the_next_publish(
+    tmp_path: Path,
+) -> None:
+    write_pin(tmp_path, "ancient", published(DAY + 60))
+    write_pin(tmp_path, "recent", published(60))
+    store(tmp_path).pinned_weights("fresh")
+    assert not pin_path(tmp_path, "ancient").exists()
+    assert pin_path(tmp_path, "recent").exists()
+    assert pin_path(tmp_path, "fresh").exists()
+
+
+def test_an_unstamped_pin_is_held_far_longer(tmp_path: Path) -> None:
+    """Pins written before the payload carried a timestamp can only be
+    dated by mtime, which is not the file's own account of itself, so
+    nothing is assumed about them until they are very old indeed."""
+    write_pin(tmp_path, "legacy", json.dumps({"weights": {}}), age_seconds=2 * DAY)
+    store(tmp_path).pinned_weights("fresh-one")
+    assert pin_path(tmp_path, "legacy").exists()
+
+    os.utime(pin_path(tmp_path, "legacy"), (time.time() - 8 * DAY,) * 2)
+    store(tmp_path).pinned_weights("fresh-two")
+    assert not pin_path(tmp_path, "legacy").exists()
+
+
+def test_a_reader_never_deletes_a_pin(tmp_path: Path) -> None:
+    """Pruning belongs to the publish path. A reader that swept would
+    be deleting on behalf of a gate it knows nothing about."""
+    store(tmp_path).pinned_weights("mine")
+    write_pin(tmp_path, "ancient", published(30 * DAY))
+    assert store(tmp_path).pinned_weights("mine") == {}
+    assert pin_path(tmp_path, "ancient").exists()
+
+
+def test_pruning_keeps_a_pin_it_cannot_date(tmp_path: Path) -> None:
+    """Never delete what could not be positively dated — and never let
+    an unreadable neighbour fail a publish that is otherwise fine."""
+    write_pin(tmp_path, "damaged", "{not json")
+    assert store(tmp_path).pinned_weights("fresh") == {}
+    assert pin_path(tmp_path, "damaged").exists()
 
 
 @pytest.mark.parametrize("epoch", ["", "../escape", "with/slash", "a" * 65])

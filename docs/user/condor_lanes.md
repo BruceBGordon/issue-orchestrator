@@ -217,7 +217,13 @@ constant to go stale in the source.
   `SLICE_WEIGHTS_EPOCH` per gate (the flat fan is one make process, and
   the scheduler wrapper carries the stamp into the job); the first
   slice to ask publishes `pinned-<epoch>.json` and every other slice of
-  that gate is answered from it. The newest ten pins are kept.
+  that gate is answered from it. Pins are retained by **age**, not by
+  count — a pin is dropped only once it is older than a day, which no
+  running gate can be. Counting would guess at liveness and guess
+  wrong exactly when it costs most: a busy day publishes enough newer
+  epochs to evict a pin whose gate is still running, and that slice
+  then republishes from newer history and disagrees with the partition
+  its siblings already ran.
 - **Capture is backend-neutral.** It is a pytest plugin
   (`infra/pytest_file_durations.py`) enabled by the slice recipe, so a
   scheduler backend — which re-invokes that same recipe inside its job
