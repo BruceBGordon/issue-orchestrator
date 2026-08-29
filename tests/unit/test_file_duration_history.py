@@ -189,8 +189,8 @@ def test_a_delayed_slice_still_gets_its_own_gates_pin(tmp_path: Path) -> None:
     history.record_success({"tests/x/test_a.py": 5.0})
     original = history.pinned_weights("gate-delayed")
 
-    # Well past the retention depth, so count pressure is real and not
-    # merely nominal — this is the round-1 reproduction.
+    # Sixty newer epochs: the round-1 reproduction, at pressure that
+    # would have mattered back when count was consulted at all.
     for index in range(60):
         history.record_success({"tests/x/test_b.py": float(index + 1)})
         history.pinned_weights(f"gate-{index:02d}")
@@ -212,31 +212,53 @@ def test_a_pin_records_when_it_was_published(tmp_path: Path) -> None:
     assert before - 0.001 <= payload["published_at"] <= time.time() + 0.001
 
 
-def test_eviction_needs_age_and_depth_to_agree(tmp_path: Path) -> None:
-    """Sixty pins aged one hour apart. The newest fifty are protected
-    whatever the clock says; of the ten beyond that depth, every one is
-    also past the age bound, so those are the ten that go. Both
-    conditions had to hold."""
-    for hours in range(1, 61):
-        write_pin(tmp_path, f"gate-{hours:02d}", published(hours * HOUR))
+def test_only_age_decides_and_the_bound_is_a_week(tmp_path: Path) -> None:
+    """Pins from one to fourteen days old. Everything past the week
+    bound goes; everything inside it stays, however many pins there
+    are. Nothing else is consulted — a second signal was the round-3
+    hole, not a safeguard."""
+    for days in (1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14):
+        write_pin(tmp_path, f"gate-{days:02d}", published(days * DAY))
     store(tmp_path).pinned_weights("fresh")
 
     survivors = {path.name for path in store_directory(tmp_path).glob("pinned-*.json")}
-    # The fresh pin is itself the newest, so the protected fifty are it
-    # plus gate-01..gate-49; gate-50 and older are past both bounds.
     assert survivors == {"pinned-fresh.json"} | {
-        f"pinned-gate-{hours:02d}.json" for hours in range(1, 50)
+        f"pinned-gate-{days:02d}.json" for days in (1, 2, 3, 4, 5, 6)
     }
-    assert len(survivors) == 50
 
 
 def test_count_pressure_alone_evicts_nothing(tmp_path: Path) -> None:
-    """Round 1's failure mode, at ten times the pressure: many newer
-    epochs, none of them old. Nothing may be dropped."""
-    for index in range(60):
-        write_pin(tmp_path, f"gate-{index:02d}", published(60))
-    store(tmp_path).pinned_weights("fresh")
-    assert len(list(store_directory(tmp_path).glob("pinned-*.json"))) == 61
+    """Round 1's failure mode, at extreme pressure: two hundred newer
+    epochs, none of them old. Count is not a liveness signal and is no
+    longer consulted, so not one pin may be dropped."""
+    history = store(tmp_path)
+    for index in range(200):
+        history.pinned_weights(f"gate-{index:03d}")
+    assert len(list(store_directory(tmp_path).glob("pinned-*.json"))) == 200
+
+
+def test_age_and_count_pressure_combined_cannot_evict_a_live_pin(
+    tmp_path: Path,
+) -> None:
+    """Round 3's failure mode: the reviewer stopped attacking each
+    signal separately and did both at once — aged a live pin thirty
+    hours *and* published fifty newer epochs — satisfying age and depth
+    together, and the fiftieth publish evicted it.
+
+    Two proxies for liveness conjoined are still proxies. The pin
+    survives now because thirty hours is not a week, and nothing else
+    is asked."""
+    history = store(tmp_path)
+    history.record_success({"tests/x/test_a.py": 5.0})
+    live = history.pinned_weights("live-gate")
+
+    redate_pin(tmp_path, "live-gate", 30 * HOUR)
+    for index in range(50):
+        history.record_success({"tests/x/test_b.py": float(index + 1)})
+        history.pinned_weights(f"gate-{index:02d}")
+
+    assert pin_path(tmp_path, "live-gate").exists()
+    assert history.pinned_weights("live-gate") == live == {"tests/x/test_a.py": 5.0}
 
 
 def test_a_forward_clock_correction_cannot_evict_a_live_pin(
@@ -321,10 +343,11 @@ def test_an_undatable_pin_is_retained_however_old(
     assert pin_path(tmp_path, "damaged").exists()
 
 
-def test_an_unstamped_pin_is_held_far_longer(tmp_path: Path) -> None:
+def test_an_unstamped_pin_is_dated_by_its_mtime(tmp_path: Path) -> None:
     """Pins written before the payload carried a timestamp can only be
-    dated by mtime, which is not the file's own account of itself, so
-    nothing is assumed about them until they are very old indeed."""
+    dated by mtime, which answers a different question — when the bytes
+    were last touched, not when the pin was published — so they get
+    their own bound rather than sharing the stamped one."""
     write_pin(tmp_path, "legacy", json.dumps({"weights": {}}), age_seconds=2 * DAY)
     store(tmp_path).pinned_weights("fresh-one")
     assert pin_path(tmp_path, "legacy").exists()

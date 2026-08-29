@@ -48,17 +48,17 @@ from typing import Mapping, TextIO, cast
 _logger = logging.getLogger(__name__)
 
 _ROLLING_WINDOW = 5
-# Eviction needs age AND depth to agree — see _PinRetention. Gates take
-# minutes, so a day is three orders of magnitude of headroom...
-_PIN_RETENTION_SECONDS = 24 * 60 * 60
-# ...and the newest pins are protected outright however old the clock
-# says they are, so a wall-clock correction cannot age a live pin out.
-# Fifty is far more than the handful of gates that can overlap.
-_PIN_RETENTION_DEPTH = 50
-# Pins written before the payload carried its own timestamp fall back
-# to mtime, which is not the file's own account of itself, so they are
-# held far longer before anything is assumed about their age.
-_UNSTAMPED_PIN_RETENTION_SECONDS = 7 * _PIN_RETENTION_SECONDS
+_DAY_SECONDS = 24 * 60 * 60
+# Seven days, and age is the ONLY signal — see _PinRetention for why a
+# second signal cannot help. The bound is derived from the system's own
+# hard limits, not chosen for comfort.
+_PIN_RETENTION_SECONDS = 7 * _DAY_SECONDS
+# Pins written before the payload carried its own timestamp can only be
+# dated by mtime, which answers a different question — when the bytes
+# were last touched, not when the pin was published. Same bound today;
+# kept as its own constant because the two are not the same fact and
+# must be free to move apart.
+_UNSTAMPED_PIN_RETENTION_SECONDS = 7 * _DAY_SECONDS
 # A recorded stamp outside these bounds is not a date, it is damage.
 # 2020-01-01T00:00:00Z: no pin predates the feature by years.
 _EARLIEST_SANE_PUBLISH_TIME = 1577836800.0
@@ -330,24 +330,44 @@ class JsonFileDurationHistory:
 class _PinRetention:
     """Which pins may be deleted — and, far more importantly, which may not.
 
-    Every earlier version of this policy evicted on a single signal,
-    and each single signal was wrong on its own:
+    Three earlier versions of this policy leaked, and the third leaked
+    because of how the first two were patched together:
 
     - **Count alone** (round 1): a busy day publishes enough newer
       epochs to evict a pin whose gate is still running.
-    - **Age alone** (round 2): a forward wall-clock correction past the
-      bound ages every live pin out at once.
+    - **Age alone** (round 2): one forward wall-clock correction past
+      the bound ages every live pin out at once.
+    - **Count AND age** (round 3): a reviewer simply did both at once —
+      aged a live pin thirty hours *and* published fifty newer epochs —
+      and the conjunction fell to the combined attack.
 
-    Both produce the same silent failure — the delayed slice
-    republishes from newer history, its partition disagrees with the
-    one its siblings already ran, and the combined gate omits some
-    files and runs others twice. So eviction of a dated pin requires
-    the two to **agree**: older than the age bound *and* outside the
-    newest ``_PIN_RETENTION_DEPTH`` pins by recorded time. A clock jump
-    alone cannot evict, because a live gate's pin is among the newest.
-    Count pressure alone cannot evict, because recent pins are young.
-    The store still stays bounded: a quiet store cannot exceed the
-    depth plus one day of gates.
+    All three end identically: the delayed slice finds its pin gone,
+    republishes from newer history, computes a partition that disagrees
+    with the one its siblings already ran, and the combined gate omits
+    some files while running others twice.
+
+    The lesson is the reviewer's, and it is why there is only one rule
+    here now. Recency-by-count and recency-by-clock are both *proxies*
+    for "somebody is still reading this", and no conjunction of proxies
+    proves the thing itself — stacking them only makes the hole harder
+    to describe. So the depth clause is gone, and eviction rests on a
+    single bound argued from the system's own hard limits:
+
+    A pin's readers are the slices of one gate, and a lane cannot
+    outlive ``LANE_TIMEOUT_SECONDS`` (1800s) plus the backend's
+    admission cap (``_ADMISSION_TIMEOUT_SECONDS``, 600s). Forty
+    minutes is the ceiling on any reader's whole life. Seven days is
+    two and a half orders of magnitude beyond that, so evicting a live
+    pin needs a wall-clock discontinuity of more than **seven days**
+    landing *inside* a gate that lives minutes. And a pin written while
+    the clock was that wrong dates itself outside the sane range, which
+    makes it :class:`UndatablePin` — retained unconditionally. The
+    remaining hole is not a proxy failure; it is a clock that moved a
+    week during a forty-minute window.
+
+    Boundedness costs nothing to keep: pins are kilobytes, so even a
+    gate every two minutes for seven days is ~5000 pins, about 10MB,
+    and anything undatable already announces itself at WARNING.
 
     The undated states keep their own policies, which is why they are
     modelled separately (round 2, finding 2).
@@ -357,7 +377,6 @@ class _PinRetention:
         self._now = now
 
     def evictable(self, dated: Mapping[Path, PinDate]) -> list[Path]:
-        protected = self._protected(dated)
         evictable: list[Path] = []
         for path, date in sorted(dated.items()):
             if type(date) is UndatablePin:
@@ -368,19 +387,9 @@ class _PinRetention:
                     "[file-durations] retaining undatable pin: %s", date.reason
                 )
                 continue
-            if self._expired(date) and path not in protected:
+            if self._expired(date):
                 evictable.append(path)
         return evictable
-
-    def _protected(self, dated: Mapping[Path, PinDate]) -> frozenset[Path]:
-        """The newest dated pins, kept whatever the clock now says."""
-        stamped = {
-            path: date.published_at
-            for path, date in dated.items()
-            if type(date) is StampedPin
-        }
-        ranked = sorted(stamped, key=lambda path: (-stamped[path], path.name))
-        return frozenset(ranked[:_PIN_RETENTION_DEPTH])
 
     def _expired(self, date: PinDate) -> bool:
         if type(date) is StampedPin:
