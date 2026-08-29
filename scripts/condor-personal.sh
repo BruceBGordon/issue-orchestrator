@@ -49,6 +49,53 @@ MOUNT_UNDER_SCRATCH =
 EOF
   write_load_backoff_config "$config_dir"
   write_capacity_config "$config_dir"
+  # LAST, deliberately: the capacity writer validates and rejects a
+  # malformed dial, and `set -e` aborts here before an intent record
+  # could claim a policy that was never installed.
+  write_policy_intent_config "$config_dir"
+}
+
+# The pool's own record of what it was BUILT to carry.
+#
+# The two opt-ins above are environment variables read exactly once,
+# here, at `up` time, by this process. Nothing else recorded that they
+# were set - so no later reader could tell a pool that deliberately
+# opted out of the backoff policy from one whose policy file was
+# removed by hand. That gap made the preflight check exit 0 on a pool
+# started with IO_CONDOR_LOAD_BACKOFF=1 whose 91- file had been
+# deleted: a reproduced false green (C1, #7132 review).
+#
+# Persisting intent as CONFIG MACROS is what closes it. Intent then
+# travels the identical staging/install/reconcile path as the policies
+# it describes, and is readable over the same condor_config_val
+# channel the check already uses - no sidecar file, no second
+# discovery mechanism, nothing that can be installed out of step with
+# what it describes.
+#
+# IO_INTENT_LOAD_BACKOFF is written in BOTH states on purpose. It is
+# the sentinel that says an intent record exists at all, so a pool
+# predating this file reads as legacy and is reported as drift rather
+# than silently trusted.
+write_policy_intent_config() {
+  local config_dir="$1"
+  {
+    echo "# Written by scripts/condor-personal.sh: what this pool was built"
+    echo "# to carry. Read by the lane preflight check, which asserts each"
+    echo "# managed policy file is present if and only if it was intended."
+    if [ "${IO_CONDOR_LOAD_BACKOFF:-0}" = "1" ]; then
+      echo "IO_INTENT_LOAD_BACKOFF = True"
+    else
+      echo "IO_INTENT_LOAD_BACKOFF = False"
+    fi
+    # Left UNDEFINED (no line at all) when no dial was asked for: an
+    # empty assignment reads back as "Not defined" from the config
+    # tool anyway, so absence is the only encoding that says the same
+    # thing on both sides. Normalized to base 10 to match the value
+    # write_capacity_config actually used.
+    if [ -n "${IO_POOL_CAPACITY_PERCENT:-}" ]; then
+      echo "IO_INTENT_CAPACITY_PERCENT = $(( 10#$IO_POOL_CAPACITY_PERCENT ))"
+    fi
+  } > "${config_dir}/90-io-policy-intent.conf"
 }
 
 # One throughput dial (IO_POOL_CAPACITY_PERCENT at `up` time): the

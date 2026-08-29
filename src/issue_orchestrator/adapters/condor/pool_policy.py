@@ -19,6 +19,15 @@ work and keeps reporting lanes as completed:
   lane whose working directory lives under the real ``/tmp`` holds with
   "Cannot access initial working directory".
 
+Two further policy files are optional, installed only when their
+opt-in was set at install time. They are asserted too, against the
+intent record the installer writes in the same pass
+(``90-io-policy-intent.conf``, read through this same config channel):
+each must be present if and only if it was asked for. A pool carrying
+no intent record at all is a pool built before the installer recorded
+one — it is reported as drift rather than trusted, because on such a
+pool "opted out" and "removed by hand" are indistinguishable.
+
 Scope: this reads the pool's effective *configuration*, which is what
 the daemons read. Daemons still running a configuration older than the
 files on disk are out of scope — the pool helper restarts them when it
@@ -32,7 +41,6 @@ from pathlib import Path
 from ...domain.lane_execution import (
     LaneExecutorError,
     LanePolicyInvariant,
-    LanePolicyObservation,
     LanePolicyReport,
 )
 from .lane_executor import CondorTools
@@ -47,24 +55,47 @@ _REQUIRED_SETTINGS: tuple[tuple[str, str], ...] = (
 )
 
 # Policy files scripts/condor-personal.sh installs only when its
-# corresponding opt-in was set at `up` time. Their intended state is
-# NOT knowable here: the opt-in is an environment variable read once,
-# at install time, by a different process — nothing on the pool records
-# whether it was set. Asserting presence would fail every correct pool
-# that opted out; asserting absence would bless every pool that opted
-# in. So they are REPORTED (present or not, and from which file), which
-# is what makes a hand-removed backoff policy visible in the gate log
-# without inventing an intent the check cannot verify.
-_MANAGED_OPTIONAL_CONFIGS: tuple[str, ...] = (
-    "91-io-load-backoff.conf",
-    "92-io-pool-capacity.conf",
+# corresponding opt-in was set at `up` time, paired with the intent
+# macro that same run wrote to declare whether it was asked for. Each
+# pair is asserted present-iff-intended: a file installed without
+# intent is stale policy nobody asked for, and intent without the file
+# is policy silently missing — the second of which was reproduced as a
+# false green (C1, #7132 review) back when these were merely reported.
+_MANAGED_POLICY_FILES: tuple[tuple[str, str], ...] = (
+    ("91-io-load-backoff.conf", "IO_INTENT_LOAD_BACKOFF"),
+    ("92-io-pool-capacity.conf", "IO_INTENT_CAPACITY_PERCENT"),
 )
+
+# The macro whose mere presence proves the pool carries an intent
+# record at all. The installer writes it in both states (True/False)
+# for exactly this reason, so a pool built before intent records
+# existed reads as legacy instead of as "opted out of everything".
+_INTENT_SENTINEL = "IO_INTENT_LOAD_BACKOFF"
+_INTENT_DECLARED = "True or False"
+_NEGATED_INTENT = "False"
+
+_INSTALLED = "installed"
+_ABSENT = "absent"
 
 _UNDEFINED_PREFIX = "Not defined:"
 _REMEDY = (
-    "re-apply the pool policy with `scripts/condor-personal.sh up` "
-    "(docs/user/condor_lanes.md), then re-run the gate"
+    "re-run `scripts/condor-personal.sh up` with the "
+    "IO_CONDOR_LOAD_BACKOFF / IO_POOL_CAPACITY_PERCENT opt-ins you intend "
+    "this pool to carry (docs/user/condor_lanes.md); an IO_INTENT_* knob "
+    "reported as '' means the pool predates policy-intent records and must "
+    "be rebuilt that way before the gate will dispatch"
 )
+
+
+def _declares_intent(value: str) -> bool:
+    """Whether an intent macro asks for its policy to be installed.
+
+    One rule reads both encodings the installer writes — a boolean for
+    the backoff policy, a number-or-nothing for the capacity dial — so
+    neither file needs its own interpretation here: intent is declared
+    when the macro carries a value and that value is not a negation.
+    """
+    return value not in ("", _NEGATED_INTENT)
 
 
 class CondorPoolPolicyCheck:
@@ -84,16 +115,49 @@ class CondorPoolPolicyCheck:
 
     def inspect(self) -> LanePolicyReport:
         sources = self._configuration_sources()
+        required = tuple(
+            LanePolicyInvariant(
+                knob=knob, expected=expected, observed=self._setting(knob)
+            )
+            for knob, expected in _REQUIRED_SETTINGS
+        )
         return LanePolicyReport(
             source=sources[0],
             remedy=_REMEDY,
-            invariants=tuple(
+            invariants=required + self._intent_invariants(sources),
+        )
+
+    def _intent_invariants(
+        self, sources: tuple[str, ...]
+    ) -> tuple[LanePolicyInvariant, ...]:
+        """Assert each managed policy file is present iff it was intended.
+
+        A pool with no intent record cannot be judged this way, and
+        "cannot be judged" is itself drift: it is a pool built before
+        the installer recorded intent, so nothing here can tell its
+        opted-out policy from its silently-removed policy. It is
+        reported loudly as one invariant naming the missing record,
+        which the remedy tells the operator how to restore.
+        """
+        declared = {knob: self._setting(knob) for _, knob in _MANAGED_POLICY_FILES}
+        if declared[_INTENT_SENTINEL] == "":
+            return (
                 LanePolicyInvariant(
-                    knob=knob, expected=expected, observed=self._setting(knob)
-                )
-                for knob, expected in _REQUIRED_SETTINGS
-            ),
-            observations=_optional_policy_files(sources),
+                    knob=_INTENT_SENTINEL,
+                    expected=_INTENT_DECLARED,
+                    observed="",
+                ),
+            )
+        installed = {Path(source).name for source in sources}
+        return tuple(
+            LanePolicyInvariant(
+                knob=name,
+                expected=(
+                    _INSTALLED if _declares_intent(declared[knob]) else _ABSENT
+                ),
+                observed=_INSTALLED if name in installed else _ABSENT,
+            )
+            for name, knob in _MANAGED_POLICY_FILES
         )
 
     def _setting(self, knob: str) -> str:
@@ -146,20 +210,3 @@ class CondorPoolPolicyCheck:
                 f"{completed.stdout.strip()!r}"
             )
         return sources
-
-
-def _optional_policy_files(
-    sources: tuple[str, ...],
-) -> tuple[LanePolicyObservation, ...]:
-    by_name = {Path(source).name: source for source in sources}
-    return tuple(
-        LanePolicyObservation(
-            name=managed,
-            detail=(
-                f"in effect ({by_name[managed]})"
-                if managed in by_name
-                else "not installed"
-            ),
-        )
-        for managed in _MANAGED_OPTIONAL_CONFIGS
-    )

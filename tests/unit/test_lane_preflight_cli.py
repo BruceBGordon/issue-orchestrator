@@ -14,7 +14,6 @@ from issue_orchestrator.domain.lane_execution import (
     LaneExecutorError,
     LaneExecutorUnavailableError,
     LanePolicyInvariant,
-    LanePolicyObservation,
     LanePolicyReport,
 )
 from issue_orchestrator.entrypoints.cli_tools import lane_preflight
@@ -39,15 +38,11 @@ class _FakeCheck:
         return self._report
 
 
-def _report(
-    *invariants: LanePolicyInvariant,
-    observations: tuple[LanePolicyObservation, ...] = (),
-) -> LanePolicyReport:
+def _report(*invariants: LanePolicyInvariant) -> LanePolicyReport:
     return LanePolicyReport(
         source="/pool/etc/pool_config",
         remedy="re-apply the pool policy and re-run the gate",
         invariants=invariants,
-        observations=observations,
     )
 
 
@@ -107,26 +102,28 @@ def test_drift_exits_78_and_names_every_drifted_knob(
     assert "re-apply the pool policy" in captured
 
 
-def test_observations_reach_the_gate_log_without_failing_the_check(
+def test_a_managed_policy_file_drift_is_reported_like_any_other(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Optional-policy files are invariants now, not commentary: a
+    missing one fails the gate through the same path as a missing
+    setting (C1, #7132 review)."""
     _install(
         monkeypatch,
         _report(
             LanePolicyInvariant(knob="KNOB_A", expected="1", observed="1"),
-            observations=(
-                LanePolicyObservation(name="91-io-load-backoff.conf", detail="in effect"),
-                LanePolicyObservation(
-                    name="92-io-pool-capacity.conf", detail="not installed"
-                ),
+            LanePolicyInvariant(
+                knob="91-io-load-backoff.conf",
+                expected="installed",
+                observed="absent",
             ),
         ),
     )
 
-    assert main(["--backend", "condor"]) == 0
+    assert main(["--backend", "condor"]) == _UNAVAILABLE
     captured = capsys.readouterr().err
-    assert "91-io-load-backoff.conf: in effect" in captured
-    assert "92-io-pool-capacity.conf: not installed" in captured
+    assert "91-io-load-backoff.conf" in captured
+    assert "'installed'" in captured and "'absent'" in captured
 
 
 def test_unavailable_backend_exits_78_with_the_backend_message(

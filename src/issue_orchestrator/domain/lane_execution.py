@@ -264,27 +264,6 @@ class LanePolicyInvariant:
 
 
 @dataclass(frozen=True, slots=True)
-class LanePolicyObservation:
-    """A backend policy fact reported rather than asserted.
-
-    Some policy is legitimately optional, and whether it *should* be
-    installed is a deployment decision the check cannot read back at
-    check time. Inventing an intent there would either fail correct
-    pools or bless drifted ones, so the fact is surfaced in the gate
-    log and left to the reader instead.
-    """
-
-    name: str
-    detail: str
-
-    def __post_init__(self) -> None:
-        if type(self.name) is not str or not self.name:
-            raise ValueError("LanePolicyObservation.name must be a non-empty string")
-        if type(self.detail) is not str or not self.detail:
-            raise ValueError("LanePolicyObservation.detail must be a non-empty string")
-
-
-@dataclass(frozen=True, slots=True)
 class LanePolicyReport:
     """Everything one backend's policy self-check found, in one pass.
 
@@ -294,12 +273,16 @@ class LanePolicyReport:
     the backend read (human-readable, opaque to callers) and ``remedy``
     is the backend's own restore instruction, printed verbatim when
     drift is found — keeping backend-specific advice out of callers.
+
+    Everything a check has to say is an invariant. There is no
+    advisory channel on purpose: a fact worth putting in the gate log
+    but not worth failing on is a fact nobody acts on, and the one
+    place that tried it shipped a false green (C1, #7132 review).
     """
 
     source: str
     remedy: str
     invariants: tuple[LanePolicyInvariant, ...]
-    observations: tuple[LanePolicyObservation, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.source) is not str or not self.source:
@@ -311,14 +294,6 @@ class LanePolicyReport:
         ):
             raise ValueError(
                 "LanePolicyReport.invariants must be a tuple of LanePolicyInvariant"
-            )
-        if type(self.observations) is not tuple or any(
-            type(observation) is not LanePolicyObservation
-            for observation in self.observations
-        ):
-            raise ValueError(
-                "LanePolicyReport.observations must be a tuple of "
-                "LanePolicyObservation"
             )
 
     @property

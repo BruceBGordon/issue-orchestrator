@@ -58,11 +58,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _report(backend: str, report: LanePolicyReport) -> int:
     """Put the whole finding in the gate log, then decide."""
-    for observation in report.observations:
-        print(
-            f"[lane-preflight] {observation.name}: {observation.detail}",
-            file=sys.stderr,
-        )
     drifted = report.drifted
     if not drifted:
         print(

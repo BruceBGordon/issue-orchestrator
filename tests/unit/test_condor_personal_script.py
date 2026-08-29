@@ -251,6 +251,95 @@ def test_load_backoff_keys_on_machine_wide_owner_load(tmp_path: Path) -> None:
     assert not _re.search(r"[^l]\bLoadAvg\b", generated.replace("TotalLoadAvg", "").replace("TotalCondorLoadAvg", "").replace("CondorLoadAvg", "")), generated
 
 
+def _intent(tmp_path: Path) -> dict[str, str]:
+    written: dict[str, str] = {}
+    for line in (tmp_path / "90-io-policy-intent.conf").read_text().splitlines():
+        if "=" in line and not line.startswith("#"):
+            key, _, value = line.partition("=")
+            written[key.strip()] = value.strip()
+    return written
+
+
+def test_intent_record_is_written_on_every_run(tmp_path: Path) -> None:
+    """The opt-ins are environment variables read once, here. Without a
+    persisted record no later reader can tell "opted out" from
+    "removed by hand" — which is exactly how a hand-deleted backoff
+    policy preflighted clean (C1, #7132 review). The sentinel is
+    written in BOTH states so a pool that predates intent records is
+    distinguishable from one that opted out."""
+    _write_lane_config(tmp_path)
+    assert _intent(tmp_path)["IO_INTENT_LOAD_BACKOFF"] == "False"
+
+    _write_lane_config(tmp_path, IO_CONDOR_LOAD_BACKOFF="1")
+    assert _intent(tmp_path)["IO_INTENT_LOAD_BACKOFF"] == "True"
+
+
+def test_intent_record_tracks_the_policy_files_symmetrically(
+    tmp_path: Path,
+) -> None:
+    """Intent and installed policy move together, in both directions:
+    every state the installer can produce must be self-consistent, or
+    the check it feeds would report drift on a pool the installer
+    itself just built."""
+    _write_lane_config(
+        tmp_path, IO_CONDOR_LOAD_BACKOFF="1", IO_POOL_CAPACITY_PERCENT="150"
+    )
+    declared = _intent(tmp_path)
+    assert declared["IO_INTENT_LOAD_BACKOFF"] == "True"
+    assert declared["IO_INTENT_CAPACITY_PERCENT"] == "150"
+    assert (tmp_path / "91-io-load-backoff.conf").exists()
+    assert (tmp_path / "92-io-pool-capacity.conf").exists()
+
+    # Opting back out must retract BOTH the policy files and the intent
+    # that claimed them; a stale claim would fail the next preflight.
+    _write_lane_config(tmp_path)
+    declared = _intent(tmp_path)
+    assert declared["IO_INTENT_LOAD_BACKOFF"] == "False"
+    assert "IO_INTENT_CAPACITY_PERCENT" not in declared
+    assert not (tmp_path / "91-io-load-backoff.conf").exists()
+    assert not (tmp_path / "92-io-pool-capacity.conf").exists()
+
+
+def test_capacity_intent_is_undefined_rather_than_empty(tmp_path: Path) -> None:
+    """An empty config assignment reads back as "Not defined" from the
+    config tool, so absence is the only encoding that means the same
+    thing on both sides of the channel."""
+    _write_lane_config(tmp_path)
+    assert "IO_INTENT_CAPACITY_PERCENT" not in (
+        tmp_path / "90-io-policy-intent.conf"
+    ).read_text()
+
+
+def test_capacity_intent_records_the_normalized_dial(tmp_path: Path) -> None:
+    """Base-10 normalization, matching what write_capacity_config
+    actually used: a leading-zero value must not record a different
+    number than the one the pool was sized with."""
+    _write_lane_config(tmp_path, IO_POOL_CAPACITY_PERCENT="080")
+    assert _intent(tmp_path)["IO_INTENT_CAPACITY_PERCENT"] == "80"
+
+
+def test_a_rejected_capacity_dial_records_no_intent_at_all(
+    tmp_path: Path,
+) -> None:
+    """The capacity writer validates and rejects a malformed dial, and
+    the intent record is written after it — so a run that installs no
+    policy never leaves a record claiming it did."""
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'export IO_POOL_CAPACITY_PERCENT=abc; source "{SCRIPT}" '
+            '&& write_lane_config "$1"',
+            "_",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0, result.stdout
+    assert not (tmp_path / "90-io-policy-intent.conf").exists()
+
+
 def test_load_backoff_disable_removes_the_previous_policy(tmp_path: Path) -> None:
     """Enable then plain re-run must leave NO suspension policy behind:
     darwin writes into the persistent directory and linux copies only

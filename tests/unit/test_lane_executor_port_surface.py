@@ -98,18 +98,20 @@ def test_policy_check_port_surface_is_pinned() -> None:
         if not name.startswith("_") and callable(getattr(LanePolicyCheck, name))
     ]
     assert operations == ["inspect"]
+    # No advisory channel beside `invariants`, deliberately: the one
+    # that existed let an unasserted fact read as a passing check
+    # (C1, #7132 review). Everything a check has to say is asserted.
     assert _field_names(lane_execution.LanePolicyReport) == (
         "source",
         "remedy",
         "invariants",
-        "observations",
     )
     assert _field_names(lane_execution.LanePolicyInvariant) == (
         "knob",
         "expected",
         "observed",
     )
-    assert _field_names(lane_execution.LanePolicyObservation) == ("name", "detail")
+    assert not hasattr(lane_execution, "LanePolicyObservation")
 
 
 def test_history_port_has_exactly_two_operations() -> None:

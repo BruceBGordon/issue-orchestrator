@@ -109,30 +109,52 @@ make lane-preflight LANE_EXECUTOR=condor   # the same check, by hand
 ```
 
 ```
-[lane-preflight] 91-io-load-backoff.conf: not installed
-[lane-preflight] 92-io-pool-capacity.conf: not installed
-[lane-preflight] condor: 3 required setting(s) hold — …/etc/condor_config
+[lane-preflight] condor: 5 required setting(s) hold — …/etc/condor_config
 ```
 
-It asserts the three settings above and nothing else, exits **78**
-naming every drifted knob at once (no warn-and-continue: a drifted pool
-stops the gate before a single lane is dispatched), and exits 70 if the
-pool cannot be read at all — a pool that will not answer is never
-reported as healthy. Cost is four `condor_config_val` reads, measured
-at about one second on the Rosetta macOS pool, which is why the gate can
-afford it unconditionally and why it runs once rather than once per lane.
-
-The two opt-in policy files are **reported, not asserted**. Whether
-they *should* be installed depends on an environment variable
-(`IO_CONDOR_LOAD_BACKOFF`, `IO_POOL_CAPACITY_PERCENT`) read once, at
-`up` time, by a different process; nothing on the pool records that it
-was set. Requiring them would fail every pool that correctly opted out,
-and ignoring them would hide a hand-removed backoff policy — so their
-presence goes in the gate log for the reader to judge. Presence means
-the pool actually parses the file, not that it exists on disk.
+It asserts the three settings above plus the two opt-in policy files
+(below), exits **78** naming every drifted knob at once (no
+warn-and-continue: a drifted pool stops the gate before a single lane
+is dispatched), and exits 70 if the pool cannot be read at all — a
+pool that will not answer is never reported as healthy. Cost is six
+`condor_config_val` reads, about one second on the Rosetta macOS pool,
+which is why the gate can afford it unconditionally and why it runs
+once rather than once per lane.
 
 Direct mode runs lanes in your own environment and has no external
 policy, so the same target reports an empty invariant set and exits 0.
+
+### Policy intent, and why `up` records it
+
+The two opt-in policy files are asserted **present if and only if they
+were intended** — and intent is something the pool has to remember.
+`IO_CONDOR_LOAD_BACKOFF` and `IO_POOL_CAPACITY_PERCENT` are read once,
+at `up` time, by the installer process. Nothing else used to record
+that they were set, which left a pool that deliberately opted out
+indistinguishable from one whose policy file had been deleted by hand:
+the check passed on both.
+
+So `up` now writes `90-io-policy-intent.conf` alongside the policies
+themselves:
+
+```
+IO_INTENT_LOAD_BACKOFF = True          # or False
+IO_INTENT_CAPACITY_PERCENT = 150       # omitted entirely when unset
+```
+
+It rides the identical staging/install/reconcile path as the files it
+describes and is read over the same `condor_config_val` channel, so it
+cannot be installed out of step with them. `IO_INTENT_LOAD_BACKOFF` is
+written in *both* states deliberately: its presence is what proves a
+pool has an intent record at all.
+
+**A pool started before this existed reads as a legacy pool and fails
+preflight**, naming `IO_INTENT_LOAD_BACKOFF` with an empty value. That
+is intentional — on such a pool "opted out" and "removed by hand" are
+the same observation, so it cannot be judged and must not be trusted.
+Fix it by re-running `scripts/condor-personal.sh up` with the opt-ins
+the pool should carry. That restarts the startd, so do it **between**
+gates, never during one.
 
 ## Which parameters belong to which mode
 

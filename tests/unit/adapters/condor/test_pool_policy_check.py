@@ -23,14 +23,22 @@ from issue_orchestrator.domain.lane_execution import (
 )
 from issue_orchestrator.ports.lane_policy_check import LanePolicyCheck
 
+_BACKOFF_FILE = "91-io-load-backoff.conf"
+_CAPACITY_FILE = "92-io-pool-capacity.conf"
+
+# A modern pool that opted out of both optional policies: the three
+# hard settings in place, an intent record present and declaring
+# neither opt-in.
 _HEALTHY = {
     "CONCURRENCY_LIMIT_DEFAULT": "1",
     "PERIODIC_EXPR_INTERVAL": "5",
+    "IO_INTENT_LOAD_BACKOFF": "False",
 }
 _DEFAULT_SOURCES = (
     "/pool/etc/condor_config",
     "/pool/local/config.d/00-personal-condor",
     "/pool/local/config.d/90-issue-orchestrator-lanes.conf",
+    "/pool/local/config.d/90-io-policy-intent.conf",
 )
 
 
@@ -83,8 +91,35 @@ def _stub_tools(
     )
 
 
+def _pool(
+    tmp_path: Path,
+    *,
+    backoff_intent: str = "False",
+    capacity_intent: str | None = None,
+    installed: tuple[str, ...] = (),
+) -> CondorTools:
+    """A healthy pool whose optional-policy intent and installed files
+    are set independently — which is exactly the axis the four drift
+    combinations below explore."""
+    values = {**_HEALTHY, "IO_INTENT_LOAD_BACKOFF": backoff_intent}
+    if capacity_intent is not None:
+        values["IO_INTENT_CAPACITY_PERCENT"] = capacity_intent
+    return _stub_tools(
+        tmp_path,
+        values=values,
+        sources=(
+            *_DEFAULT_SOURCES,
+            *(f"/pool/local/config.d/{name}" for name in installed),
+        ),
+    )
+
+
 def _inspect(tools: CondorTools) -> LanePolicyReport:
     return CondorPoolPolicyCheck(tools).inspect()
+
+
+def _drifted(report: LanePolicyReport) -> set[str]:
+    return {invariant.knob for invariant in report.drifted}
 
 
 def _observed(report: LanePolicyReport, knob: str) -> str:
@@ -94,8 +129,17 @@ def _observed(report: LanePolicyReport, knob: str) -> str:
     raise AssertionError(f"{knob} is not among the checked invariants")
 
 
-def test_healthy_pool_reports_three_invariants_and_no_drift(tmp_path: Path) -> None:
-    report = _inspect(_stub_tools(tmp_path))
+def _expected(report: LanePolicyReport, knob: str) -> str:
+    for invariant in report.invariants:
+        if invariant.knob == knob:
+            return invariant.expected
+    raise AssertionError(f"{knob} is not among the checked invariants")
+
+
+def test_healthy_pool_asserts_settings_and_both_policy_files(
+    tmp_path: Path,
+) -> None:
+    report = _inspect(_pool(tmp_path))
 
     assert isinstance(report, LanePolicyReport)
     assert report.drifted == ()
@@ -103,14 +147,16 @@ def test_healthy_pool_reports_three_invariants_and_no_drift(tmp_path: Path) -> N
         "CONCURRENCY_LIMIT_DEFAULT",
         "PERIODIC_EXPR_INTERVAL",
         "MOUNT_UNDER_SCRATCH",
+        _BACKOFF_FILE,
+        _CAPACITY_FILE,
     }
-    # The three are asserted unconditionally: no opt-in, no environment
-    # lookup, no way for a caller to shrink the set.
-    assert len(report.invariants) == 3
+    # Everything the check has to say is asserted; there is no advisory
+    # channel a reader could mistake for a passing check.
+    assert len(report.invariants) == 5
 
 
 def test_check_instance_satisfies_the_policy_port(tmp_path: Path) -> None:
-    check: LanePolicyCheck = CondorPoolPolicyCheck(_stub_tools(tmp_path))
+    check: LanePolicyCheck = CondorPoolPolicyCheck(_pool(tmp_path))
     assert isinstance(check, LanePolicyCheck)
 
 
@@ -121,7 +167,7 @@ def test_empty_mount_under_scratch_is_satisfied_when_the_tool_says_undefined(
     to the tool (verified live: both answer "Not defined"), and mean
     the same thing — no value in effect. The check must agree, or every
     correctly configured pool reads as drifted."""
-    report = _inspect(_stub_tools(tmp_path))
+    report = _inspect(_pool(tmp_path))
 
     assert _observed(report, "MOUNT_UNDER_SCRATCH") == ""
     assert report.drifted == ()
@@ -132,12 +178,12 @@ def test_non_empty_mount_under_scratch_is_drift(tmp_path: Path) -> None:
     under the real /tmp holds with "Cannot access initial working
     directory" when this comes back."""
     report = _inspect(
-        _stub_tools(tmp_path, values={**_HEALTHY, "MOUNT_UNDER_SCRATCH": "/tmp,/var/tmp"})
+        _stub_tools(
+            tmp_path, values={**_HEALTHY, "MOUNT_UNDER_SCRATCH": "/tmp,/var/tmp"}
+        )
     )
 
-    assert [invariant.knob for invariant in report.drifted] == [
-        "MOUNT_UNDER_SCRATCH"
-    ]
+    assert _drifted(report) == {"MOUNT_UNDER_SCRATCH"}
     assert "/tmp,/var/tmp" in report.drifted[0].describe()
 
 
@@ -145,12 +191,16 @@ def test_lost_concurrency_limit_default_is_drift_naming_the_knob(
     tmp_path: Path,
 ) -> None:
     report = _inspect(
-        _stub_tools(tmp_path, values={"PERIODIC_EXPR_INTERVAL": "5"})
+        _stub_tools(
+            tmp_path,
+            values={
+                "PERIODIC_EXPR_INTERVAL": "5",
+                "IO_INTENT_LOAD_BACKOFF": "False",
+            },
+        )
     )
 
-    assert [invariant.knob for invariant in report.drifted] == [
-        "CONCURRENCY_LIMIT_DEFAULT"
-    ]
+    assert _drifted(report) == {"CONCURRENCY_LIMIT_DEFAULT"}
     described = report.drifted[0].describe()
     assert "CONCURRENCY_LIMIT_DEFAULT" in described
     assert "'1'" in described
@@ -161,9 +211,7 @@ def test_changed_concurrency_limit_default_is_drift(tmp_path: Path) -> None:
         _stub_tools(tmp_path, values={**_HEALTHY, "CONCURRENCY_LIMIT_DEFAULT": "4"})
     )
 
-    assert [invariant.knob for invariant in report.drifted] == [
-        "CONCURRENCY_LIMIT_DEFAULT"
-    ]
+    assert _drifted(report) == {"CONCURRENCY_LIMIT_DEFAULT"}
     assert _observed(report, "CONCURRENCY_LIMIT_DEFAULT") == "4"
 
 
@@ -172,83 +220,150 @@ def test_changed_periodic_expr_interval_is_drift(tmp_path: Path) -> None:
         _stub_tools(tmp_path, values={**_HEALTHY, "PERIODIC_EXPR_INTERVAL": "60"})
     )
 
-    assert [invariant.knob for invariant in report.drifted] == [
-        "PERIODIC_EXPR_INTERVAL"
-    ]
+    assert _drifted(report) == {"PERIODIC_EXPR_INTERVAL"}
     assert _observed(report, "PERIODIC_EXPR_INTERVAL") == "60"
 
 
 def test_every_drifted_knob_is_named_in_one_pass(tmp_path: Path) -> None:
     """Drift is data, not an exception: a wholesale-reverted pool is
-    fixed in one round, not one knob per gate attempt."""
+    fixed in one round, not one knob per gate attempt. A pool reverted
+    this far has also lost its intent record, so that is named too."""
     report = _inspect(
         _stub_tools(tmp_path, values={"MOUNT_UNDER_SCRATCH": "/tmp"})
     )
 
-    assert {invariant.knob for invariant in report.drifted} == {
+    assert _drifted(report) == {
         "CONCURRENCY_LIMIT_DEFAULT",
         "PERIODIC_EXPR_INTERVAL",
         "MOUNT_UNDER_SCRATCH",
+        "IO_INTENT_LOAD_BACKOFF",
     }
 
 
-def test_managed_optional_files_are_reported_never_asserted(
-    tmp_path: Path,
-) -> None:
-    """Their intended state is not knowable at check time (the opt-in
-    is an environment variable read once by the installer), so they are
-    reported and never fail the check — in either direction."""
-    installed = _inspect(
+# --- present-iff-intended: the four combinations, per policy file ---
+
+
+def test_intended_backoff_policy_installed_is_satisfied(tmp_path: Path) -> None:
+    report = _inspect(
+        _pool(tmp_path, backoff_intent="True", installed=(_BACKOFF_FILE,))
+    )
+
+    assert report.drifted == ()
+    assert _expected(report, _BACKOFF_FILE) == "installed"
+
+
+def test_intended_backoff_policy_missing_is_drift(tmp_path: Path) -> None:
+    """THE reproduced false green (C1, #7132 review): a pool brought up
+    with IO_CONDOR_LOAD_BACKOFF=1 whose 91- file was removed by hand
+    used to preflight clean, because nothing recorded that the policy
+    had been asked for. The intent record is what makes this a
+    failure."""
+    report = _inspect(_pool(tmp_path, backoff_intent="True"))
+
+    assert _drifted(report) == {_BACKOFF_FILE}
+    described = report.drifted[0].describe()
+    assert "'installed'" in described and "'absent'" in described
+
+
+def test_unintended_backoff_policy_absent_is_satisfied(tmp_path: Path) -> None:
+    report = _inspect(_pool(tmp_path, backoff_intent="False"))
+
+    assert report.drifted == ()
+    assert _expected(report, _BACKOFF_FILE) == "absent"
+
+
+def test_unintended_backoff_policy_installed_is_drift(tmp_path: Path) -> None:
+    """Stale policy nobody asked for: lanes would be frozen by a
+    backoff policy the operator opted out of."""
+    report = _inspect(
+        _pool(tmp_path, backoff_intent="False", installed=(_BACKOFF_FILE,))
+    )
+
+    assert _drifted(report) == {_BACKOFF_FILE}
+    assert _observed(report, _BACKOFF_FILE) == "installed"
+
+
+def test_intended_capacity_dial_installed_is_satisfied(tmp_path: Path) -> None:
+    report = _inspect(
+        _pool(tmp_path, capacity_intent="150", installed=(_CAPACITY_FILE,))
+    )
+
+    assert report.drifted == ()
+    assert _expected(report, _CAPACITY_FILE) == "installed"
+
+
+def test_intended_capacity_dial_missing_is_drift(tmp_path: Path) -> None:
+    report = _inspect(_pool(tmp_path, capacity_intent="150"))
+
+    assert _drifted(report) == {_CAPACITY_FILE}
+
+
+def test_unintended_capacity_dial_absent_is_satisfied(tmp_path: Path) -> None:
+    """Capacity intent encodes "not asked for" as an UNDEFINED macro,
+    not as a negation — the check reads both encodings under one rule
+    so neither file needs its own interpretation."""
+    report = _inspect(_pool(tmp_path, capacity_intent=None))
+
+    assert report.drifted == ()
+    assert _expected(report, _CAPACITY_FILE) == "absent"
+
+
+def test_unintended_capacity_dial_installed_is_drift(tmp_path: Path) -> None:
+    report = _inspect(_pool(tmp_path, installed=(_CAPACITY_FILE,)))
+
+    assert _drifted(report) == {_CAPACITY_FILE}
+
+
+def test_both_policy_files_drift_independently(tmp_path: Path) -> None:
+    report = _inspect(
+        _pool(tmp_path, backoff_intent="True", installed=(_CAPACITY_FILE,))
+    )
+
+    assert _drifted(report) == {_BACKOFF_FILE, _CAPACITY_FILE}
+
+
+def test_a_pool_with_no_intent_record_is_loud_drift(tmp_path: Path) -> None:
+    """A legacy pool — built before the installer recorded intent —
+    cannot be judged present-iff-intended at all, and "cannot be
+    judged" is itself the finding. Trusting it is what the false green
+    was. The three hard settings still pass; only the missing record
+    fails, and the remedy says how to restore it.
+    """
+    values = {key: value for key, value in _HEALTHY.items() if key.startswith(("C", "P"))}
+    report = _inspect(
         _stub_tools(
             tmp_path,
-            sources=(
-                *_DEFAULT_SOURCES,
-                "/pool/local/config.d/91-io-load-backoff.conf",
-                "/pool/local/config.d/92-io-pool-capacity.conf",
-            ),
+            values=values,
+            sources=_DEFAULT_SOURCES[:3],
         )
     )
-    absent = _inspect(_stub_tools(tmp_path))
 
-    assert installed.drifted == ()
-    assert absent.drifted == ()
-    assert {
-        observation.name for observation in installed.observations
-    } == {"91-io-load-backoff.conf", "92-io-pool-capacity.conf"}
-    assert all(
-        observation.detail.startswith("in effect")
-        for observation in installed.observations
-    )
-    assert [observation.detail for observation in absent.observations] == [
-        "not installed",
-        "not installed",
-    ]
+    assert _drifted(report) == {"IO_INTENT_LOAD_BACKOFF"}
+    assert _expected(report, "IO_INTENT_LOAD_BACKOFF") == "True or False"
+    assert _observed(report, "IO_INTENT_LOAD_BACKOFF") == ""
+    # A legacy pool is not judged on the optional files: the check says
+    # what it actually knows and no more.
+    assert _BACKOFF_FILE not in {
+        invariant.knob for invariant in report.invariants
+    }
+    assert "predates policy-intent records" in report.remedy
 
 
-def test_optional_file_presence_follows_what_the_pool_actually_reads(
+def test_policy_file_presence_follows_what_the_pool_actually_reads(
     tmp_path: Path,
 ) -> None:
     """A file the pool never parses is not policy, so presence is read
     from the effective source list rather than a directory listing."""
     report = _inspect(
-        _stub_tools(
-            tmp_path,
-            sources=(*_DEFAULT_SOURCES, "/pool/local/config.d/91-io-load-backoff.conf"),
-        )
+        _pool(tmp_path, backoff_intent="True", installed=(_BACKOFF_FILE,))
     )
 
-    details = {
-        observation.name: observation.detail for observation in report.observations
-    }
-    assert details["91-io-load-backoff.conf"].startswith("in effect")
-    assert "/pool/local/config.d/91-io-load-backoff.conf" in (
-        details["91-io-load-backoff.conf"]
-    )
-    assert details["92-io-pool-capacity.conf"] == "not installed"
+    assert _observed(report, _BACKOFF_FILE) == "installed"
+    assert _observed(report, _CAPACITY_FILE) == "absent"
 
 
 def test_report_names_the_configuration_it_read(tmp_path: Path) -> None:
-    report = _inspect(_stub_tools(tmp_path))
+    report = _inspect(_pool(tmp_path))
 
     assert report.source == "/pool/etc/condor_config"
     assert "condor-personal.sh up" in report.remedy
@@ -301,7 +416,7 @@ def test_a_failing_setting_read_is_a_backend_fault(tmp_path: Path) -> None:
 
 
 def test_a_missing_config_tool_is_a_backend_fault(tmp_path: Path) -> None:
-    tools = _stub_tools(tmp_path)
+    tools = _pool(tmp_path)
     (tmp_path / "bin" / "condor_config_val").unlink()
 
     with pytest.raises(LaneExecutorError, match="scheduler tool invocation failed"):
@@ -311,6 +426,33 @@ def test_a_missing_config_tool_is_a_backend_fault(tmp_path: Path) -> None:
 def test_the_check_rejects_anything_but_resolved_tools() -> None:
     with pytest.raises(ValueError, match="must be CondorTools"):
         CondorPoolPolicyCheck("condor_config_val")  # type: ignore[arg-type]
+
+
+def _generate_pool_config(tmp_path: Path, **environment: str) -> dict[str, str]:
+    """Run the installer's real config writer and read back what it
+    wrote across every file it produced."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    script = Path(__file__).resolve().parents[4] / "scripts" / "condor-personal.sh"
+    exports = "".join(f"export {key}={value}; " for key, value in environment.items())
+    generated = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'{exports}source "{script}" && write_lane_config "$1"',
+            "_",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert generated.returncode == 0, generated.stderr
+    written: dict[str, str] = {}
+    for path in sorted(tmp_path.glob("*.conf")):
+        for line in path.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                key, _, value = line.partition("=")
+                written[key.strip()] = value.strip()
+    return written
 
 
 def test_the_checked_invariants_are_exactly_what_the_helper_installs(
@@ -324,24 +466,7 @@ def test_the_checked_invariants_are_exactly_what_the_helper_installs(
     unguarded policy. Both directions are held here, from the
     helper's real output rather than a hand-copied list.
     """
-    script = Path(__file__).resolve().parents[4] / "scripts" / "condor-personal.sh"
-    generated = subprocess.run(
-        ["bash", "-c", f'source "{script}" && write_lane_config "$1"', "_", str(tmp_path)],
-        capture_output=True,
-        text=True,
-    )
-    assert generated.returncode == 0, generated.stderr
-    written = {
-        key.strip(): value.strip()
-        for key, _, value in (
-            line.partition("=")
-            for line in (tmp_path / "90-issue-orchestrator-lanes.conf")
-            .read_text()
-            .splitlines()
-            if "=" in line and not line.startswith("#")
-        )
-    }
-
+    written = _generate_pool_config(tmp_path)
     checked = dict(_REQUIRED_SETTINGS)
     for knob, expected in checked.items():
         assert knob in written, (
@@ -364,16 +489,38 @@ def test_the_checked_invariants_are_exactly_what_the_helper_installs(
         "JOB_START_COUNT",
         "CLAIM_WORKLIFE",
     }
-    assert set(written) - latency_tuning == set(checked), (
+    intent = {"IO_INTENT_LOAD_BACKOFF", "IO_INTENT_CAPACITY_PERCENT"}
+    unguarded = set(written) - latency_tuning - intent - set(checked)
+    assert not unguarded, (
         "the pool helper writes a correctness-bearing setting this check "
-        f"does not assert: {set(written) - latency_tuning - set(checked)}"
+        f"does not assert: {unguarded}"
     )
+
+
+def test_the_helper_records_intent_the_check_can_read(tmp_path: Path) -> None:
+    """The other half of the same contract: the sentinel the check
+    keys on must be written in BOTH opt-in states, and the capacity
+    intent must be present exactly when the dial was set. If the
+    installer stopped writing the sentinel, every pool it built would
+    read as legacy."""
+    opted_out = _generate_pool_config(tmp_path)
+    assert opted_out["IO_INTENT_LOAD_BACKOFF"] == "False"
+    assert "IO_INTENT_CAPACITY_PERCENT" not in opted_out
+
+    opted_in = _generate_pool_config(
+        tmp_path / "opted-in",
+        IO_CONDOR_LOAD_BACKOFF="1",
+        IO_POOL_CAPACITY_PERCENT="150",
+    )
+    assert opted_in["IO_INTENT_LOAD_BACKOFF"] == "True"
+    assert opted_in["IO_INTENT_CAPACITY_PERCENT"] == "150"
 
 
 def test_the_check_costs_a_handful_of_tool_calls(tmp_path: Path) -> None:
     """Cost is the reason this can run at the head of a gate at all —
-    and the reason it must not run per lane. One call per invariant
-    plus one for the source listing, and no polling loop."""
+    and the reason it must not run per lane. One call per required
+    setting, one per intent macro, one for the source listing, and no
+    polling loop."""
     binaries = tmp_path / "bin"
     binaries.mkdir()
     ledger = tmp_path / "calls.txt"
@@ -387,6 +534,7 @@ def test_the_check_costs_a_handful_of_tool_calls(tmp_path: Path) -> None:
         'case "$1" in\n'
         '  CONCURRENCY_LIMIT_DEFAULT) echo 1;;\n'
         '  PERIODIC_EXPR_INTERVAL) echo 5;;\n'
+        '  IO_INTENT_LOAD_BACKOFF) echo False;;\n'
         '  *) echo "Not defined: $1" >&2; exit 1;;\n'
         "esac\n"
     )
@@ -408,4 +556,6 @@ def test_the_check_costs_a_handful_of_tool_calls(tmp_path: Path) -> None:
         "CONCURRENCY_LIMIT_DEFAULT",
         "PERIODIC_EXPR_INTERVAL",
         "MOUNT_UNDER_SCRATCH",
+        "IO_INTENT_LOAD_BACKOFF",
+        "IO_INTENT_CAPACITY_PERCENT",
     ]
