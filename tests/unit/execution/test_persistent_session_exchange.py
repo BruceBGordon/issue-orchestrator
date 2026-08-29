@@ -7342,3 +7342,232 @@ class TestSpawnPartialConstructionCleanup:
         assert registry.acquired == [], (
             "no pair must reach the registry on partial spawn failure"
         )
+
+
+# ---------------------------------------------------------------------------
+# Retained kill evidence (#7128)
+# ---------------------------------------------------------------------------
+
+
+_KILL_BRANCH = "kill-evidence-retention-7128"
+_KILL_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _linked_worktrees(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Shape ``coder-wt`` / ``reviewer-wt`` as git worktrees of a shared repo.
+
+    Production agent worktrees are linked worktrees that get torn down after
+    the run, which is precisely why kill evidence must land in the *repo's*
+    retained diagnostics rather than anywhere under the worktree.
+    """
+    coder, reviewer = _setup_worktrees(tmp_path)
+    repo = tmp_path / "repo"
+    git_dir = repo / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    (git_dir / "HEAD").write_text(f"ref: refs/heads/{_KILL_BRANCH}\n", encoding="utf-8")
+    (git_dir / "refs" / "heads" / _KILL_BRANCH).write_text(
+        f"{_KILL_SHA}\n", encoding="utf-8"
+    )
+    for worktree in (coder, reviewer):
+        admin = git_dir / "worktrees" / worktree.name
+        admin.mkdir(parents=True)
+        (admin / "commondir").write_text("../..\n", encoding="utf-8")
+        (admin / "HEAD").write_text(
+            f"ref: refs/heads/{_KILL_BRANCH}\n", encoding="utf-8"
+        )
+        (worktree / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+    return coder, reviewer, repo
+
+
+class TestRetainedKillEvidence:
+    """A simulated round failure must leave evidence that outlives the run."""
+
+    def _run_failing_exchange(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        tail_bytes: bytes,
+    ) -> tuple[Any, Any, Path, Path]:
+        from issue_orchestrator.domain.review_exchange_failures import (
+            RoundFailureReason,
+        )
+        from issue_orchestrator.execution.persistent_round_failures import (
+            PersistentRoundTimeoutError,
+        )
+
+        prompt_path = tmp_path / "p.md"
+        prompt_path.write_text("Prompt", encoding="utf-8")
+        coder_wt, reviewer_wt, repo = _linked_worktrees(tmp_path)
+        session_output = FileSystemSessionOutput()
+        sink = _Sink()
+
+        # PROMPT_NOT_ACCEPTED is respawn-retryable, so the turn dies twice:
+        # once on the initial attempt and once on its respawn retry. Both are
+        # separate kills and both must be captured.
+        state = _patch_persistent_runner(
+            monkeypatch,
+            response_script={
+                "reviewer": [
+                    PersistentRoundTimeoutError(
+                        "Agent did not produce terminal output or a response "
+                        "after prompt delivery for 120.0s",
+                        failure_reason=RoundFailureReason.PROMPT_NOT_ACCEPTED,
+                    ),
+                    PersistentRoundTimeoutError(
+                        "Agent did not produce terminal output or a response "
+                        "after prompt delivery for 120.0s",
+                        failure_reason=RoundFailureReason.PROMPT_NOT_ACCEPTED,
+                    ),
+                ],
+                "coder": [],
+            },
+        )
+
+        def _paint_reviewer_screen(_round_index: int) -> None:
+            state["writers"]["reviewer"].write(tail_bytes)
+
+        outcome = pse.run_persistent_session_exchange(
+            exchange_run=_start_exchange_run(
+                session_output=session_output,
+                coder_worktree_path=coder_wt,
+                issue_number=42,
+                coder_label="agent:backend",
+            ),
+            session_output=session_output,
+            pair_registry=state["registry"],
+            persistent_pair_root=tmp_path / "persistent-pairs",
+            coder_worktree_path=coder_wt,
+            reviewer_worktree_factory=lambda: reviewer_wt,
+            issue_number=42,
+            issue_title="Test",
+            coder_label="agent:backend",
+            reviewer_label="agent:reviewer",
+            coder_agent=_make_agent(prompt_path),
+            reviewer_agent=_make_agent(prompt_path),
+            runtime_config=_runtime_config(tmp_path),
+            max_rounds=3,
+            max_no_progress=2,
+            require_validation=False,
+            before_reviewer_round=_paint_reviewer_screen,
+            events=sink,
+            event_context=EventContext(),
+        )
+        retained = repo / ".issue-orchestrator" / "diagnostics" / "exchange-kills"
+        return outcome, sink, retained, coder_wt
+
+    def test_round_failure_retains_recording_idle_trace_and_identity(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outcome, _sink, retained, coder_wt = self._run_failing_exchange(
+            tmp_path,
+            monkeypatch,
+            tail_bytes=b"\x1b[2m  \xe2\x8f\xb5\xe2\x8f\xb5 tab to queue message\x1b[0m\r\n",
+        )
+
+        assert outcome.reason == "reviewer_no_completion"
+        captures = sorted(p for p in retained.iterdir() if p.is_dir())
+        assert len(captures) == 2, "initial attempt and respawn retry are both kills"
+        for capture in captures:
+            assert (capture / "terminal-recording.jsonl").exists()
+            assert (capture / "idle-trace.json").exists()
+            assert (capture / "run-identity.json").exists()
+        # The retained home survives worktree teardown by construction.
+        assert coder_wt not in retained.parents
+
+    def test_retained_identity_supports_correlation_without_mtime_archaeology(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outcome, _sink, retained, _coder_wt = self._run_failing_exchange(
+            tmp_path,
+            monkeypatch,
+            tail_bytes=b"  tab to queue message\r\n",
+        )
+
+        captures = sorted(p for p in retained.iterdir() if p.is_dir())
+        names = [capture.name for capture in captures]
+        assert names[0].endswith("__issue-42__reviewer__round-1-attempt-1-respawn-0")
+        assert names[1].endswith("__issue-42__reviewer__round-1-attempt-1-respawn-1")
+        identity = json.loads(
+            (captures[0] / "run-identity.json").read_text(encoding="utf-8")
+        )
+        assert identity["branch"] == _KILL_BRANCH
+        assert identity["head_sha"] == _KILL_SHA
+        assert identity["failure_reason"] == "prompt_not_accepted"
+        assert identity["issue_key"] == "issue-42"
+        assert identity["session_name"].startswith("review-exchange-42-")
+        assert identity["exchange_dir"] == str(outcome.exchange_dir)
+        index = (retained / "index.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(index) == 2
+
+    def test_back_reference_lands_next_to_the_turn_result(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outcome, _sink, retained, _coder_wt = self._run_failing_exchange(
+            tmp_path,
+            monkeypatch,
+            tail_bytes=b"  tab to queue message\r\n",
+        )
+
+        assert outcome.exchange_dir is not None
+        pointer_path = outcome.exchange_dir / (
+            "round-1-reviewer-attempt-1-respawn-0.kill-evidence.json"
+        )
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        assert Path(pointer["retained_dir"]).parent == retained
+        assert Path(pointer["retained_recording"]).exists()
+
+    def test_stranded_composer_is_classified_and_reported_on_the_event(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The 2026-08-28 screen: prompt sitting unsent in the composer."""
+        _outcome, sink, retained, _coder_wt = self._run_failing_exchange(
+            tmp_path,
+            monkeypatch,
+            tail_bytes=b"\x1b[2m  \xe2\x8f\xb5\xe2\x8f\xb5 tab to queue message\x1b[0m\r\n",
+        )
+
+        captures = sorted(p for p in retained.iterdir() if p.is_dir())
+        identity = json.loads(
+            (captures[0] / "run-identity.json").read_text(encoding="utf-8")
+        )
+        assert identity["composer_state"]["state"] == "composer_stranded"
+        assert "tab to queue message" in identity["composer_state"]["evidence_snippet"]
+        timeouts = [
+            evt
+            for evt in sink.events
+            if evt.event_type is EventName.REVIEW_EXCHANGE_ROLE_TIMEOUT
+        ]
+        assert timeouts[0].data["composer_state"] == "composer_stranded"
+
+    def test_emptied_composer_is_distinguished_from_a_stranded_one(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Same failure reason, different screen: the submit did register."""
+        _outcome, sink, retained, _coder_wt = self._run_failing_exchange(
+            tmp_path,
+            monkeypatch,
+            tail_bytes=b"\xe2\x8f\xba Thinking\xe2\x80\xa6 (esc to interrupt)\r\n",
+        )
+
+        captures = sorted(p for p in retained.iterdir() if p.is_dir())
+        identity = json.loads(
+            (captures[0] / "run-identity.json").read_text(encoding="utf-8")
+        )
+        assert identity["composer_state"]["state"] == "composer_emptied"
+        timeouts = [
+            evt
+            for evt in sink.events
+            if evt.event_type is EventName.REVIEW_EXCHANGE_ROLE_TIMEOUT
+        ]
+        assert timeouts[0].data["composer_state"] == "composer_emptied"

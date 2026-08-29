@@ -35,12 +35,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..domain.review_exchange_failures import (
-    RoundFailureReason,
-    round_failure_reason_value,
-)
+from ..domain.exchange_kill_evidence import RoundIdleDetector
+from ..domain.review_exchange_failures import RoundFailureReason
 from ..infra.shutdown_signals import child_signal_reset_preexec
 from ..infra.terminal_recording import MirroredTerminalRecordingWriter
+from .persistent_round_failures import (
+    PersistentRoundError,
+    PersistentRoundTimeoutError,
+)
 from .persistent_round_io import drain_pty_output_until_quiet
 from .persistent_round_interactions import (
     PersistentInteractionState,
@@ -69,48 +71,6 @@ _ENTER_SETTLE_QUIET_SECONDS = 0.3
 # us *which* step is wedged instead of just "something hung."
 _SEND_ROUND_HEARTBEAT_SECONDS = 30.0
 _PTY_WRITE_HEARTBEAT_SECONDS = 5.0
-
-
-class PersistentRoundError(RuntimeError):
-    """Raised when a persistent round fails before a valid response exists."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        failure_reason: RoundFailureReason = RoundFailureReason.ROUND_ERROR,
-    ) -> None:
-        if not isinstance(failure_reason, RoundFailureReason):
-            raise TypeError("failure_reason must be a RoundFailureReason")
-        super().__init__(message)
-        self.failure_reason = round_failure_reason_value(failure_reason)
-
-
-class PersistentRoundTimeoutError(TimeoutError):
-    """Raised when a round's response file does not appear within the timeout."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        failure_reason: RoundFailureReason = RoundFailureReason.TIMEOUT,
-    ) -> None:
-        if not isinstance(failure_reason, RoundFailureReason):
-            raise TypeError("failure_reason must be a RoundFailureReason")
-        super().__init__(message)
-        self.failure_reason = round_failure_reason_value(failure_reason)
-
-
-def persistent_round_failure_reason(exc: BaseException) -> str:
-    """Return the machine reason for a round failure exception."""
-    reason = getattr(exc, "failure_reason", None)
-    if isinstance(reason, str) and reason:
-        return reason
-    if isinstance(exc, PersistentRoundTimeoutError):
-        return RoundFailureReason.TIMEOUT.value
-    if isinstance(exc, PersistentRoundError):
-        return RoundFailureReason.ROUND_ERROR.value
-    return RoundFailureReason.UNKNOWN.value
 
 
 @dataclass
@@ -544,31 +504,30 @@ def _wait_for_round_response(
     response distinguishes "invalid JSON left behind" from "never answered"
     via the round failure reason, which drives the respawn logic upstream.
     """
+    # The detector owns the liveness counters (poll iterations, drained bytes,
+    # last-activity clock) and the acceptance-window rule. It also keeps the
+    # heartbeat-sampled trajectory that kill-evidence capture retains: zero
+    # bytes drained over a long interval means the agent never read its prompt,
+    # which is the failure mode that hung the #6160 e2e regression.
+    detector = RoundIdleDetector(
+        window_seconds=prompt_acceptance_idle_seconds,
+        deadline_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        round_started_at=started_at,
+        activity_since=now(),
+        recording_bytes=_safe_recording_size(session),
+    )
     last_heartbeat = now()
-    last_activity_at = last_heartbeat
-    last_recording_size = _safe_recording_size(session)
-    poll_iter = 0
-    bytes_drained_total = 0
     while now() < deadline:
-        poll_iter += 1
-        # Track how much we drained so the heartbeat can show
-        # "agent has produced N bytes since the prompt was sent" —
-        # zero bytes drained over a long interval means the agent
-        # hasn't even read its prompt yet, which is the failure
-        # mode that hung the test.
         current = now()
-        drained = _drain_pty_output(session)
-        bytes_drained_total += drained
-        recording_size = _safe_recording_size(session)
-        recording_grew = (
-            last_recording_size is not None
-            and recording_size is not None
-            and recording_size > last_recording_size
+        detector.observe(
+            current,
+            drained=_drain_pty_output(session),
+            recording_bytes=_safe_recording_size(session),
         )
-        if drained or recording_grew:
-            last_activity_at = current
-        if recording_size is not None:
-            last_recording_size = recording_size
+        poll_iter = detector.poll_iterations
+        bytes_drained_total = detector.bytes_drained_total
+        recording_size = detector.recording_bytes
         parsed = read_response()
         if parsed is not None:
             drain_pty_output_until_quiet(
@@ -620,12 +579,11 @@ def _wait_for_round_response(
             raise PersistentRoundError(
                 f"Agent exited unexpectedly (code={ret}) before responding",
                 failure_reason=RoundFailureReason.PROCESS_EXITED_BEFORE_RESPONSE,
+                idle_trace=detector.snapshot(now()),
             )
-        idle_for = now() - last_activity_at
-        if (
-            prompt_acceptance_idle_seconds is not None
-            and idle_for >= prompt_acceptance_idle_seconds
-        ):
+        idle_at = now()
+        idle_for = detector.idle_for(idle_at)
+        if detector.acceptance_window_exhausted(idle_at):
             logger.warning(
                 "[send_round] prompt not accepted role=%s pid=%d after %.1fs idle "
                 "(elapsed=%.1fs poll_iters=%d bytes_drained=%d "
@@ -643,6 +601,7 @@ def _wait_for_round_response(
                 "Agent did not produce terminal output or a response after "
                 f"prompt delivery for {idle_for:.1f}s",
                 failure_reason=RoundFailureReason.PROMPT_NOT_ACCEPTED,
+                idle_trace=detector.snapshot(idle_at),
             )
         if now() - last_heartbeat >= _SEND_ROUND_HEARTBEAT_SECONDS:
             logger.info(
@@ -657,16 +616,19 @@ def _wait_for_round_response(
                 response_file.exists(),
                 recording_size if recording_size is not None else "n/a",
             )
+            detector.record_sample(now())
             last_heartbeat = now()
         sleep(poll_interval_seconds)
     logger.warning(
         "[send_round] timeout role=%s pid=%d after %.1fs "
         "(poll_iters=%d bytes_drained=%d response_file_exists=%s)",
         label, session.proc.pid, timeout_seconds,
-        poll_iter, bytes_drained_total, response_file.exists(),
+        detector.poll_iterations, detector.bytes_drained_total,
+        response_file.exists(),
     )
     raise PersistentRoundTimeoutError(
-        f"Agent did not produce valid JSON in {response_file} within {timeout_seconds}s"
+        f"Agent did not produce valid JSON in {response_file} within {timeout_seconds}s",
+        idle_trace=detector.snapshot(now()),
     )
 
 

@@ -141,6 +141,48 @@ cat $RUN_DIR/validation-errors.txt
 cat $WORKTREE/.issue-orchestrator/sessions/index.json | jq '.runs'
 ```
 
+## Retained Kill Evidence (review-exchange round failures)
+
+Run directories live in homes that disappear — a torn-down agent worktree, or a
+pytest tmp directory the async E2E runner rotates within the hour. When a
+review-exchange round is declared failed (`prompt_not_accepted`, timeout,
+process exit), the evidence is copied *out* of that home at declaration time
+into the repository's retained diagnostics:
+
+```
+<repo-root>/.issue-orchestrator/diagnostics/exchange-kills/
+├── index.jsonl                                # one line per capture, grep-able
+└── <ts>__issue-<n>__<role>__round-R-attempt-A-respawn-K/
+    ├── terminal-recording.jsonl               # copy of the role recording (tail-capped)
+    ├── idle-trace.json                        # window config + bytes_drained trajectory
+    └── run-identity.json                      # branch, HEAD SHA, session, run/exchange dirs
+```
+
+The exchange directory gets a matching
+`round-R-<role>-attempt-A-respawn-K.kill-evidence.json` back-pointer, so the
+cross-reference runs both ways and correlation never needs mtime archaeology.
+
+```bash
+KILLS=.issue-orchestrator/diagnostics/exchange-kills
+
+# Every capture for one branch, newest last
+jq -c 'select(.branch == "my-branch") | {captured_at, role, failure_reason, composer_state: .composer_state.state, retained_dir}' $KILLS/index.jsonl
+
+# Did the prompt ever submit? composer_stranded = the injected text never left
+# the composer (injection/settle race); composer_emptied = the submit
+# registered and the provider then went silent.
+jq '.composer_state' $KILLS/<capture>/run-identity.json
+
+# Did the agent produce anything at all after the prompt?
+jq '.idle_trace | {window_seconds, idle_for_seconds, bytes_drained_total}' $KILLS/<capture>/idle-trace.json
+```
+
+A frozen `bytes_drained_total` across the whole `samples` trajectory means the
+agent never engaged with the prompt. Combine that with `composer_stranded` and
+you are looking at the PR #6484 injection/settle family, not a provider stall.
+
+Captures accumulate; prune the directory manually when it gets large.
+
 ## Common Issues
 
 ### Dependency Changes Not Reflected Locally
