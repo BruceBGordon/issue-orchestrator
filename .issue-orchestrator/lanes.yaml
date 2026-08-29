@@ -45,7 +45,11 @@ lanes:
   test-simulated-agent:
     request_cpus: 2 # unmeasured; historical
     memory_mb: 1024
-    suspendability: anywhere
+    # NEVER despite the "simulated" name: this lane's foreign-repo
+    # lifecycle tests drive REAL `claude -p` and `codex exec` turns
+    # (A1, #7134 review) - frozen mid-turn, the provider window
+    # expires and the thaw manufactures an outage failure.
+    suspendability: never
   test-integration-core-local:
     request_cpus: 4 # unmeasured; historical
     memory_mb: 3072

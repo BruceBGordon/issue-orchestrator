@@ -169,15 +169,22 @@ write_load_backoff_config() {
   # the same host (B1, #7118 review — verified live: two busy dynamic
   # slots on one 18-core host advertised LoadAvg 3.16 and 0.0 while
   # TotalLoadAvg was 3.16).
-  # Eligibility is the job's own three-valued classification:
+  # Eligibility is the job's own three-valued classification —
   # "anywhere" lanes freeze whenever the owner needs the machine;
-  # "cooperative" lanes freeze ONLY while their own chirp
-  # advertisement holds SafeToSuspend true (=?= keeps every undefined
-  # or stale state on the not-frozen side); "never" lanes — and any
-  # job predating the classification vocabulary — match nothing.
+  # "never" lanes, and any job predating the classification
+  # vocabulary, match nothing (=?= keeps every undefined state on the
+  # not-frozen side). "cooperative" is deliberately NOT eligible yet:
+  # the intended gate (the job's own chirped SafeToSuspend) was
+  # DISPROVEN live on 2026-08-29 — runtime set_job_attr reaches the
+  # schedd's ad (verified via condor_q) but never the startd copy that
+  # evaluates SUSPEND: a chirping cooperative job ran unfrozen for
+  # 180s of over-threshold owner load while an anywhere control froze
+  # in 15s. Until a startd-visible channel is proven (#7139),
+  # cooperative behaves exactly like never here, and the lane-side
+  # plumbing (owner, transport, plugin) ships dormant-but-exercised.
   cat > "${config_dir}/91-io-load-backoff.conf" <<EOF
 OwnerLoadAvg = (TotalLoadAvg - TotalCondorLoadAvg)
-LaneEligibleToFreeze = ((TARGET.SuspendableLane =?= "anywhere") || ((TARGET.SuspendableLane =?= "cooperative") && (TARGET.SafeToSuspend =?= True)))
+LaneEligibleToFreeze = (TARGET.SuspendableLane =?= "anywhere")
 WANT_SUSPEND = \$(LaneEligibleToFreeze)
 SUSPEND = (\$(OwnerLoadAvg) > ${IO_CONDOR_SUSPEND_LOAD:-5.0}) && \$(LaneEligibleToFreeze)
 CONTINUE = (\$(OwnerLoadAvg) < ${IO_CONDOR_CONTINUE_LOAD:-2.0})

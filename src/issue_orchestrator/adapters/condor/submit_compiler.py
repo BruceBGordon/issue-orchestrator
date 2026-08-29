@@ -114,12 +114,16 @@ def compile_submit_description(
         f'+LaneSubmitter = "{submitter}"',
     ]
     if resources.suspendability is LaneSuspendability.COOPERATIVE:
-        # A cooperative lane starts UNSAFE: the pool may freeze it only
-        # after the running lane's own chirp advertisement flips
-        # SafeToSuspend true, so an advertisement that never arrives
-        # (no chirp binary, plugin not enabled, crash before the first
-        # boundary) degrades to never-frozen. WantIOProxy is the
-        # starter-side prerequisite for condor_chirp to reach the ad.
+        # A cooperative lane starts UNSAFE and advertises safe windows
+        # via chirp (WantIOProxy is the starter-side prerequisite).
+        # NOTE: the pool's suspension policy currently holds
+        # cooperative CLOSED — never freeze-eligible — because runtime
+        # chirp updates provably reach only the schedd's ad, not the
+        # startd copy that evaluates SUSPEND (disproven live
+        # 2026-08-29; #7139 tracks a startd-visible channel). The
+        # attributes ship anyway so the lane-side contract is
+        # exercised end-to-end and #7139 can open eligibility without
+        # touching jobs.
         lines.append("+SafeToSuspend = False")
         lines.append("+WantIOProxy = True")
     if resources.priority > 0:

@@ -243,18 +243,22 @@ Three rules are built in, each load-bearing:
   `.issue-orchestrator/lanes.yaml`: `anywhere` (hermetic — freeze and
   thaw safely at any point), `never` (live provider exchanges: frozen
   mid-turn, the response window expires and the thaw manufactures a
-  provider-outage failure), or `cooperative` — freezable **only at
-  safe points the running lane advertises itself**. A cooperative
-  lane's job starts unsafe; enabling the opt-in pytest plugin
-  (`-p issue_orchestrator.entrypoints.pytest_cooperative_yield`)
-  advertises safe between test items and unsafe during them via
-  `condor_chirp`, so a live agent turn or an open test fixture is
-  never interrupted while idle gaps between items are fair game. The
-  fail-safe direction is built in at every layer: no advertisement
-  (no chirp, plugin absent, xdist workers — which stay silent because
-  they share one job ad), stale state, or a pre-migration job all
-  mean never-frozen. The field is schema-required — a lane nobody
-  classified fails validation loudly instead of defaulting.
+  provider-outage failure), or `cooperative` — a lane that CAN
+  advertise safe interruption points (between test items, via the
+  opt-in plugin `-p issue_orchestrator.entrypoints.pytest_cooperative_yield`
+  and `condor_chirp`). **Cooperative lanes are currently never
+  frozen**: the pool's policy deliberately holds their eligibility
+  closed, because a live experiment (2026-08-29) proved runtime chirp
+  updates reach the schedd's job ad but not the startd copy that
+  evaluates SUSPEND — the advertisement machinery ships and is
+  exercised end-to-end (acknowledged transitions, hard errors when an
+  unsafe state cannot be restored), and #7139 tracks the
+  startd-visible channel that will open eligibility. The fail-safe
+  direction is built in at every layer regardless: no advertisement,
+  failed transport, xdist workers (silent by design — they share one
+  job ad), stale state, or a pre-migration job all mean never-frozen.
+  The field is schema-required — a lane nobody classified fails
+  validation loudly instead of defaulting.
 - **Frozen time is charged to nothing.** The compiled lane deadline
   subtracts suspension time (a freeze must not manufacture a timeout),
   and observed runtime excludes it (a freeze must not teach the

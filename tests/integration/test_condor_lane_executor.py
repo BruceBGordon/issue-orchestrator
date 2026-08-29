@@ -639,3 +639,85 @@ def test_owner_load_spike_freezes_only_suspendable_lanes(tmp_path: Path) -> None
     assert type(exempt_outcome) is LaneCompleted and exempt_outcome.exit_code == 0
     # Frozen time must not appear in the learning signal either.
     assert frozen_outcome.observed_runtime_seconds < 150.0
+
+
+@pytest.mark.requires_backoff_pool
+def test_cooperative_lanes_are_not_freeze_eligible_even_when_marked_safe(
+    tmp_path: Path,
+) -> None:
+    """The SHIPPED cooperative contract (B2/#7134, held closed by
+    #7139): cooperative lanes are NOT freeze-eligible, full stop —
+    the intended runtime-chirp gate was disproven live (set_job_attr
+    reaches the schedd's ad but never the startd copy that evaluates
+    SUSPEND). This pin uses a job whose ad carries SafeToSuspend=True
+    FROM SUBMISSION — strictly more visible to the startd than any
+    runtime chirp could be — and it must still run unfrozen while an
+    anywhere control under the identical load window suspends. When
+    #7139 opens eligibility, this test flips to the open contract in
+    the same change."""
+    import os
+
+    policy = _run_pool_tool("condor_config_val", "SUSPEND").stdout
+    assert "TotalLoadAvg - TotalCondorLoadAvg" in policy, (
+        "this test requires a pool started with IO_CONDOR_LOAD_BACKOFF=1; "
+        f"effective SUSPEND: {policy!r}"
+    )
+    assert "SafeToSuspend" not in policy, (
+        "the pool's policy references the disproven chirp gate - the "
+        "closed contract (#7139) no longer holds and this pin must be "
+        f"rewritten to the proven open contract: {policy!r}"
+    )
+
+    coop_key = _unique_lane_key("backoff.coop-closed")
+    control_key = _unique_lane_key("backoff.anywhere-ctl")
+
+    def _submit_sleeper(work_key: str, classification: str, extra: str) -> None:
+        submit_path = tmp_path / f"{work_key}.sub"
+        submit_path.write_text(
+            "universe = vanilla\n"
+            "executable = /bin/sleep\n"
+            "arguments = 240\n"
+            f"initialdir = {tmp_path}\n"
+            f"batch_name = {work_key}\n"
+            "request_cpus = 1\n"
+            "getenv = true\n"
+            f'+SuspendableLane = "{classification}"\n'
+            f"{extra}"
+            "queue\n"
+        )
+        submitted = _run_pool_tool("condor_submit", str(submit_path))
+        assert submitted.returncode == 0, submitted.stderr
+
+    burners: list[subprocess.Popen[bytes]] = []
+    try:
+        # Submit-time True: the most freeze-eligible a cooperative job
+        # can ever look; the closed policy must still ignore it.
+        _submit_sleeper(coop_key, "cooperative", "+SafeToSuspend = True\n")
+        _submit_sleeper(control_key, "anywhere", "")
+        _await_status(coop_key, _RUNNING, 90.0)
+        _await_status(control_key, _RUNNING, 90.0)
+
+        burner_count = (os.cpu_count() or 4) + 2
+        burners = [
+            subprocess.Popen([sys.executable, "-c", "while True: pass"])
+            for _ in range(burner_count)
+        ]
+        # The control suspending proves load and policy are live...
+        _await_status(control_key, _SUSPENDED_STATUS, 180.0)
+        # ...and through a full minute of that proven window (multiple
+        # PERIODIC_EXPR_INTERVAL=5 evaluation cycles), the cooperative
+        # job must never leave RUNNING.
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            status = _job_status(coop_key)
+            assert status == _RUNNING, (
+                "a cooperative lane was frozen under the closed contract "
+                f"(JobStatus={status!r}) - eligibility must stay closed "
+                "until #7139 proves a startd-visible channel"
+            )
+            time.sleep(5.0)
+    finally:
+        for burner in burners:
+            burner.kill()
+        _release_batch(coop_key)
+        _release_batch(control_key)

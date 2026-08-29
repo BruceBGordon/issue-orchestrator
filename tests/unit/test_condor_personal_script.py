@@ -351,28 +351,33 @@ def test_load_backoff_disable_removes_the_previous_policy(tmp_path: Path) -> Non
     assert not (tmp_path / "91-io-load-backoff.conf").exists()
 
 
-def test_load_backoff_freezes_only_lanes_whose_class_permits_it(
+def test_load_backoff_freezes_only_anywhere_lanes_for_now(
     tmp_path: Path,
 ) -> None:
-    """Three-valued gating (#7124): "anywhere" lanes are always
-    eligible, "cooperative" lanes only while their own advertisement
-    holds SafeToSuspend true, and "never" lanes — plus any job
-    predating the classification vocabulary, plus any undefined or
-    stale advertisement — match nothing (=?= semantics keep every
-    ambiguous state on the not-frozen side). Eligibility has one
-    owner expression consumed by both WANT_SUSPEND and SUSPEND."""
+    """Three-valued vocabulary, two-valued eligibility (B2, #7134):
+    only "anywhere" is freeze-eligible. "cooperative" is deliberately
+    CLOSED - its intended chirp gate was disproven live (runtime
+    set_job_attr reaches the schedd ad, never the startd copy that
+    evaluates SUSPEND; see #7139) - so the policy must not reference
+    SafeToSuspend at all until a startd-visible channel exists, and
+    "never" plus every pre-migration boolean job matches nothing
+    (=?= semantics). Eligibility has one owner expression consumed by
+    both WANT_SUSPEND and SUSPEND."""
     _write_lane_config(tmp_path, IO_CONDOR_LOAD_BACKOFF="1")
     generated = (tmp_path / "91-io-load-backoff.conf").read_text()
     assert (
-        'LaneEligibleToFreeze = ((TARGET.SuspendableLane =?= "anywhere") '
-        '|| ((TARGET.SuspendableLane =?= "cooperative") '
-        "&& (TARGET.SafeToSuspend =?= True)))" in generated
+        'LaneEligibleToFreeze = (TARGET.SuspendableLane =?= "anywhere")'
+        in generated
     )
     assert "WANT_SUSPEND = $(LaneEligibleToFreeze)" in generated
     assert generated.count("$(LaneEligibleToFreeze)") == 2
-    assert "=?= True)" not in generated.replace(
-        "TARGET.SafeToSuspend =?= True", ""
-    ), "a boolean SuspendableLane comparison survived the migration"
+    assert "SafeToSuspend" not in generated, (
+        "the disproven chirp gate leaked back into the policy - "
+        "reopen only with the startd-visible channel proven (#7139)"
+    )
+    assert "cooperative" not in generated, (
+        "cooperative eligibility must stay closed until #7139"
+    )
 
 
 def test_load_backoff_thresholds_are_overridable(tmp_path: Path) -> None:
