@@ -52,6 +52,9 @@ from .terminal_protocol import (
     _IGNORED_ESCAPE_MARKERS,
     _IGNORED_PRIVATE_FINALS,
     RenderedScreen,
+    blank_cells,
+    erase_span,
+    render_screen,
     _IGNORED_PRIVATE_MODES,
     _INERT_ANSI_RESETS,
     _C1_CSI,
@@ -63,7 +66,6 @@ from .terminal_protocol import (
     _ESCAPE_STRING_INTRODUCERS,
     BLANK,
     SavedCursor,
-    render_row,
     _ESC,
     _TAB_WIDTH,
     amount,
@@ -97,12 +99,11 @@ class TerminalViewport:
             raise ValueError("viewport geometry must be positive")
         self._rows = min(rows, MAX_TERMINAL_ROWS)
         self._cols = min(cols, MAX_TERMINAL_COLS)
-        self._grid: list[list[str]] = self._blank_grid()
         # Per-cell width, the way the terminal stores it: 2 marks a wide glyph
         # that owns the following column, 0 marks that follower. Rendering
         # skips what a wide owner covers, which is why a character written into
         # a follower can sit in the buffer and never appear on screen.
-        self._widths: list[list[int]] = [[1] * self._cols for _ in range(self._rows)]
+        self._grid, self._widths = blank_cells(self._rows, self._cols)
         # A wide owner immediately left of the cursor is blanked once per print
         # run, not once per character — measured.
         self._run_start = True
@@ -116,6 +117,7 @@ class TerminalViewport:
         self._saved = SavedCursor()
         self._cluster = EMPTY_CLUSTER
         self._autowrap = True
+        self._scrollback_dropped = False
         # Pending wrap is a state bit, not an out-of-range column: DECRC
         # restores a column without the promise attached, so inferring one from
         # the other reproduces a screen the terminal does not draw.
@@ -146,23 +148,25 @@ class TerminalViewport:
             cursor_col=self._col,
             saved=self._saved,
             written_extents=self._extent,
+            scrollback_dropped=self._scrollback_dropped,
         )
         if plan is None:
             return
-        if plan.refusal is not None:
-            self._refuse(plan.refusal)
+        for refusal in plan.refusals:
+            self._refuse(refusal)
         self._reshape(plan)
 
     def _reshape(self, plan: ResizePlan) -> None:
         """Move the grid and the cursor state onto the planned geometry."""
         keep = plan.rows_dropped_from_top
+        if keep:
+            self._scrollback_dropped = True
         old_grid = self._grid[keep:]
         old_written = self._written[keep:]
         old_extent = self._extent[keep:]
         old_widths = self._widths[keep:]
         self._rows, self._cols = plan.rows, plan.cols
-        self._grid = self._blank_grid()
-        self._widths = [[1] * plan.cols for _ in range(plan.rows)]
+        self._grid, self._widths = blank_cells(plan.rows, plan.cols)
         self._written = [False] * plan.rows
         self._extent = [0] * plan.rows
         for index in range(min(len(old_grid), plan.rows)):
@@ -242,25 +246,17 @@ class TerminalViewport:
 
     def render(self) -> RenderedScreen:
         """Freeze the current screen. Non-mutating; safe to call repeatedly."""
-        rows = tuple(
-            render_row(row, widths, extent)
-            for row, widths, extent in zip(self._grid, self._widths, self._extent)
-        )
-        written = tuple(
-            text for text, was_written in zip(rows, self._written) if was_written
-        )
-        return RenderedScreen(
-            rows=rows,
-            written_rows=written,
+        return render_screen(
+            grid=self._grid,
+            widths=self._widths,
+            extents=self._extent,
+            written=self._written,
             cursor_row=self._row,
             cursor_col=self._col,
             fed_bytes=self._fed,
         )
 
     # -- character handling -----------------------------------------------
-
-    def _blank_grid(self) -> list[list[str]]:
-        return [[BLANK] * self._cols for _ in range(self._rows)]
 
     def _apply_control(self, byte: int) -> None:
         """Apply one single-byte ASCII control character.
@@ -378,6 +374,12 @@ class TerminalViewport:
 
     def _scroll_up(self, count: int) -> None:
         top, bottom = self._scroll_top, self._scroll_bottom
+        if top == 0 and bottom == self._rows - 1:
+            # Rows leaving the top of the *whole screen* enter the scrollback,
+            # which a later row growth would restore. Measured: a scroll region
+            # narrower than the screen discards them instead, even when it is
+            # anchored to the top row.
+            self._scrollback_dropped = True
         for _ in range(count):
             del self._grid[top]
             del self._widths[top]
@@ -460,13 +462,16 @@ class TerminalViewport:
     def _save_cursor(self) -> None:
         """DECSC. Measured: saves row, column and charset, never the wrap.
 
-        The saved column is the clamped one, so restoring never brings back a
-        pending wrap — which is why a restored column-10 cursor does not wrap
-        the next glyph (#7141 round 8).
+        Restoring never brings back a pending wrap — a restored column-10
+        cursor does not wrap the next glyph (#7141 round 8) — but the column it
+        saves is the overflow one, which only shows once a resize widens the
+        screen enough for that column to exist (#7141 round 10).
         """
-        self._saved = SavedCursor(
-            row=self._row, column=min(self._col, self._cols - 1)
-        )
+        # A parked cursor sits one past the last cell, and DECSC keeps that
+        # overflow column rather than clamping it away: restoring inside the
+        # same width clamps it back anyway, but restoring after the screen has
+        # grown lands on the column the terminal really saved (round 10).
+        self._saved = SavedCursor(row=self._row, column=self._col)
 
     def _restore_cursor(self) -> None:
         """DECRC. Restores position without the pending-wrap promise."""
@@ -636,10 +641,11 @@ class TerminalViewport:
         """
         self._resolve(ColumnOperation.FULL_RESET)
         self._autowrap = True
+        # Measured: RIS empties the scrollback, so growth is faithful again.
+        self._scrollback_dropped = False
         self._run_start = True
         self._saved = SavedCursor()
-        self._grid = self._blank_grid()
-        self._widths = [[1] * self._cols for _ in range(self._rows)]
+        self._grid, self._widths = blank_cells(self._rows, self._cols)
         self._written = [True] * self._rows
         self._extent = [0] * self._rows
         self._row = self._col = 0
@@ -682,18 +688,11 @@ class TerminalViewport:
     def _erase_in_line(self, params: list[int]) -> None:
         self._resolve(ColumnOperation.ERASE)
         mode = params[0] if params else 0
-        start, stop = self._erase_span(mode)
+        start, stop = erase_span(mode, column=self._col, cols=self._cols)
         self._blank_span(start, stop)
         if stop >= self._cols:
             # Erasing to the end of the line untouches those cells again.
             self._extent[self._row] = min(self._extent[self._row], start)
-
-    def _erase_span(self, mode: int) -> tuple[int, int]:
-        if mode == 1:
-            return 0, min(self._col + 1, self._cols)
-        if mode == 2:
-            return 0, self._cols
-        return self._col, self._cols
 
     def _erase_characters(self, params: list[int]) -> None:
         """ECH. Blanks cells from the cursor without moving it."""

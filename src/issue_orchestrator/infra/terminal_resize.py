@@ -27,7 +27,17 @@ Column shrink losing content The terminal rewraps the overflow onto new lines.
                              Refused — see below.
 ===========================  =================================================
 
-Column reflow is the one behaviour here that is not modelled. Reproducing it
+Row growth is history-sensitive, which is the sharper half of the same
+problem: growing a screen does not append blank rows, it *un-drops* whatever
+fell off the top. A replay that appends blanks instead puts every live row on
+the wrong line, so a later erase clears the wrong one — which is how a marker
+the terminal had wiped survived into a trusted verdict (#7141 round 10).
+Measuring it showed the class is wider than the report: ordinary scrolling
+fills the scrollback too, not just a row shrink. So the owner carries one bit
+of "the screen has already lost rows", and any later row growth while it is set
+is refused. A full reset clears it, measured.
+
+Column reflow is the other behaviour here that is not modelled. Reproducing it
 needs line-continuation state this viewport does not carry, and the measured
 probes disagree in ways a guess would get wrong. Real recordings make that
 cheap to refuse: they carry at most one resize event, emitted before any output
@@ -51,8 +61,9 @@ class ResizePlan:
     """The reconciliation a resize implies, decided before anything is moved.
 
     ``rows_dropped_from_top`` is how much of the old screen the row shrink
-    discards to keep the cursor visible; ``refusal`` is set when the resize
-    would need the reflow model this viewport does not have.
+    discards to keep the cursor visible; ``refusals`` names every channel the
+    resize would need a model this viewport does not have. Both can apply to a
+    single event, so it is a tuple rather than one reason.
     """
 
     rows: int
@@ -61,7 +72,7 @@ class ResizePlan:
     cursor_row: int
     cursor_col: int
     saved: SavedCursor
-    refusal: str | None
+    refusals: tuple[str, ...]
 
 
 def plan_resize(
@@ -74,6 +85,7 @@ def plan_resize(
     cursor_col: int,
     saved: SavedCursor,
     written_extents: Sequence[int],
+    scrollback_dropped: bool,
 ) -> ResizePlan | None:
     """Decide the reconciliation, or ``None`` when the resize is a no-op.
 
@@ -83,9 +95,11 @@ def plan_resize(
     if rows == current_rows and cols == current_cols:
         return None
 
-    refusal: str | None = None
+    refusals: list[str] = []
     if cols < current_cols and any(extent > cols for extent in written_extents):
-        refusal = f"resize {current_cols}->{cols} with content past the edge"
+        refusals.append(f"resize {current_cols}->{cols} with content past the edge")
+    if rows > current_rows and scrollback_dropped:
+        refusals.append(f"resize {current_rows}->{rows} rows over dropped history")
 
     dropped = max(0, cursor_row - (rows - 1)) if rows < current_rows else 0
     return ResizePlan(
@@ -101,5 +115,5 @@ def plan_resize(
             row=min(max(0, saved.row - dropped), rows - 1),
             column=min(saved.column, cols - 1),
         ),
-        refusal=refusal,
+        refusals=tuple(refusals),
     )

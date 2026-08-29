@@ -221,8 +221,13 @@ travels with any rows a shrink drops from the top, then both coordinates are
 clamped — and keeps the cursor visible on a row shrink; a same-size resize does
 nothing at all. A column shrink that would push written content past the new
 edge is *refused*, because the terminal rewraps there and the viewport carries
-no line-continuation state; real recordings only ever hold one resize, emitted
-before any output, so nothing is reflowed in practice. A reset restores the terminal but never clears a refusal: whatever the
+no line-continuation state. Row *growth* is refused too once the screen has
+already lost rows — to a shrink, or to ordinary scrolling — because the
+terminal restores them from scrollback and pushes the live rows down, so a
+replay that appends blank rows instead clears the wrong line on the next erase.
+A full reset empties that history and makes growth faithful again; a soft reset
+does not. Real recordings only ever hold one resize, emitted before any output,
+so neither refusal costs a verdict in practice. A reset restores the terminal but never clears a refusal: whatever the
 unmodelled channel already did to the reconstructed rows cannot be undone. `matched_marker` names
 the affordance that decided it and `evidence_snippet` is the screen row it came
 from — check them before acting on the classification. `replayed_from_start:

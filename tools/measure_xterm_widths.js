@@ -399,6 +399,38 @@ function resizeProbes() {
             10, 5,
             ['a\r\nb\r\nc\r\nd\r\ne', `${ESC}[4;1H${ESC}7${ESC}[5;1H`, [10, 3], `${ESC}8Z`],
         ],
+        // Round 10: is row GROWTH history-sensitive? Does what a shrink
+        // dropped -- or what plain scrolling pushed off -- come back?
+        rows_shrink_grow_plain: [10, 5, ['a\r\nb\r\nc\r\nMARK', [10, 3], [10, 5]]],
+        rows_shrink_grow_erase: [
+            10, 5,
+            ['a\r\nb\r\nc\r\nMARK', [10, 3], [10, 5], `${ESC}[4;1H${ESC}[2K`],
+        ],
+        scroll_then_grow: [10, 3, ['a\r\nb\r\nc\r\nd', [10, 5]]],
+        scroll_then_grow_erase: [
+            10, 3, ['a\r\nb\r\nc\r\nd', [10, 5], `${ESC}[3;1H${ESC}[2K`],
+        ],
+        // Does a full reset empty the scrollback that growth would restore?
+        scroll_reset_then_grow: [10, 3, ['a\r\nb\r\nc\r\nd', `${ESC}c`, [10, 5], 'Z']],
+        // A soft reset restores modes, not history -- does growth still
+        // restore what scrolled off?
+        scroll_soft_reset_then_grow: [
+            10, 3, ['a\r\nb\r\nc\r\nd', `${ESC}[!p`, [10, 5]],
+        ],
+        // Scrolling inside a region that starts at the top row but does not
+        // reach the bottom: does that reach the scrollback at all?
+        region_scroll_then_grow: [
+            10, 4, [`${ESC}[1;3r`, 'a\r\nb\r\nc\r\nd', [10, 6]],
+        ],
+        // Growth with nothing ever dropped: faithful, and must stay allowed.
+        rows_grow_no_history: [10, 2, ['a\r\nb', [10, 5], `${ESC}[3;1HZ`]],
+        // The saved cursor's parked-ness across a resize -- the sibling of the
+        // live-cursor discharge measured in round 9.
+        parked_saved_no_resize: [10, 4, [`${FILL}${ESC}7${ESC}8Z`]],
+        parked_saved_then_grow: [10, 4, [`${FILL}${ESC}7`, [15, 4], `${ESC}8Z`]],
+        parked_saved_then_shrink_grow: [
+            10, 4, [`${FILL}${ESC}7`, [5, 4], [15, 4], `${ESC}8Z`],
+        ],
         // The reported footer case, at the widths it was reported with.
         parked_120_grow_125_footer: [120, 3, ['X'.repeat(120), [125, 3], 'tab to queue message']],
         saved_120_shrink_grow_footer: [

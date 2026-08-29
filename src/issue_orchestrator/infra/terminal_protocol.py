@@ -199,6 +199,53 @@ class SavedCursor:
 #: ``_IGNORED_ESCAPE_MARKERS`` is refused rather than silently dropped.
 
 
+def render_screen(
+    *,
+    grid: list[list[str]],
+    widths: list[list[int]],
+    extents: list[int],
+    written: list[bool],
+    cursor_row: int,
+    cursor_col: int,
+    fed_bytes: int,
+) -> "RenderedScreen":
+    """Project the cell store into the screen a reader sees.
+
+    Pure: the caller's state is only read, so a snapshot can be taken at any
+    time, repeatedly, including from another thread.
+    """
+    rows = tuple(
+        render_row(row, row_widths, extent)
+        for row, row_widths, extent in zip(grid, widths, extents)
+    )
+    return RenderedScreen(
+        rows=rows,
+        written_rows=tuple(
+            text for text, was_written in zip(rows, written) if was_written
+        ),
+        cursor_row=cursor_row,
+        cursor_col=cursor_col,
+        fed_bytes=fed_bytes,
+    )
+
+
+def blank_cells(rows: int, cols: int) -> tuple[list[list[str]], list[list[int]]]:
+    """A fresh cell store: every cell blank, every cell one column wide."""
+    return (
+        [[BLANK] * cols for _ in range(rows)],
+        [[1] * cols for _ in range(rows)],
+    )
+
+
+def erase_span(mode: int, *, column: int, cols: int) -> tuple[int, int]:
+    """The half-open span ``CSI <mode> K`` blanks, relative to the cursor."""
+    if mode == 1:
+        return 0, min(column + 1, cols)
+    if mode == 2:
+        return 0, cols
+    return column, cols
+
+
 @dataclass(frozen=True)
 class RenderedScreen:
     """The reconstructed viewport plus the honesty flags that qualify it.

@@ -53,6 +53,14 @@ _REFUSED_RESIZE_PROBES = frozenset(
         "resize_parked_then_shrink",
         "resize_both_dimensions",
         "resize_wide_glyph_across_shrink",
+        "resize_parked_saved_then_shrink_grow",
+        # Row growth after the screen has already lost rows: the terminal
+        # restores them from scrollback, which this model cannot reproduce.
+        "resize_rows_shrink_grow_plain",
+        "resize_rows_shrink_grow_erase",
+        "resize_scroll_then_grow",
+        "resize_scroll_then_grow_erase",
+        "resize_scroll_soft_reset_then_grow",
     }
 )
 
@@ -330,6 +338,95 @@ class TestResizeIsAMeasuredChannel:
         view.feed(b"Z")
 
         assert list(view.render().rows) == ["c", "dZ"]
+
+    def test_growing_rows_after_a_shrink_dropped_one_is_refused(self) -> None:
+        """The terminal un-drops the row from scrollback; this model cannot.
+
+        Appending a blank row instead puts every live row one line too high,
+        so a later erase clears the wrong one — which is how a marker the
+        terminal had already wiped survived into a trusted verdict.
+        """
+        view = TerminalViewport(rows=5, cols=10)
+        view.feed(b"a\r\nb\r\nc\r\nMARK")
+        view.resize(rows=3, cols=10)
+        view.resize(rows=5, cols=10)
+
+        assert view.unmodelled_state == ["resize 3->5 rows over dropped history"]
+
+    def test_growing_rows_after_plain_scrolling_is_refused(self) -> None:
+        """Wider than reported: ordinary scrolling fills the scrollback too."""
+        view = TerminalViewport(rows=3, cols=10)
+        view.feed(b"a\r\nb\r\nc\r\nd")
+        view.resize(rows=5, cols=10)
+
+        assert view.unmodelled_state == ["resize 3->5 rows over dropped history"]
+
+    def test_a_top_anchored_region_scroll_does_not_poison_later_growth(
+        self,
+    ) -> None:
+        """Measured: a region shorter than the screen discards, not scrolls back.
+
+        Refusing on any scroll whose region starts at row 0 was the obvious
+        conservative rule, and it is wrong — the terminal restores nothing
+        here, so refusing would cost a verdict for no reason.
+        """
+        view = TerminalViewport(rows=4, cols=10)
+        view.feed(b"\x1b[1;3ra\r\nb\r\nc\r\nd")
+        view.resize(rows=6, cols=10)
+
+        assert view.unmodelled_state == []
+        assert list(view.render().rows) == ["b", "c", "d", "", "", ""]
+
+    def test_scrolling_inside_a_region_does_not_poison_later_growth(self) -> None:
+        """Only rows leaving the top of the screen reach the scrollback."""
+        view = TerminalViewport(rows=5, cols=10)
+        view.feed(b"\x1b[2;4r\x1b[2;1Ha\nb\nc\nd")
+        view.resize(rows=8, cols=10)
+
+        assert view.unmodelled_state == []
+
+    def test_growing_rows_with_no_history_stays_modelled(self) -> None:
+        view = TerminalViewport(rows=2, cols=10)
+        view.feed(b"a\r\nb")
+        view.resize(rows=5, cols=10)
+        view.feed(b"\x1b[3;1HZ")
+
+        assert view.unmodelled_state == []
+        assert list(view.render().rows) == ["a", "b", "Z", "", ""]
+
+    def test_a_full_reset_empties_the_scrollback_so_growth_is_faithful_again(
+        self,
+    ) -> None:
+        view = TerminalViewport(rows=3, cols=10)
+        view.feed(b"a\r\nb\r\nc\r\nd\x1bc")
+        view.resize(rows=5, cols=10)
+        view.feed(b"Z")
+
+        assert view.unmodelled_state == []
+        assert list(view.render().rows) == ["Z", "", "", "", ""]
+
+    def test_a_soft_reset_does_not_empty_the_scrollback(self) -> None:
+        """DECSTR restores modes, not history — refusing must survive it."""
+        view = TerminalViewport(rows=3, cols=10)
+        view.feed(b"a\r\nb\r\nc\r\nd\x1b[!p")
+        view.resize(rows=5, cols=10)
+
+        assert view.unmodelled_state == ["resize 3->5 rows over dropped history"]
+
+    def test_the_saved_cursor_keeps_the_column_a_park_overflowed_to(self) -> None:
+        """DECSC saves the overflow column; only a widening screen reveals it."""
+        view = TerminalViewport(rows=4, cols=10)
+        view.feed(b"abcdefghij\x1b7")
+        view.resize(rows=4, cols=15)
+        view.feed(b"\x1b8Z")
+
+        assert list(view.render().rows)[0] == "abcdefghijZ"
+
+    def test_restoring_inside_the_same_width_still_clamps_that_column(self) -> None:
+        view = TerminalViewport(rows=4, cols=10)
+        view.feed(b"abcdefghij\x1b7\x1b8Z")
+
+        assert list(view.render().rows)[0] == "abcdefghiZ"
 
     def test_a_column_shrink_that_would_reflow_is_refused(self) -> None:
         view = TerminalViewport(rows=4, cols=10)

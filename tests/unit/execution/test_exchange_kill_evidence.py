@@ -1673,6 +1673,29 @@ class TestStateReachedOutsideTheParserDoesNotForgeAVerdict:
 
         assert verdict.state is ComposerState.COMPOSER_STRANDED
 
+    def test_a_marker_the_terminal_erased_does_not_survive_into_a_verdict(
+        self, tmp_path: Path
+    ) -> None:
+        """The reported repro: growth restores a dropped row and shifts the rest.
+
+        The terminal ends with the footer band erased. Appending a blank row on
+        growth instead left the marker one line above the erase, which read as
+        a trusted composer_stranded off a screen that no longer showed it.
+        """
+        path = self._mixed(
+            tmp_path / "regrow.jsonl",
+            (
+                self._output(b"\x1b[1;1Ha\r\nb\r\nc\r\n  tab to queue message"),
+                {"event_type": "resize", "rows": 3, "cols": 120},
+                {"event_type": "resize", "rows": 40, "cols": 120},
+                self._output(b"\x1b[4;1H\x1b[2K"),
+            ),
+        )
+
+        verdict = classify_composer_state(path)
+
+        assert verdict.state is ComposerState.UNDETERMINED
+
     def test_a_shrink_that_would_reflow_the_screen_refuses_a_verdict(
         self, tmp_path: Path
     ) -> None:
