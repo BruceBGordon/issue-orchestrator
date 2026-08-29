@@ -830,6 +830,71 @@ def test_decoy_curdir_cannot_reaim_the_store(tmp_path: Path) -> None:
     )
 
 
+def test_decoy_gmake_cannot_mint_a_verdict_for_work_never_done(
+    tmp_path: Path,
+) -> None:
+    """Round-6 finding: the written $(GMAKE) exclusion was disproven
+    by the same selective-decoy construction that killed the round-4
+    $(PYTHON) exclusion. A decoy gmake that delegates outer calls
+    faithfully but selectively succeeds the INNER re-invocation runs
+    inside the sanctioned wrapper's command - so the REAL layer mints
+    a green verdict for work that never happened. GMAKE is now
+    override-pinned to its shell derivation; a command-line decoy
+    loses and the inner work's real failure keeps the lane red."""
+    repo, _ = _fake_repo(tmp_path)
+    (repo / "extra.mk").write_text(
+        "outer-lane:\n"
+        "\t$(call TIMED_RUN,outer-lane,"
+        f"$(GMAKE) -f {REPO_ROOT / 'Makefile'} -f extra.mk "
+        "PYTHON=$(PYTHON) inner-step)\n"
+        "inner-step:\n"
+        "\t$(call TIMED_RUN,inner-step,sh -c 'exit 1')\n"
+    )
+    sha = _commit_all(repo)
+    real_make = shutil.which("gmake") or "make"
+    decoy = tmp_path / "decoy-gmake"
+    decoy.write_text(
+        "#!/bin/sh\n"
+        '. /dev/null\n'
+        'for a in "$@"; do\n'
+        '  [ "$a" = inner-step ] && exit 0\n'
+        "done\n"
+        f'exec {real_make} "$@"\n'
+    )
+    decoy.chmod(0o755)
+    result = subprocess.run(
+        [
+            real_make,
+            "-f",
+            str(REPO_ROOT / "Makefile"),
+            "-f",
+            "extra.mk",
+            f"PYTHON={REPO_ROOT / '.venv' / 'bin' / 'python'}",
+            "outer-lane",
+            f"GMAKE={decoy}",
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env={
+            **_scrubbed_environment(),
+            "LANE_VERDICT_SHA": sha,
+            "LANE_VERDICT_LANES": "outer-lane",
+            "PYTHONPATH": str(REPO_ROOT / "src"),
+        },
+    )
+    assert "recorded-green" not in result.stdout, (
+        "a decoy $(GMAKE) minted a verdict for work never done:\n"
+        + result.stdout
+    )
+    assert result.returncode != 0, (
+        "the inner step fails for real - a green outer lane means the "
+        "decoy ran it:\n" + result.stdout
+    )
+    lanes_root = repo / ".issue-orchestrator" / "validation" / "lanes"
+    assert not list(lanes_root.glob("*/*.json"))
+
+
 def test_untracked_state_disengages_the_cache_both_ways(
     tmp_path: Path,
 ) -> None:

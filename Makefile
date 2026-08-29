@@ -3,7 +3,13 @@
 # GNU make detection - required for parallel validation with grouped output
 # On macOS: brew install make (provides gmake)
 # On Linux: GNU make is the default
-GMAKE := $(shell command -v gmake 2>/dev/null || command -v make)
+# `override` (round 6): GMAKE exists solely as the macOS gmake-vs-make
+# host fact, already shell-derived; nothing in the repo, CI, or docs
+# overrides it on a command line (audited). It sits on the verdict
+# enforcement path - the scheduler lane's wrapped command re-invokes
+# $(GMAKE), and a selective decoy there runs INSIDE the sanctioned
+# wrapper, making the real layer mint a green for work never done.
+override GMAKE := $(shell command -v gmake 2>/dev/null || command -v make)
 GMAKE_VERSION := $(shell $(GMAKE) --version 2>/dev/null | head -1)
 
 # Default target
@@ -406,10 +412,16 @@ endef
 # a decoy $(PYTHON) is exactly positioned to lie selectively to the
 # layer's own invocations while the venv path either IS the real
 # interpreter or fails loudly (127) - fail-fast, no follow-the-build
-# indirection. Documented exclusion: $(GMAKE) is outside this layer's
-# ownership - a decoy make forges the SUITE record through the
-# pre-existing PublishGate exit-code trust and prevents per-lane
-# verdicts from being consulted at all; it cannot mint one.
+# indirection. The exclusion list is EMPTY as of round 6: the
+# $(GMAKE) exclusion was disproven by a selective decoy (delegate the
+# outer calls, lie about the inner re-invocation) minting a real
+# per-lane verdict - the second such precedent after $(PYTHON), so
+# GMAKE is now override-pinned at its definition. Any future
+# exclusion candidate must survive the selective-decoy test, and two
+# precedents say it will not. Ambient process environment (PATH,
+# underlying every $(shell) derivation and every tool invocation
+# alike) is the shared trust floor of the whole build, not a
+# make-override channel.
 override LANE_VERDICT_WORKTREE := $(shell pwd)
 override LANE_VERDICT_PYTHON := $(LANE_VERDICT_WORKTREE)/.venv/bin/python
 override LANE_VERDICT = $(LANE_VERDICT_PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_verdict
