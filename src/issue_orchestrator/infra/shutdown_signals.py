@@ -106,7 +106,9 @@ def describe_sender(pid: int) -> str:
         return "unknown (not reported)"
     try:
         result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
+            # -ww: procps truncates COMMAND to $COLUMNS even into a pipe,
+            # which would silently shorten the attribution this returns.
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
             capture_output=True,
             text=True,
             timeout=2,

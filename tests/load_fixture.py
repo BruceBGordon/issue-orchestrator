@@ -225,13 +225,26 @@ def _marked_pids(marker: str) -> tuple[int, ...]:
 
     ``-U <uid> -o pid,command`` is the spelling both BSD ps (macOS) and procps
     (Linux CI) accept; the BSD-style ``-x`` does not survive the crossing.
+
+    ``-ww`` and the scrubbed ``COLUMNS`` are not belt-and-braces, they are the
+    fix for a real CI failure (#7142): procps truncates the COMMAND column to
+    ``$COLUMNS`` even when writing to a pipe, and a pytest-xdist worker on
+    Linux starts with ``COLUMNS=80`` already set — the controller does not, and
+    macOS workers do not, which is why this passed everywhere except CI. The
+    marker sits ~450 characters into the argv, so every row came back cut off
+    at the interpreter path and the sweep reaped nothing while reporting
+    success. A width the environment can choose is a width this cannot use.
     """
+    env = {**os.environ}
+    env.pop("COLUMNS", None)
+    env.pop("LINES", None)
     result = subprocess.run(
-        ["ps", "-U", str(os.getuid()), "-o", "pid,command"],
+        ["ps", "-ww", "-U", str(os.getuid()), "-o", "pid,command"],
         capture_output=True,
         text=True,
         check=True,
         timeout=_PS_TIMEOUT_SECONDS,
+        env=env,
     )
     own_pid = os.getpid()
     pids: list[int] = []

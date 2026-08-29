@@ -253,6 +253,71 @@ class TestReapMarkedProcesses:
     def test_nothing_to_sweep_is_not_an_error(self, tmp_path: Path) -> None:
         assert reap_marked_processes(str(tmp_path / "never-spawned")) == ()
 
+    def test_a_marker_past_the_terminal_width_is_still_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The CI failure, reproduced as a test (#7142).
+
+        procps truncates ``ps`` output to ``$COLUMNS`` even when writing to a
+        pipe, and a pytest-xdist worker on Linux starts with ``COLUMNS=80``.
+        The marker sits far past column 80 — behind the interpreter path and a
+        ~250 character ``-c`` script — so every row came back cut off, the
+        sweep matched nothing, and it reported success having reaped nothing.
+
+        Deterministic on Linux, where the mechanism lives; on macOS BSD ``ps``
+        ignores ``COLUMNS`` and this has always passed, which is exactly why
+        the structural check below exists too.
+        """
+        monkeypatch.setenv("COLUMNS", "80")
+        monkeypatch.setenv("LINES", "24")
+        marker = tmp_path / "lane-marker"
+        # The precondition that gives this test its teeth: the marker is the
+        # last argv element, so a truncating ps loses it before anything else.
+        preceding = f"{sys.executable} -c {_TERM_IMMUNE_TREE} {FIXTURE_LIFETIME_SECONDS} "
+        assert len(preceding) > 80, "the marker no longer sits past the truncation width"
+        process = _spawn_leader(_TERM_IMMUNE_TREE, marker)
+        try:
+            assert _await_paths(Path(f"{marker}.parent"), Path(f"{marker}.child"))
+
+            killed = reap_marked_processes(
+                str(marker), terminate_grace_seconds=0.2, kill_grace_seconds=5.0
+            )
+
+            assert process.pid in killed, (
+                "the sweep reaped nothing and said so quietly: ps truncated the "
+                "command column to the environment's width"
+            )
+        finally:
+            _backstop(process.pid)
+            process.wait(timeout=OBSERVATION_TIMEOUT_SECONDS)
+
+    def test_the_process_table_read_is_not_width_dependent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pins the fix on every platform, including the one that cannot fail.
+
+        macOS ignores ``COLUMNS``, so the behavioural test above can never turn
+        red here — and a developer on macOS is exactly who would drop ``-ww``
+        as noise.
+        """
+        seen: dict[str, object] = {}
+
+        def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            seen["args"] = args
+            seen["env"] = kwargs["env"]
+            return subprocess.CompletedProcess(args, 0, "  PID COMMAND\n", "")
+
+        monkeypatch.setenv("COLUMNS", "80")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        reap_marked_processes("/nothing/matches/this")
+
+        args = seen["args"]
+        env = seen["env"]
+        assert isinstance(args, list) and isinstance(env, dict)
+        assert "-ww" in args, "ps must be told to ignore the terminal width"
+        assert "COLUMNS" not in env, "and must not inherit one either"
+
     def test_refuses_a_marker_that_would_match_this_process(self) -> None:
         with pytest.raises(ValueError, match="own argv"):
             reap_marked_processes(sys.argv[0])

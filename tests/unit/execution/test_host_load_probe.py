@@ -222,6 +222,38 @@ class TestProbeExecution:
             assert env["LANG"] == "C"
             assert "PATH" in env, "the pin must extend the environment, not replace it"
 
+    def test_the_process_table_is_read_at_unlimited_width(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """COMMAND is the column this probe exists for (#7142).
+
+        procps truncates it to ``$COLUMNS`` even into a pipe, so a stray
+        ``python -c 'while True: pass'`` would arrive as a bare interpreter
+        path: every row still present, every command a lie, and the debris
+        section silently empty. The CI failure that found this was in the test
+        helper; the same ``ps`` call is here, one layer from the gate.
+        """
+        seen: list[tuple[list[str], dict[str, str]]] = []
+
+        def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            seen.append((args, env))
+            stdout = _TOP_OUTPUT if args[0] == "top" else _PS_OUTPUT
+            return subprocess.CompletedProcess(args, 0, stdout.encode(), b"")
+
+        monkeypatch.setenv("COLUMNS", "80")
+        monkeypatch.setenv("LINES", "24")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        probe_host()
+
+        ps_args, ps_env = next((a, e) for a, e in seen if a[0] == "ps")
+        assert "-ww" in ps_args, "ps must be told to ignore the terminal width"
+        for _, env in seen:
+            assert "COLUMNS" not in env, "and must not inherit one either"
+            assert "LINES" not in env
+
     def test_undecodable_output_is_a_probe_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

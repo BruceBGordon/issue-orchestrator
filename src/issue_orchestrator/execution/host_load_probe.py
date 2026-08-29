@@ -201,7 +201,10 @@ def probe_host() -> HostSnapshot:
     """
     return build_snapshot(
         _run_probe(["top", "-l", "1", "-n", "0"]),
-        _run_probe(["ps", "-Ao", ",".join(_PS_FIELDS)]),
+        # ``-ww``: unlimited width, spelled the same for procps and BSD ps. The
+        # COMMAND column is the whole point of this probe, and its default
+        # width comes from the environment.
+        _run_probe(["ps", "-ww", "-Ao", ",".join(_PS_FIELDS)]),
     )
 
 
@@ -215,13 +218,25 @@ def current_owner() -> str:
 
 
 def _probe_env() -> dict[str, str]:
-    """The inherited environment with the numeric locale pinned.
+    """The inherited environment with everything that reshapes output removed.
 
-    Under a comma-decimal locale ``top`` prints ``49,90% idle`` and ``ps``
-    prints ``87,3`` for %CPU. C is the only locale whose number formatting the
-    parsers here are written against, so it is pinned rather than hoped for.
+    Locale: under a comma-decimal locale ``top`` prints ``49,90% idle`` and
+    ``ps`` prints ``87,3`` for %CPU. C is the only locale whose number
+    formatting the parsers here are written against, so it is pinned rather
+    than hoped for.
+
+    Width: procps honours ``COLUMNS`` even when its output is a pipe, and
+    truncates the COMMAND column to it. A pytest-xdist worker on Linux starts
+    with ``COLUMNS=80`` already in its environment, which is enough to cut
+    every argv down to the interpreter path — the process table would still
+    list every process, and every command in it would be a lie. Dropped here
+    as well as pinned at the call site, because a width the caller's
+    environment can set is not a width this module can parse against.
     """
-    return {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    env.pop("COLUMNS", None)
+    env.pop("LINES", None)
+    return env
 
 
 def _run_probe(args: list[str]) -> str:

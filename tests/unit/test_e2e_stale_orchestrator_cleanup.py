@@ -143,6 +143,6 @@ def test_kill_cleanup_only_kills_selected_processes() -> None:
 
     assert killed == 1
     assert calls == [
-        ["ps", "ax", "-o", "pid=,command="],
+        ["ps", "ax", "-ww", "-o", "pid=,command="],
         ["kill", "301"],
     ]

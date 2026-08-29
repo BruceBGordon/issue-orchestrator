@@ -73,7 +73,10 @@ def kill_stale_e2e_orchestrators(
     """
     try:
         ps_result = run(
-            ["ps", "ax", "-o", "pid=,command="],
+            # -ww: without it procps truncates COMMAND to $COLUMNS even
+            # into a pipe, and the substring match below decides what to
+            # KILL. A truncated table quietly matches nothing (#7142).
+            ["ps", "ax", "-ww", "-o", "pid=,command="],
             capture_output=True,
             text=True,
             check=False,

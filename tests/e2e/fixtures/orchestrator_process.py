@@ -506,7 +506,8 @@ class OrchestratorProcess:
             return
         try:
             result = subprocess.run(
-                ["ps", "-ax", "-o", "pid=,command="],
+                # -ww: see tests/e2e/_stale_orchestrator_cleanup (#7142).
+                ["ps", "-ax", "-ww", "-o", "pid=,command="],
                 capture_output=True,
                 text=True,
                 check=False,
