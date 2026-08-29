@@ -86,17 +86,36 @@ class TestIdlePercent:
             parse_idle_percent(comma_output)
 
     @pytest.mark.parametrize(
-        "line",
+        "idle_token",
         [
-            "CPU usage: 1.00% user, 2.00% sys, .% idle \n",
-            "CPU usage: 1.00% user, 2.00% sys, .5% idle \n",
-            "CPU usage: 1.00% user, 2.00% sys, % idle \n",
-            "CPU usage: 1.00% user, 2.00% sys, nan% idle \n",
+            ".",
+            ".5",
+            "",
+            "nan",
+            "+90",  # a sign is not part of the number this field prints
+            "abc90",  # leading garbage: the token must match whole
+            "-90",
+            "1.2.3",  # a second dot makes the whole token unreadable
         ],
     )
-    def test_malformed_numbers_are_refused(self, line: str) -> None:
+    def test_a_partial_token_is_refused_rather_than_half_read(
+        self, idle_token: str
+    ) -> None:
+        """Partial matches are the danger, not absent ones.
+
+        Every one of these ends in digits that would parse to a plausible,
+        wrong, and reassuringly high idle figure — silence exactly when the
+        machine is on fire.
+        """
         with pytest.raises(HostProbeError, match="CPU usage"):
-            parse_idle_percent(line)
+            parse_idle_percent(
+                f"CPU usage: 1.00% user, 2.00% sys, {idle_token}% idle \n"
+            )
+
+    def test_the_real_macos_line_still_reads(self) -> None:
+        line = "CPU usage: 17.99% user, 10.4% sys, 71.96% idle \n"
+
+        assert parse_idle_percent(line) == pytest.approx(71.96)
 
     @pytest.mark.parametrize("idle", ["150.00", "101"])
     def test_a_reading_outside_0_100_is_not_a_percentage(self, idle: str) -> None:
@@ -112,6 +131,7 @@ class TestElapsedField:
             ("11:48:38", 42518),
             ("03-11:48:38", 301718),
             ("05-13:59:02", 482342),
+            ("0-11:48:38", 42518),  # a zero day prefix is well-formed with hh:mm:ss
         ],
     )
     def test_supported_formats(self, elapsed: str, seconds: int) -> None:
@@ -125,6 +145,8 @@ class TestElapsedField:
             "",
             "1:2:3:4",
             "03-11:48",  # ps never prints a day field without hh:mm:ss
+            "0-2:3",  # ...and a zero day prefix is still a day prefix
+            "0-11:48",
             "-1:00",
             "11:99:38",  # sexagesimal by construction
             "11:48:99",

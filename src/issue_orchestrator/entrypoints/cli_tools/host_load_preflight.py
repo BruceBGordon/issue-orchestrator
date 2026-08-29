@@ -20,6 +20,7 @@ This module owns the policy; ``execution/host_load_probe`` owns the sampling.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from typing import TextIO
@@ -161,10 +162,54 @@ def report_lines(snapshot: HostSnapshot, *, owner: str) -> tuple[str, ...]:
 
 
 def emit(stream: TextIO, lines: tuple[str, ...]) -> None:
-    """Write report lines to ``stream`` with the greppable prefix."""
-    for line in lines:
-        stream.write(f"{LINE_PREFIX} {line}\n")
-    stream.flush()
+    """Write report lines to ``stream`` with the greppable prefix.
+
+    Output failure is swallowed here, and this is the only place in the module
+    that swallows anything. Everywhere else a failure has somewhere to go --
+    the probe reports through ``HostProbeError`` and the caller prints it. A
+    write that fails has nowhere left to report to: the report *is* the
+    reporting channel. Raising would then fail the gate over the diagnostic
+    that exists to protect it, which inverts the whole point.
+
+    ``BrokenPipeError`` (a closed reader) is the likely one; ``ValueError``
+    covers a stderr that has already been closed, which raises that instead.
+    """
+    try:
+        for line in lines:
+            stream.write(f"{LINE_PREFIX} {line}\n")
+        stream.flush()
+    except (OSError, ValueError):
+        _abandon(stream)
+
+
+def _abandon(stream: TextIO) -> None:
+    """Point a failed stream's descriptor at devnull.
+
+    Catching the write is not enough on its own: the unwritten bytes stay in
+    the wrapper's buffer, and CPython flushes the std streams again during
+    interpreter shutdown, outside any handler this module can install. That
+    second failure is reported as "Exception ignored" and exits **120** — the
+    gate lost to its own diagnostic after all. Redirecting the descriptor (the
+    idiom the standard library documents for ``BrokenPipeError``) leaves that
+    final flush somewhere harmless to land.
+
+    A stream with no real descriptor -- a ``StringIO`` under test -- has no
+    shutdown flush to survive, so there is nothing to do.
+    """
+    try:
+        descriptor = stream.fileno()
+    except (OSError, ValueError):
+        return
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(devnull, descriptor)
+    except OSError:
+        return
+    finally:
+        os.close(devnull)
 
 
 def main() -> None:

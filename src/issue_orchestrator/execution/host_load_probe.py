@@ -31,12 +31,17 @@ from dataclasses import dataclass
 # The probe is bounded so a wedged ``top`` cannot stall the gate it precedes.
 PROBE_TIMEOUT_SECONDS = 15.0
 
-# The idle figure must be a whole, well-formed decimal immediately before
-# ``% idle``. The lookbehind is the load-bearing part: under a comma-decimal
-# locale ``49,90% idle`` would otherwise match its own tail as ``90`` and read
-# a wedged host as nearly clean. Probes are run under LC_ALL=C so that shape
-# should never arrive; refusing to parse it is the backstop for when it does.
-_CPU_IDLE_RE = re.compile(r"CPU usage:[^\n]*?(?<![\d.,])(\d+(?:\.\d+)?)%\s+idle")
+# The idle figure must be a WHOLE token: the match starts at a space and runs
+# to ``%``, so nothing may precede the digits inside the token. Partial matches
+# are the danger, not absent ones -- ``49,90% idle`` under a comma locale,
+# ``+90% idle``, ``abc90% idle`` all end in a plausible number that is not the
+# host's idle time, and a wrong-but-high reading is silence exactly when the
+# machine is on fire. Probes run under LC_ALL=C so the comma shape should never
+# arrive; this grammar is the backstop for when something else does.
+#
+# ``top`` always separates the field from the previous one with whitespace, so
+# requiring it costs nothing real and makes the token unambiguous.
+_CPU_IDLE_RE = re.compile(r"CPU usage:[^\n]*?(?<=\s)(\d+(?:\.\d+)?)%\s+idle")
 _PS_FIELDS = ("pid", "ppid", "user", "pcpu", "etime", "command")
 
 # A process older than a century is a parse error, not a process. Deliberately
@@ -95,14 +100,17 @@ def parse_elapsed_seconds(elapsed: str) -> int:
     """
     days = 0
     remainder = elapsed
-    if "-" in elapsed:
+    # Presence, not truthiness: ``0-2:3`` has a day prefix worth nothing, and
+    # testing ``if days`` would wave it through as a bare mm:ss.
+    has_day_prefix = "-" in elapsed
+    if has_day_prefix:
         day_text, _, remainder = elapsed.partition("-")
         days = _to_count(day_text, field=f"ETIME days in {elapsed!r}")
     parts = remainder.split(":")
     if not 2 <= len(parts) <= 3:
         raise HostProbeError(f"unparseable ps ETIME field: {elapsed!r}")
     # ``ps`` only prints a day field alongside a full hh:mm:ss.
-    if days and len(parts) != 3:
+    if has_day_prefix and len(parts) != 3:
         raise HostProbeError(f"unparseable ps ETIME field: {elapsed!r}")
     hours = _to_count(parts[0], field=f"ETIME hours in {elapsed!r}") if len(parts) == 3 else 0
     minutes = _to_count(parts[-2], field=f"ETIME minutes in {elapsed!r}")

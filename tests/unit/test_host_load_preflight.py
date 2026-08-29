@@ -8,6 +8,8 @@ daemon) independently of how the host is sampled.
 from __future__ import annotations
 
 import io
+import subprocess
+import sys
 
 import pytest
 
@@ -233,6 +235,79 @@ class TestOutput:
         emit(stream, ("first", "second"))
 
         assert stream.getvalue() == "[host-preflight] first\n[host-preflight] second\n"
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            pytest.param(BrokenPipeError(32, "Broken pipe"), id="broken-pipe"),
+            pytest.param(OSError(5, "Input/output error"), id="io-error"),
+            pytest.param(ValueError("I/O operation on closed file"), id="closed"),
+        ],
+    )
+    def test_a_stream_that_cannot_be_written_does_not_fail_the_gate(
+        self, monkeypatch: pytest.MonkeyPatch, failure: Exception
+    ) -> None:
+        """The last path out of the always-exit-0 contract.
+
+        The probe reports failure through a typed error and the caller prints
+        it; a *printing* failure has nowhere left to report to. Raising here
+        would fail the gate over the diagnostic meant to protect it.
+        """
+
+        class RefusingStream(io.StringIO):
+            def write(self, s: str) -> int:
+                raise failure
+
+        monkeypatch.setattr(f"{_MODULE}.sys.platform", "darwin")
+        monkeypatch.setattr(
+            f"{_MODULE}.probe_host", lambda: _snapshot(0.0, _burner(41600))
+        )
+        monkeypatch.setattr(f"{_MODULE}.current_owner", lambda: OWNER)
+        monkeypatch.setattr(f"{_MODULE}.sys.stderr", RefusingStream())
+
+        main()  # must simply return
+
+    def test_a_flush_that_fails_does_not_fail_the_gate(self) -> None:
+        class UnflushableStream(io.StringIO):
+            def flush(self) -> None:
+                raise BrokenPipeError(32, "Broken pipe")
+
+        emit(UnflushableStream(), ("something worth saying",))
+
+    def test_a_real_hung_up_reader_still_exits_zero(self) -> None:
+        """A fake stream cannot show this one.
+
+        Containing the write leaves the unwritten bytes in the buffer, and
+        CPython flushes the std streams again during shutdown — outside any
+        handler, reported as "Exception ignored", exit 120. Only a real
+        process with a real broken descriptor exercises that path.
+        """
+        driver = (
+            "from issue_orchestrator.entrypoints.cli_tools "
+            "import host_load_preflight as h;"
+            "from issue_orchestrator.execution.host_load_probe "
+            "import HostSnapshot, ProcessRow;"
+            "h.probe_host = lambda: HostSnapshot(0.0, (ProcessRow("
+            "1, 9001, 't', 99.0, '00:42', 42, 'python3 -c pass'),));"
+            "h.current_owner = lambda: 't';"
+            "h.main()"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", driver],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            assert process.stderr is not None
+            process.stderr.close()  # the reader hangs up before anything is read
+
+            assert process.wait(timeout=60) == 0, (
+                "the preflight failed the gate because it could not print"
+            )
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=30)
 
     def test_long_commands_are_truncated_but_keep_the_arguments(self) -> None:
         buried = _row(
