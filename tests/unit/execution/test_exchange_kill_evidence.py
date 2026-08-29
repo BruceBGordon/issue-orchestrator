@@ -27,12 +27,12 @@ from issue_orchestrator.domain.exchange_kill_evidence import (
 )
 from issue_orchestrator.execution.exchange_kill_evidence import (
     IDLE_TRACE_FILENAME,
+    CapturedKillEvidence,
     INDEX_FILENAME,
     RECORDING_COPY_FILENAME,
     RUN_IDENTITY_FILENAME,
     ExchangeKillEvidenceRecorder,
     RoundIdentity,
-    RoundKillFacts,
     classify_composer_state,
     resolve_retained_diagnostics_root,
 )
@@ -164,9 +164,18 @@ def _trace() -> object:
     return detector.snapshot(200.0)
 
 
-def _facts(tmp_path: Path, **kwargs: object) -> RoundKillFacts:
-    return RoundKillFacts(
-        identity=_identity(tmp_path, **kwargs),  # type: ignore[arg-type]
+def _capture(
+    recorder: ExchangeKillEvidenceRecorder, tmp_path: Path, **kwargs: object
+) -> CapturedKillEvidence | None:
+    """Register a round and capture it the way the round loop does.
+
+    Production always captures through a ticket — that is the arbitration
+    token that stops the inner and outer paths both retaining one round — so
+    the tests drive the same entry rather than a facts-shaped side door.
+    """
+    ticket = recorder.round_started(_identity(tmp_path, **kwargs))  # type: ignore[arg-type]
+    return recorder.capture_declared_failure(
+        ticket,
         failure_reason="prompt_not_accepted",
         error_text="Agent did not produce terminal output for 120.0s",
         idle_trace=_trace(),  # type: ignore[arg-type]
@@ -390,8 +399,11 @@ class TestRetainedRootResolution:
         recorder = ExchangeKillEvidenceRecorder(clock=lambda: _FROZEN_AT)
 
         assert (
-            recorder.capture_declared_failure(
-                _facts(tmp_path, recording=_stranded_recording(tmp_path), worktree=plain)
+            _capture(
+                recorder,
+                tmp_path,
+                recording=_stranded_recording(tmp_path),
+                worktree=plain,
             )
             is None
         )
@@ -408,9 +420,8 @@ class TestCaptureArtifacts:
     ) -> None:
         root = tmp_path / "retained"
         recording = _stranded_recording(tmp_path)
-        facts = _facts(tmp_path, recording=recording)
 
-        captured = _recorder(root).capture_declared_failure(facts)
+        captured = _capture(_recorder(root), tmp_path, recording=recording)
 
         assert captured is not None
         directory = captured.directory
@@ -422,9 +433,7 @@ class TestCaptureArtifacts:
 
     def test_directory_name_carries_the_correlation_keys(self, tmp_path: Path) -> None:
         """Naming supports gate→session correlation without mtime archaeology."""
-        captured = _recorder(tmp_path / "retained").capture_declared_failure(
-            _facts(tmp_path, recording=_stranded_recording(tmp_path))
-        )
+        captured = _capture(_recorder(tmp_path / "retained"), tmp_path, recording=_stranded_recording(tmp_path))
 
         assert captured is not None
         assert captured.directory.name == (
@@ -432,9 +441,13 @@ class TestCaptureArtifacts:
         )
 
     def test_identity_pins_branch_head_sha_and_run_paths(self, tmp_path: Path) -> None:
-        facts = _facts(tmp_path, recording=_stranded_recording(tmp_path))
+        expected = _identity(tmp_path, recording=_stranded_recording(tmp_path))
 
-        captured = _recorder(tmp_path / "retained").capture_declared_failure(facts)
+        captured = _capture(
+            _recorder(tmp_path / "retained"),
+            tmp_path,
+            recording=expected.recording_path,
+        )
 
         assert captured is not None
         identity = json.loads(
@@ -442,23 +455,21 @@ class TestCaptureArtifacts:
         )
         assert identity["branch"] == _BRANCH
         assert identity["head_sha"] == _SHA
-        assert identity["session_name"] == facts.identity.session_name
+        assert identity["session_name"] == expected.session_name
         assert identity["exchange_run_id"] == "run-7128-abc"
         assert identity["issue_key"] == "issue-7128"
         assert identity["failure_reason"] == "prompt_not_accepted"
         assert identity["agent_pid"] == 4242
-        assert identity["original_recording"] == str(facts.identity.recording_path)
-        assert identity["run_dir"] == str(facts.identity.run_dir)
-        assert identity["exchange_dir"] == str(facts.identity.exchange_dir)
+        assert identity["original_recording"] == str(expected.recording_path)
+        assert identity["run_dir"] == str(expected.run_dir)
+        assert identity["exchange_dir"] == str(expected.exchange_dir)
         assert identity["composer_state"]["state"] == "composer_stranded"
         assert identity["retained_dir"] == str(captured.directory)
 
     def test_idle_trace_file_holds_the_window_and_trajectory(
         self, tmp_path: Path
     ) -> None:
-        captured = _recorder(tmp_path / "retained").capture_declared_failure(
-            _facts(tmp_path, recording=_stranded_recording(tmp_path))
-        )
+        captured = _capture(_recorder(tmp_path / "retained"), tmp_path, recording=_stranded_recording(tmp_path))
 
         assert captured is not None
         payload = json.loads(
@@ -472,12 +483,16 @@ class TestCaptureArtifacts:
         assert payload["idle_trace_unavailable"] is None
 
     def test_cross_reference_runs_both_ways(self, tmp_path: Path) -> None:
-        facts = _facts(tmp_path, recording=_stranded_recording(tmp_path))
+        expected = _identity(tmp_path, recording=_stranded_recording(tmp_path))
 
-        captured = _recorder(tmp_path / "retained").capture_declared_failure(facts)
+        captured = _capture(
+            _recorder(tmp_path / "retained"),
+            tmp_path,
+            recording=expected.recording_path,
+        )
 
         assert captured is not None
-        back = facts.identity.exchange_dir / (
+        back = expected.exchange_dir / (
             "round-2-reviewer-attempt-1-respawn-0.kill-evidence.json"
         )
         pointer = json.loads(back.read_text(encoding="utf-8"))
@@ -493,12 +508,8 @@ class TestCaptureArtifacts:
         recorder = _recorder(root)
         recording = _stranded_recording(tmp_path)
 
-        recorder.capture_declared_failure(
-            _facts(tmp_path, recording=recording, respawn_retries=0)
-        )
-        recorder.capture_declared_failure(
-            _facts(tmp_path, recording=recording, respawn_retries=1)
-        )
+        _capture(recorder, tmp_path, recording=recording, respawn_retries=0)
+        _capture(recorder, tmp_path, recording=recording, respawn_retries=1)
 
         lines = (root / INDEX_FILENAME).read_text(encoding="utf-8").splitlines()
         assert [json.loads(line)["respawn_retries"] for line in lines] == [0, 1]
@@ -509,10 +520,8 @@ class TestCaptureArtifacts:
         recorder = _recorder(root)
         recording = _stranded_recording(tmp_path)
 
-        first = recorder.capture_declared_failure(_facts(tmp_path, recording=recording))
-        second = recorder.capture_declared_failure(
-            _facts(tmp_path, recording=recording, respawn_retries=1)
-        )
+        first = _capture(recorder, tmp_path, recording=recording)
+        second = _capture(recorder, tmp_path, recording=recording, respawn_retries=1)
 
         assert first is not None and second is not None
         assert first.directory != second.directory
@@ -525,10 +534,8 @@ class TestCaptureArtifacts:
         recorder = _recorder(root)
         recording = _stranded_recording(tmp_path)
 
-        first = recorder.capture_declared_failure(_facts(tmp_path, recording=recording))
-        second = recorder.capture_declared_failure(
-            _facts(tmp_path, recording=recording)
-        )
+        first = _capture(recorder, tmp_path, recording=recording)
+        second = _capture(recorder, tmp_path, recording=recording)
 
         assert first is not None and second is not None
         assert second.directory.name.endswith("-2")
@@ -545,7 +552,7 @@ class TestCaptureAtomicity:
         root = tmp_path / "retained"
         recorder = _recorder(root)
         calls: list[Path] = []
-        real_write = module._write_json
+        real_write = module.write_json
 
         def _flaky(path: Path, payload: dict[str, object]) -> None:
             calls.append(path)
@@ -553,12 +560,10 @@ class TestCaptureAtomicity:
                 raise OSError("disk full on the second artifact")
             real_write(path, payload)
 
-        monkeypatch.setattr(module, "_write_json", _flaky)
+        monkeypatch.setattr(module, "write_json", _flaky)
 
         assert (
-            recorder.capture_declared_failure(
-                _facts(tmp_path, recording=_stranded_recording(tmp_path))
-            )
+            _capture(recorder, tmp_path, recording=_stranded_recording(tmp_path))
             is None
         )
         assert list(root.iterdir()) == [], "a partial capture must leave nothing behind"
@@ -568,9 +573,7 @@ class TestCaptureAtomicity:
     ) -> None:
         root = tmp_path / "retained"
 
-        captured = _recorder(root).capture_declared_failure(
-            _facts(tmp_path, recording=_stranded_recording(tmp_path))
-        )
+        captured = _capture(_recorder(root), tmp_path, recording=_stranded_recording(tmp_path))
 
         assert captured is not None
         assert [entry.name for entry in root.iterdir() if entry.is_dir()] == [
@@ -590,9 +593,7 @@ class TestCaptureAtomicity:
             encoding="utf-8",
         )
 
-        captured = _recorder(root).capture_declared_failure(
-            _facts(tmp_path, recording=_stranded_recording(tmp_path))
-        )
+        captured = _capture(_recorder(root), tmp_path, recording=_stranded_recording(tmp_path))
 
         assert captured is not None
         lines = index.read_text(encoding="utf-8").splitlines()
@@ -606,9 +607,7 @@ class TestCaptureAtomicity:
         index = root / INDEX_FILENAME
         index.write_text('{"kind": "keep me"}\n', encoding="utf-8")
 
-        _recorder(root).capture_declared_failure(
-            _facts(tmp_path, recording=_stranded_recording(tmp_path))
-        )
+        _capture(_recorder(root), tmp_path, recording=_stranded_recording(tmp_path))
 
         lines = index.read_text(encoding="utf-8").splitlines()
         assert json.loads(lines[0])["kind"] == "keep me"
@@ -623,9 +622,11 @@ class TestRecordingCopyRobustness:
         chunks.append(_STRANDED_FOOTER)
         recording = _recording(tmp_path / "huge.jsonl", chunks)
 
-        captured = _recorder(
-            tmp_path / "retained", max_copy_bytes=2_000
-        ).capture_declared_failure(_facts(tmp_path, recording=recording))
+        captured = _capture(
+            _recorder(tmp_path / "retained", max_copy_bytes=2_000),
+            tmp_path,
+            recording=recording,
+        )
 
         assert captured is not None
         assert captured.recording_truncated is True
@@ -648,9 +649,7 @@ class TestRecordingCopyRobustness:
         with recording.open("a", encoding="utf-8") as handle:
             handle.write('{"schema_version": 1, "event_type": "out')
 
-        captured = _recorder(tmp_path / "retained").capture_declared_failure(
-            _facts(tmp_path, recording=recording)
-        )
+        captured = _capture(_recorder(tmp_path / "retained"), tmp_path, recording=recording)
 
         assert captured is not None
         copied = (captured.directory / RECORDING_COPY_FILENAME).read_text(
@@ -662,9 +661,11 @@ class TestRecordingCopyRobustness:
     def test_missing_recording_still_produces_identity_and_idle_trace(
         self, tmp_path: Path
     ) -> None:
-        facts = _facts(tmp_path, recording=tmp_path / "never-written.jsonl")
 
-        captured = _recorder(tmp_path / "retained").capture_declared_failure(facts)
+        captured = _capture(
+            _recorder(tmp_path / "retained"), tmp_path,
+            recording=tmp_path / "never-written.jsonl",
+        )
 
         assert captured is not None
         assert not (captured.directory / RECORDING_COPY_FILENAME).exists()
@@ -682,9 +683,7 @@ class TestRecordingCopyRobustness:
         bogus = tmp_path / "recording-is-a-directory.jsonl"
         bogus.mkdir()
 
-        captured = _recorder(tmp_path / "retained").capture_declared_failure(
-            _facts(tmp_path, recording=bogus)
-        )
+        captured = _capture(_recorder(tmp_path / "retained"), tmp_path, recording=bogus)
 
         assert captured is not None
         assert (captured.directory / IDLE_TRACE_FILENAME).exists()
@@ -704,9 +703,7 @@ class TestCaptureNeverRaisesIntoTheFailurePath:
         blocked.write_text("this is a file, not a directory", encoding="utf-8")
 
         with caplog.at_level("ERROR"):
-            captured = _recorder(blocked).capture_declared_failure(
-                _facts(tmp_path, recording=_stranded_recording(tmp_path))
-            )
+            captured = _capture(_recorder(blocked), tmp_path, recording=_stranded_recording(tmp_path))
 
         assert captured is None
         assert "kill-evidence" in caplog.text
@@ -720,9 +717,7 @@ class TestCaptureNeverRaisesIntoTheFailurePath:
         )
 
         assert (
-            recorder.capture_declared_failure(
-                _facts(tmp_path, recording=_stranded_recording(tmp_path))
-            )
+            _capture(recorder, tmp_path, recording=_stranded_recording(tmp_path))
             is None
         )
 
@@ -922,12 +917,10 @@ class TestConcurrentCaptures:
         errors: list[BaseException] = []
         lock = threading.Lock()
 
-        def _capture() -> None:
+        def _one_capture() -> None:
             try:
                 barrier.wait(timeout=30)
-                captured = recorder.capture_declared_failure(
-                    _facts(tmp_path, recording=recording)
-                )
+                captured = _capture(recorder, tmp_path, recording=recording)
                 assert captured is not None
                 with lock:
                     results.append(captured.directory)
@@ -935,7 +928,7 @@ class TestConcurrentCaptures:
                 with lock:
                     errors.append(exc)
 
-        threads = [threading.Thread(target=_capture) for _ in range(64)]
+        threads = [threading.Thread(target=_one_capture) for _ in range(64)]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -956,14 +949,14 @@ class TestConcurrentCaptures:
         barrier = threading.Barrier(64)
         errors: list[BaseException] = []
 
-        def _capture() -> None:
+        def _one_capture() -> None:
             try:
                 barrier.wait(timeout=30)
-                recorder.capture_declared_failure(_facts(tmp_path, recording=recording))
+                _capture(recorder, tmp_path, recording=recording)
             except BaseException as exc:  # pragma: no cover - reported below
                 errors.append(exc)
 
-        threads = [threading.Thread(target=_capture) for _ in range(64)]
+        threads = [threading.Thread(target=_one_capture) for _ in range(64)]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -983,9 +976,7 @@ class TestConcurrentCaptures:
         recording = _stranded_recording(tmp_path)
         threads = [
             threading.Thread(
-                target=lambda: recorder.capture_declared_failure(
-                    _facts(tmp_path, recording=recording)
-                )
+                target=lambda: _capture(recorder, tmp_path, recording=recording)
             )
             for _ in range(16)
         ]
@@ -996,3 +987,301 @@ class TestConcurrentCaptures:
 
         leftovers = [entry.name for entry in root.iterdir() if entry.name.startswith(".")]
         assert leftovers == []
+
+
+class TestUndecodableRecordingIsNotTrusted:
+    """#7141 round 2 finding 1b: a decode gap means the stream is not sound."""
+
+    def test_invalid_base64_forces_undetermined(self, tmp_path: Path) -> None:
+        path = _stranded_recording(tmp_path)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                '{"schema_version": 1, "event_type": "output", "offset_ms": 99, '
+                '"data_b64": "!!not base64!!"}\n'
+            )
+
+        verdict = classify_composer_state(path)
+
+        assert verdict.state is ComposerState.UNDETERMINED
+        assert "incomplete" in verdict.evidence_snippet
+
+    def test_a_missing_payload_field_forces_undetermined(self, tmp_path: Path) -> None:
+        path = _stranded_recording(tmp_path)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write('{"schema_version": 1, "event_type": "output"}\n')
+
+        assert classify_composer_state(path).state is ComposerState.UNDETERMINED
+
+    def test_a_clean_recording_is_still_classified(self, tmp_path: Path) -> None:
+        """The guard must not swallow the healthy case."""
+        assert (
+            classify_composer_state(_stranded_recording(tmp_path)).state
+            is ComposerState.COMPOSER_STRANDED
+        )
+
+
+class TestOneCapturePerRound:
+    """#7141 round 2 finding 2: inner and outer must not both capture a round."""
+
+    def test_the_outer_capture_wins_and_the_inner_becomes_a_no_op(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "retained"
+        recorder = _recorder(root)
+        recording = _stranded_recording(tmp_path)
+        identity = _identity(tmp_path, recording=recording)
+        ticket = recorder.round_started(identity)
+
+        # Teardown captures while the sources still exist.
+        outer = recorder.capture_abandoned_rounds(7128, reason="deadline")
+        # The unwinding worker then tries to capture the same round; by now the
+        # pair is gone and its recording with it.
+        recording.unlink()
+        inner = recorder.capture_declared_failure(
+            ticket,
+            failure_reason="prompt_not_accepted",
+            error_text="boom",
+            idle_trace=None,
+        )
+
+        assert len(outer) == 1
+        assert inner is None, "the second capture of one round must be a no-op"
+        directories = [entry for entry in root.iterdir() if entry.is_dir()]
+        assert len(directories) == 1
+
+    def test_the_back_reference_points_at_the_capture_that_was_kept(
+        self, tmp_path: Path
+    ) -> None:
+        """The reported symptom: the pointer named the evidence-poor copy."""
+        root = tmp_path / "retained"
+        recorder = _recorder(root)
+        recording = _stranded_recording(tmp_path)
+        identity = _identity(tmp_path, recording=recording)
+        ticket = recorder.round_started(identity)
+
+        recorder.capture_abandoned_rounds(7128, reason="deadline")
+        recording.unlink()
+        recorder.capture_declared_failure(
+            ticket,
+            failure_reason="prompt_not_accepted",
+            error_text="boom",
+            idle_trace=None,
+        )
+
+        pointer = json.loads(
+            (
+                identity.exchange_dir
+                / "round-2-reviewer-attempt-1-respawn-0.kill-evidence.json"
+            ).read_text(encoding="utf-8")
+        )
+        retained = json.loads(
+            (Path(pointer["retained_dir"]) / RUN_IDENTITY_FILENAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert retained["recording_present"] is True
+        assert retained["failure_reason"] == "abandoned_by_teardown"
+
+    def test_the_inner_capture_wins_when_no_teardown_intervenes(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "retained"
+        recorder = _recorder(root)
+        ticket = recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        inner = recorder.capture_declared_failure(
+            ticket,
+            failure_reason="prompt_not_accepted",
+            error_text="boom",
+            idle_trace=None,
+        )
+        outer = recorder.capture_abandoned_rounds(7128, reason="deadline")
+
+        assert inner is not None
+        assert outer == ()
+        assert len([entry for entry in root.iterdir() if entry.is_dir()]) == 1
+
+    def test_a_finished_round_cannot_be_captured(self, tmp_path: Path) -> None:
+        recorder = _recorder(tmp_path / "retained")
+        ticket = recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+        recorder.round_finished(ticket)
+
+        assert (
+            recorder.capture_declared_failure(
+                ticket,
+                failure_reason="timeout",
+                error_text="boom",
+                idle_trace=None,
+            )
+            is None
+        )
+
+    def test_concurrent_inner_and_outer_produce_exactly_one_capture(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "retained"
+        recorder = _recorder(root)
+        recording = _stranded_recording(tmp_path)
+        ticket = recorder.round_started(_identity(tmp_path, recording=recording))
+        barrier = threading.Barrier(2)
+        results: list[object] = []
+        lock = threading.Lock()
+
+        def _inner() -> None:
+            barrier.wait(timeout=10)
+            got = recorder.capture_declared_failure(
+                ticket, failure_reason="timeout", error_text="x", idle_trace=None
+            )
+            with lock:
+                results.append(got)
+
+        def _outer() -> None:
+            barrier.wait(timeout=10)
+            got = recorder.capture_abandoned_rounds(7128, reason="deadline")
+            with lock:
+                results.append(got)
+
+        threads = [threading.Thread(target=_inner), threading.Thread(target=_outer)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        assert len([entry for entry in root.iterdir() if entry.is_dir()]) == 1
+
+
+class TestAtomicityEdges:
+    """#7141 round 2 finding 3: the gaps either side of the staged write."""
+
+    def test_a_failed_staging_creation_leaves_no_claimed_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The final-name claim must be cleaned up if staging never happens."""
+        from issue_orchestrator.execution import exchange_kill_evidence as module
+
+        root = tmp_path / "retained"
+        recorder = _recorder(root)
+        real_mkdir = Path.mkdir
+        calls: list[Path] = []
+
+        def _flaky_mkdir(self: Path, *args: object, **kwargs: object) -> None:
+            calls.append(self)
+            if self.name.startswith(".") and self.name.endswith(module.STAGING_SUFFIX):
+                raise OSError("no space left for the staging directory")
+            real_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", _flaky_mkdir)
+
+        assert (
+            _capture(recorder, tmp_path, recording=_stranded_recording(tmp_path))
+            is None
+        )
+        monkeypatch.undo()
+        assert list(root.iterdir()) == [], "an empty claimed directory survived"
+
+    def test_a_short_index_write_is_repaired_immediately(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A committed capture must never leave a torn index behind it."""
+        from issue_orchestrator.execution import exchange_kill_evidence as module
+
+        root = tmp_path / "retained"
+        recorder = _recorder(root)
+        from issue_orchestrator.execution import exchange_kill_artifacts as artifacts
+
+        real_write = artifacts.os.write
+
+        def _short_write(fd: int, data: bytes) -> int:
+            return real_write(fd, data[:11])
+
+        monkeypatch.setattr(artifacts.os, "write", _short_write)
+        _capture(recorder, tmp_path, recording=_stranded_recording(tmp_path))
+        monkeypatch.undo()
+
+        index = root / INDEX_FILENAME
+        raw = index.read_text(encoding="utf-8") if index.exists() else ""
+        assert raw == "" or raw.endswith("\n"), f"torn index left behind: {raw!r}"
+        for line in raw.splitlines():
+            json.loads(line)
+
+    def test_a_capture_survives_an_index_failure(self, tmp_path: Path) -> None:
+        """The index is a convenience; the artifacts are the evidence."""
+        root = tmp_path / "retained"
+        root.mkdir(parents=True)
+        (root / INDEX_FILENAME).mkdir()  # an index that cannot be written
+
+        captured = _capture(_recorder(root), tmp_path, recording=_stranded_recording(tmp_path))
+
+        assert captured is not None
+        assert (captured.directory / RUN_IDENTITY_FILENAME).exists()
+
+
+class TestCaptureBudget:
+    """#7141 round 2 finding 4: teardown capture runs under the registry lock."""
+
+    def test_an_exhausted_budget_abandons_the_capture(self, tmp_path: Path) -> None:
+        root = tmp_path / "retained"
+        recorder = _recorder(root, capture_budget_seconds=0.0)
+        recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        assert recorder.capture_abandoned_rounds(7128, reason="deadline") == ()
+
+    def test_an_exhausted_budget_says_what_it_abandoned(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        recorder = _recorder(tmp_path / "retained", capture_budget_seconds=0.0)
+        recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        with caplog.at_level("WARNING"):
+            recorder.capture_abandoned_rounds(7128, reason="deadline")
+
+        assert "budget" in caplog.text.lower()
+        assert "round-2-attempt-1-respawn-0" in caplog.text
+
+    def test_a_budget_that_expires_mid_capture_still_retains_identity(
+        self, tmp_path: Path
+    ) -> None:
+        """Partial evidence beats none when the disk is the thing stalling."""
+        ticks = iter([0.0, 0.0, 0.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0])
+        recorder = _recorder(
+            tmp_path / "retained",
+            capture_budget_seconds=10.0,
+            monotonic=lambda: next(ticks, 500.0),
+        )
+        recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        captured = recorder.capture_abandoned_rounds(7128, reason="deadline")
+
+        assert len(captured) == 1
+        identity = json.loads(
+            (captured[0] / RUN_IDENTITY_FILENAME).read_text(encoding="utf-8")
+        )
+        assert identity["recording_copy_error"] is not None
+        assert "budget" in identity["recording_copy_error"].lower()
+
+    def test_a_generous_budget_does_not_disturb_the_happy_path(
+        self, tmp_path: Path
+    ) -> None:
+        recorder = _recorder(tmp_path / "retained", capture_budget_seconds=600.0)
+        recorder.round_started(
+            _identity(tmp_path, recording=_stranded_recording(tmp_path))
+        )
+
+        captured = recorder.capture_abandoned_rounds(7128, reason="deadline")
+
+        assert len(captured) == 1
+        identity = json.loads(
+            (captured[0] / RUN_IDENTITY_FILENAME).read_text(encoding="utf-8")
+        )
+        assert identity["recording_present"] is True
+        assert identity["recording_copy_error"] is None

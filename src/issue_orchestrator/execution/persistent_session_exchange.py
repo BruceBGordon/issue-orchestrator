@@ -109,7 +109,6 @@ from .exchange_kill_evidence import (
     CapturedKillEvidence,
     ExchangeKillEvidenceRecorder,
     RoundIdentity,
-    RoundKillFacts,
     RoundTicket,
 )
 from .persistent_exchange_pair_registry_inmemory import (
@@ -2281,7 +2280,7 @@ def _finish_round(
 
 def _capture_round_kill_evidence(
     command: _RoleRoundCommand,
-    identity: RoundIdentity,
+    ticket: RoundTicket | None,
     error: BaseException,
     failure_reason: str,
 ) -> CapturedKillEvidence | None:
@@ -2293,17 +2292,19 @@ def _capture_round_kill_evidence(
     the volatile paths and the run identity. Returns ``None`` when no recorder
     was wired or the capture itself failed; the caller reports the round
     failure either way, because diagnostics must never mask it.
+
+    ``ticket`` is the arbitration token: if the exchange teardown already
+    captured this round, claiming it here fails and the capture is skipped
+    rather than writing a second, evidence-poor copy over the good one.
     """
     recorder = command.kill_evidence
-    if recorder is None:
+    if recorder is None or ticket is None:
         return None
     return recorder.capture_declared_failure(
-        RoundKillFacts(
-            identity=identity,
-            failure_reason=failure_reason,
-            error_text=str(error),
-            idle_trace=persistent_round_idle_trace(error),
-        )
+        ticket,
+        failure_reason=failure_reason,
+        error_text=str(error),
+        idle_trace=persistent_round_idle_trace(error),
     )
 
 
@@ -2405,16 +2406,15 @@ def _send_role_round(command: _RoleRoundCommand) -> ReviewExchangeResponse | Non
         if use_mailbox:
             assert turn_mailbox is not None
             turn_mailbox.close(mailbox_key)
-        # This round is over: deregister before capturing so a teardown racing
-        # us cannot capture the same round twice, and so the respawn retry
-        # below registers a fresh attempt rather than extending this one.
-        _finish_round(command.kill_evidence, ticket)
         failure_reason = persistent_round_failure_reason(exc)
         # Retain the kill evidence HERE, not after the respawn branch below:
         # prompt_not_accepted is respawn-retryable, so a capture placed after
         # that branch would miss the very failure this exists for, and the
         # respawn's fresh output would already have polluted the recording tail.
-        captured = _capture_round_kill_evidence(command, identity, exc, failure_reason)
+        # Claiming the ticket IS the deregistration: the capture below either
+        # takes this round (and the respawn retry then registers a fresh
+        # attempt) or finds a teardown already took it and does nothing.
+        captured = _capture_round_kill_evidence(command, ticket, exc, failure_reason)
         composer_state = None if captured is None else captured.composer.state.value
         logger.warning(
             "[REVIEW_EXCHANGE] %s round failed issue=%s session_name=%s "

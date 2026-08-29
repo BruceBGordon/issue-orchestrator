@@ -194,7 +194,9 @@ agent never engaged with the prompt. Combine that with `composer_stranded` and
 you are looking at the PR #6484 injection/settle family, not a provider stall.
 
 `composer_state` is read off the **rendered final viewport**, not the raw byte
-history, so an erased footer cannot support a verdict. `matched_marker` names
+history, so an erased footer cannot support a verdict. Anything that makes the
+reconstruction untrustworthy — a half-written recording, an unparseable row, an
+undecodable payload — yields `undetermined` rather than a guess. `matched_marker` names
 the affordance that decided it and `evidence_snippet` is the screen row it came
 from — check them before acting on the classification. `replayed_from_start:
 false` means only a trailing window of the recording was replayed; the verdict
@@ -202,6 +204,13 @@ is still sound (only rows the replay wrote are searched) but the screen above
 the footer band may be incomplete. A holding marker outranks a busy marker when
 both are visible: "tab to queue message" is direct evidence of unsent composer
 text, while "esc to interrupt" only says the agent is busy.
+
+`recording_copy_error` is set when the recording could not be copied whole.
+One cause is the capture budget: the teardown capture runs while the pair
+registry holds its lock, so it is bounded by wall clock as well as by size. A
+stalled filesystem shows up as an abandoned stage with a recorded reason (and a
+`capture budget ... exhausted` warning naming the rounds it dropped) rather
+than a teardown that never returns.
 
 Captures accumulate; prune the directory manually when it gets large.
 

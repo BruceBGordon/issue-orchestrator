@@ -41,6 +41,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, ClassVar
@@ -50,6 +51,7 @@ DEFAULT_COLS = 120
 _MAX_ROWS = 500
 _MAX_COLS = 1000
 _BLANK = " "
+_REPLACEMENT = "\ufffd"
 _TAB_WIDTH = 8
 
 _ESC = 0x1B
@@ -138,12 +140,13 @@ class TerminalViewport:
                 index += consumed
                 continue
             if byte >= 0x80:
-                width = _utf8_width(byte)
-                if index + width > size:
+                char, consumed = _decode_utf8(buffer, index, size)
+                if consumed == 0:
+                    # Genuinely truncated at the chunk edge — hold it over.
                     self._pending = buffer[index:]
                     return
-                self._print(_decode_character(buffer[index : index + width]))
-                index += width
+                self._print(char)
+                index += consumed
                 continue
             self._apply_control_byte(byte)
             index += 1
@@ -186,12 +189,30 @@ class TerminalViewport:
         self._print(chr(byte))
 
     def _print(self, char: str) -> None:
-        if self._col >= self._cols:
+        # A grid narrower than the glyph cannot represent it; clamping keeps
+        # the write in bounds instead of running off the end of the row.
+        cells = min(_char_cells(char), self._cols)
+        if cells == 0:
+            self._attach_combining(char)
+            return
+        if self._col + cells > self._cols:
             self._col = 0
             self._line_feed()
         self._grid[self._row][self._col] = char
+        # A wide glyph owns its trailing cell too; the empty string keeps the
+        # rendered row the right length without printing a second glyph.
+        for offset in range(1, cells):
+            self._grid[self._row][self._col + offset] = ""
         self._written[self._row] = True
-        self._col += 1
+        self._col += cells
+
+    def _attach_combining(self, char: str) -> None:
+        """Decorate the last written cell rather than consuming a new one."""
+        column = max(0, self._col - 1)
+        while column > 0 and self._grid[self._row][column] == "":
+            column -= 1
+        self._grid[self._row][column] += char
+        self._written[self._row] = True
 
     def _line_feed(self) -> None:
         if self._row == self._scroll_bottom:
@@ -370,9 +391,35 @@ def _numeric_params(raw: str) -> list[int]:
     return values
 
 
-def _decode_character(raw: bytes) -> str:
-    """Decode one multi-byte UTF-8 sequence into a single grid character."""
-    return raw.decode("utf-8", errors="replace")[:1] or "\ufffd"
+def _decode_utf8(buffer: bytes, index: int, size: int) -> tuple[str, int]:
+    """Decode one UTF-8 character at ``index``; return ``(char, consumed)``.
+
+    ``consumed == 0`` means the sequence is genuinely truncated at the end of
+    the chunk and the caller should hold the bytes over.
+
+    A declared byte count is not enough on its own: every byte after the lead
+    must be a continuation (0x80-0xBF). A lead that announces three bytes and
+    is followed by ``\x1b[`` is *corrupt*, not incomplete — consuming those two
+    bytes on its word swallows the escape sequence, and a swallowed screen
+    clear leaves an erased footer searchable, which is a false
+    ``composer_stranded`` verdict (#7141 round 2).
+    """
+    lead = buffer[index]
+    width = _utf8_width(lead)
+    if width == 1:
+        return _REPLACEMENT, 1
+    end = index + width
+    for offset in range(index + 1, min(end, size)):
+        if not _is_continuation(buffer[offset]):
+            # Corrupt, not truncated: the lead alone is the bad byte.
+            return _REPLACEMENT, 1
+    if end > size:
+        return "", 0
+    return buffer[index:end].decode("utf-8", errors="replace")[:1] or _REPLACEMENT, width
+
+
+def _is_continuation(byte: int) -> bool:
+    return 0x80 <= byte <= 0xBF
 
 
 def _utf8_width(lead: int) -> int:
@@ -380,8 +427,7 @@ def _utf8_width(lead: int) -> int:
 
     Invalid leads (0xC0/0xC1 overlongs, 0xF5-0xFF, and stray continuation
     bytes) are width 1 so one bad byte becomes one replacement character
-    instead of swallowing the bytes that follow it — including, across a chunk
-    boundary, the start of the next event.
+    instead of swallowing the bytes that follow it.
     """
     if 0xF0 <= lead <= 0xF4:
         return 4
@@ -390,6 +436,20 @@ def _utf8_width(lead: int) -> int:
     if 0xC2 <= lead <= 0xDF:
         return 2
     return 1
+
+
+def _char_cells(char: str) -> int:
+    """Screen cells this character occupies.
+
+    wcwidth semantics, narrowed to what a grid needs: East Asian Wide and
+    Fullwidth forms take two cells, combining marks take none and decorate the
+    cell already written. Getting this wrong desynchronises every subsequent
+    cursor address on the row, so a later erase clears the wrong columns and
+    leaves a footer behind (#7141 round 2).
+    """
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
 
 
 def _string_sequence_length(buffer: bytes, start: int) -> int | None:
@@ -473,7 +533,10 @@ def replay_terminal_recording(
         if event is None:
             complete = False
             continue
-        applied += _apply_event(viewport, event)
+        outcome = _apply_event(viewport, event)
+        applied += outcome.applied
+        if not outcome.sound:
+            complete = False
     return RecordingReplay(
         screen=viewport.render(),
         events_applied=applied,
@@ -500,20 +563,39 @@ def _parse_row(raw_row: bytes) -> dict[str, Any] | None:
     return event if isinstance(event, dict) else None
 
 
-def _apply_event(viewport: TerminalViewport, event: dict[str, Any]) -> int:
+@dataclass(frozen=True)
+class _EventOutcome:
+    """Whether an event reached the screen, and whether it was trustworthy.
+
+    ``sound`` is False when an event that *should* have carried PTY bytes could
+    not be decoded. Skipping it quietly would leave a hole in the reconstructed
+    stream while the replay still claimed to be complete — and a hole is
+    exactly where a screen clear hides (#7141 round 2).
+    """
+
+    applied: int
+    sound: bool
+
+
+_SOUND_NO_OP = _EventOutcome(applied=0, sound=True)
+
+
+def _apply_event(viewport: TerminalViewport, event: dict[str, Any]) -> _EventOutcome:
     kind = event.get("event_type")
     if kind == "resize":
         rows, cols = event.get("rows"), event.get("cols")
-        if isinstance(rows, int) and isinstance(cols, int):
-            viewport.resize(rows=rows, cols=cols)
-        return 0
+        if not isinstance(rows, int) or not isinstance(cols, int):
+            return _EventOutcome(applied=0, sound=False)
+        viewport.resize(rows=rows, cols=cols)
+        return _SOUND_NO_OP
     if kind != "output":
-        return 0
+        return _SOUND_NO_OP
     encoded = event.get("data_b64")
     if not isinstance(encoded, str):
-        return 0
+        return _EventOutcome(applied=0, sound=False)
     try:
-        viewport.feed(base64.b64decode(encoded, validate=True))
+        payload = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError):
-        return 0
-    return 1
+        return _EventOutcome(applied=0, sound=False)
+    viewport.feed(payload)
+    return _EventOutcome(applied=1, sound=True)

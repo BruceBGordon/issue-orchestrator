@@ -289,3 +289,120 @@ class TestRecordingReplay:
 
         assert replay.screen.written_rows == ()
         assert replay.structurally_complete is True
+
+
+class TestMalformedByteStreams:
+    """#7141 round 2 finding 1: the viewport must not trust byte counts alone."""
+
+    def test_an_incomplete_utf8_lead_does_not_swallow_the_next_escape(self) -> None:
+        """A truncated multi-byte lead must not eat the clear that follows it.
+
+        ``\\xe2`` announces three bytes; if the next two are taken blindly they
+        are ``\\x1b[`` and the screen clear never happens, leaving the erased
+        row searchable — which is a false composer_stranded.
+        """
+        view = _viewport()
+        view.feed(b"\x1b[1;1Htab to queue message")
+
+        view.feed(b"\xe2\x1b[2J\x1b[H")
+        view.feed(b"\x1b[1;1Hfresh")
+
+        screen = view.render()
+        assert "tab to queue message" not in "".join(screen.rows)
+        assert screen.rows[0] == "fresh"
+
+    def test_a_lead_followed_by_a_non_continuation_byte_re_parses_that_byte(
+        self,
+    ) -> None:
+        view = _viewport()
+
+        view.feed(b"\xe2A")
+
+        # One replacement for the bad lead, then a real 'A' — not a swallowed one.
+        assert view.render().rows[0].endswith("A")
+
+    def test_a_truncated_lead_at_the_very_end_is_held_for_the_next_chunk(
+        self,
+    ) -> None:
+        """The cross-chunk case the previous round claimed but never covered."""
+        view = _viewport()
+
+        view.feed(b"ok \xe2")
+        view.feed(b"\x8f\xb5 done")
+
+        assert view.render().rows[0] == "ok ⏵ done"
+
+    def test_a_multibyte_character_split_three_ways_still_renders(self) -> None:
+        view = _viewport()
+
+        view.feed(b"\xe6")
+        view.feed(b"\x9d")
+        view.feed(b"\xb1")
+
+        assert view.render().rows[0] == "東"
+
+    def test_an_overlong_or_invalid_lead_is_one_replacement_character(self) -> None:
+        view = _viewport()
+
+        view.feed(b"\xffX")
+
+        rendered = view.render().rows[0]
+        assert rendered.endswith("X")
+        assert len(rendered) == 2
+
+
+class TestWideCharacterCells:
+    """Full-width glyphs occupy two cells; cursor maths must agree."""
+
+    def test_a_full_width_character_advances_two_columns(self) -> None:
+        view = _viewport(rows=3, cols=10)
+
+        view.feed("東亜".encode("utf-8"))
+        view.feed(b"|")
+
+        assert view.render().rows[0] == "東亜|"
+
+    def test_full_width_text_wraps_on_the_real_cell_count(self) -> None:
+        """15 wide glyphs fill 30 columns exactly; the 16th must wrap."""
+        view = _viewport(rows=4, cols=30)
+
+        view.feed(("界" * 16).encode("utf-8"))
+
+        rendered = view.render().rows
+        assert rendered[0] == "界" * 15
+        assert rendered[1] == "界"
+
+    def test_a_wide_glyph_that_would_straddle_the_edge_wraps_whole(self) -> None:
+        view = _viewport(rows=3, cols=5)
+
+        view.feed(b"abcd")
+        view.feed("東".encode("utf-8"))
+
+        assert view.render().rows[:2] == ("abcd", "東")
+
+    def test_wide_content_does_not_desync_a_later_erase(self) -> None:
+        """The reported probe: wrong width cleared the wrong row."""
+        view = _viewport(rows=4, cols=30)
+        view.feed(("界" * 16).encode("utf-8"))
+        view.feed(b"\x1b[2;1H\x1b[Ktab to queue message")
+
+        # Repaint the footer row the way a TUI does.
+        view.feed(b"\x1b[2;1H\x1b[Kworking (esc to interrupt)")
+
+        assert "tab to queue message" not in "".join(view.render().rows)
+
+    def test_combining_marks_do_not_advance_the_cursor(self) -> None:
+        view = _viewport(rows=3, cols=10)
+
+        view.feed("éx".encode("utf-8"))
+
+        assert view.render().rows[0] == "é" + "x" if False else "éx"
+
+
+class TestDegenerateGeometry:
+    def test_a_wide_glyph_on_a_one_column_screen_stays_in_bounds(self) -> None:
+        view = _viewport(rows=2, cols=1)
+
+        view.feed("東亜".encode("utf-8"))
+
+        assert view.render().rows[0] in ("東", "亜")

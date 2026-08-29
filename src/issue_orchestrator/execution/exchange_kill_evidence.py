@@ -58,21 +58,18 @@ for fire-and-forget trace events: observability may degrade loudly
 
 from __future__ import annotations
 
-import itertools
 import json
 import logging
 import os
 import threading
 import time
 from collections.abc import Hashable
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 from ..domain.exchange_kill_evidence import (
     ComposerStateVerdict,
-    RoundIdleDetector,
     RoundIdleTrace,
     undetermined_composer_state,
 )
@@ -80,18 +77,33 @@ from ..domain.review_exchange_failures import (
     RoundFailureReason,
     round_failure_reason_value,
 )
-from ..infra.validation_timings import read_branch_name, read_head_sha, resolve_git_common_dir
+from .exchange_kill_artifacts import (
+    IDLE_TRACE_FILENAME,
+    INDEX_FILENAME,
+    RECORDING_COPY_FILENAME,
+    RUN_IDENTITY_FILENAME,
+    STAGING_SUFFIX,
+    CaptureBudget,
+    CapturedKillEvidence,
+    RecordingCopy,
+    RoundIdentity,
+    RoundKillFacts,
+    RoundTicket,
+    back_reference_path,
+    back_reference_payload,
+    discard_empty_claim,
+    identity_payload,
+    idle_payload,
+    record_index_line,
+    remove_tree,
+    stream_copy,
+    write_json,
+)
+from ..infra.validation_timings import resolve_git_common_dir
 from .composer_state import DEFAULT_REPLAY_BYTES, classify_composer_state
 
 logger = logging.getLogger(__name__)
 
-KILL_EVIDENCE_SCHEMA_VERSION = 2
-RECORDING_COPY_FILENAME = "terminal-recording.jsonl"
-IDLE_TRACE_FILENAME = "idle-trace.json"
-RUN_IDENTITY_FILENAME = "run-identity.json"
-INDEX_FILENAME = "index.jsonl"
-BACK_REFERENCE_SUFFIX = ".kill-evidence.json"
-STAGING_SUFFIX = ".part"
 
 _ORCHESTRATOR_DIRNAME = ".issue-orchestrator"
 _DIAGNOSTICS_DIRNAME = "diagnostics"
@@ -101,20 +113,18 @@ _KILL_EVIDENCE_DIRNAME = "exchange-kills"
 # the file, and an unbounded copy on the failure path could fill the disk the
 # orchestrator itself needs.
 _DEFAULT_MAX_COPY_BYTES = 64 * 1024 * 1024
-_COPY_CHUNK_BYTES = 1024 * 1024
-_MAX_ERROR_CHARS = 2_000
 # Linear probe depth for the same-second name collision. Generous because
 # the probe is a cheap mkdir and the cap has to exceed any plausible burst
 # of concurrent captures sharing one timestamp and turn slug.
 _MAX_DIRECTORY_ATTEMPTS = 256
+# Wall-clock ceiling for one capture. The teardown path runs under the pair
+# registry's lock, so this is what stops a stalled disk from wedging the whole
+# registry; generous enough that a healthy tail-capped copy never trips it.
+_DEFAULT_CAPTURE_BUDGET_SECONDS = 30.0
 
 RetainedRootResolver = Callable[[Path], Path | None]
 
-#: Process-wide sequence for unique temp-file names (see ``_write_json``).
-_TEMP_SEQ = itertools.count()
 
-#: Serialises the read-repair-then-append sequence on the index file.
-_INDEX_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -144,89 +154,6 @@ def resolve_retained_diagnostics_root(worktree: Path) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class RoundIdentity:
-    """Where one in-flight round lives and what it is.
-
-    Registered when the round *starts*, so a teardown that arrives while the
-    round is still wedged knows exactly which evidence to retain.
-    """
-
-    issue_number: int
-    role: str
-    round_index: int
-    attempt_index: int
-    respawn_retries: int
-    session_name: str
-    exchange_run_id: str
-    agent_pid: int
-    recording_path: Path
-    run_dir: Path
-    exchange_dir: Path
-    worktree: Path
-    response_file: Path
-    prompt_marker: str
-
-    @property
-    def issue_key(self) -> str:
-        return f"issue-{self.issue_number}"
-
-    @property
-    def turn_slug(self) -> str:
-        return (
-            f"round-{self.round_index}"
-            f"-attempt-{self.attempt_index}"
-            f"-respawn-{self.respawn_retries}"
-        )
-
-
-@dataclass(frozen=True)
-class RoundKillFacts:
-    """One round's identity plus how it died."""
-
-    identity: RoundIdentity
-    failure_reason: str
-    error_text: str
-    idle_trace: RoundIdleTrace | None
-    idle_trace_unavailable: str | None = None
-
-
-@dataclass(frozen=True)
-class CapturedKillEvidence:
-    """What one successful capture produced."""
-
-    directory: Path
-    composer: ComposerStateVerdict
-    recording_bytes_copied: int
-    recording_truncated: bool
-
-
-@dataclass
-class RoundTicket:
-    """Handle for one registered in-flight round.
-
-    Carries an optional live idle detector so a teardown can retain the
-    trajectory of a round that is *still running* — for a wedged worker that
-    frozen ``bytes_drained`` series is the whole diagnosis.
-    """
-
-    ticket_id: int
-    identity: RoundIdentity
-    detector: RoundIdleDetector | None = field(default=None)
-
-    def attach_detector(self, detector: RoundIdleDetector) -> None:
-        self.detector = detector
-
-
-@dataclass(frozen=True)
-class _RecordingCopy:
-    present: bool
-    source_bytes: int
-    copied_bytes: int
-    truncated: bool
-    error: str | None = None
-
-
 # ---------------------------------------------------------------------------
 # Capture owner
 # ---------------------------------------------------------------------------
@@ -249,12 +176,14 @@ class ExchangeKillEvidenceRecorder:
         replay_bytes: int = DEFAULT_REPLAY_BYTES,
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        capture_budget_seconds: float = _DEFAULT_CAPTURE_BUDGET_SECONDS,
     ) -> None:
         self._resolve_root = resolve_root
         self._max_copy_bytes = max_copy_bytes
         self._replay_bytes = replay_bytes
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic
+        self._capture_budget_seconds = capture_budget_seconds
         self._lock = threading.RLock()
         self._in_flight: dict[int, RoundTicket] = {}
         self._next_ticket_id = 1
@@ -271,9 +200,20 @@ class ExchangeKillEvidenceRecorder:
             return ticket
 
     def round_finished(self, ticket: RoundTicket) -> None:
-        """Clear a registration. Idempotent so callers can put it in a finally."""
+        """Clear a registration without capturing. Idempotent."""
+        self._claim(ticket)
+
+    def _claim(self, ticket: RoundTicket) -> bool:
+        """Take exclusive ownership of a round, once.
+
+        The ticket is the arbitration token shared by both capture paths: the
+        first path to claim it captures, the second finds it gone and does
+        nothing. Without this the teardown and the unwinding worker both
+        captured the same round, and the later (evidence-poor, sources already
+        destroyed) copy won the back-reference (#7141 round 2 finding 2).
+        """
         with self._lock:
-            self._in_flight.pop(ticket.ticket_id, None)
+            return self._in_flight.pop(ticket.ticket_id, None) is not None
 
     def in_flight_for(self, issue_key: Hashable) -> tuple[RoundIdentity, ...]:
         """Snapshot the rounds currently registered for one issue."""
@@ -287,15 +227,43 @@ class ExchangeKillEvidenceRecorder:
     # -- capture entries ---------------------------------------------------
 
     def capture_declared_failure(
-        self, facts: RoundKillFacts
+        self,
+        ticket: RoundTicket,
+        *,
+        failure_reason: str,
+        error_text: str,
+        idle_trace: RoundIdleTrace | None,
     ) -> CapturedKillEvidence | None:
         """Retain evidence for a round that declared its own failure.
 
-        Returns ``None`` when the capture itself failed; the caller keeps
+        Claims ``ticket`` first, so a round the teardown already captured is
+        not captured a second time. Returns ``None`` when the round was already
+        retained elsewhere or the capture itself failed; the caller keeps
         reporting the real round failure either way.
         """
+        if not self._claim(ticket):
+            logger.info(
+                "[kill-evidence] %s %s was already retained by the teardown path; "
+                "skipping the duplicate capture",
+                ticket.identity.issue_key,
+                ticket.identity.turn_slug,
+            )
+            return None
+        return self._capture_facts(
+            RoundKillFacts(
+                identity=ticket.identity,
+                failure_reason=failure_reason,
+                error_text=error_text,
+                idle_trace=idle_trace,
+            ),
+            budget=self._new_budget(),
+        )
+
+    def _capture_facts(
+        self, facts: RoundKillFacts, *, budget: "CaptureBudget"
+    ) -> CapturedKillEvidence | None:
         try:
-            return self._capture(facts)
+            return self._capture(facts, budget=budget)
         except Exception:
             # Observability boundary, not a swallowed bug: see module docstring.
             logger.exception(
@@ -325,12 +293,27 @@ class ExchangeKillEvidenceRecorder:
                 "[kill-evidence] could not read in-flight rounds for %s", issue_key
             )
             return ()
+        budget = self._new_budget()
+        abandoned: list[str] = []
         for ticket in tickets:
-            evidence = self.capture_declared_failure(
-                _abandoned_facts(ticket, reason=reason, now=self._monotonic)
+            if budget.expired():
+                abandoned.append(ticket.identity.turn_slug)
+                continue
+            evidence = self._capture_facts(
+                _abandoned_facts(ticket, reason=reason, now=self._monotonic),
+                budget=budget,
             )
             if evidence is not None:
                 captured.append(evidence.directory)
+        if abandoned:
+            logger.warning(
+                "[kill-evidence] capture budget of %.1fs exhausted during teardown "
+                "of %s; abandoned %d round(s) without retaining them: %s",
+                self._capture_budget_seconds,
+                issue_key,
+                len(abandoned),
+                ", ".join(abandoned),
+            )
         if tickets:
             logger.warning(
                 "[kill-evidence] exchange teardown abandoned %d in-flight round(s) "
@@ -361,7 +344,14 @@ class ExchangeKillEvidenceRecorder:
 
     # -- the capture itself ------------------------------------------------
 
-    def _capture(self, facts: RoundKillFacts) -> CapturedKillEvidence:
+    def _new_budget(self) -> CaptureBudget:
+        return CaptureBudget.starting_now(
+            seconds=self._capture_budget_seconds, now=self._monotonic
+        )
+
+    def _capture(
+        self, facts: RoundKillFacts, *, budget: CaptureBudget
+    ) -> CapturedKillEvidence:
         identity = facts.identity
         root = self._resolve_root(identity.worktree)
         if root is None:
@@ -373,23 +363,27 @@ class ExchangeKillEvidenceRecorder:
         final, staging = self._allocate_directory(root, identity, captured_at)
         try:
             evidence = self._commit(
-                facts, staging=staging, final=final, captured_at=captured_at
+                facts,
+                staging=staging,
+                final=final,
+                captured_at=captured_at,
+                budget=budget,
             )
             # The rename is the commit point. POSIX replaces the empty claimed
             # directory atomically, so the final name goes from empty straight
             # to complete with no partial state in between.
             os.rename(staging, final)
         except BaseException:
-            _remove_tree(staging)
-            _discard_empty_claim(final)
+            remove_tree(staging)
+            discard_empty_claim(final)
             raise
         identity_payload = json.loads(
             (final / RUN_IDENTITY_FILENAME).read_text(encoding="utf-8")
         )
-        _write_json(
-            _back_reference_path(identity), _back_reference_payload(facts, identity_payload)
+        write_json(
+            back_reference_path(identity), back_reference_payload(facts, identity_payload)
         )
-        _append_index_line(root / INDEX_FILENAME, identity_payload)
+        record_index_line(root / INDEX_FILENAME, identity_payload)
         logger.warning(
             "[kill-evidence] retained %s %s %s reason=%s composer_state=%s marker=%s "
             "recording_bytes=%d truncated=%s at %s",
@@ -417,6 +411,7 @@ class ExchangeKillEvidenceRecorder:
         staging: Path,
         final: Path,
         captured_at: datetime,
+        budget: CaptureBudget,
     ) -> CapturedKillEvidence:
         """Write every artifact into the staging directory.
 
@@ -425,19 +420,27 @@ class ExchangeKillEvidenceRecorder:
         both steps below degrade into a recorded error rather than aborting.
         Anything else raises and the staging directory is discarded whole.
         """
-        composer = self._classify(facts.identity)
-        copy = self._copy_recording_or_note_why_not(
-            facts.identity.recording_path, staging / RECORDING_COPY_FILENAME
+        composer = (
+            undetermined_composer_state(
+                "capture budget exhausted before the recording could be replayed"
+            )
+            if budget.expired()
+            else self._classify(facts.identity)
         )
-        payload = _identity_payload(
+        copy = self._copy_recording_or_note_why_not(
+            facts.identity.recording_path,
+            staging / RECORDING_COPY_FILENAME,
+            budget=budget,
+        )
+        payload = identity_payload(
             facts,
             directory=final,
             captured_at=captured_at,
             composer=composer,
             copy=copy,
         )
-        _write_json(staging / RUN_IDENTITY_FILENAME, payload)
-        _write_json(staging / IDLE_TRACE_FILENAME, _idle_payload(facts))
+        write_json(staging / RUN_IDENTITY_FILENAME, payload)
+        write_json(staging / IDLE_TRACE_FILENAME, idle_payload(facts))
         return CapturedKillEvidence(
             directory=staging,
             composer=composer,
@@ -473,7 +476,14 @@ class ExchangeKillEvidenceRecorder:
             except FileExistsError:
                 continue
             staging = root / f".{base}{suffix}.{self._next_staging_id()}{STAGING_SUFFIX}"
-            staging.mkdir(parents=True)
+            try:
+                staging.mkdir(parents=True)
+            except BaseException:
+                # The claim is only ever allowed to outlive this call as a
+                # directory we are about to fill; if staging never happened,
+                # an empty final-named directory must not be left behind.
+                discard_empty_claim(final)
+                raise
             return final, staging
         raise RuntimeError(
             f"could not allocate a kill-evidence directory under {root} for "
@@ -500,16 +510,24 @@ class ExchangeKillEvidenceRecorder:
             return undetermined_composer_state(f"classification failed: {exc!r}")
 
     def _copy_recording_or_note_why_not(
-        self, source: Path, destination: Path
-    ) -> _RecordingCopy:
+        self, source: Path, destination: Path, *, budget: CaptureBudget
+    ) -> RecordingCopy:
+        if budget.expired():
+            return RecordingCopy(
+                present=source.exists(),
+                source_bytes=0,
+                copied_bytes=0,
+                truncated=False,
+                error="capture budget exhausted before the recording was copied",
+            )
         try:
-            return self._copy_recording(source, destination)
+            return self._copy_recording(source, destination, budget=budget)
         except Exception as exc:
             logger.exception("[kill-evidence] could not copy recording %s", source)
             destination.with_name(destination.name + STAGING_SUFFIX).unlink(
                 missing_ok=True
             )
-            return _RecordingCopy(
+            return RecordingCopy(
                 present=source.exists(),
                 source_bytes=0,
                 copied_bytes=0,
@@ -517,7 +535,9 @@ class ExchangeKillEvidenceRecorder:
                 error=repr(exc),
             )
 
-    def _copy_recording(self, source: Path, destination: Path) -> _RecordingCopy:
+    def _copy_recording(
+        self, source: Path, destination: Path, *, budget: CaptureBudget
+    ) -> RecordingCopy:
         """Snapshot the recording, keeping the tail when it exceeds the cap.
 
         The source is open for append by a live PTY writer, so the copy is
@@ -525,23 +545,30 @@ class ExchangeKillEvidenceRecorder:
         trimmed — the retained file is always valid NDJSON.
         """
         if not source.exists():
-            return _RecordingCopy(
+            return RecordingCopy(
                 present=False, source_bytes=0, copied_bytes=0, truncated=False
             )
         size = source.stat().st_size
         start = max(0, size - self._max_copy_bytes)
-        copied, last_newline, ends_clean = _stream_copy(
-            source, destination, start=start, total=size - start
+        copied, last_newline, ends_clean = stream_copy(
+            source, destination, start=start, total=size - start, budget=budget
         )
         if copied and not ends_clean:
             with destination.open("r+b") as handle:
                 handle.truncate(last_newline + 1)
             copied = max(0, last_newline + 1)
-        return _RecordingCopy(
+        cut_short = copied < size - start
+        return RecordingCopy(
             present=True,
             source_bytes=size,
             copied_bytes=copied,
-            truncated=start > 0,
+            truncated=start > 0 or cut_short,
+            error=(
+                "capture budget exhausted mid-copy; retained only the leading "
+                f"{copied} bytes of the window"
+                if cut_short and budget.expired()
+                else None
+            ),
         )
 
 
@@ -575,214 +602,3 @@ def _abandoned_facts(
     )
 
 
-def _stream_copy(
-    source: Path, destination: Path, *, start: int, total: int
-) -> tuple[int, int, bool]:
-    """Copy ``total`` bytes from ``start``; report newline framing as we go."""
-    copied = 0
-    last_newline = -1
-    ends_clean = True
-    with source.open("rb") as reader, destination.open("wb") as writer:
-        reader.seek(start)
-        if start > 0:
-            # The window opens mid-row; skip to the first complete row so the
-            # retained copy parses as NDJSON from its first line.
-            total -= len(reader.readline())
-        while copied < total:
-            chunk = reader.read(min(_COPY_CHUNK_BYTES, total - copied))
-            if not chunk:
-                break
-            index = chunk.rfind(b"\n")
-            if index >= 0:
-                last_newline = copied + index
-            writer.write(chunk)
-            copied += len(chunk)
-            ends_clean = chunk.endswith(b"\n")
-    return copied, last_newline, ends_clean
-
-
-def _back_reference_path(identity: RoundIdentity) -> Path:
-    name = (
-        f"round-{identity.round_index}-{identity.role}"
-        f"-attempt-{identity.attempt_index}-respawn-{identity.respawn_retries}"
-        f"{BACK_REFERENCE_SUFFIX}"
-    )
-    return identity.exchange_dir / name
-
-
-def _back_reference_payload(
-    facts: RoundKillFacts, identity_payload: dict[str, Any]
-) -> dict[str, Any]:
-    """The volatile-side pointer at the retained capture.
-
-    Deliberately small: it exists so someone holding a run directory can jump
-    to the retained evidence, which carries the full identity.
-    """
-    return {
-        "schema_version": KILL_EVIDENCE_SCHEMA_VERSION,
-        "kind": "exchange_kill_evidence_reference",
-        "retained_dir": identity_payload["retained_dir"],
-        "retained_recording": identity_payload["retained_recording"],
-        "captured_at": identity_payload["captured_at"],
-        "failure_reason": facts.failure_reason,
-        "composer_state": identity_payload["composer_state"]["state"],
-    }
-
-
-def _identity_payload(
-    facts: RoundKillFacts,
-    *,
-    directory: Path,
-    captured_at: datetime,
-    composer: ComposerStateVerdict,
-    copy: _RecordingCopy,
-) -> dict[str, Any]:
-    """Run identity for one capture — the correlation record.
-
-    Every key a human or a grep needs to tie a retained capture back to the
-    gate run, the branch, and the session is here, so correlation never
-    degrades into sorting directories by mtime. Paths point at the *final*
-    directory even while staging, because that is where they will live.
-    """
-    identity = facts.identity
-    final = directory
-    return {
-        "schema_version": KILL_EVIDENCE_SCHEMA_VERSION,
-        "kind": "exchange_kill_evidence",
-        "captured_at": captured_at.isoformat(),
-        "issue_key": identity.issue_key,
-        "issue_number": identity.issue_number,
-        "role": identity.role,
-        "round_index": identity.round_index,
-        "attempt_index": identity.attempt_index,
-        "respawn_retries": identity.respawn_retries,
-        "failure_reason": facts.failure_reason,
-        "error": facts.error_text[:_MAX_ERROR_CHARS],
-        "session_name": identity.session_name,
-        "exchange_run_id": identity.exchange_run_id,
-        "agent_pid": identity.agent_pid,
-        "branch": read_branch_name(identity.worktree),
-        "head_sha": read_head_sha(identity.worktree),
-        "worktree": str(identity.worktree),
-        "run_dir": str(identity.run_dir),
-        "exchange_dir": str(identity.exchange_dir),
-        "response_file": str(identity.response_file),
-        "original_recording": str(identity.recording_path),
-        "recording_present": copy.present,
-        "recording_source_bytes": copy.source_bytes,
-        "recording_bytes_copied": copy.copied_bytes,
-        "recording_truncated": copy.truncated,
-        "recording_copy_error": copy.error,
-        "retained_dir": str(final),
-        "retained_recording": str(final / RECORDING_COPY_FILENAME),
-        "back_reference": str(_back_reference_path(identity)),
-        "composer_state": composer.to_dict(),
-    }
-
-
-def _idle_payload(facts: RoundKillFacts) -> dict[str, Any]:
-    identity = facts.identity
-    trace = facts.idle_trace
-    return {
-        "schema_version": KILL_EVIDENCE_SCHEMA_VERSION,
-        "kind": "exchange_kill_idle_trace",
-        "issue_key": identity.issue_key,
-        "role": identity.role,
-        "round_index": identity.round_index,
-        "attempt_index": identity.attempt_index,
-        "respawn_retries": identity.respawn_retries,
-        "failure_reason": facts.failure_reason,
-        "idle_trace": None if trace is None else trace.to_dict(),
-        "idle_trace_unavailable": facts.idle_trace_unavailable,
-    }
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Write one JSON artifact atomically.
-
-    The temp name is unique per call, not derived from the destination: two
-    captures of the same turn share a back-reference path, and a shared temp
-    name makes them clobber each other's half-written file mid-rename. Unique
-    temps make the destination a clean last-writer-wins, which is the right
-    answer for a pointer that should name the newest capture.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    staging = path.with_name(f"{path.name}.{os.getpid()}-{next(_TEMP_SEQ)}{STAGING_SUFFIX}")
-    try:
-        staging.write_text(
-            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
-        )
-        os.rename(staging, path)
-    except BaseException:
-        staging.unlink(missing_ok=True)
-        raise
-
-
-def _append_index_line(path: Path, payload: dict[str, Any]) -> None:
-    """Append one index row, repairing a trailing partial line first.
-
-    Pinned choice: **self-healing on append**. ``os.write`` can return short,
-    and a previous short write would otherwise leave a JSON fragment that every
-    later append silently concatenates onto, corrupting the row that follows
-    it. Rather than assume single-write atomicity we check the framing and
-    truncate back to the last newline before writing.
-
-    The write itself goes through ``O_APPEND`` so concurrent writers cannot
-    land on the same offset — a plain seek-to-end would let two captures
-    compute the same position and overwrite each other, which 64 concurrent
-    captures reproduce immediately. The repair is not part of that atomicity,
-    so it is serialised in-process by ``_INDEX_LOCK``; across processes it is
-    idempotent and only ever triggered by the rare short write it repairs.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    line = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
-    with _INDEX_LOCK:
-        _repair_trailing_fragment(path)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        try:
-            written = os.write(fd, line)
-            if written != len(line):
-                raise OSError(
-                    f"short index write to {path}: {written} of {len(line)} bytes"
-                )
-        finally:
-            os.close(fd)
-
-
-def _repair_trailing_fragment(path: Path) -> None:
-    """Truncate a trailing partial line so the next append starts framed."""
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        size = os.lseek(fd, 0, os.SEEK_END)
-        if size == 0:
-            return
-        os.lseek(fd, size - 1, os.SEEK_SET)
-        if os.read(fd, 1) == b"\n":
-            return
-        window = min(size, _COPY_CHUNK_BYTES)
-        os.lseek(fd, size - window, os.SEEK_SET)
-        tail = os.read(fd, window)
-        cut = tail.rfind(b"\n")
-        os.ftruncate(fd, size - window + cut + 1 if cut >= 0 else 0)
-    finally:
-        os.close(fd)
-
-
-def _discard_empty_claim(final: Path) -> None:
-    """Drop the claimed-but-never-filled final directory. Never raises."""
-    try:
-        final.rmdir()
-    except OSError:
-        logger.exception(
-            "[kill-evidence] could not discard the claimed directory %s", final
-        )
-
-
-def _remove_tree(path: Path) -> None:
-    """Best-effort removal of a staging directory; never raises."""
-    try:
-        for child in sorted(path.rglob("*"), reverse=True):
-            child.rmdir() if child.is_dir() else child.unlink(missing_ok=True)
-        path.rmdir()
-    except OSError:
-        logger.exception("[kill-evidence] could not discard staging directory %s", path)
