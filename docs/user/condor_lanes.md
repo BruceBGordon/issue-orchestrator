@@ -217,21 +217,22 @@ constant to go stale in the source.
   `SLICE_WEIGHTS_EPOCH` per gate (the flat fan is one make process, and
   the scheduler wrapper carries the stamp into the job); the first
   slice to ask publishes `pinned-<epoch>.json` and every other slice of
-  that gate is answered from it. A pin is dropped on one condition
-  only: it is more than **seven days** old. Nothing about how many
-  newer pins exist is consulted — recency-by-count and recency-by-clock
-  are both only *proxies* for "somebody is still reading this", and
-  conjoining two proxies does not prove the thing (a reviewer defeated
-  the conjunction by satisfying both at once). The week comes from the
-  system's own ceiling instead: a pin's readers are one gate's lanes,
-  and a lane cannot outlive the 1800s lane deadline plus the 600s
-  admission cap, so evicting a live pin would take a wall-clock jump of
-  over a week landing inside a forty-minute window — and a pin written
-  under a clock that wrong dates itself out of range, which makes it
-  undatable and therefore retained anyway. A pin whose age cannot be
-  established at all (unreadable, not JSON, or carrying something that
-  is not a date) is never evicted, and says so at `WARNING`. Pins are
-  kilobytes, so a week of them is single-digit megabytes.
+  that gate is answered from it.
+- **A snapshot is never recomputed.** The store records every epoch it
+  has pinned. If a slice asks for an epoch whose snapshot has since
+  been reclaimed — a lane's deadline excludes time it spent suspended,
+  so a frozen slice can legitimately return days later — the store
+  **refuses**, naming the epoch and the remedy, and the lane fails.
+  Recomputing would be the silent version of the same problem: weights
+  derived now differ from the ones this gate's earlier slices already
+  partitioned on, so some tests would run twice and others not at all.
+  A rare honest red is the correct outcome; wrong weights never are.
+- **Pin retention is housekeeping, not a safety mechanism.** Pins older
+  than seven days are deleted so the directory stays small. Nothing
+  about correctness rests on that number — outliving it produces the
+  loud failure above, never a wrong partition. A pin whose age cannot
+  be established at all (unreadable, not JSON, or carrying something
+  that is not a date) is never deleted, and says so at `WARNING`.
 - **Capture is backend-neutral.** It is a pytest plugin
   (`infra/pytest_file_durations.py`) enabled by the slice recipe, so a
   scheduler backend — which re-invokes that same recipe inside its job

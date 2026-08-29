@@ -49,9 +49,9 @@ _logger = logging.getLogger(__name__)
 
 _ROLLING_WINDOW = 5
 _DAY_SECONDS = 24 * 60 * 60
-# Seven days, and age is the ONLY signal — see _PinRetention for why a
-# second signal cannot help. The bound is derived from the system's own
-# hard limits, not chosen for comfort.
+# Housekeeping only — see _PinRetention. Correctness does not rest on
+# this number: outliving it produces a loud failure, never wrong
+# weights. Seven days keeps that failure rare and the directory small.
 _PIN_RETENTION_SECONDS = 7 * _DAY_SECONDS
 # Pins written before the payload carried its own timestamp can only be
 # dated by mtime, which answers a different question — when the bytes
@@ -68,6 +68,7 @@ _LOCK_FILENAME = "history.lock"
 _PINNED_PREFIX = "pinned-"
 _PINNED_SUFFIX = ".json"
 _DURATIONS_FIELD = "durations"
+_PINNED_EPOCHS_FIELD = "pinned_epochs"
 _WEIGHTS_FIELD = "weights"
 _PUBLISHED_AT_FIELD = "published_at"
 _SAFE_EPOCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -123,6 +124,40 @@ class FileDurationHistoryError(RuntimeError):
     """
 
 
+class PinnedEpochExpiredError(FileDurationHistoryError):
+    """This epoch was pinned once, and its snapshot is gone.
+
+    A store fault rather than a cache miss, because the only other
+    thing this store could do is recompute — and recomputing is the
+    defect every round of review has been circling. Weights derived now
+    differ from the ones this gate's earlier slices already partitioned
+    on, so the slices stop being a partition: some files run twice and
+    others not at all, in a gate that goes green. A loud failure is the
+    correct outcome; wrong weights never are.
+    """
+
+
+@dataclass(frozen=True)
+class _StoreDocument:
+    """Everything ``history.json`` holds.
+
+    The ledger of pinned epochs rides in the same document as the
+    durations because both are written under the same lock in the same
+    atomic replace — a ledger that could fall out of step with the
+    store it guards would be worse than none.
+
+    It is never pruned, and that is deliberate. Pruning it would
+    reinstate the silent recompute at whatever horizon was chosen: an
+    epoch forgotten by the ledger is indistinguishable from one never
+    pinned. An entry is an epoch name and a float, so a gate costs
+    tens of bytes here — years of them are a rounding error against
+    the snapshots themselves.
+    """
+
+    durations: dict[str, list[float]]
+    pinned_epochs: dict[str, float]
+
+
 class JsonFileDurationHistory:
     """Rolling per-file duration history under one directory."""
 
@@ -143,14 +178,15 @@ class JsonFileDurationHistory:
         if not observations:
             return
         with self._locked():
-            recorded = self._read_history()
+            document = self._read_document()
+            recorded = document.durations
             for path, seconds in observations.items():
                 window = recorded.get(path, [])
                 window.append(seconds)
                 recorded[path] = window[-self._window :]
-            self._write_json(
-                self._directory / _HISTORY_FILENAME, {_DURATIONS_FIELD: recorded}
-            )
+            # The ledger is carried through untouched: losing it would
+            # turn every evicted pin back into a silent recompute.
+            self._write_document(_StoreDocument(recorded, document.pinned_epochs))
 
     def pinned_weights(self, epoch: str) -> Mapping[str, float]:
         pinned_path = self._pinned_path(epoch)
@@ -164,20 +200,39 @@ class JsonFileDurationHistory:
             published = self._read_pinned(pinned_path)
             if published is not None:
                 return published
+            document = self._read_document()
+            if epoch in document.pinned_epochs:
+                raise PinnedEpochExpiredError(
+                    f"the weight snapshot for epoch {epoch!r} was published but is "
+                    f"no longer on disk (pins are pruned after "
+                    f"{_PIN_RETENTION_SECONDS // _DAY_SECONDS} days). Weights "
+                    "cannot be recomputed for it: the slices of this gate that "
+                    "already ran partitioned on the original snapshot, and a "
+                    "second, different partition of the same file list would "
+                    "run some tests twice and others not at all. Re-run the "
+                    "gate so every slice shares a fresh epoch."
+                )
             weights = {
                 path: statistics.median(window)
-                for path, window in self._read_history().items()
+                for path, window in document.durations.items()
                 if window
             }
+            published_at = round(time.time(), 3)
+            # The pin lands BEFORE the ledger entry. Crashing between
+            # the two leaves a pin nobody has recorded, which readers
+            # simply use; the reverse order would leave a ledger entry
+            # with no pin and fail a gate that never got its weights.
             self._write_json(
                 pinned_path,
                 {
                     _WEIGHTS_FIELD: weights,
                     # The pin's own account of its age, so retention
                     # never has to trust a filesystem timestamp.
-                    _PUBLISHED_AT_FIELD: round(time.time(), 3),
+                    _PUBLISHED_AT_FIELD: published_at,
                 },
             )
+            document.pinned_epochs[epoch] = published_at
+            self._write_document(document)
             self._prune_pinned()
             return weights
 
@@ -240,18 +295,45 @@ class JsonFileDurationHistory:
             for key, value in cast(dict[str, object], weights).items()
         }
 
-    def _read_history(self) -> dict[str, list[float]]:
+    def _read_document(self) -> _StoreDocument:
         path = self._directory / _HISTORY_FILENAME
         payload = self._read_json(path)
         if payload is None:
-            return {}
+            return _StoreDocument({}, {})
         entries = payload.get(_DURATIONS_FIELD)
         if not isinstance(entries, dict):
             raise self._corrupt(path, f"has no {_DURATIONS_FIELD!r} mapping")
+        return _StoreDocument(
+            {
+                key: self._read_window(path, key, window)
+                for key, window in cast(dict[str, object], entries).items()
+            },
+            self._read_ledger(path, payload.get(_PINNED_EPOCHS_FIELD)),
+        )
+
+    def _read_ledger(self, path: Path, entries: object) -> dict[str, float]:
+        """Which epochs have ever been pinned, and when.
+
+        Absent is not corrupt: a store written before the ledger
+        existed simply has no record, and the first pin adds one.
+        """
+        if entries is None:
+            return {}
+        if not isinstance(entries, dict):
+            raise self._corrupt(path, f"has a non-mapping {_PINNED_EPOCHS_FIELD!r}")
         return {
-            key: self._read_window(path, key, window)
-            for key, window in cast(dict[str, object], entries).items()
+            key: self._duration(path, key, value)
+            for key, value in cast(dict[str, object], entries).items()
         }
+
+    def _write_document(self, document: _StoreDocument) -> None:
+        self._write_json(
+            self._directory / _HISTORY_FILENAME,
+            {
+                _DURATIONS_FIELD: document.durations,
+                _PINNED_EPOCHS_FIELD: document.pinned_epochs,
+            },
+        )
 
     def _read_window(self, path: Path, key: str, window: object) -> list[float]:
         if not isinstance(window, list):
@@ -328,49 +410,35 @@ class JsonFileDurationHistory:
 
 
 class _PinRetention:
-    """Which pins may be deleted — and, far more importantly, which may not.
+    """Disk hygiene. Nothing more is claimed, and nothing more is needed.
 
-    Three earlier versions of this policy leaked, and the third leaked
-    because of how the first two were patched together:
+    Four rounds of review went into trying to prove that a pin has no
+    live reader — by count, by clock age, by the two conjoined, and
+    finally by an argument from lane deadlines. Each was defeated,
+    the last one because this repo's own suspension support excludes
+    frozen time from a lane's deadline (#7118), so a suspended reader
+    can legitimately live for days. The lesson is that liveness is not
+    provable from anything this store can see.
 
-    - **Count alone** (round 1): a busy day publishes enough newer
-      epochs to evict a pin whose gate is still running.
-    - **Age alone** (round 2): one forward wall-clock correction past
-      the bound ages every live pin out at once.
-    - **Count AND age** (round 3): a reviewer simply did both at once —
-      aged a live pin thirty hours *and* published fifty newer epochs —
-      and the conjunction fell to the combined attack.
+    So it stopped trying. Retention no longer protects correctness —
+    :meth:`JsonFileDurationHistory.pinned_weights` does, by refusing to
+    recompute a snapshot it once published. Deleting a pin too early is
+    therefore no longer a correctness bug; it can only turn a slice
+    that outlived retention into a loud
+    :class:`PinnedEpochExpiredError` naming the epoch and the remedy.
+    Wrong weights are impossible by construction; a rare honest red
+    after a week-scale suspension is the correct outcome, and the one
+    this repo's no-silent-degradation rule asks for.
 
-    All three end identically: the delayed slice finds its pin gone,
-    republishes from newer history, computes a partition that disagrees
-    with the one its siblings already ran, and the combined gate omits
-    some files while running others twice.
-
-    The lesson is the reviewer's, and it is why there is only one rule
-    here now. Recency-by-count and recency-by-clock are both *proxies*
-    for "somebody is still reading this", and no conjunction of proxies
-    proves the thing itself — stacking them only makes the hole harder
-    to describe. So the depth clause is gone, and eviction rests on a
-    single bound argued from the system's own hard limits:
-
-    A pin's readers are the slices of one gate, and a lane cannot
-    outlive ``LANE_TIMEOUT_SECONDS`` (1800s) plus the backend's
-    admission cap (``_ADMISSION_TIMEOUT_SECONDS``, 600s). Forty
-    minutes is the ceiling on any reader's whole life. Seven days is
-    two and a half orders of magnitude beyond that, so evicting a live
-    pin needs a wall-clock discontinuity of more than **seven days**
-    landing *inside* a gate that lives minutes. And a pin written while
-    the clock was that wrong dates itself outside the sane range, which
-    makes it :class:`UndatablePin` — retained unconditionally. The
-    remaining hole is not a proxy failure; it is a clock that moved a
-    week during a forty-minute window.
-
-    Boundedness costs nothing to keep: pins are kilobytes, so even a
-    gate every two minutes for seven days is ~5000 pins, about 10MB,
-    and anything undatable already announces itself at WARNING.
+    That leaves this class free to be what it always should have been:
+    a way to stop kilobytes accumulating forever. Seven days is chosen
+    for comfort, not proof — long enough that the loud failure stays
+    rare, short enough that the directory stays small.
 
     The undated states keep their own policies, which is why they are
-    modelled separately (round 2, finding 2).
+    modelled separately (round 2, finding 2): an undatable pin is never
+    deleted at all, because deleting what cannot be read would trade a
+    known state for an unknown one.
     """
 
     def __init__(self, now: float) -> None:

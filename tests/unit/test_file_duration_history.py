@@ -15,6 +15,7 @@ from issue_orchestrator.adapters.json_file_duration_history import (
     InertFileDurationHistory,
     JsonFileDurationHistory,
     LegacyUnstampedPin,
+    PinnedEpochExpiredError,
     StampedPin,
     UndatablePin,
     classify_pin_date,
@@ -189,8 +190,7 @@ def test_a_delayed_slice_still_gets_its_own_gates_pin(tmp_path: Path) -> None:
     history.record_success({"tests/x/test_a.py": 5.0})
     original = history.pinned_weights("gate-delayed")
 
-    # Sixty newer epochs: the round-1 reproduction, at pressure that
-    # would have mattered back when count was consulted at all.
+    # Sixty newer epochs: the round-1 reproduction.
     for index in range(60):
         history.record_success({"tests/x/test_b.py": float(index + 1)})
         history.pinned_weights(f"gate-{index:02d}")
@@ -242,12 +242,14 @@ def test_age_and_count_pressure_combined_cannot_evict_a_live_pin(
 ) -> None:
     """Round 3's failure mode: the reviewer stopped attacking each
     signal separately and did both at once — aged a live pin thirty
-    hours *and* published fifty newer epochs — satisfying age and depth
-    together, and the fiftieth publish evicted it.
+    hours *and* published fifty newer epochs, and the fiftieth publish
+    evicted it.
 
-    Two proxies for liveness conjoined are still proxies. The pin
-    survives now because thirty hours is not a week, and nothing else
-    is asked."""
+    Kept as a regression on the retention rule that replaced all of
+    that: age is the only question asked, and thirty hours is not a
+    week. Correctness no longer rests on this test passing — an evicted
+    pin is now a loud failure rather than a silent recompute — but
+    routine gates should never provoke that failure."""
     history = store(tmp_path)
     history.record_success({"tests/x/test_a.py": 5.0})
     live = history.pinned_weights("live-gate")
@@ -435,6 +437,99 @@ def test_an_unsafe_epoch_is_refused(tmp_path: Path, epoch: str) -> None:
     than trusted."""
     with pytest.raises(ValueError, match="filesystem-safe"):
         store(tmp_path).pinned_weights(epoch)
+
+
+# --- an evicted pin is loud, never recomputed ---------------------------------
+
+
+def test_a_reader_whose_pin_was_pruned_fails_loudly(tmp_path: Path) -> None:
+    """The defect four rounds of retention tuning were circling.
+
+    A lane's deadline excludes time it spent suspended (#7118) and
+    suspension is unbounded, so a frozen slice can legitimately come
+    back days later — after its gate's snapshot was reclaimed. Every
+    previous version quietly recomputed weights from current history
+    and handed back a partition that disagreed with the one its
+    siblings already ran, so the gate omitted some files and ran others
+    twice while going green.
+
+    No amount of retention tuning can prevent that, because liveness is
+    not provable from anything the store can see. What IS provable is
+    that recomputing is never right: the store refuses, and says so."""
+    history = store(tmp_path)
+    history.record_success({"tests/x/test_a.py": 5.0})
+    assert history.pinned_weights("suspended-gate") == {"tests/x/test_a.py": 5.0}
+
+    pin_path(tmp_path, "suspended-gate").unlink()
+    history.record_success({"tests/x/test_b.py": 900.0})
+
+    with pytest.raises(PinnedEpochExpiredError) as raised:
+        history.pinned_weights("suspended-gate")
+
+    message = str(raised.value)
+    assert "suspended-gate" in message, "the failure must name the epoch"
+    assert "7 days" in message, "the failure must state the retention policy"
+    assert "Re-run the gate" in message, "the failure must state the remedy"
+    assert not pin_path(tmp_path, "suspended-gate").exists(), (
+        "a refused epoch must not be quietly republished"
+    )
+
+
+def test_an_expired_pin_is_a_store_fault(tmp_path: Path) -> None:
+    """It travels the path already wired for a broken store, so the
+    slicer turns it into a failed lane rather than a partition."""
+    history = store(tmp_path)
+    history.pinned_weights("gone")
+    pin_path(tmp_path, "gone").unlink()
+    with pytest.raises(FileDurationHistoryError):
+        history.pinned_weights("gone")
+
+
+def test_an_epoch_never_pinned_is_published_not_refused(tmp_path: Path) -> None:
+    """The refusal must not swallow the ordinary first ask — that would
+    fail every gate instead of every stale slice."""
+    history = store(tmp_path)
+    history.record_success({"tests/x/test_a.py": 5.0})
+    assert history.pinned_weights("brand-new") == {"tests/x/test_a.py": 5.0}
+
+
+def test_the_ledger_outlives_the_process_that_wrote_it(tmp_path: Path) -> None:
+    """Each slice is its own process, so the record of what was pinned
+    has to be on disk, not in an instance."""
+    store(tmp_path).pinned_weights("earlier-gate")
+    pin_path(tmp_path, "earlier-gate").unlink()
+    with pytest.raises(PinnedEpochExpiredError):
+        store(tmp_path).pinned_weights("earlier-gate")
+
+
+def test_recording_durations_preserves_the_ledger(tmp_path: Path) -> None:
+    """Losing the ledger would turn every evicted pin straight back
+    into a silent recompute, so the write path that does not care about
+    it must still carry it through."""
+    history = store(tmp_path)
+    history.pinned_weights("earlier-gate")
+    pin_path(tmp_path, "earlier-gate").unlink()
+    for index in range(10):
+        history.record_success({"tests/x/test_a.py": float(index)})
+    with pytest.raises(PinnedEpochExpiredError):
+        history.pinned_weights("earlier-gate")
+
+
+def test_a_corrupt_ledger_fails_loudly(tmp_path: Path) -> None:
+    write_history(
+        tmp_path, json.dumps({"durations": {}, "pinned_epochs": "everything"})
+    )
+    with pytest.raises(FileDurationHistoryError, match="delete the file"):
+        store(tmp_path).pinned_weights("any")
+
+
+def test_a_store_written_before_the_ledger_existed_still_works(
+    tmp_path: Path,
+) -> None:
+    """An absent ledger is not corruption — it is a store from before
+    the field existed, and the first pin starts one."""
+    write_history(tmp_path, json.dumps({"durations": {"tests/x/test_a.py": [4.0]}}))
+    assert store(tmp_path).pinned_weights("first") == {"tests/x/test_a.py": 4.0}
 
 
 # --- corrupt state is loud ----------------------------------------------------

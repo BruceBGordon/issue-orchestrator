@@ -255,6 +255,28 @@ def test_the_slicer_reads_the_repository_store(
     assert lane_slices.pinned_weights(EPOCH) == {"tests/x/test_a.py": 42.0}
 
 
+def test_the_slicer_fails_the_lane_when_its_pin_has_expired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slice that outlived its gate's snapshot must take the lane
+    down, not partition on freshly recomputed weights. The Makefile
+    recipe aborts on a non-zero slicer, so SystemExit here is a red
+    lane — the same route a corrupt store already takes."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(lane_slices, "REPO_ROOT", tmp_path)
+    history = open_file_duration_history(tmp_path)
+    history.record_success({"tests/x/test_a.py": 5.0})
+    lane_slices.pinned_weights("suspended-gate")
+
+    store = tmp_path / ".git" / "issue-orchestrator" / "file-durations"
+    (store / "pinned-suspended-gate.json").unlink()
+
+    with pytest.raises(SystemExit) as raised:
+        lane_slices.pinned_weights("suspended-gate")
+    assert "suspended-gate" in str(raised.value)
+    assert "Re-run the gate" in str(raised.value)
+
+
 def test_the_slicer_is_naive_outside_a_repository(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -304,6 +326,9 @@ def test_verify_rejects_a_node_split_file_missing_from_a_slice() -> None:
 
 
 def test_check_mode_passes_on_the_live_integration_glob() -> None:
+    """End to end on the real file list — and deliberately without an
+    epoch, so running the unit suite never pins anything in the shared
+    store (a pin is durable, and this run has no gate behind it)."""
     live = sorted(str(p) for p in (REPO_ROOT / "tests/integration").glob("test_*.py"))
     completed = subprocess.run(
         (
@@ -313,8 +338,6 @@ def test_check_mode_passes_on_the_live_integration_glob() -> None:
             "1",
             "--of",
             "3",
-            "--epoch",
-            "unit-check",
             "--check",
             *live,
         ),
@@ -322,6 +345,20 @@ def test_check_mode_passes_on_the_live_integration_glob() -> None:
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_check_mode_never_pins_an_epoch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verification must leave no trace in the shared store. Pinning is
+    durable and refusals are permanent, so a check run that pinned
+    would eventually fail itself once its own pin aged out."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(lane_slices, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        sys, "argv", ["lane_slices.py", "--group", "1", "--of", "2", "--check",
+                      "tests/x/test_a.py", "tests/x/test_b.py"]
+    )
+    assert lane_slices.main() == 0
+    assert not list(tmp_path.rglob("pinned-*.json"))
 
 
 def test_the_baked_constants_are_gone() -> None:
