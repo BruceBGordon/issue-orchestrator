@@ -321,7 +321,10 @@ PYTEST_TIMINGS ?= --durations=$(PYTEST_DURATIONS) --durations-min=$(PYTEST_DURAT
 # only-green rule) lives in the lane-verdict CLI. Inert unless the
 # gate phase exports LANE_VERDICT_SHA/LANE_VERDICT_LANES: check exit
 # 0 = cached green, skip; 3 = run; anything else = real error and the
-# lane fails with it (a corrupt store is never green). The guard uses
+# lane fails with it (a corrupt store is never green). The wrapper
+# NEVER alters a red lane's own exit status: record is attempted only
+# for green lanes, and a record-invocation failure becomes a labeled
+# STORE FAULT (70), never an adopted arbitrary code. The guard uses
 # -z (not -n) so recipe text stays free of " -n ", which the phase
 # tests read as an xdist width marker.
 define TIMED_RUN
@@ -333,7 +336,7 @@ define TIMED_RUN
 	if [ -z "$$LANE_VERDICT_SHA" ]; then \
 		vrc=3; \
 	else \
-		$(LANE_VERDICT) check --target "$$target"; vrc=$$?; \
+		$(LANE_VERDICT) check --worktree "$(CURDIR)" --target "$$target"; vrc=$$?; \
 	fi; \
 	if [ $$vrc -eq 0 ]; then \
 		status=0; \
@@ -342,7 +345,12 @@ define TIMED_RUN
 	else \
 		{ $(2); }; \
 		status=$$?; \
-		[ -z "$$LANE_VERDICT_SHA" ] || { $(LANE_VERDICT) record --target "$$target" --exit-status $$status || status=$$?; }; \
+		if [ -z "$$LANE_VERDICT_SHA" ] || [ $$status -ne 0 ]; then \
+			:; \
+		elif ! $(LANE_VERDICT) record --worktree "$(CURDIR)" --target "$$target" --exit-status $$status; then \
+			echo "[lane-verdict] STORE FAULT recording $$target - failing the gate as a store fault, not a lane failure" >&2; \
+			status=70; \
+		fi; \
 	fi; \
 	end=$$(date +%s); \
 	end_hr=$$(date '+%Y-%m-%dT%H:%M:%S%z'); \
@@ -351,7 +359,14 @@ define TIMED_RUN
 	exit $$status
 endef
 
-LANE_VERDICT = $(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_verdict
+# The verdict CLI runs AFTER the wrapped command, which may have cd'd
+# away from the worktree (test-vscode ends in `cd packages/vscode &&
+# npm test` - a relative interpreter 127'd there and clobbered a green
+# lane's status on the first live gate). Correct by construction: the
+# interpreter is absolutized when it is a path, and the worktree is
+# passed explicitly as $(CURDIR) - never inferred from the shell's cwd.
+LANE_VERDICT_PYTHON = $(if $(findstring /,$(PYTHON)),$(abspath $(PYTHON)),$(PYTHON))
+LANE_VERDICT = $(LANE_VERDICT_PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_verdict
 
 # Two-pass typecheck: strict for core (domain/ports/control), standard for rest
 # --warnings ensures 0 warnings required (exit code 1 if warnings reported)

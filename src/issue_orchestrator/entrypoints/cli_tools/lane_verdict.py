@@ -62,7 +62,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _CONFIGURATION_EXIT_CODE
     lanes = set(lanes_raw.split())
     target = str(arguments.target)
-    worktree = Path.cwd()
+    # The worktree is an explicit input, never inferred from cwd: the
+    # record call runs after the wrapped command, which may have cd'd
+    # anywhere (test-vscode ends inside packages/vscode - inferring
+    # cwd there both missed the store and misread HEAD).
+    worktree = Path(arguments.worktree)
+    if not worktree.is_absolute() or not worktree.is_dir():
+        print(
+            f"lane-verdict: --worktree must be an existing absolute "
+            f"directory, got {arguments.worktree!r}",
+            file=sys.stderr,
+        )
+        return _CONFIGURATION_EXIT_CODE
     if target not in lanes:
         # Phase aggregates and non-gate targets pass through untouched:
         # membership in the gate's own lane list is what makes a target
@@ -125,8 +136,10 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("check")
+    check.add_argument("--worktree", required=True)
     check.add_argument("--target", required=True)
     record = commands.add_parser("record")
+    record.add_argument("--worktree", required=True)
     record.add_argument("--target", required=True)
     record.add_argument("--exit-status", type=int, required=True)
     return parser.parse_args(argv)
