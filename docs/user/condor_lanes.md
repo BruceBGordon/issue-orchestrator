@@ -260,6 +260,69 @@ not yet submitted. The properties to know:
 - History is shared across all worktrees of a repository (it lives in
   the git common dir, like the validation timings).
 
+## Learned slice weights
+
+The fat integration suite is split into slice lanes, and the split is
+learned the same way the dispatch order is. Every green slice run
+records what each test file it ran *whole* cost — every phase, summed
+per file — into
+`<git-common-dir>/issue-orchestrator/file-durations/history.json`, and
+the next gate's partition balances on the rolling median of the last
+five. Nothing is mined by hand, so there is no regeneration step and no
+constant to go stale in the source.
+
+- **Coverage never depends on the store.** The partition is computed
+  from the Makefile's live file wildcard: every live file lands in
+  exactly one slice whatever the store holds, and a file it has never
+  heard of gets a default weight. Staleness can cost speed; it cannot
+  drop a test.
+- **The first run is naive by design.** An empty store weighs every
+  file the same, which is exactly an equal split — no worse than the
+  unweighted behavior, and sharper every run after.
+- **Only successes teach, and only whole files.** An aborted run (`-x`)
+  would teach every file it never reached that it is free. A file too
+  fat to balance is run at test-node granularity, split across all
+  slices; those partial measurements are deliberately *not* recorded,
+  since storing a third of a file as the file's weight would make it
+  look thin and the run after would fatten it again.
+- **One gate, one set of weights.** The slices of a gate are admitted
+  minutes apart and each teaches the store as it finishes, so a live
+  read would hand the last slice different numbers than the first — and
+  two different partitions of one file list can leave a file unrun in a
+  gate that still goes green. The Makefile stamps one
+  `SLICE_WEIGHTS_EPOCH` per gate (the flat fan is one make process, and
+  the scheduler wrapper carries the stamp into the job); the first
+  slice to ask publishes `pinned-<epoch>.json` and every other slice of
+  that gate is answered from it.
+- **A snapshot is never recomputed.** The store records every epoch it
+  has pinned, and that record is made durable *before* the snapshot
+  itself becomes observable. Dying between the two writes can therefore
+  only leave a remembered epoch with no snapshot — which fails loudly —
+  never a snapshot no ledger knows about, which would be adopted, later
+  pruned, and then silently recomputed. If a slice asks for an epoch whose snapshot has since
+  been reclaimed — a lane's deadline excludes time it spent suspended,
+  so a frozen slice can legitimately return days later — the store
+  **refuses**, naming the epoch and the remedy, and the lane fails.
+  Recomputing would be the silent version of the same problem: weights
+  derived now differ from the ones this gate's earlier slices already
+  partitioned on, so some tests would run twice and others not at all.
+  A rare honest red is the correct outcome; wrong weights never are.
+- **Pin retention is housekeeping, not a safety mechanism.** Pins older
+  than seven days are deleted so the directory stays small. Nothing
+  about correctness rests on that number — outliving it produces the
+  loud failure above, never a wrong partition. A pin whose age cannot
+  be established at all (unreadable, not JSON, or carrying something
+  that is not a date) is never deleted, and says so at `WARNING`.
+- **Capture is backend-neutral.** It is a pytest plugin
+  (`infra/pytest_file_durations.py`) enabled by the slice recipe, so a
+  scheduler backend — which re-invokes that same recipe inside its job
+  — captures identical durations by construction. It is enabled there
+  and nowhere else: an always-on plugin would also learn from a
+  developer running one test out of a file.
+- **Nothing to invalidate.** To reset the weights, delete the file; the
+  next gate seeds them again. A corrupt store fails loudly (the message
+  names the file) rather than silently reverting to a guess.
+
 Every completed lane also reports its dispatch facts — the priority it
 ran with, how long it queued, how long it executed — as a
 `[lane-dispatch]` line in the gate log and a row in
@@ -275,9 +338,14 @@ normal.
   that crosses the port).
 - `ports/lane_executor.py` — the port.
 - `ports/lane_runtime_history.py` +
-  `adapters/json_lane_runtime_history.py` — the learning loop
-  (backend-neutral: every backend reports runtime, every backend's
+  `adapters/json_lane_runtime_history.py` — the dispatch-order learning
+  loop (backend-neutral: every backend reports runtime, every backend's
   submissions may consume the ordering).
+- `ports/file_duration_history.py` +
+  `adapters/json_file_duration_history.py` — the slice-weight learning
+  loop, with `infra/file_duration_store.py` resolving its one shared
+  home, `infra/pytest_file_durations.py` capturing, and
+  `scripts/lane_slices.py` consuming.
 - `adapters/direct_lane_executor.py` — default backend.
 - `adapters/condor/` — the anti-corruption layer: `submit_compiler.py`
   translates lane specs outbound into job descriptions;

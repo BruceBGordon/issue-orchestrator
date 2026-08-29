@@ -400,9 +400,25 @@ LANE_TIMEOUT_SECONDS ?= 1800
 # balanced lanes so the flat gate's wall time tracks the longest SLICE,
 # not the longest suite. scripts/lane_slices.py computes the partition
 # from the live file list (coverage by construction) with LPT balancing
-# over measured durations; one dominant file is split at test-node
-# granularity. Direct mode never uses these targets.
+# over the per-file durations the slices LEARNED from their own green
+# runs; a file too fat to balance is split at test-node granularity.
+# Nothing is baked and nothing is regenerated: the plugin below records
+# what each slice observed, the next run consumes it, and an empty
+# store is exactly an equal split. Direct mode never uses these targets.
 INTEGRATION_CORE_SLICES := 3
+# The capture half of that loop. Enabled here and nowhere else: an
+# always-on plugin would also learn from a developer running one test
+# out of a file and record the file as nearly free.
+SLICE_DURATIONS_PLUGIN := issue_orchestrator.infra.pytest_file_durations
+# One gate, one set of weights. The slice lanes read the store minutes
+# apart (a pool admits them when it has room) and each one teaches the
+# store as it finishes, so an unpinned read would give the last slice a
+# different partition than the first — and two different partitions of
+# one file list can drop a file out of the gate entirely. This stamp is
+# expanded once per make process, so the flat fan (a single make with
+# -j) hands every slice the same one, and the condor wrapper carries it
+# into the job so both modes pin identically.
+SLICE_WEIGHTS_EPOCH := $(shell date -u +%Y%m%dT%H%M%SZ)
 INTEGRATION_CORE_FILES = $(filter-out $(INTEGRATION_AGENT_FILES),$(wildcard tests/integration/test_*.py))
 # Default to the declared lane width so both modes run the same
 # shape, but keep the documented overrides working: an explicit
@@ -571,12 +587,18 @@ ifeq ($(LANE_EXECUTOR),condor)
 	$(call TIMED_RUN,test-integration-core-slice-$*,\
 		$(LANE_RUN) --backend condor --work-key test-integration-core-slice-$* \
 			--timeout-seconds $(LANE_TIMEOUT_SECONDS) -- \
-			$(GMAKE) test-integration-core-slice-$* LANE_EXECUTOR=direct)
+			$(GMAKE) test-integration-core-slice-$* LANE_EXECUTOR=direct \
+				SLICE_WEIGHTS_EPOCH=$(SLICE_WEIGHTS_EPOCH))
 else
 	$(call TIMED_RUN,test-integration-core-slice-$*,\
-		$(PYTEST) $$($(PYTHON) scripts/lane_slices.py --group $* --of $(INTEGRATION_CORE_SLICES) $(INTEGRATION_CORE_FILES)) \
-			-x -q --tb=short -m "not requires_infra and not live_codex" \
-			-n $(LANE_WORKERS_INTEGRATION_SLICE) --dist=loadgroup $(PYTEST_TIMINGS))
+		targets=$$($(PYTHON) scripts/lane_slices.py --group $* --of $(INTEGRATION_CORE_SLICES) --epoch $(SLICE_WEIGHTS_EPOCH) $(INTEGRATION_CORE_FILES)) && \
+		if [ -z "$$targets" ]; then \
+			echo "lane_slices: slice $* selects no tests"; \
+		else \
+			$(PYTEST) $$targets -x -q --tb=short -m "not requires_infra and not live_codex" \
+				-p $(SLICE_DURATIONS_PLUGIN) \
+				-n $(LANE_WORKERS_INTEGRATION_SLICE) --dist=loadgroup $(PYTEST_TIMINGS); \
+		fi)
 endif
 
 # The live-agent suite splits by provider file, which keeps each
