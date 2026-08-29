@@ -360,6 +360,122 @@ their submitting worktree (`LaneSubmitter` in the queue), since the
 pool is shared and concurrent gates from different worktrees are
 normal.
 
+## Forensics: what every record carries
+
+A duration on its own cannot be read. Two overlapping gates produce
+contention-inflated samples that look exactly like regressions, and the
+covariate that separates them is gone the moment nobody had a terminal
+open. So every row of both
+`<git-common-dir>/issue-orchestrator/validate-timings.jsonl` and
+`lane-dispatch.jsonl` carries a `machine_state` envelope:
+
+```json
+"machine_state": {
+  "sampled_at": "2026-08-29T12:00:00+00:00",
+  "loadavg_1m": 7.91, "loadavg_5m": 12.51, "loadavg_15m": 9.0,
+  "cpu_idle_percent": 85.68,
+  "cpu_idle_source": "host_statistics(HOST_CPU_LOAD_INFO) over 0.1s",
+  "physical_cores": 18, "probe_error": null
+}
+```
+
+- **CPU idle is not derivable from load average**, especially on macOS
+  where load counts parked threads: a host reading 12.5 can be 85%
+  idle. Both platforms expose cumulative CPU tick counters, so both are
+  read the same way — two reads a window apart, idle share of the
+  delta. Linux reads `/proc/stat`; darwin reads the kernel counters
+  `top` itself prints, without paying for `top` (measured at ~1-1.5s of
+  CPU per probe, rising with load). `cpu_idle_source` always names
+  which probe answered, or why none did.
+- **The window is a floor, not a fixed wait.** Darwin's aggregate
+  refreshes on a cadence that coarsens under load, so the probe
+  re-reads until the counters move (bounded at 2s). A "no measurement"
+  answer exactly when the host is pegged would be the worst possible
+  failure for this envelope.
+- **The host is probed on a bounded cadence**, not once per record: one
+  sampler per process holds its reading for a few seconds, and
+  `sampled_at` makes the reuse visible.
+- **A failed probe never fails the work.** The envelope keeps its shape
+  with nulls and a `probe_error`; an observability probe that could turn
+  a green lane red would manufacture the failures this exists to
+  explain. This is the one deliberate exception to the repository's
+  fail-fast stance, owned in `infra/machine_state.py`. It is a
+  `BaseException` boundary, not an `Exception` one: a sampler raising
+  `SystemExit` — or a signal handler raising one mid-sample — is
+  contained and recorded, because the alternative is a probe replacing
+  the gate's own exit code. Only teardown signals get out
+  (`KeyboardInterrupt`, `GeneratorExit`, `CancelledError`, listed once
+  in `infra/containment.py` and shared with the lane executor's
+  cancellation path): the operator's Ctrl-C must win. Rendering the
+  failure is itself contained, so an exception whose `__str__` or
+  `__repr__` raises degrades to its type name instead of escaping.
+- **Concurrency is derivable, not sampled.** A running-job count would
+  cost a scheduler subprocess per record; instead, each dispatch row's
+  end instant, runtime and queue wait let overlap be reconstructed from
+  the journal itself.
+
+The pool is also configured with `PER_JOB_HISTORY_DIR`
+(`$(SPOOL)/per-job-history`), so the scheduler writes every finished
+job's complete final ClassAd to `history.<cluster>.<proc>`. When a lane
+does **not** end cleanly, its retained run directory collects that file
+as `lane.classad` beside `lane.sub`, `lane.events`, `lane.out` and
+`lane.err` — memory and CPU usage, slot, hold reason and every
+timestamp travel with the diagnostics instead of staying in a rotating
+global history. Collection runs on **every** path that retains the run
+directory, cancellation included — a lane killed by Ctrl-C is exactly the
+one whose final ClassAd a reader wants, and the removal is what makes it
+appear. It is best-effort by construction: it runs while a lane is
+already ending badly, so a pool without the knob costs the ClassAd and a
+stderr line, never the lane's own result.
+
+Two properties make that safe to do while a lane is being cancelled.
+Both start at the first instruction of the wind-down and cover all of
+it — job removal, stream draining, configuration lookup, the wait for
+the file, and the copy:
+
+- **One budget spans the whole wind-down** (a couple of seconds there
+  rather than the usual ten), not a per-stage timeout. A pool whose
+  tools have gone slow cannot spend an interrupted lane's allowance on
+  the removal or the lookup and then start waiting: whatever a stage
+  spends is gone, and a stage with nothing left is skipped rather than
+  started — including the `stat` and the copy. Spending the budget costs
+  the ClassAd, and says so.
+- **A second Ctrl-C wins, from the first instruction.** Ordinary
+  failures and `SystemExit` stay contained so a diagnostic cannot
+  rewrite why the lane ended — and are *recorded*, since a containment
+  that reports nothing is indistinguishable from a bug. A teardown
+  signal arriving *during* cleanup means the operator is no longer
+  willing to wait for it: it propagates, with the original ending
+  chained as `__cause__` rather than discarded.
+
+The primitives both boundaries share — which exceptions are teardown
+signals, and how to render a contained one without trusting it — live in
+`infra/containment.py`, so the sampler and the wind-down cannot drift
+apart.
+
+**That knob is a loaded gun, and the pool helper treats it as one.** A
+*missing* per-job history directory is safe — condor logs `must point to
+a valid directory; disabling per-job history output` and carries on. A
+directory the scheduler cannot *write* is not: it EXCEPTs the schedd
+(`error 13 (Permission denied) opening per-job history file`,
+`classadHistory.cpp:262`), and the master then restarts a schedd that
+immediately re-EXCEPTs on the same queued job, forever. So:
+
+- `scripts/condor-personal.sh up` creates the directory mode **1777**
+  (sticky, world-writable) rather than guessing which uid the daemons
+  run as — the submitting user on the tarball pools, `condor` on a
+  system install. It refuses to touch the path at all if something
+  other than a plain directory is already there (a symlink would send
+  the privileged `chmod` at an unrelated target), then *verifies the
+  outcome* — a real non-symlink directory carrying sticky, other-write
+  and other-execute — and writes the `PER_JOB_HISTORY_DIR` knob into a
+  managed optional config (`93-io-per-job-history.conf`) **only** if
+  that check passed, removing a previously written one otherwise.
+- The worst case is therefore per-job accounting silently off, never a
+  dead pool. `condor-personal.sh up` prints why when it turns off.
+- The execenv image makes the same guarantee at build time, and the
+  build fails if the directory is not world-writable.
+
 ## Architecture
 
 - `domain/lane_execution.py` — the typed contracts (the only vocabulary
@@ -375,6 +491,9 @@ normal.
   home, `infra/pytest_file_durations.py` capturing, and
   `scripts/lane_slices.py` consuming.
 - `adapters/direct_lane_executor.py` — default backend.
+- `ports/machine_state.py` + `infra/machine_state.py` — the forensics
+  envelope every timing and dispatch record carries (backend-neutral,
+  and the single owner of probe-failure semantics).
 - `adapters/condor/` — the anti-corruption layer: `submit_compiler.py`
   translates lane specs outbound into job descriptions;
   `event_classifier.py` translates job event logs inbound into typed

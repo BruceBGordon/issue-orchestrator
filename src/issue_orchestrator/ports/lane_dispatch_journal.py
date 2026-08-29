@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from ..domain.lane_execution import LaneWorkKey
+from .machine_state import MachineState
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,11 @@ class LaneDispatchRecord:
 
     Failed lanes are recorded too — a kill's dispatch facts are
     diagnosis, even though only successes feed the learning loop.
+
+    ``machine_state`` is required, not optional: a runtime without the
+    contention it ran under is the ambiguity this record exists to end
+    (#7127). It is a measurement only — nothing may schedule, order or
+    gate on it.
     """
 
     work_key: LaneWorkKey
@@ -32,8 +38,13 @@ class LaneDispatchRecord:
     queue_wait_seconds: float
     observed_runtime_seconds: float
     exit_code: int
+    machine_state: MachineState
 
     def __post_init__(self) -> None:
+        if type(self.machine_state) is not MachineState:
+            raise ValueError(
+                "LaneDispatchRecord.machine_state must be a MachineState"
+            )
         if type(self.work_key) is not LaneWorkKey:
             raise ValueError("LaneDispatchRecord.work_key must be a LaneWorkKey")
         if type(self.backend) is not str or not self.backend:

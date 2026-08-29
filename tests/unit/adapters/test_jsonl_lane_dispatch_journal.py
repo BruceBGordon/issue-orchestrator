@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,18 @@ from issue_orchestrator.ports.lane_dispatch_journal import (
     LaneDispatchJournalError,
     LaneDispatchRecord,
 )
+from issue_orchestrator.ports.machine_state import MachineState
+
+_MACHINE_STATE = MachineState(
+    sampled_at=datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc),
+    loadavg_1m=7.91,
+    loadavg_5m=12.51,
+    loadavg_15m=9.0,
+    cpu_idle_percent=85.68,
+    cpu_idle_source="top -l 1 -n 0",
+    physical_cores=18,
+    probe_error=None,
+)
 
 
 def _record(exit_code: int = 0) -> LaneDispatchRecord:
@@ -26,6 +39,7 @@ def _record(exit_code: int = 0) -> LaneDispatchRecord:
         queue_wait_seconds=12.0,
         observed_runtime_seconds=45.0,
         exit_code=exit_code,
+        machine_state=_MACHINE_STATE,
     )
 
 
@@ -45,6 +59,45 @@ def test_records_append_as_one_json_row_each(tmp_path: Path) -> None:
     assert first["queue_wait_seconds"] == 12.0
     assert first["observed_runtime_seconds"] == 45.0
     assert first["recorded_at"]
+
+
+def test_every_row_carries_the_machine_state_envelope(tmp_path: Path) -> None:
+    """Acceptance (#7127): a runtime is only interpretable next to the
+    contention it ran under, so the envelope rides EVERY row — the
+    faked sampler's reading, verbatim, under one key."""
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    journal.record(_record(exit_code=0))
+    journal.record(_record(exit_code=1))
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "lane-dispatch.jsonl").read_text().splitlines()
+    ]
+    for row in rows:
+        assert row["machine_state"] == {
+            "sampled_at": "2026-08-29T12:00:00+00:00",
+            "loadavg_1m": 7.91,
+            "loadavg_5m": 12.51,
+            "loadavg_15m": 9.0,
+            "cpu_idle_percent": 85.68,
+            "cpu_idle_source": "top -l 1 -n 0",
+            "physical_cores": 18,
+            "probe_error": None,
+        }
+
+
+def test_a_record_without_a_reading_is_rejected() -> None:
+    """Required, not optional: a row that may omit the covariate
+    re-creates the ambiguity the envelope exists to end."""
+    with pytest.raises(ValueError, match="machine_state"):
+        LaneDispatchRecord(
+            work_key=LaneWorkKey("test-unit"),
+            backend="direct",
+            priority=0,
+            queue_wait_seconds=0.0,
+            observed_runtime_seconds=1.0,
+            exit_code=0,
+            machine_state=None,  # type: ignore[arg-type]
+        )
 
 
 def test_unwritable_destination_raises_the_journal_error(
@@ -82,6 +135,7 @@ def test_record_validation_rejects_nonsense() -> None:
             queue_wait_seconds=0.0,
             observed_runtime_seconds=1.0,
             exit_code=0,
+            machine_state=_MACHINE_STATE,
         )
     with pytest.raises(ValueError, match="queue_wait_seconds"):
         LaneDispatchRecord(
@@ -91,6 +145,7 @@ def test_record_validation_rejects_nonsense() -> None:
             queue_wait_seconds=float("nan"),
             observed_runtime_seconds=1.0,
             exit_code=0,
+            machine_state=_MACHINE_STATE,
         )
     with pytest.raises(ValueError, match="backend"):
         LaneDispatchRecord(
@@ -100,4 +155,5 @@ def test_record_validation_rejects_nonsense() -> None:
             queue_wait_seconds=0.0,
             observed_runtime_seconds=1.0,
             exit_code=0,
+            machine_state=_MACHINE_STATE,
         )

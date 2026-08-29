@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from ...domain.lane_execution import (
     LaneResources,
     LaneTimedOut,
 )
+from ...infra.containment import TEARDOWN_SIGNALS, describe_exception
 from .event_classifier import (
     LaneJobDeadlineRemoved,
     LaneJobExited,
@@ -49,6 +51,25 @@ _SCHEDULER_SLACK_SECONDS = 120.0
 # bound only catches a structurally dead pool that accepts submissions
 # and never matches them.
 _ADMISSION_TIMEOUT_SECONDS = 600.0
+
+# Per-job accounting (#7127). The pool is configured (by
+# scripts/condor-personal.sh and the execenv image) to drop every
+# finished job's complete final ClassAd at
+# <PER_JOB_HISTORY_DIR>/history.<cluster>.<proc>. A retained run
+# directory collects its own job's file, so a failed lane's full
+# accounting travels with its diagnostics instead of living in a
+# rotating global history nothing correlates back to the lane.
+_PER_JOB_HISTORY_CONFIGURATION_KNOB = "PER_JOB_HISTORY_DIR"
+_JOB_ACCOUNTING_FILE_NAME = "lane.classad"
+# The schedd writes the ClassAd when the job leaves the QUEUE, which is
+# shortly after its terminal event reaches the log. Bounded so a pool
+# that never writes it costs seconds, never the gate.
+_JOB_ACCOUNTING_WAIT_SECONDS = 10.0
+# Much tighter while unwinding a cancellation: the operator pressed
+# Ctrl-C and is owed a prompt exit, so the ClassAd gets the couple of
+# seconds it normally needs after a removal and no more.
+_CANCELLED_ACCOUNTING_WAIT_SECONDS = 2.0
+_JOB_IDENTIFIER_RE = re.compile(r"\d+\.\d+")
 
 
 # Where scripts/condor-personal.sh installs the personal pool. Resolving
@@ -80,6 +101,45 @@ _TOOL_EXECUTABLES = (
     ("query", "condor_q"),
     ("config_query", "condor_config_val"),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _CollectionBudget:
+    """One wall-clock allowance for an ENTIRE collection attempt.
+
+    Round 2 finding 1: bounding only the file-wait left the earlier
+    stages unbounded, so the configuration lookup could spend the whole
+    tool timeout (30s) before a 2s "wait" even started — a 2s
+    cancellation budget measured 2.56s with a slow lookup, and a slower
+    one would have measured far worse. A budget belongs to the whole
+    operation: every stage asks what is left, a stage with nothing left
+    is skipped rather than started, and the subprocess that dominates
+    the cost is capped by the same clock as the poll loop.
+    """
+
+    expires_at: float
+
+    @classmethod
+    def lasting(cls, seconds: float) -> _CollectionBudget:
+        if type(seconds) is not float or seconds < 0:
+            raise ValueError("_CollectionBudget.lasting needs non-negative seconds")
+        return cls(time.monotonic() + seconds)
+
+    def remaining_seconds(self) -> float:
+        return self.expires_at - time.monotonic()
+
+    def exhausted(self) -> bool:
+        return self.remaining_seconds() <= 0.0
+
+
+def _job_accounting_budget() -> _CollectionBudget:
+    """The allowance for collecting a concluded lane's accounting.
+
+    Not a cancellation: nobody is waiting on a keystroke, so this is the
+    generous bound. The cancellation path builds its own, much tighter
+    one and spends it across the whole wind-down.
+    """
+    return _CollectionBudget.lasting(_JOB_ACCOUNTING_WAIT_SECONDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,9 +237,17 @@ class CondorTools:
         return _DEFAULT_PERSONAL_POOL_HOME
 
     def invoke(
-        self, arguments: tuple[str, ...]
+        self,
+        arguments: tuple[str, ...],
+        timeout_seconds: float = _TOOL_TIMEOUT_SECONDS,
     ) -> subprocess.CompletedProcess[str]:
         """Run one scheduler tool against this pool, bounded in time.
+
+        ``timeout_seconds`` defaults to the general bound and is passed
+        explicitly by callers running under an allowance of their own —
+        a cancelling lane's wind-down spends ONE budget across every
+        stage, so a tool invocation inside it cannot quietly take the
+        general timeout instead (#7135 round 3).
 
         The caller's environment is passed through, deliberately. The
         submit description sets ``getenv = true``, so the environment
@@ -193,10 +261,16 @@ class CondorTools:
         invocation that never produced one (missing binary, hung tool)
         is a backend fault.
         """
-        return self._run(arguments, scrub_macro_overrides=False)
+        return self._run(
+            arguments,
+            scrub_macro_overrides=False,
+            timeout_seconds=timeout_seconds,
+        )
 
     def read_configuration(
-        self, *query: str
+        self,
+        *query: str,
+        timeout_seconds: float = _TOOL_TIMEOUT_SECONDS,
     ) -> subprocess.CompletedProcess[str]:
         """Ask the pool what its own configuration says.
 
@@ -215,12 +289,23 @@ class CondorTools:
         no submission can be routed through it by mistake.
         """
         return self._run(
-            (str(self.config_query), *query), scrub_macro_overrides=True
+            (str(self.config_query), *query),
+            scrub_macro_overrides=True,
+            timeout_seconds=timeout_seconds,
         )
 
     def _run(
-        self, arguments: tuple[str, ...], *, scrub_macro_overrides: bool
+        self,
+        arguments: tuple[str, ...],
+        *,
+        scrub_macro_overrides: bool,
+        timeout_seconds: float,
     ) -> subprocess.CompletedProcess[str]:
+        # A non-positive timeout is not clamped away: it means the
+        # caller's budget is already spent, and subprocess raises
+        # TimeoutExpired promptly, which becomes the LaneExecutorError
+        # the caller already reports. Silently granting more time would
+        # be the fallback that made the bound a lie.
         environment = dict(os.environ)
         if scrub_macro_overrides:
             environment = {
@@ -236,7 +321,7 @@ class CondorTools:
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=_TOOL_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
                 env=environment,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -283,19 +368,30 @@ class CondorLaneExecutor:
             terminal = self._follow_job(command, compiled, job_id, streams)
             if type(terminal) is LaneCompleted and terminal.exit_code == 0:
                 retain_run_directory = False
+            else:
+                # Retention and accounting collection are ONE decision:
+                # whatever is worth keeping the directory for is worth
+                # the scheduler's own final word on the job.
+                self._collect_job_accounting(
+                    job_id, run_directory, _job_accounting_budget()
+                )
             return terminal
         except LaneExecutorError as error:
             if job_id is not None and streams is not None:
-                self._remove(job_id)
+                self._remove(job_id, _TOOL_TIMEOUT_SECONDS)
                 streams.pump()
+                self._collect_job_accounting(
+                    job_id, run_directory, _job_accounting_budget()
+                )
             raise LaneExecutorError(
                 f"{error} (lane diagnostics retained at {run_directory})"
             ) from error
-        except BaseException:
+        except BaseException as unwinding:
             # Cancellation or supervisor death: the job must not outlive us.
             if job_id is not None and streams is not None:
-                self._remove(job_id)
-                streams.pump()
+                self._wind_down_cancelled(
+                    job_id, streams, run_directory, unwinding
+                )
             raise
         finally:
             if retain_run_directory:
@@ -411,6 +507,174 @@ class CondorLaneExecutor:
             )
         raise AssertionError("lane job state is a closed union")
 
+    def _wind_down_cancelled(
+        self,
+        job_id: str,
+        streams: _OutputStreamer,
+        run_directory: Path,
+        unwinding: BaseException,
+    ) -> None:
+        """Wind a lane down when its caller is being torn down.
+
+        The job must not outlive us, its last output belongs in the
+        retained directory, and so does its accounting — the removal
+        here is exactly what makes the ClassAd appear.
+
+        ONE clock and ONE policy, both from the first instruction (round
+        3). Round 2 put the budget and the exception boundary around the
+        accounting only, which left the two stages before it — the
+        removal and the stream drain — outside both: a slow ``condor_rm``
+        spent the general tool timeout on top of the budget, a second
+        interrupt during it propagated with no ``__cause__``, and a
+        ``SystemExit`` during it replaced the original ending outright.
+        A method that owns an operation owns all of it, so the budget is
+        created here and every stage below draws from it.
+
+        Nothing this does may rewrite why the lane ended, so ordinary
+        failures and ``SystemExit`` are contained — and RECORDED, because
+        a containment that reports nothing is indistinguishable from a
+        bug. The single exception is the teardown policy: a second
+        interrupt arriving during cleanup means the operator is no longer
+        willing to wait for it, so it wins over the first — chained,
+        never substituted in silence, so the original ending stays
+        readable as ``__cause__`` even when both are interrupts.
+        """
+        try:
+            # Inside the boundary, not before it: NOTHING in this body
+            # may precede the policy, and "the budget" was the last
+            # instruction still doing so (round 4). Reading the clock is
+            # about the least likely thing here to fail, which is
+            # exactly why it was easy to leave outside and exactly why
+            # leaving it there was wrong — the guarantee is structural,
+            # not a bet on which statements can throw.
+            budget = _CollectionBudget.lasting(
+                _CANCELLED_ACCOUNTING_WAIT_SECONDS
+            )
+            self._remove(job_id, budget.remaining_seconds())
+            if not budget.exhausted():
+                streams.pump()
+            self._collect_job_accounting(job_id, run_directory, budget)
+        except TEARDOWN_SIGNALS as interrupt:
+            raise interrupt from unwinding
+        except BaseException as contained:
+            print(
+                "condor lane: cancellation cleanup gave up after "
+                f"{describe_exception(contained)}",
+                file=sys.stderr,
+            )
+
+    def _collect_job_accounting(
+        self,
+        job_id: str,
+        run_directory: Path,
+        budget: _CollectionBudget,
+    ) -> None:
+        """Copy this job's final ClassAd into the retained diagnostics.
+
+        Runs on EVERY path that retains the run directory, cancellation
+        included (round 1 finding C) — the retention and accounting
+        decisions are one, and a lane killed by Ctrl-C is exactly the
+        one whose final ClassAd a reader wants.
+
+        Best-effort by construction, and deliberately so: this runs while
+        a lane is ALREADY ending badly, so a diagnostic that could raise
+        would replace the real failure with its own. Every giving-up
+        path says why on stderr, beside the retention line, so a pool
+        that stopped writing per-job accounting is visible rather than
+        quietly unhelpful.
+
+        The ``budget`` belongs to the caller's whole operation, not to
+        this collection: on the cancellation path the removal has
+        already drawn from it. Every stage below asks what is left
+        before it starts, so nothing new begins after expiry (round 2
+        finding 1, round 3 finding 1).
+        """
+        if _JOB_IDENTIFIER_RE.fullmatch(job_id) is None:
+            # The ClassAd file is named history.<cluster>.<proc>, so the
+            # identifier is also a path component: never build a read
+            # path out of a token that is not that shape.
+            print(
+                f"condor lane: unexpected job identifier {job_id!r}; no "
+                "per-job accounting was collected",
+                file=sys.stderr,
+            )
+            return
+        if budget.exhausted():
+            print(
+                "condor lane: no time left in the per-job accounting budget; "
+                "nothing was collected",
+                file=sys.stderr,
+            )
+            return
+        try:
+            directory = self._per_job_history_directory(budget)
+        except LaneExecutorError as error:
+            print(
+                f"condor lane: per-job accounting lookup failed: {error}",
+                file=sys.stderr,
+            )
+            return
+        if directory is None:
+            print(
+                "condor lane: this pool sets no "
+                f"{_PER_JOB_HISTORY_CONFIGURATION_KNOB}, so no per-job "
+                "accounting was collected (scripts/condor-personal.sh up "
+                "configures it)",
+                file=sys.stderr,
+            )
+            return
+        source = directory / f"history.{job_id}"
+        # The SAME budget the lookup drew from: whatever it spent is
+        # gone. Exhaustion is checked BEFORE the stat, not after it, so
+        # a stuck filesystem cannot start one more probe past the
+        # deadline, and the sleep never runs past the end of it.
+        while not budget.exhausted() and not source.is_file():
+            time.sleep(min(_POLL_INTERVAL_SECONDS, budget.remaining_seconds()))
+        if budget.exhausted():
+            print(
+                "condor lane: the per-job accounting budget ran out before "
+                f"{source} could be collected",
+                file=sys.stderr,
+            )
+            return
+        try:
+            shutil.copyfile(source, run_directory / _JOB_ACCOUNTING_FILE_NAME)
+        except OSError as error:
+            print(
+                f"condor lane: could not collect per-job accounting from "
+                f"{source}: {error}",
+                file=sys.stderr,
+            )
+
+    def _per_job_history_directory(
+        self, budget: _CollectionBudget
+    ) -> Path | None:
+        """Where this pool drops each job's final ClassAd, or None.
+
+        Read from the pool's own effective configuration rather than
+        recomputed here, so the helpers that WRITE the knob remain its
+        only authors — and read through ``read_configuration``, the
+        scrubbed channel (#7132), because this is a question ABOUT the
+        pool: a ``_CONDOR_PER_JOB_HISTORY_DIR`` exported into this
+        process would otherwise answer for the caller's environment and
+        send the collector looking somewhere the daemons never write.
+
+        Capped by the CALLER'S budget, not by the general tool timeout:
+        this lookup is one stage of a bounded collection, and a pool
+        whose tools have gone slow must not spend a cancelling lane's
+        whole allowance here (round 2 finding 1).
+        """
+        completed = self._tools.read_configuration(
+            _PER_JOB_HISTORY_CONFIGURATION_KNOB,
+            timeout_seconds=budget.remaining_seconds(),
+        )
+        if completed.returncode != 0:
+            return None
+        value = completed.stdout.strip()
+        if not value or value.lower() == "undefined":
+            return None
+        return Path(value)
+
     def _observe(self, compiled: CompiledSubmitDescription) -> LaneJobState:
         try:
             log_text = compiled.event_log_path.read_text(encoding="utf-8")
@@ -439,9 +703,20 @@ class CondorLaneExecutor:
             )
         return first_token[0]
 
-    def _remove(self, job_id: str) -> None:
+    def _remove(self, job_id: str, timeout_seconds: float) -> None:
+        """Remove the job, within the CALLER'S allowance.
+
+        The timeout is required rather than defaulted: a removal during
+        a cancellation draws from the same budget as everything else
+        that cleanup does, and one that quietly took the general tool
+        timeout instead is what made a 2s cancellation budget measure
+        5.35s (round 3 finding 1).
+        """
         try:
-            self._tools.invoke((str(self._tools.remove), job_id))
+            self._tools.invoke(
+                (str(self._tools.remove), job_id),
+                timeout_seconds=timeout_seconds,
+            )
         except LaneExecutorError:
             # Best-effort during unwinding; the primary error wins.
             return

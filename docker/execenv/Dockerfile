@@ -56,6 +56,22 @@ COPY selftest.sh /usr/local/bin/execenv-selftest
 RUN chmod 0755 /usr/local/bin/execenv-entrypoint /usr/local/bin/execenv-selftest \
     && mkdir -p /work && chown io:io /work
 
+# PER_JOB_HISTORY_DIR must exist before the schedd writes into it, and
+# it must be writable by whatever uid the daemons drop to -- an
+# unwritable one does not disable the feature, it EXCEPTs the schedd
+# into a restart loop (#7127, PR #7135: "error 13 (Permission denied)
+# opening per-job history file", classadHistory.cpp:262). Mode 1777
+# guarantees writability without this layer having to know the daemon
+# uid; copying the spool's ownership at build time is what failed,
+# because the packaged spool is root-owned until condor first starts.
+# The sticky bit keeps it safe, and this image is a single trusted user
+# by design (ADR-0009/0013).
+RUN set -eu; \
+    history="$(condor_config_val SPOOL)/per-job-history"; \
+    mkdir -p "$history"; \
+    chmod 1777 "$history"; \
+    [ -n "$(find "$history" -maxdepth 0 -perm -0002)" ]
+
 # condor_master is PID 1 (ADR-0003): it is already a supervisor, and
 # docker stop's SIGTERM drains the pool cleanly — provided the run
 # recipe passes --stop-timeout 60 (default 10s defeats the drain).

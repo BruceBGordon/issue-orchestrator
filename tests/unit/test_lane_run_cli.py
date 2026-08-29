@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ from issue_orchestrator.ports.lane_dispatch_journal import (
     LaneDispatchJournalError,
     LaneDispatchRecord,
 )
+from issue_orchestrator.ports.machine_state import MachineState
 from issue_orchestrator.entrypoints.cli_tools.lane_run import (
     BACKEND_ENVIRONMENT_VARIABLE,
     main,
@@ -86,6 +88,38 @@ def fake_journal(monkeypatch: pytest.MonkeyPatch) -> _FakeJournal:
     journal = _FakeJournal()
     monkeypatch.setattr(lane_run_module, "_build_journal", lambda: journal)
     return journal
+
+
+_FAKE_READING = MachineState(
+    sampled_at=datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc),
+    loadavg_1m=7.91,
+    loadavg_5m=12.51,
+    loadavg_15m=9.0,
+    cpu_idle_percent=85.68,
+    cpu_idle_source="fake",
+    physical_cores=18,
+    probe_error=None,
+)
+
+
+class _FakeMachineStateSampler:
+    def __init__(self, state: MachineState) -> None:
+        self.state = state
+
+    def sample(self) -> MachineState:
+        return self.state
+
+
+@pytest.fixture(autouse=True)
+def fake_machine_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A faked host probe: these tests assert what the CLI puts on the
+    record, and the real probe is a subprocess whose answer depends on
+    the machine running the suite."""
+    monkeypatch.setattr(
+        lane_run_module,
+        "_build_machine_state_sampler",
+        lambda: _FakeMachineStateSampler(_FAKE_READING),
+    )
 
 
 def _run(*command: str, flags: tuple[str, ...] = (), timeout: str = "60") -> int:
@@ -286,6 +320,39 @@ def test_failed_lane_still_journals_its_dispatch_facts(
     (record,) = fake_journal.records
     assert record.exit_code == 1
     assert record.observed_runtime_seconds == 482.0
+
+
+def test_every_dispatch_record_carries_the_machine_state_envelope(
+    monkeypatch: pytest.MonkeyPatch, fake_journal: _FakeJournal
+) -> None:
+    """Acceptance (#7127): the CLI samples the host and puts the
+    reading on the record, so a 482s lane can be told apart from a 482s
+    lane that ran against a saturated machine."""
+    _capture(monkeypatch, LaneCompleted(0, 45.0, 12.0))
+    assert _run("/usr/bin/true") == 0
+    (record,) = fake_journal.records
+    assert record.machine_state == _FAKE_READING
+
+
+def test_a_broken_host_probe_never_fails_the_lane(
+    monkeypatch: pytest.MonkeyPatch, fake_journal: _FakeJournal
+) -> None:
+    """The owner decision, at the boundary that matters: an
+    observability probe that raises mid-record must not turn a green
+    lane red. The failure is recorded, not swallowed."""
+
+    class _Exploding:
+        def sample(self) -> MachineState:
+            raise RuntimeError("probe host melted")
+
+    monkeypatch.setattr(
+        lane_run_module, "_build_machine_state_sampler", lambda: _Exploding()
+    )
+    _capture(monkeypatch, LaneCompleted(0, 45.0, 12.0))
+    assert _run("/usr/bin/true") == 0
+    (record,) = fake_journal.records
+    assert record.machine_state.probe_error is not None
+    assert "probe host melted" in record.machine_state.probe_error
 
 
 def test_journal_failure_is_a_backend_fault(

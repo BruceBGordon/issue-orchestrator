@@ -170,20 +170,17 @@ class ResourceSampler:
             self.recorder.append_resource_sample(self._collect_sample())
 
     def _collect_sample(self) -> dict[str, object]:
+        # Load average, CPU idle and core count are NOT collected here:
+        # they are the machine-state envelope every validate-timings
+        # record now carries (infra/machine_state.py, #7127), stamped by
+        # the recorder itself. Duplicating them per sample would put the
+        # same fact under two names with two collection rules.
         sample: dict[str, object] = {
             "recorded_at": datetime.now(timezone.utc).isoformat(),
         }
-        try:
-            load1, load5, load15 = os.getloadavg()
-            sample["loadavg_1m"] = round(load1, 3)
-            sample["loadavg_5m"] = round(load5, 3)
-            sample["loadavg_15m"] = round(load15, 3)
-        except OSError:
-            pass
-
-        # These probes are macOS-specific today. Linux validate runs still record
-        # load averages, and we can add /proc-based probes later if CI analysis
-        # needs the same memory/swap/disk visibility.
+        # These probes are macOS-specific today. Linux validate runs still
+        # carry the machine-state envelope, and we can add /proc-based probes
+        # later if CI analysis needs the same memory/swap/disk visibility.
         memory_output = run_command_text(["memory_pressure", "-Q"], cwd=self.worktree)
         free_percent = parse_memory_free_percent(memory_output)
         if free_percent is not None:

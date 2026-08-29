@@ -51,6 +51,10 @@ from ...infra.lane_declarations import (
     LaneDeclarationError,
     load_lane_declaration,
 )
+from ...infra.machine_state import (
+    default_machine_state_sampler,
+    sample_machine_state_from,
+)
 from ...infra.validation_timings import resolve_git_common_dir
 from ...ports.lane_dispatch_journal import (
     LaneDispatchJournal,
@@ -58,6 +62,7 @@ from ...ports.lane_dispatch_journal import (
     LaneDispatchRecord,
 )
 from ...ports.lane_runtime_history import LaneRuntimeHistory
+from ...ports.machine_state import MachineStateSampler
 
 _UNAVAILABLE_EXIT_CODE = 78
 _BACKEND_FAULT_EXIT_CODE = 70
@@ -164,6 +169,15 @@ def _conclude_completed(
                 queue_wait_seconds=outcome.queue_wait_seconds,
                 observed_runtime_seconds=outcome.observed_runtime_seconds,
                 exit_code=outcome.exit_code,
+                # Sampled after the lane concluded, so the reading
+                # describes the machine the lane just competed on and
+                # cannot itself perturb the lane's own timing. The
+                # SEAM is passed, not its result: building the probe
+                # happens inside the containment too, so nothing about
+                # the probe can replace this lane's decided outcome.
+                machine_state=sample_machine_state_from(
+                    _build_machine_state_sampler
+                ),
             )
         )
     except LaneDispatchJournalError as error:
@@ -206,6 +220,11 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
 def _load_declaration(work_key: str) -> LaneDeclaration:
     """The declared scheduling facts for this work key (test seam)."""
     return load_lane_declaration(Path.cwd(), work_key)
+
+
+def _build_machine_state_sampler() -> MachineStateSampler:
+    """The host probe stamped on this lane's dispatch record (test seam)."""
+    return default_machine_state_sampler()
 
 
 def _build_journal() -> LaneDispatchJournal:

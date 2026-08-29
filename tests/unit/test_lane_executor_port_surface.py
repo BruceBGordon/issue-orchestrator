@@ -13,7 +13,7 @@ from __future__ import annotations
 import dataclasses
 
 from issue_orchestrator.domain import lane_execution
-from issue_orchestrator.ports import lane_dispatch_journal
+from issue_orchestrator.ports import lane_dispatch_journal, machine_state
 from issue_orchestrator.ports.lane_executor import LaneExecutor
 from issue_orchestrator.ports.lane_policy_check import LanePolicyCheck
 from issue_orchestrator.ports.lane_runtime_history import LaneRuntimeHistory
@@ -87,6 +87,14 @@ def test_dispatch_journal_surface_is_pinned() -> None:
         "queue_wait_seconds",
         "observed_runtime_seconds",
         "exit_code",
+        # Deliberate widening (#7127, forensics envelope): a runtime
+        # without the host contention it ran under cannot be told apart
+        # from a regression, and the covariate is unrecoverable after
+        # the fact. Required rather than optional for the same reason
+        # queue_wait_seconds is: a record that may omit it re-creates
+        # the ambiguity. Measurement only — nothing may schedule,
+        # order, or gate on it.
+        "machine_state",
     )
 
 
@@ -115,6 +123,34 @@ def test_policy_check_port_surface_is_pinned() -> None:
         "observed",
     )
     assert not hasattr(lane_execution, "LanePolicyObservation")
+
+
+def test_machine_state_surface_is_pinned() -> None:
+    """The envelope stamped on every forensic record (#7127).
+
+    Pinned for the same reason the dispatch record is: it is written to
+    durable JSONL that later analysis parses, so widening or reshaping
+    it must be a decision, not a drift. Every measured field is
+    optional on purpose — an unavailable reading is recorded as
+    unavailable and never invented — while ``cpu_idle_source`` always
+    names the probe (or the reason there was none)."""
+    assert _field_names(machine_state.MachineState) == (
+        "sampled_at",
+        "loadavg_1m",
+        "loadavg_5m",
+        "loadavg_15m",
+        "cpu_idle_percent",
+        "cpu_idle_source",
+        "physical_cores",
+        "probe_error",
+    )
+    operations = [
+        name
+        for name in vars(machine_state.MachineStateSampler)
+        if not name.startswith("_")
+        and callable(getattr(machine_state.MachineStateSampler, name))
+    ]
+    assert operations == ["sample"]
 
 
 def test_history_port_has_exactly_two_operations() -> None:
