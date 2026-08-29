@@ -87,8 +87,28 @@ def test_per_process_macro_overrides_never_reach_the_tools(
 
     seen = _read_environment(_dumping_tools(tmp_path))
 
-    leaked = [key for key in seen if key.startswith("_CONDOR_")]
+    leaked = [key for key in seen if key.upper().startswith("_CONDOR_")]
     assert not leaked, f"macro overrides reached a configuration read: {leaked}"
+
+
+@pytest.mark.parametrize(
+    "prefix", ["_CONDOR_", "_condor_", "_CoNdOr_", "_Condor_", "_cOnDoR_"]
+)
+def test_overrides_are_scrubbed_from_reads_in_any_casing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, prefix: str
+) -> None:
+    """The scheduler matches the override prefix case-INSENSITIVELY
+    while POSIX environments are case-SENSITIVE, so `_condor_X` is a
+    different variable that the tool honours identically. A
+    case-sensitive scrub is one lowercase export away from useless —
+    all four casings were proven live to inject (round 4, #7132
+    review)."""
+    monkeypatch.setenv(f"{prefix}IO_INTENT_LOAD_BACKOFF", "Bogus")
+
+    seen = _read_environment(_dumping_tools(tmp_path))
+
+    leaked = [key for key in seen if key.upper().startswith("_CONDOR_")]
+    assert not leaked, f"a {prefix!r} override reached a configuration read: {leaked}"
 
 
 def test_the_submit_path_carries_the_caller_environment_unchanged(
@@ -100,6 +120,7 @@ def test_the_submit_path_carries_the_caller_environment_unchanged(
     silently delete variables from the job's environment — a mutation
     nobody asked for, and not what the read-path property requires."""
     monkeypatch.setenv("_CONDOR_IO_INTENT_LOAD_BACKOFF", "False")
+    monkeypatch.setenv("_condor_lowercase_variant", "False")
     monkeypatch.setenv("IO_SENTINEL_FOR_TEST", "kept")
 
     seen = _submit_environment(_dumping_tools(tmp_path))
@@ -108,6 +129,9 @@ def test_the_submit_path_carries_the_caller_environment_unchanged(
         "the submit path must pass the caller's environment through "
         "unchanged - getenv = true carries it into the lane"
     )
+    # The case-insensitive scrub must not leak across the asymmetry
+    # either: neither casing is removed from what the lane inherits.
+    assert seen["_condor_lowercase_variant"] == "False"
     assert seen["IO_SENTINEL_FOR_TEST"] == "kept"
 
 
@@ -132,10 +156,14 @@ def test_a_variable_merely_containing_the_prefix_is_kept(
     """Only the override PREFIX is meaningful to the scheduler; a name
     that happens to contain it elsewhere is an ordinary variable."""
     monkeypatch.setenv("MY_CONDOR_SETTING", "kept")
+    monkeypatch.setenv("my_condor_setting_lower", "kept")
+    monkeypatch.setenv("CONDOR_CONFIG_LIKE", "kept")
 
     seen = _environment_seen(_dumping_tools(tmp_path))
 
     assert seen["MY_CONDOR_SETTING"] == "kept"
+    assert seen["my_condor_setting_lower"] == "kept"
+    assert seen["CONDOR_CONFIG_LIKE"] == "kept"
 
 
 def test_the_pool_configuration_is_still_pinned(tmp_path: Path) -> None:

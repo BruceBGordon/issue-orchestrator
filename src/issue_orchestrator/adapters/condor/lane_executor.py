@@ -62,7 +62,18 @@ _DEFAULT_PERSONAL_POOL_HOME = Path.home() / ".local/share/issue-orchestrator/con
 # the daemons. Scrubbed on the configuration-READ path (an answer about
 # the pool must come from the pool) and deliberately preserved on the
 # submit path (`getenv = true` carries it to the lane).
+#
+# The scheduler matches this prefix CASE-INSENSITIVELY while POSIX
+# environments are case-SENSITIVE, so `_condor_X` and `_CoNdOr_X` are
+# distinct variables that the tool nonetheless honours identically
+# (verified live: all four casings injected). Matching must therefore
+# be case-insensitive too, or the scrub is a lowercase bypass away
+# from useless (round 4, #7132 review).
 _MACRO_OVERRIDE_PREFIX = "_CONDOR_"
+
+
+def _is_macro_override(name: str) -> bool:
+    return name.upper().startswith(_MACRO_OVERRIDE_PREFIX)
 _TOOL_EXECUTABLES = (
     ("submit", "condor_submit"),
     ("remove", "condor_rm"),
@@ -215,7 +226,7 @@ class CondorTools:
             environment = {
                 key: value
                 for key, value in environment.items()
-                if not key.startswith(_MACRO_OVERRIDE_PREFIX)
+                if not _is_macro_override(key)
             }
         if self.pool_config is not None:
             environment["CONDOR_CONFIG"] = str(self.pool_config)
