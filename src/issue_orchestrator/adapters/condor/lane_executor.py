@@ -373,6 +373,17 @@ class CondorLaneExecutor:
         lane that ended on Ctrl-C must not report that it ended on a
         closed stderr. Every stage of this method chains, or none of
         them can be said to.
+
+        And the ending carries the cleanup failure OUT (round 8). Writing
+        it to stderr protected the ending but not the evidence: when the
+        write failed there was nowhere left to put ``contained``, and it
+        vanished. The exception chain is the one carrier that always
+        exists, so the ending is re-raised from inside the handler and
+        implicit chaining records ``contained`` as its ``__context__`` —
+        unconditionally, not only when the report failed, so the
+        invariant does not depend on whether stderr happened to work.
+        The ORIGINAL is what escapes and its ``__cause__`` stays clear,
+        so it is still directly readable as the ending.
         """
         try:
             # Inside the boundary, not before it: NOTHING in this body
@@ -407,6 +418,15 @@ class CondorLaneExecutor:
                 ),
                 chain_from=unwinding,
             )
+            # Re-raise the ending from HERE, while `contained` is the
+            # exception being handled, so Python records it as the ending's
+            # __context__. That is the point: stderr may be gone, and the
+            # chain is the one carrier that cannot be. The same object the
+            # caller was already unwinding is what leaves — the ending is
+            # restored, not replaced — and its __cause__ stays clear, so it
+            # is still directly readable. CPython severs the reverse link
+            # while doing this, so the chain cannot become a cycle.
+            raise unwinding
 
     def _collect_job_accounting(
         self,

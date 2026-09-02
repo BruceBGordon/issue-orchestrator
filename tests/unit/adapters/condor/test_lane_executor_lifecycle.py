@@ -723,6 +723,16 @@ def test_a_second_interrupt_during_cleanup_wins(
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    """Every exception reachable from ``error`` by cause or context."""
+    chain: list[BaseException] = []
+    walker: BaseException | None = error
+    while walker is not None and not any(link is walker for link in chain):
+        chain.append(walker)
+        walker = walker.__cause__ or walker.__context__
+    return chain
+
+
 class _StderrThatFails:
     """A stderr whose ``write`` raises — a closed pipe, a full disk, a
     supervisor that took the descriptor away mid-teardown."""
@@ -798,14 +808,65 @@ def test_a_failure_while_RECORDING_does_not_become_the_ending(
     assert caught.value is original, (
         "the recording failure replaced the original ending"
     )
-    chain: list[BaseException] = []
-    walker: BaseException | None = caught.value
-    while walker is not None and walker not in chain:
-        chain.append(walker)
-        walker = walker.__cause__ or walker.__context__
-    assert recording_failure not in chain, (
-        "the failure to write the report became part of the ending"
+    assert caught.value.__cause__ is None, (
+        "the original ending is no longer directly readable as the ending"
     )
+    chain = _exception_chain(caught.value)
+    assert cleanup_failure in chain, (
+        "the cleanup failure vanished: the report could not be written, so "
+        "the exception chain was the only carrier left and it carried nothing"
+    )
+    assert recording_failure not in chain, (
+        "the failure to write the report became part of the ending; it is a "
+        "property of the process's stderr, not of why this lane ended, and "
+        "the chain now carries the lane's own evidence without it"
+    )
+    for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_the_cleanup_failure_rides_the_chain_even_when_stderr_WORKS(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The linkage is unconditional, not a fallback for a broken stderr.
+
+    Making it conditional would mean the evidence a caller can reach depends
+    on whether a write happened to succeed — untestable in the case that
+    matters and silently different in production. The chain carries the
+    cleanup failure always; the stderr line is the redundant copy, not the
+    other way round.
+    """
+    history = tmp_path / "per-job-history"
+    history.mkdir()
+    _unhurried_cancellation(monkeypatch)
+    tools = _cancellable_tools(tmp_path, history=history, removal_writes_classad=False)
+    work_key = "lifecycle.chainalways"
+    executor = CondorLaneExecutor(tools)
+    original = KeyboardInterrupt("original ending")
+    cleanup_failure = RuntimeError("condor_rm exploded")
+
+    def _exploding_remove(job_id: str, timeout_seconds: float) -> None:
+        raise cleanup_failure
+
+    monkeypatch.setattr(lane_executor_module, "time", _WaitsThatRaise(original))
+    monkeypatch.setattr(executor, "_remove", _exploding_remove)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        executor.run(
+            LaneCommand(
+                work_key=LaneWorkKey(work_key),
+                arguments=(sys.executable, "-c", "pass"),
+                working_directory=tmp_path,
+                deadline=LaneDeadline(300.0),
+            ),
+            LaneResources(request_cpus=1),
+        )
+
+    assert caught.value is original
+    assert caught.value.__cause__ is None
+    assert cleanup_failure in _exception_chain(caught.value)
+    # ...and the stderr line still went out; the two are not exclusive.
+    assert "cancellation cleanup gave up after" in capsys.readouterr().err
     for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
         shutil.rmtree(directory, ignore_errors=True)
 
