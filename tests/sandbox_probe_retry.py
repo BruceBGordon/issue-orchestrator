@@ -17,7 +17,7 @@ This module owns that distinction so no probe can accidentally re-derive it:
 - Every attempt's output and on-disk evidence is captured, so the caller's
   breach assertions still run against a run that ultimately failed.
 - Exhausting the retries on a timeout fails loudly via
-  :meth:`ProbeRun.require_completed`, restoring the pre-retry behaviour where
+  :meth:`ProbeRun.require_intact`, restoring the pre-retry behaviour where
   a ``TimeoutExpired`` aborted the test.
 
 WHAT COUNTS AS EVIDENCE IS THE CALLER'S DECLARATION, NOT A FIXED RULE. Probes
@@ -54,13 +54,18 @@ sites, because the call sites are where it was got wrong:
 - :meth:`ProbeRun.require_intact` evaluates every attempt's snapshot BEFORE the
   completion requirement. A breach recorded by an attempt that later timed out
   is reported as a breach, never masked by the timeout failure. The ordering is
-  not a caller's choice; there is one entry point and it owns the order.
+  not a caller's choice: it is the ONLY entry point, so there is nothing to
+  call that would complete a run without evaluating its checks.
+- A check is handed only the entries it declared (:class:`_DeclaredPaths`), so
+  "declare what you inspect" is enforced rather than asked for. Reading an
+  undeclared path raises instead of silently reporting a clean run over
+  evidence nothing captured.
 """
 
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -88,6 +93,62 @@ class ProbeBreach(AssertionError):
     """
 
 
+class UndeclaredBreachPath(AssertionError):
+    """Raised when a breach check reads a path it did not declare.
+
+    Declaring a path is what gets it captured, so a check that reads one it
+    did not declare is reading something nothing captured — it would silently
+    see ``None`` for a file that may in fact hold a leak, and report intact.
+    The scoped view makes that impossible rather than merely discouraged, and
+    this is what it raises when a check tries.
+
+    An ``AssertionError`` and deliberately NOT a ``KeyError``: ``Mapping.get``
+    swallows ``KeyError`` to return its default, which would turn this back
+    into the silent ``None`` it exists to prevent.
+    """
+
+
+class _DeclaredPaths(Mapping[Path, bytes | None]):
+    """One attempt's snapshot, narrowed to exactly what a check declared.
+
+    A :class:`BreachCheck` is handed this, never the whole snapshot. Reading
+    any other path raises :class:`UndeclaredBreachPath` — through ``[]``,
+    ``get()`` and ``in`` alike — so "a check only inspects what it declared"
+    holds by construction, including for a check this module did not write.
+    """
+
+    def __init__(self, entries: Mapping[Path, bytes | None]) -> None:
+        self._entries = dict(entries)
+
+    def __getitem__(self, path: Path) -> bytes | None:
+        if path not in self._entries:
+            raise UndeclaredBreachPath(
+                f"a breach check read {path}, which it did not declare in "
+                "`paths`; nothing captured it, so what it read proves nothing"
+            )
+        return self._entries[path]
+
+    def get(  # type: ignore[override]
+        self, path: Path, default: bytes | None = None
+    ) -> bytes | None:
+        # Never silently defaults: an undeclared read is an error, not a miss.
+        return self[path]
+
+    def __contains__(self, path: object) -> bool:
+        if path not in self._entries:
+            raise UndeclaredBreachPath(
+                f"a breach check tested membership of {path!r}, which it did "
+                "not declare in `paths`"
+            )
+        return True
+
+    def __iter__(self) -> Iterator[Path]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
 @runtime_checkable
 class BreachCheck(Protocol):
     """One thing that must never be true of an attempt's on-disk evidence.
@@ -95,6 +156,13 @@ class BreachCheck(Protocol):
     ``paths`` is what the check needs captured. :func:`run_until_evidence`
     snapshots exactly these, so a breach path cannot be silently left out of
     the capture set the way it can when the two are declared separately.
+
+    This Protocol stays open — a probe may need a check shape this module does
+    not have — but the invariant does not depend on implementers behaving.
+    :meth:`ProbeRun.require_intact` passes a :class:`_DeclaredPaths` view
+    holding exactly ``paths``, so a check with ``paths == ()`` that reaches for
+    a secret sink raises instead of reporting a clean run over uncaptured
+    evidence.
     """
 
     @property
@@ -102,7 +170,10 @@ class BreachCheck(Protocol):
         """Paths this check inspects, snapshotted after every attempt."""
 
     def violated_by(self, snapshot: Mapping[Path, bytes | None]) -> str | None:
-        """Describe the breach this snapshot shows, or ``None`` if intact."""
+        """Describe the breach this snapshot shows, or ``None`` if intact.
+
+        ``snapshot`` holds exactly the entries named by :attr:`paths`.
+        """
 
 
 @dataclass(frozen=True)
@@ -351,40 +422,40 @@ class ProbeRun:
     def require_intact(self) -> None:
         """Report any attempt's breach, THEN require the run to have completed.
 
-        This is the entry point a live probe calls. It exists so the ordering
-        is the owner's and not the caller's: two call sites had it backwards
-        and a run that leaked on its final attempt and then timed out reported
-        the timeout, burying the leak. Snapshots are evaluated oldest-first, so
-        evidence from an attempt whose output was later reset — or which was
-        killed mid-run — is still what gets reported.
+        The ONE entry point. There is deliberately no separate public timeout
+        guard: while the two were separate methods, a checked run could be
+        completed without its breach checks ever being evaluated, and two call
+        sites did exactly that in the other order. Folding the timeout in here
+        leaves nothing to call instead, so the ordering is not merely the
+        documented convention — it is the only reachable path.
+
+        Snapshots are evaluated oldest-first, so evidence from an attempt whose
+        output was later reset, or which was killed mid-run, is still what gets
+        reported. Each check sees a :class:`_DeclaredPaths` view of exactly the
+        paths it declared, so it cannot reach a path nothing captured.
 
         A probe with no on-disk breach surface declares that by passing no
         breach checks; the absence is then a visible decision in the call
-        rather than a line someone forgot to write.
+        rather than a line someone forgot to write. The timeout guard still
+        applies to it.
+
+        The timeout is the only completion failure raised here. "The probe
+        completed but produced nothing" is left to the caller's own
+        positive-control assertion, which carries a far more specific message —
+        and which cannot be satisfied by a stale artifact, since the evidence
+        is reset before each retry.
         """
         for attempt in self.attempts:
             for check in self.breach_checks:
-                reason = check.violated_by(attempt.snapshot)
+                declared = _DeclaredPaths(
+                    {path: attempt.snapshot[path] for path in check.paths}
+                )
+                reason = check.violated_by(declared)
                 if reason is not None:
                     raise ProbeBreach(
                         f"SANDBOX BREACH on attempt {attempt.number} of "
                         f"{len(self.attempts)}: {reason}"
                     )
-        self.require_completed()
-
-    def require_completed(self) -> None:
-        """Fail loudly if the run never produced a non-timed-out attempt.
-
-        Prefer :meth:`require_intact`, which runs this after the breach checks.
-        Calling it directly is correct only for a probe that declares no breach
-        checks at all; with checks declared it would report a timeout ahead of
-        a leak.
-
-        This guards the timeout case only. "The probe completed but produced
-        nothing" is left to the caller's own positive-control assertion, which
-        carries a far more specific message — and which cannot be satisfied by
-        a stale artifact, since the evidence is reset before each retry.
-        """
         if not self.timed_out:
             return
         raise ProbeTimeout(
@@ -445,18 +516,25 @@ def run_until_evidence(
 
     Returns:
         A :class:`ProbeRun`. Callers must call
-        :meth:`ProbeRun.require_intact` before treating the run as evidence.
+        :meth:`ProbeRun.require_intact` before treating the run as evidence;
+        it is the only entry point, so breach evaluation cannot be skipped.
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
 
+    # Freeze BEFORE deriving the capture set from it. ``breach_checks`` is a
+    # Sequence the caller still holds; appending to it during ``run_attempt``
+    # would leave the run evaluating checks whose paths were never captured,
+    # and the scoped view would then raise on a key that simply is not there.
+    # One tuple() at the entry makes the checks, the capture set, and the
+    # ProbeRun all the same fixed list.
+    checks = tuple(breach_checks)
     # The union, deduplicated and order-stable: every breach path is captured
     # whether or not the caller also listed it, so the two declarations cannot
     # drift apart.
     captured = tuple(
         dict.fromkeys(
-            [path for check in breach_checks for path in check.paths]
-            + list(observed_paths)
+            [path for check in checks for path in check.paths] + list(observed_paths)
         )
     )
     attempts: list[ProbeAttempt] = []
@@ -488,4 +566,4 @@ def run_until_evidence(
         attempts.append(attempt)
         if attempt.is_complete_evidence:
             break
-    return ProbeRun(attempts=tuple(attempts), breach_checks=tuple(breach_checks))
+    return ProbeRun(attempts=tuple(attempts), breach_checks=checks)

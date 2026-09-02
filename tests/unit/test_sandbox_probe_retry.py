@@ -21,8 +21,11 @@ from tests.sandbox_probe_retry import (
     CreatedPaths,
     PresentContent,
     ProbeBreach,
+    ProbeRun,
     ProbeTimeout,
     UnchangedBytes,
+    UndeclaredBreachPath,
+    _DeclaredPaths,
     run_until_evidence,
 )
 
@@ -65,7 +68,7 @@ def test_snapshots_preserve_first_attempt_breach_before_later_overwrite(
         b"OPENED",
         b"CLOSED",
     ]
-    probe.require_completed()
+    probe.require_intact()
 
 
 def test_timeout_then_success_retries_and_completes(tmp_path: Path) -> None:
@@ -90,7 +93,7 @@ def test_timeout_then_success_retries_and_completes(tmp_path: Path) -> None:
     assert attempts == 2
     assert not probe.timed_out
     assert probe.result.stdout == "second attempt ok"
-    probe.require_completed()  # must not raise
+    probe.require_intact()  # must not raise
     # The timed-out attempt's evidence is still reported.
     assert "probe timed out after 1s" in probe.combined_output
 
@@ -123,7 +126,7 @@ def test_timed_out_attempt_with_all_paths_present_is_not_success(
 
     assert attempts == 2, "a timed-out attempt must never satisfy the success check"
     assert not probe.timed_out
-    probe.require_completed()
+    probe.require_intact()
     # The accepted evidence is attempt 2's own, not the killed attempt's.
     assert probe.completed_attempt is not None
     assert probe.completed_attempt.number == 2
@@ -196,7 +199,7 @@ def test_clearing_is_limited_to_the_attempt_owned_outputs(tmp_path: Path) -> Non
         observed_paths=(completed, planted, escaped),
     )
 
-    probe.require_completed()
+    probe.require_intact()
     assert planted.read_text(encoding="utf-8") == "ORIGINAL"
     # The breach from attempt 1 is still on disk for the caller's final check.
     assert escaped.read_text(encoding="utf-8") == "ESCAPED"
@@ -225,7 +228,7 @@ def test_two_timeouts_exhaust_and_fail_loudly(tmp_path: Path) -> None:
     assert probe.result.returncode == TIMEOUT_RETURNCODE
 
     with pytest.raises(ProbeTimeout) as excinfo:
-        probe.require_completed()
+        probe.require_intact()
 
     message = str(excinfo.value)
     assert "timed out on all 2 attempt(s)" in message
@@ -258,7 +261,7 @@ def test_exhausted_run_still_exposes_every_attempt_snapshot(tmp_path: Path) -> N
 def test_missing_expected_paths_without_timeout_does_not_raise(tmp_path: Path) -> None:
     """A completed-but-incomplete run is the caller's assertion to make.
 
-    ``require_completed`` only guards the timeout case; "the probe ran but did
+    ``require_intact`` only guards the timeout case beyond the breach checks; "the probe ran but did
     not produce its files" is reported by the caller's own positive-control
     assertion, which carries a far more specific message.
     """
@@ -273,7 +276,7 @@ def test_missing_expected_paths_without_timeout_does_not_raise(tmp_path: Path) -
     assert not probe.timed_out
     assert probe.snapshots == ({completed: None}, {completed: None})
     assert probe.completed_attempt is None
-    probe.require_completed()
+    probe.require_intact()
 
 
 class _StdoutContains:
@@ -326,7 +329,7 @@ def test_completed_attempt_without_its_evidence_is_retried() -> None:
 def test_evidence_never_produced_exhausts_without_masking_the_caller() -> None:
     """Exhaustion leaves no completed attempt and does not raise as a timeout.
 
-    ``require_completed`` guards timeouts only, so the caller's own assertion —
+    ``require_intact`` adds only the timeout guard, so the caller's own assertion —
     which names the boundary that went unexercised — is what fails.
     """
 
@@ -344,7 +347,7 @@ def test_evidence_never_produced_exhausts_without_masking_the_caller() -> None:
     assert probe.completed_attempt is None
     assert not probe.timed_out
     assert probe.missing_evidence == "the output never contained 'tool_use: Write'"
-    probe.require_completed()  # must not raise: this is not a timeout
+    probe.require_intact()  # must not raise: this is not a timeout
 
 
 def test_all_evidence_requires_every_part_and_resets_every_part(
@@ -422,7 +425,7 @@ def test_a_breach_is_reported_ahead_of_the_timeout_that_followed_it(
 ) -> None:
     """Breach-first ordering, owned here so no call site can reverse it.
 
-    Two probes had ``require_completed()`` before their snapshot assertions,
+    Two probes had the completion guard before their snapshot assertions,
     and a run that escaped the worktree on its final attempt and then timed out
     reported the timeout — burying the breach. ``require_intact`` evaluates
     every attempt's snapshot first, so the finding that surfaces is the leak.
@@ -445,9 +448,15 @@ def test_a_breach_is_reported_ahead_of_the_timeout_that_followed_it(
         probe.require_intact()
     assert "a write escaped the worktree" in str(excinfo.value)
 
-    # ...and the timeout is still there for a run with nothing to report.
+    # ...and the same timeout IS what surfaces when there is no breach to
+    # outrank it, so the breach is being preferred rather than the timeout lost.
+    clean = run_until_evidence(
+        lambda: (_ for _ in ()).throw(_timeout()),
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(AbsentPath(tmp_path / "never-written.txt", "escaped"),),
+    )
     with pytest.raises(ProbeTimeout):
-        probe.require_completed()
+        clean.require_intact()
 
 
 def test_declaring_a_breach_check_is_what_captures_its_path(tmp_path: Path) -> None:
@@ -553,3 +562,136 @@ def test_all_evidence_rejects_no_parts() -> None:
     """A conjunction of nothing is true — the same vacuity, one layer up."""
     with pytest.raises(ValueError, match="at least one part"):
         AllEvidence(())
+
+
+class _ReachesBeyondItsDeclaration:
+    """A conforming check that declares nothing and inspects a secret anyway.
+
+    Not a strawman: ``BreachCheck`` is an open Protocol, so this satisfies it
+    completely. While ``violated_by`` received the whole snapshot, this shape
+    reported a clean run over a path nothing had captured.
+    """
+
+    def __init__(self, undeclared: Path) -> None:
+        self.undeclared = undeclared
+        self.saw: bytes | None | str = "never ran"
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        return ()
+
+    def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+        self.saw = snapshot.get(self.undeclared)
+        return None
+
+
+def test_a_check_cannot_inspect_a_path_it_did_not_declare(tmp_path: Path) -> None:
+    """Declare-is-capture is structural, not a rule implementers must follow.
+
+    A check is handed only the entries it declared, so reaching past them
+    raises instead of silently reading ``None`` and reporting intact — which
+    is what a check with ``paths == ()`` would otherwise do to a real leak.
+    """
+    secret_sink = tmp_path / "secret-read.txt"
+    completed = tmp_path / "completed.txt"
+    rogue = _ReachesBeyondItsDeclaration(secret_sink)
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        secret_sink.write_text("TOPSECRET", encoding="utf-8")
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(rogue,),
+    )
+
+    with pytest.raises(UndeclaredBreachPath) as excinfo:
+        probe.require_intact()
+
+    assert "did not declare" in str(excinfo.value)
+    assert rogue.saw == "never ran", "the undeclared read must not have returned"
+
+
+def test_the_scoped_view_refuses_every_undeclared_access_shape(
+    tmp_path: Path,
+) -> None:
+    """``[]``, ``get()`` and ``in`` all refuse; declared entries all work.
+
+    ``get()`` matters most: ``Mapping.get`` swallows ``KeyError`` to return its
+    default, so an undeclared read would have come back as ``None`` — exactly
+    the silent "no leak here" this prevents. That is why the error is not a
+    ``KeyError``.
+    """
+    declared = tmp_path / "declared.txt"
+    other = tmp_path / "other.txt"
+    view = _DeclaredPaths({declared: b"value"})
+
+    assert view[declared] == b"value"
+    assert view.get(declared) == b"value"
+    assert list(view) == [declared]
+    assert len(view) == 1
+
+    with pytest.raises(UndeclaredBreachPath):
+        view[other]
+    with pytest.raises(UndeclaredBreachPath):
+        view.get(other)
+    with pytest.raises(UndeclaredBreachPath):
+        other in view  # noqa: B015
+
+
+def test_a_declared_but_absent_path_reads_as_none_not_an_error(
+    tmp_path: Path,
+) -> None:
+    """Absence is data, not an undeclared access — a sink may legitimately be gone."""
+    declared = tmp_path / "declared.txt"
+
+    assert _DeclaredPaths({declared: None})[declared] is None
+
+
+def test_mutating_the_check_list_mid_run_cannot_desync_the_capture_set(
+    tmp_path: Path,
+) -> None:
+    """The checks are frozen at entry, before the capture set is derived.
+
+    While the sequence was read twice — once to build the capture set, once to
+    build the run — a caller still holding the list could append during
+    ``run_attempt`` and leave the run evaluating a check whose path nothing
+    captured.
+    """
+    completed = tmp_path / "completed.txt"
+    late = tmp_path / "late.txt"
+    checks: list[object] = [AbsentPath(tmp_path / "escaped.txt", "escaped")]
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        checks.append(AbsentPath(late, "a late arrival nothing captured"))
+        late.write_text("APPEARED", encoding="utf-8")
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=checks,  # type: ignore[arg-type]
+    )
+
+    assert len(checks) == 2, "the caller really did mutate its list"
+    assert len(probe.breach_checks) == 1, "the run kept the list it was given"
+    probe.require_intact()  # must not raise KeyError on the uncaptured path
+
+
+def test_require_intact_is_the_only_completion_entry_point() -> None:
+    """There is nothing to call that completes a run without its breach checks.
+
+    A separate public timeout guard was callable on a run that HAD checks, and
+    returned without evaluating them. Folding it in removed the bypass rather
+    than documenting against it.
+    """
+    entry_points = {
+        name
+        for name in vars(ProbeRun)
+        if name.startswith("require") or name.startswith("assert")
+    }
+
+    assert entry_points == {"require_intact"}

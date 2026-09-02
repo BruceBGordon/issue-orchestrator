@@ -702,9 +702,9 @@ def test_persistent_decline_exhausts_and_never_passes_vacuously(
     assert probe.completed_attempt is None
     assert probe.missing_evidence is not None
     assert str(target) in probe.missing_evidence
-    # Not a timeout, so require_completed stays silent and the caller's own
+    # Not a timeout and no breach checks, so require_intact stays silent and
     # `assert writes` is what fails — with the reason attached.
-    probe.require_completed()
+    probe.require_intact()
     assert not _native_writes_to(_tool_events(probe.result.stdout or ""), target)
 
 
