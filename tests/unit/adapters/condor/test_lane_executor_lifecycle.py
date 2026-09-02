@@ -723,6 +723,85 @@ def test_a_second_interrupt_during_cleanup_wins(
         shutil.rmtree(directory, ignore_errors=True)
 
 
+class _StderrThatFails:
+    """A stderr whose ``write`` raises — a closed pipe, a full disk, a
+    supervisor that took the descriptor away mid-teardown."""
+
+    def __init__(self, failure: BaseException) -> None:
+        self._failure = failure
+
+    def write(self, text: str) -> int:
+        raise self._failure
+
+    def flush(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    "recording_failure",
+    [OSError("stderr is gone"), SystemExit(17)],
+    ids=["ordinary-failure", "system-exit"],
+)
+def test_a_failure_while_RECORDING_does_not_become_the_ending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recording_failure: BaseException,
+) -> None:
+    """Round 7: the other half of the policy, at the stage round 6 fixed.
+
+    The cleanup fails ordinarily, so the recording stage runs — and the write
+    to stderr fails too. Round 6 gave that stage a teardown guard only, so an
+    ordinary failure or a ``SystemExit`` from the write escaped
+    ``_wind_down_cancelled`` and REPLACED the original ending: the lane
+    reported that stderr was closed instead of that the operator interrupted
+    it, with ``__cause__`` None.
+
+    A diagnostic must not rewrite why the lane ended (#7135 round 3), and a
+    report that cannot be written must not change the outcome — there is
+    nowhere left to report the reporting failure to.
+    """
+    history = tmp_path / "per-job-history"
+    history.mkdir()
+    _unhurried_cancellation(monkeypatch)
+    tools = _cancellable_tools(tmp_path, history=history, removal_writes_classad=False)
+    work_key = "lifecycle.recordfails"
+    executor = CondorLaneExecutor(tools)
+    original = KeyboardInterrupt("original ending")
+    cleanup_failure = RuntimeError("condor_rm exploded")
+
+    def _exploding_remove(job_id: str, timeout_seconds: float) -> None:
+        raise cleanup_failure
+
+    monkeypatch.setattr(lane_executor_module, "time", _WaitsThatRaise(original))
+    monkeypatch.setattr(executor, "_remove", _exploding_remove)
+    monkeypatch.setattr(sys, "stderr", _StderrThatFails(recording_failure))
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        executor.run(
+            LaneCommand(
+                work_key=LaneWorkKey(work_key),
+                arguments=(sys.executable, "-c", "pass"),
+                working_directory=tmp_path,
+                deadline=LaneDeadline(300.0),
+            ),
+            LaneResources(request_cpus=1),
+        )
+
+    assert caught.value is original, (
+        "the recording failure replaced the original ending"
+    )
+    chain: list[BaseException] = []
+    walker: BaseException | None = caught.value
+    while walker is not None and walker not in chain:
+        chain.append(walker)
+        walker = walker.__cause__ or walker.__context__
+    assert recording_failure not in chain, (
+        "the failure to write the report became part of the ending"
+    )
+    for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 class _UnrenderableCleanupFailure(Exception):
     """An ordinary cleanup failure whose rendering raises a second interrupt.
 

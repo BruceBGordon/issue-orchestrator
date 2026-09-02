@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -109,6 +110,43 @@ def _job_accounting_budget() -> _CollectionBudget:
     return _CollectionBudget.lasting(_JOB_ACCOUNTING_WAIT_SECONDS)
 
 
+def _report_diagnostic(
+    compose: Callable[[], str], *, chain_from: BaseException | None = None
+) -> None:
+    """Write a diagnostic to stderr without letting it become the ending.
+
+    Two places need this and they need exactly the same thing, so it lives
+    in one: the cancellation path recording what it contained, and the
+    ``finally`` saying where the diagnostics were retained.
+
+    A diagnostic must not rewrite why the lane ended (#7135 round 3). That
+    holds for the diagnostic's OWN failures too, which is the recursion this
+    function stops: stderr is the channel a containment reports to, so a
+    failure to write leaves nowhere to report the failure to write. Ordinary
+    failures and ``SystemExit`` are therefore swallowed here — the one place
+    in this file where a bare swallow is right, and only because there is no
+    remaining channel. The caller's ending survives untouched.
+
+    Teardown signals still get out, because they mean the operator is going
+    away rather than the pipe being broken. ``chain_from`` is the ending
+    already in flight, if there is one: a second interrupt chains from it so
+    the original stays readable as ``__cause__``.
+
+    ``compose`` is called INSIDE the guard, not before it. Composing renders
+    a contained exception, ``describe_exception`` re-raises teardown signals
+    rather than eating them, and a signal arriving while composing needs the
+    same treatment as one arriving while writing.
+    """
+    try:
+        print(compose(), file=sys.stderr)
+    except TEARDOWN_SIGNALS as interrupt:
+        if chain_from is None:
+            raise
+        raise interrupt from chain_from
+    except BaseException:  # noqa: BLE001, S110
+        pass
+
+
 class CondorLaneExecutor:
     """Submit each lane as one scheduler job and follow it to its end."""
 
@@ -172,10 +210,14 @@ class CondorLaneExecutor:
             raise
         finally:
             if retain_run_directory:
-                print(
-                    f"condor lane {command.work_key.value}: diagnostics "
-                    f"retained at {run_directory}",
-                    file=sys.stderr,
+                # Same policy, stronger reason: this runs in a
+                # ``finally``, so a failure here replaces EVERY ending,
+                # including a clean return.
+                _report_diagnostic(
+                    lambda: (
+                        f"condor lane {command.work_key.value}: "
+                        f"diagnostics retained at {run_directory}"
+                    )
                 )
             else:
                 shutil.rmtree(run_directory, ignore_errors=True)
@@ -320,8 +362,12 @@ class CondorLaneExecutor:
         stage renders a contained exception, rendering re-raises teardown
         signals rather than eating them, and a signal raised inside one
         handler cannot re-enter its sibling — so the recording carries
-        its own copy of the policy. Every stage of this method chains,
-        or none of them can be said to.
+        its own copy of the policy. BOTH halves of it (round 7): a
+        second interrupt while recording chains, and an ordinary failure
+        or ``SystemExit`` from the write itself is contained, because a
+        lane that ended on Ctrl-C must not report that it ended on a
+        closed stderr. Every stage of this method chains, or none of
+        them can be said to.
         """
         try:
             # Inside the boundary, not before it: NOTHING in this body
@@ -349,14 +395,13 @@ class CondorLaneExecutor:
             # propagates with no `__cause__` — exactly the round-3 defect
             # this method already fixed for the earlier stages, reappearing
             # at the last one.
-            try:
-                print(
+            _report_diagnostic(
+                lambda: (
                     "condor lane: cancellation cleanup gave up after "
-                    f"{describe_exception(contained)}",
-                    file=sys.stderr,
-                )
-            except TEARDOWN_SIGNALS as interrupt:
-                raise interrupt from unwinding
+                    f"{describe_exception(contained)}"
+                ),
+                chain_from=unwinding,
+            )
 
     def _collect_job_accounting(
         self,
