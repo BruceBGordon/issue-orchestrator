@@ -563,7 +563,7 @@ def test_a_half_written_cpu_request_is_corruption(tmp_path: Path) -> None:
     half = {k: v for k, v in modern.items() if k != "request_cpus"}
     _rewrite(path, half)
 
-    with pytest.raises(LaneDispatchJournalError, match="must\n?\\s*both be integers"):
+    with pytest.raises(LaneDispatchJournalError, match="half written"):
         journal.read_recent(10)
 
 
@@ -636,3 +636,146 @@ def test_integer_busy_cores_are_the_same_fact_as_floats(tmp_path: Path) -> None:
     (entry,) = journal.read_recent(10).entries
     assert entry.record.observed_busy_cores == 2.0
     assert entry.record.cpu_request.learned_busy_cores == 6.0
+
+
+def _without(row: dict[str, object], *names: str) -> dict[str, object]:
+    return {k: v for k, v in row.items() if k not in names}
+
+
+def _only_base(row: dict[str, object]) -> dict[str, object]:
+    """The row with the whole cpu-request dimension removed."""
+    return _without(row, *_CPU_COLUMNS)
+
+
+def test_dropping_one_nullable_cpu_column_is_corruption(tmp_path: Path) -> None:
+    """F1 (#7136 journal review): epoch detection sampled only part of
+    the dimension, so a modern row missing ONE nullable column read as
+    good and the absent column silently became None.
+
+    That is a fabricated value — the exact thing this reader refuses to
+    do for `declared_cpus` — wearing a nullable type. Absence of a
+    column and a stored null are different facts and must never
+    collapse into each other."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    for column in ("learned_busy_cores", "observed_busy_cores"):
+        _rewrite(path, _without(modern, column))
+        with pytest.raises(LaneDispatchJournalError, match="half written"):
+            journal.read_recent(10)
+
+
+def test_dropping_the_derived_column_is_also_corruption(tmp_path: Path) -> None:
+    """`cpu_request_capped` is never read for its VALUE, but it is part
+    of what this epoch's writer emits, so its absence still means
+    something wrote a partial row. Presence and trust are separate
+    questions."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    _rewrite(path, _without(modern, "cpu_request_capped"))
+    with pytest.raises(LaneDispatchJournalError, match="half written"):
+        journal.read_recent(10)
+
+
+def test_a_lone_null_cpu_column_is_corruption_not_an_epoch(tmp_path: Path) -> None:
+    """A row carrying only `{"declared_cpus": null}` of the dimension is
+    not a pre-#7136 row: something wrote part of it. Counting it as an
+    epoch skip would file a writer bug under 'old history'."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    _rewrite(path, {**_only_base(modern), "declared_cpus": None})
+    with pytest.raises(LaneDispatchJournalError, match="half written"):
+        journal.read_recent(10)
+
+
+def test_a_lone_present_cpu_column_is_corruption_not_an_epoch(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    _rewrite(path, {**_only_base(modern), "observed_busy_cores": 3.0})
+    with pytest.raises(LaneDispatchJournalError, match="half written"):
+        journal.read_recent(10)
+
+
+def test_a_null_in_a_column_that_is_never_null_is_corruption(
+    tmp_path: Path,
+) -> None:
+    """Only the two busy-cores columns may be null, because null THERE
+    is a recorded observation. A null declared_cpus is a writer bug: no
+    lane ran without a declaration."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    for column in ("declared_cpus", "request_cpus"):
+        _rewrite(path, {**modern, column: None})
+        with pytest.raises(LaneDispatchJournalError, match="not an integer"):
+            journal.read_recent(10)
+
+
+def test_a_boolean_is_not_a_cpu_count(tmp_path: Path) -> None:
+    """bool is an int subclass in Python; a JSON `true` must not read
+    back as one core."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    _rewrite(path, {**modern, "request_cpus": True})
+    with pytest.raises(LaneDispatchJournalError, match="not an integer"):
+        journal.read_recent(10)
+
+
+def test_corruption_outranks_an_absent_dimension(tmp_path: Path) -> None:
+    """F2 (#7136 journal review): the envelope was parsed first, so an
+    ABSENT envelope short-circuited before a present-and-contradictory
+    cpu request was ever looked at — and a row breaking an invariant the
+    WRITE path enforces was reported as merely old.
+
+    Corruption is a claim about something that is there, so it outranks
+    absence: a row old in one dimension and wrong in another is wrong."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    _rewrite(path, {**_without(modern, "machine_state"), "request_cpus": 99})
+    with pytest.raises(LaneDispatchJournalError, match="never exceed"):
+        journal.read_recent(10)
+
+
+def test_epoch_skippable_in_one_dimension_corrupt_in_another_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    """The general form of the same rule, with the corruption in a
+    column rather than in an invariant across columns."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    _rewrite(
+        path,
+        {
+            **_without(modern, "machine_state"),
+            "learned_busy_cores": "not a number",
+        },
+    )
+    with pytest.raises(LaneDispatchJournalError, match="not a number or null"):
+        journal.read_recent(10)
+
+
+def test_verdicts_do_not_depend_on_dimension_order(tmp_path: Path) -> None:
+    """Whichever dimension is absent, the verdict is the same — the
+    property that stops being incidental once one owner weighs them
+    all."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+
+    # Absent envelope, corrupt cpu request.
+    _rewrite(path, {**_without(modern, "machine_state"), "declared_cpus": None})
+    with pytest.raises(LaneDispatchJournalError):
+        journal.read_recent(10)
+
+    # Absent cpu request, corrupt envelope.
+    _rewrite(path, {**_only_base(modern), "machine_state": "not an envelope"})
+    with pytest.raises(LaneDispatchJournalError):
+        journal.read_recent(10)
