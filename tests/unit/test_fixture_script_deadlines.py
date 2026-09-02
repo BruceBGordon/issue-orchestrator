@@ -23,6 +23,27 @@ fails here — it cannot slide by not being mentioned.
 
 TERM-immunity is re-asserted alongside, because a fixture that quietly started
 cooperating with SIGTERM would make the contract tests that use it vacuous.
+
+Error model, stated so it stops being re-traded
+-----------------------------------------------
+
+This is an induction test, so the two ways it can be wrong are not equal:
+
+* a **false negative** is a real fixture with no ceiling, sliding through
+  silently — the failure this module exists to prevent;
+* a **false positive** is a line of prose flagged as a fixture, which someone
+  reads, disagrees with, and puts in ``LIFETIME_ALLOWLIST`` with a reason.
+
+One is a leak; the other is a decision on the record. So the scan
+deliberately over-includes, and ``LIFETIME_ALLOWLIST`` is the escape — for
+genuine prose exactly as much as for a justified long-running fixture.
+
+The temptation each round is to tighten the rule until the noise stops. That
+trade was made once already, by requiring a recognisable interpreter beside
+``-c``, and it bought a quieter scan at the price of missing ``python3 -uc``.
+Tighten *shapes* (what counts as a docstring, what parses as code); do not
+tighten *reach* (which strings are examined at all) without moving the missed
+fixtures somewhere they are still caught.
 """
 
 from __future__ import annotations
@@ -190,10 +211,21 @@ def test_a_cpu_load_burner_expires_when_its_harness_is_sigkilled(
 
 TEST_TREE = Path(__file__).resolve().parents[1]
 
-# Justified exceptions, as ``(path relative to tests/, matched source)``. Empty,
-# and worth keeping empty: an entry here is a fixture allowed to outlive the
-# budget, which is the thing that cost nine hours.
-LIFETIME_ALLOWLIST: frozenset[tuple[str, str]] = frozenset()
+# Justified exceptions, as ``(path relative to tests/, matched source)``.
+#
+# An entry is a decision on the record, and there are two kinds. A fixture
+# allowed to outlive the budget is the expensive kind — that is the thing that
+# cost nine hours, and it should be argued for. Prose that the scan flagged
+# because it quotes a real command is the cheap kind: the scan over-includes on
+# purpose (see the error model above), and this is where that noise is
+# answered, rather than by narrowing what the scan looks at.
+LIFETIME_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
+    {
+        # A sentence about a command, in the test that pins the error model.
+        # No process is spawned from it — it is the flagged-prose example.
+        ("unit/test_fixture_script_deadlines.py", "time.sleep(7200)"),
+    }
+)
 
 # The shapes that give a spawned process its duration. Literal-valued only —
 # a value is either statically knowable or it is not, and pretending otherwise
@@ -223,15 +255,12 @@ _SCAN_HINTS = ("time.sleep(", "signal.alarm(", "LIFETIME_SECONDS", "MAX_SECONDS"
 # not a two-hour fixture, and reporting it would teach people to silence this.
 _DOCSTRING_HOLDERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
 
-# An interpreter being handed a script: `python -c ...`, or the f-string that
-# builds one, where the interpreter is an expression rather than the word
-# "python" (`f"{sys.executable} -c ..."`). Reconstructing the f-string is what
-# makes that expression visible here — see _string_sources.
-_INTERPRETER_DASH_C_RE = re.compile(
-    r"(?:python[0-9.]*|executable)\b[^\n]*?\s-c(?:\s|$)", re.IGNORECASE
-)
-# The script argument of a ``python -c <script>`` command line.
-_DASH_C_RE = re.compile(r"-c\s+(.*)", re.DOTALL)
+# An interpreter being handed a script. The FLAG is matched, not the
+# interpreter: `python -c`, `python3.14 -c`, `env python -c`, a venv path,
+# `-uc` and `-u -c` are all the same instruction, and enumerating the ways an
+# interpreter can be spelled is a losing game whose losses are silent. Any
+# short-option cluster ending in `c` counts.
+_DASH_C_RE = re.compile(r"(?:^|\s)-[A-Za-z]*c\s+(.*)", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -310,18 +339,19 @@ def _candidate_sources(text: str) -> list[str]:
     * the string is a *command line* running an interpreter with ``-c``, the
       script quoted inside it: ``f"{sys.executable} -c 'import time; ...'"``.
 
-    The third is the dangerous one, and it is gated rather than tried on
-    everything. Pulling quoted runs out of any string at all was the earlier
-    rule, and it meant a sentence like ``"the run left 'time.sleep(7200)'
-    burning a core"`` reported a two-hour fixture: the quotes in prose are
-    punctuation, not an argument boundary. So the quoted script is only read
-    out of a string that names an interpreter and passes it ``-c``.
+    The third is read out of any string carrying the flag, with no check that
+    an interpreter is visible beside it. That is deliberate over-inclusion —
+    see the error model in the module docstring. Requiring a recognisable
+    interpreter is what made ``python3 -uc`` invisible, and an invocation that
+    hides behind a spelling is a lifetime with no ceiling.
+
+    Quotes alone are still not an argument boundary: ``"the run left
+    'time.sleep(7200)' burning a core"`` names no flag and is not a command.
     """
     candidates = [text, textwrap.dedent(text)]
-    if _INTERPRETER_DASH_C_RE.search(text):
-        candidates.extend(
-            match.group(1).strip("\"' ") for match in _DASH_C_RE.finditer(text)
-        )
+    candidates.extend(
+        match.group(1).strip("\"' ") for match in _DASH_C_RE.finditer(text)
+    )
     return candidates
 
 
@@ -512,21 +542,53 @@ def test_prose_that_quotes_a_call_is_not_a_fixture(tmp_path: Path) -> None:
 
 
 def test_a_command_line_still_gives_up_its_script(tmp_path: Path) -> None:
-    """The gate must not cost the fixtures the loose rule existed to find.
+    """Every spelling of "hand this interpreter a script" is the same fixture.
 
-    The interpreter is usually an f-string placeholder, so the reconstruction
-    is what makes the command shape visible at all.
+    An earlier rule required a recognisable interpreter beside the flag, which
+    quietly lost ``python3 -uc``. A lifetime that hides behind a spelling is a
+    lifetime with no ceiling, so the flag is what is matched.
     """
     (tmp_path / "spawner.py").write_text(
-        "import subprocess, sys\n"
-        'CMD = f"{sys.executable} -c \'import time; time.sleep(33)\'"\n'
-        'QUOTED = f\'{sys.executable} -c "import time; time.sleep(44)"\'\n',
+        "import sys\n"
+        'PLACEHOLDER = f"{sys.executable} -c \'import time; time.sleep(11)\'"\n'
+        'ESCAPED = f\'{sys.executable} -c "import time; time.sleep(12)"\'\n'
+        "CLUSTERED = \"python3 -uc 'import time; time.sleep(22)'\"\n"
+        "SEPARATE = \"python3.14 -u -c 'import time; time.sleep(33)'\"\n"
+        "VIA_ENV = \"/usr/bin/env python -c 'import time; time.sleep(44)'\"\n"
+        "VENV = \"/repo/.venv/bin/python -c 'import time; time.sleep(55)'\"\n"
+        "ISOLATED = \"podman run img python -Ic 'import time; time.sleep(66)'\"\n",
         encoding="utf-8",
     )
 
     found = {item.seconds for item in discover_fixture_lifetimes(tmp_path)}
 
-    assert found == {33.0, 44.0}, f"a spawned script went undiscovered: {found}"
+    assert found == {11.0, 12.0, 22.0, 33.0, 44.0, 55.0, 66.0}, (
+        f"an invocation spelling hid a spawned script: {found}"
+    )
+
+
+def test_a_flagged_command_in_prose_is_accepted_noise(tmp_path: Path) -> None:
+    """The error model, pinned so it is not quietly re-traded.
+
+    Prose that quotes a real ``python -c`` command IS flagged. That is the
+    deliberate direction: a false positive is a line someone reads and
+    allowlists, a false negative is an unbounded fixture nobody sees. The
+    allowlist is the escape, and it is as legitimate for prose as for a
+    fixture.
+    """
+    (tmp_path / "note.py").write_text(
+        'HOW_WE_REPRODUCED = "we ran python -c \'import time; time.sleep(7200)\'"\n',
+        encoding="utf-8",
+    )
+
+    flagged = discover_fixture_lifetimes(tmp_path)
+
+    assert [item.seconds for item in flagged] == [7200.0]
+    # ...and what an owner does about it is write the entry below, not a
+    # tighter rule. This is the exact key LIFETIME_ALLOWLIST takes.
+    assert [(item.path, item.source) for item in flagged] == [
+        ("note.py", "time.sleep(7200)")
+    ]
 
 
 def test_the_scanner_recognises_every_shape_it_claims(tmp_path: Path) -> None:

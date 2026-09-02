@@ -174,68 +174,18 @@ def emit(stream: TextIO, lines: tuple[str, ...]) -> None:
 
     ``BrokenPipeError`` (a closed reader) is the likely one; ``ValueError``
     covers a stderr that has already been closed, which raises that instead.
+
+    Containment is all this does. It does not repair the stream, redirect a
+    descriptor or rebind a name: the caller owns those, and a report writer
+    that edits its caller's globals is not a report writer. Surviving the
+    *process* is :func:`run`'s job, and it is a different job.
     """
     try:
         for line in lines:
             stream.write(f"{LINE_PREFIX} {line}\n")
         stream.flush()
     except (OSError, ValueError):
-        _abandon(stream)
-
-
-def _abandon(stream: TextIO) -> None:
-    """Leave a failed stream somewhere harmless before the interpreter exits.
-
-    Catching the write is not enough on its own: the unwritten bytes stay in
-    the wrapper's buffer, and CPython flushes the std streams again during
-    interpreter shutdown, outside any handler this module can install. That
-    second failure is reported as "Exception ignored" and exits **120** — the
-    gate lost to its own diagnostic after all.
-
-    Two kinds of broken stream, so two repairs. One with a descriptor is
-    redirected to devnull, the idiom the standard library documents for
-    ``BrokenPipeError``. One without a descriptor cannot be redirected, so if
-    it is ``sys.stderr`` it is replaced outright: the shutdown flush follows
-    the current binding, and the discarded object's own finaliser complains
-    into the void without changing the exit status.
-    """
-    descriptor = _descriptor_of(stream)
-    if descriptor is not None:
-        _redirect_to_devnull(descriptor)
         return
-    if stream is sys.stderr:
-        # Deliberately never closed: it must outlive this call and absorb the
-        # shutdown flush. The process is about to exit.
-        sys.stderr = open(os.devnull, "w", encoding="utf-8")
-
-
-def _release_output() -> None:
-    """Detach the report stream from interpreter shutdown.
-
-    The reactive repair in :func:`_abandon` can only fire on a failure it
-    sees. It cannot reach the last one: CPython flushes ``sys.stderr`` again
-    during finalisation, outside any handler, and exits **120** if that raises
-    -- and a stream whose first flush succeeded can still raise on its second.
-    Waiting for that failure is the wrong shape; by then there is nobody left
-    to catch it.
-
-    So this does not wait. The report has been written and nothing in this
-    process needs stderr again, so the name is rebound to something that
-    cannot fail and shutdown finds that instead. Rebinding rather than
-    ``dup2``-ing fd 2 keeps the change to this interpreter's own name: an
-    in-process caller's descriptors, and anything sharing them, are untouched.
-    """
-    stream = sys.stderr
-    if stream is None:
-        return
-    sys.stderr = open(os.devnull, "w", encoding="utf-8")
-    try:
-        stream.flush()
-    except (OSError, ValueError):
-        # Draining it here rather than leaving it for the finaliser keeps the
-        # "Exception ignored" noise off a gate log that is already reporting
-        # something worth reading.
-        _abandon(stream)
 
 
 def _descriptor_of(stream: TextIO) -> int | None:
@@ -273,24 +223,21 @@ def _redirect_to_devnull(descriptor: int) -> None:
 
 
 def main() -> None:
-    """Report host load, then get out of the way.
+    """Report host load, then get out of the way. Importable and inert.
 
-    Always exits 0, and the report stream is released before returning so that
-    stays true however the stream later misbehaves. The only degradation this
-    tolerates is a host that cannot be sampled, and it says so on one line
-    rather than falling silent. Every way that can fail -- spawn, exit status,
-    decode, parse, range, passwd lookup -- arrives here as ``HostProbeError``,
-    so the single typed handler is the whole contract and no blanket
-    ``except`` is needed to keep it.
+    Returns rather than exits, raises nothing, and leaves ``sys.stderr`` and
+    every descriptor exactly as it found them. Calling it twice reports twice.
+
+    The only degradation it tolerates is a host that cannot be sampled, and it
+    says so on one line rather than falling silent. Every way that can fail --
+    spawn, exit status, decode, parse, range, passwd lookup -- arrives here as
+    ``HostProbeError``, so the single typed handler is the whole contract and
+    no blanket ``except`` is needed to keep it.
+
+    The exit-0 guarantee is *not* here. It belongs to :func:`run`, because
+    keeping it means editing process-global state that a caller of this
+    function owns.
     """
-    try:
-        _report()
-    finally:
-        _release_output()
-
-
-def _report() -> None:
-    """Write the report, or the one line saying why there isn't one."""
     if sys.platform != "darwin":
         emit(
             sys.stderr,
@@ -309,5 +256,53 @@ def _report() -> None:
     emit(sys.stderr, report_lines(snapshot, owner=owner))
 
 
+def run() -> int:
+    """Process entry point. Reports, then guarantees a zero exit status.
+
+    This is what ``python -m ...host_load_preflight`` runs and what the gate's
+    Makefile line invokes. The exit-0 contract lives here rather than in
+    :func:`main` because keeping it means dismantling the process's stderr,
+    and that is only defensible when the process is ending: there is no caller
+    left whose stream, descriptors, or later output could be damaged by it.
+    """
+    try:
+        main()
+    finally:
+        _release_process_output()
+    return 0
+
+
+def _release_process_output() -> None:
+    """Make this process's stderr incapable of failing at shutdown.
+
+    CPython flushes the std streams during finalisation, outside any handler
+    this module can install, and exits **120** if that raises. Waiting to
+    catch it is the wrong shape -- a stream whose first flush succeeded can
+    still raise on its second, and by then there is nobody left to catch
+    anything. So the channel is dismantled up front instead:
+
+    * the descriptor is pointed at devnull, which also silences the discarded
+      wrapper's finaliser when it flushes bytes a broken pipe never took;
+    * the name is rebound, for a stream that has no descriptor to redirect;
+    * the old stream is drained, contained, so nothing is left pending.
+
+    Both edits are process-global, and both are correct *here* for the same
+    reason: the next thing that happens is exit.
+    """
+    stream = sys.stderr
+    if stream is None:
+        return
+    descriptor = _descriptor_of(stream)
+    if descriptor is not None:
+        _redirect_to_devnull(descriptor)
+    # Deliberately never closed: it must outlive this call and absorb whatever
+    # finalisation still flushes.
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    try:
+        stream.flush()
+    except (OSError, ValueError):
+        return
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(run())

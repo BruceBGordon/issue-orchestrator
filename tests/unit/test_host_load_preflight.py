@@ -322,11 +322,14 @@ class TestOutput:
 
         ``second-flush`` is the one that reactive repair cannot pass: the
         stream is healthy for every call this module makes and only fails on
-        the flush CPython performs after ``main`` has returned. Catching
-        failures is the wrong shape for it; releasing the stream is the right
-        one.
+        the flush CPython performs after the report is written. Catching
+        failures is the wrong shape for it; dismantling the channel before
+        exit is the right one.
+
+        Driven through ``run``, which is what the Makefile invokes and where
+        the exit-0 contract lives. ``main`` deliberately does not carry it.
         """
-        driver = _DRIVER_PREAMBLE + breakage + "\nh.main()\n"
+        driver = _DRIVER_PREAMBLE + breakage + "\nraise SystemExit(h.run())\n"
 
         completed = subprocess.run(
             [sys.executable, "-c", driver],
@@ -340,11 +343,69 @@ class TestOutput:
             f"{scenario}: the preflight failed the gate because it could not "
             f"print (exit {completed.returncode}); stderr={completed.stderr!r}"
         )
+        assert b"Exception ignored" not in completed.stderr, (
+            f"{scenario}: shutdown noise reached the gate log: "
+            f"{completed.stderr!r}"
+        )
+
+    def test_main_leaves_the_callers_stream_and_descriptors_alone(self) -> None:
+        """The importable half must be inert, even for a stream it cannot use.
+
+        This is the shape the earlier version got wrong twice: finalisation
+        embedded in a returning function meant every call replaced the
+        caller's ``sys.stderr``, and a drain failure redirected fd 2 out from
+        under them. Both are process-wide edits with no process to justify
+        them. So the fixture here is the stream that motivated that repair —
+        one whose flush raises and whose ``fileno`` is a real descriptor —
+        and ``main`` still has to leave both exactly as it found them.
+
+        ``os._exit`` reports the verdict: the child's stderr is deliberately
+        broken, so a normal exit would be scored by the shutdown flush rather
+        than by the assertion.
+        """
+        driver = (
+            _DRIVER_PREAMBLE
+            + "import os, sys\n"
+            + "sys.stderr = SecondFlushFails()\n"
+            + "before_stream = sys.stderr\n"
+            + "before = os.fstat(2)\n"
+            + "h.main()\n"
+            + "h.main()\n"
+            + "after = os.fstat(2)\n"
+            + "same_stream = sys.stderr is before_stream\n"
+            + "same_fd = (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)\n"
+            + "os.write(1, repr((same_stream, same_fd)).encode())\n"
+            + "os._exit(0)\n"
+        )
+
+        completed = subprocess.run(
+            [sys.executable, "-c", driver],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+
+        assert completed.stdout == b"(True, True)", (
+            "main() edited process-global stream state its caller owns: "
+            f"(sys.stderr unchanged, fd 2 unchanged) = {completed.stdout!r}"
+        )
+
+    def test_the_module_entry_point_the_makefile_runs_exits_zero(self) -> None:
+        """End to end through ``python -m``, against this real host."""
+        completed = subprocess.run(
+            [sys.executable, "-m", _MODULE],
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr[-400:]
+        assert completed.stdout == b"", "the report belongs on stderr"
 
     def test_a_real_hung_up_reader_still_exits_zero(self) -> None:
         """The reader closes the pipe before the report is written."""
         process = subprocess.Popen(
-            [sys.executable, "-c", _DRIVER_PREAMBLE + "h.main()\n"],
+            [sys.executable, "-c", _DRIVER_PREAMBLE + "raise SystemExit(h.run())\n"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
