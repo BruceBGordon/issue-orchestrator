@@ -202,10 +202,12 @@ class _CancellationAttempt:
     outcome: LaneOutcome | None
     cancelled: BaseException | None
     pids: TreePids | None
+    readiness_timed_out: bool
 
 
 class _CancelWhenTreeIsReady:
-    """Cancel the lane the moment its process tree announces itself.
+    """Cancel the lane when its process tree announces itself — or when
+    the backstop says it never will.
 
     The backends' cancellation path is entered by an exception raised in
     the thread that called ``run()`` — an operator's Ctrl-C, a dying
@@ -214,6 +216,17 @@ class _CancelWhenTreeIsReady:
     and then raises ``KeyboardInterrupt`` in the main thread with
     ``_thread.interrupt_main``. No signal is delivered to any process, and
     none to any other thread.
+
+    A backstop that only stops WATCHING would leave the run to finish on
+    somebody else's clock (round 1, #7148). A lane that is admitted and
+    then never dispatched does not reach its own deadline — that clock
+    starts at dispatch — so it runs until the backend's admission
+    watchdog, ten minutes away, and the enclosing pytest timeout gets
+    there first. The operator would then read a generic "test exceeded
+    600s" for precisely the failure this suite exists to name. So the
+    expiry cancels too: the run ends here, the named readiness assertion
+    is what fails, and the lane's job is removed instead of sitting in a
+    queue nobody is watching any more.
 
     Armed only while ``run()`` is in progress. If the lane instead
     concludes on its own — a regression, or the deadline backstop — the
@@ -226,6 +239,7 @@ class _CancelWhenTreeIsReady:
         self._lock = threading.Lock()
         self._armed = False
         self._observed_pids: TreePids | None = None
+        self._readiness_timed_out = False
         self._thread = threading.Thread(
             target=self._watch, name="lane-cancel-when-ready", daemon=True
         )
@@ -234,6 +248,11 @@ class _CancelWhenTreeIsReady:
     def observed_pids(self) -> TreePids | None:
         """The tree the watcher saw, or None if readiness never arrived."""
         return self._observed_pids
+
+    @property
+    def readiness_timed_out(self) -> bool:
+        """Whether the run was cancelled for never announcing a tree."""
+        return self._readiness_timed_out
 
     def arm(self) -> None:
         self._armed = True
@@ -261,6 +280,14 @@ class _CancelWhenTreeIsReady:
                     _thread.interrupt_main()
                     return
             time.sleep(_POLL_SECONDS)
+        # Nothing is ever going to announce itself. End the run on THIS
+        # clock so the test's own assertion is the failure the operator
+        # reads, and so the lane does not outlive the watcher.
+        with self._lock:
+            if not self._armed:
+                return
+            self._readiness_timed_out = True
+            _thread.interrupt_main()
 
     def _read_pids(self) -> TreePids | None:
         try:
@@ -292,7 +319,9 @@ def _cancel_when_ready(
             # check and this disarm. It belongs to this attempt, not to
             # whatever pytest would have run next.
             cancelled = late if cancelled is None else cancelled
-    return _CancellationAttempt(outcome, cancelled, trigger.observed_pids)
+    return _CancellationAttempt(
+        outcome, cancelled, trigger.observed_pids, trigger.readiness_timed_out
+    )
 
 
 class LaneExecutorContract:
@@ -562,9 +591,16 @@ class LaneExecutorContract:
             )
             assert attempt.pids is not None, (
                 "the lane never announced a running process tree at "
-                f"{readiness_path} within {_READINESS_BACKSTOP_SECONDS:.0f}s, "
-                "so no cancellation was ever triggered; the lane ended as "
-                f"{attempt.outcome!r}"
+                f"{readiness_path} within {_READINESS_BACKSTOP_SECONDS:.0f}s. "
+                + (
+                    "The run was cancelled at that backstop so THIS is the "
+                    "failure you are reading, rather than the enclosing test "
+                    "timeout: the lane was still running (queued, or started "
+                    "and mute) with nothing to kill."
+                    if attempt.readiness_timed_out
+                    else "The lane concluded on its own first, as "
+                    f"{attempt.outcome!r}."
+                )
             )
             assert attempt.cancelled is not None, (
                 "the backend swallowed its caller's cancellation and "

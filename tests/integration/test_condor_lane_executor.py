@@ -47,6 +47,67 @@ _LANE_JOIN_BACKSTOP_SECONDS = 180.0
 # escaped burner cannot become someone else's unexplained gate.
 _LOAD_SPIKE_MAX_SECONDS = 240.0
 
+# --------------------------------------------------------------------------
+# The token holder: a lane that keeps holding until it is told to stop.
+# --------------------------------------------------------------------------
+#
+# Round 1 of #7148, and the same lesson one level deeper than the audit went:
+# OBSERVING a status does not hold the world still. A holder on its own fixed
+# clock stops holding the exclusive token while the test is still assembling
+# the contention it needs — and assembling it is not free, since constructing
+# an executor alone runs a scheduler reachability query that is allowed 30s.
+# When the token frees early the contender never queues, and the test then
+# fails as though the property had (measured by the reviewer against a scaled
+# backend: ``queue_wait=0.0s``, ``never reached JobStatus 1``).
+#
+# So the holder waits for an acknowledgment this test writes, and this test
+# writes it only once every contender is OBSERVABLY queued behind the token.
+# Announce, then act — the same shape as the tree fixture's readiness record.
+#
+# Self-limiting all the same (#7142): a harness that dies before writing the
+# release file cannot leave the token held for the machine's next gate.
+_HOLDER_LIFETIME_SECONDS = 300.0
+# The holder's lane deadline. It must outlast the whole handshake — every
+# await, plus the queued duration the billing test measures — because a lane
+# removed at its deadline stops holding the token just as surely as one that
+# exits.
+_HOLDER_DEADLINE_SECONDS = 300.0
+_HOLDER_SCRIPT = (
+    "import sys, time\n"
+    "from pathlib import Path\n"
+    "release = Path(sys.argv[1])\n"
+    "deadline = time.monotonic() + float(sys.argv[2])\n"
+    "with Path(sys.argv[3]).open('a') as handle:\n"
+    "    handle.write(f'start:{sys.argv[4]}\\n')\n"
+    "while not release.exists() and time.monotonic() < deadline:\n"
+    "    time.sleep(0.1)\n"
+)
+
+
+def _holder_command(
+    work_key: str,
+    release_path: Path,
+    journal: Path,
+    name: str,
+    working_directory: Path,
+) -> LaneCommand:
+    """A lane that holds its exclusive token until ``release_path`` exists."""
+    return LaneCommand(
+        work_key=LaneWorkKey(work_key),
+        arguments=(
+            sys.executable,
+            "-c",
+            _HOLDER_SCRIPT,
+            str(release_path),
+            str(_HOLDER_LIFETIME_SECONDS),
+            str(journal),
+            name,
+        ),
+        working_directory=working_directory,
+        deadline=LaneDeadline(_HOLDER_DEADLINE_SECONDS),
+    )
+
+
 # Ceiling on the setsid escapee, which no group signal can reach. Must outlast
 # this test's ~260s observation path; must not outlast the day.
 _ESCAPE_LIFETIME_SECONDS = 600.0
@@ -214,73 +275,104 @@ def test_detached_session_escape_states_the_platform_boundary(
         reap_marked_processes(str(marker))
 
 
+# The contender's own runtime budget in the billing test. Deliberately
+# generous for ~1s of work: under emulation (this amd64 execution environment
+# on Apple Silicon) interpreter startup alone can eat several seconds, and a
+# native-calibrated margin turns this into an emulation-speed test — observed
+# live, a 4s deadline removed a healthy 1s lane 5s after its execute event.
+_CONTENDER_DEADLINE_SECONDS = 8.0
+# How long the contender is held in the queue once it is OBSERVABLY queued.
+# Longer than its own deadline, because that gap is the whole property: a
+# wait this size would have killed the lane if the deadline charged it.
+_REQUIRED_QUEUED_SECONDS = 12.0
+
+
 def test_queue_wait_is_never_billed_to_the_lane_deadline(tmp_path: Path) -> None:
     """Contract: scheduling wait is machinery, not lane budget. A lane
     queued behind an exclusive token for longer than its own runtime
     deadline must still run and complete once the token frees."""
-    import threading
+    release = tmp_path / "release-holder"
+    journal = tmp_path / "holder-journal.txt"
+    journal.write_text("")
+    results: dict[str, object] = {}
+    holder_key = _unique_lane_key("contract.queuebill-holder")
+    contender_key = _unique_lane_key("contract.queuebill-queued")
 
-    def run_lane(work_key: str, sleep_seconds: float, deadline: float) -> object:
-        return CondorLaneExecutor(CondorTools.resolve()).run(
+    def run_holder() -> None:
+        results["holder"] = CondorLaneExecutor(CondorTools.resolve()).run(
+            _holder_command(holder_key, release, journal, "holder", tmp_path),
+            LaneResources(request_cpus=1, exclusive=("queuebilltoken",)),
+        )
+
+    def run_contender() -> None:
+        results["queued"] = CondorLaneExecutor(CondorTools.resolve()).run(
             LaneCommand(
-                work_key=LaneWorkKey(work_key),
-                arguments=(sys.executable, "-c", f"import time; time.sleep({sleep_seconds})"),
+                work_key=LaneWorkKey(contender_key),
+                arguments=(sys.executable, "-c", "import time; time.sleep(1)"),
                 working_directory=tmp_path,
-                deadline=LaneDeadline(deadline),
+                deadline=LaneDeadline(_CONTENDER_DEADLINE_SECONDS),
             ),
             LaneResources(request_cpus=1, exclusive=("queuebilltoken",)),
         )
 
-    results: dict[str, object] = {}
-    holder_key = _unique_lane_key("contract.queuebill-holder")
-    holder = threading.Thread(
-        target=lambda: results.__setitem__("holder", run_lane(holder_key, 12.0, 60.0))
-    )
-    holder.start()
-    try:
-        # Wait for the EVENT this test's discriminator needs — the holder
-        # actually holding the token — instead of a stagger long enough to
-        # hope it does (#7148). A slow match under a fixed 1s sleep meant
-        # the "queued" lane never queued, and the queue-wait assertion
-        # below then failed for a reason that has nothing to do with
-        # billing.
-        _await_status(holder_key, _RUNNING, _DISPATCH_BACKSTOP_SECONDS)
-        # Queued behind a 12s holder with only an 8s deadline of its own:
-        # the ~11s queue wait exceeds the deadline, which is the
-        # discriminator. The runtime margin (8s budget for ~1s of work) is
-        # deliberately generous: under emulation (this amd64 execution
-        # environment on Apple Silicon) interpreter startup alone can eat
-        # several seconds, and a native-calibrated margin turns this test
-        # into an emulation-speed test - observed live: a 4s deadline
-        # removed a healthy 1s lane 5s after its execute event.
-        results["queued"] = run_lane(
-            _unique_lane_key("contract.queuebill-queued"), 1.0, 8.0
-        )
-    finally:
-        holder.join(timeout=_LANE_JOIN_BACKSTOP_SECONDS)
+    launched: list[threading.Thread] = []
 
+    def launch(thread: threading.Thread) -> None:
+        thread.start()
+        launched.append(thread)
+
+    holder = threading.Thread(target=run_holder)
+    contender = threading.Thread(target=run_contender)
+    queued_seconds = 0.0
+    launch(holder)
+    try:
+        # The holder is executing, so the token is held — and it stays
+        # held, because the holder is waiting for this test rather than
+        # for a clock (see _HOLDER_SCRIPT).
+        _await_status(holder_key, _RUNNING, _DISPATCH_BACKSTOP_SECONDS)
+        launch(contender)
+        # Submitted is not queued: wait until the scheduler says this
+        # lane is IDLE behind the token before timing anything.
+        _await_status(contender_key, _IDLE, _DISPATCH_BACKSTOP_SECONDS)
+        queued_at = time.monotonic()
+        # The one deliberate duration here, and it is the property, not a
+        # coordination guess: the lane must sit queued for longer than its
+        # own deadline. The handshake is what makes it a duration this
+        # test CONTROLS rather than a race it hopes to win.
+        time.sleep(_REQUIRED_QUEUED_SECONDS)
+        assert _job_status(contender_key) == _IDLE, (
+            "the contender left the queue while the token was still held, "
+            "so this measured no queue wait at all"
+        )
+        queued_seconds = time.monotonic() - queued_at
+    finally:
+        release.write_text("go")
+        for thread in launched:
+            thread.join(timeout=_LANE_JOIN_BACKSTOP_SECONDS)
+        _release_batch(holder_key)
+        _release_batch(contender_key)
+
+    for thread in launched:
+        assert not thread.is_alive(), "a billing lane never concluded"
     assert type(results["holder"]) is LaneCompleted
     queued = results["queued"]
     assert type(queued) is LaneCompleted, (
-        "queue wait was billed to the lane deadline: "
-        f"{queued!r}"
+        f"queue wait was billed to the lane deadline: {queued!r}"
     )
-    # The learning loop's precondition: the ~7s token wait must not
-    # appear in observed runtime (the lane slept 1s). A queue-inflated
-    # number here would make learned ordering chase its own delays.
-    # Bound matches the widened emulation margins: the ~11s token wait
-    # is the discriminator, and a completed lane already proves the 8s
-    # deadline charged runtime only.
-    assert queued.observed_runtime_seconds < 8.0, (
+    # The learning loop's precondition: the token wait must not appear in
+    # observed runtime (the lane slept 1s). A queue-inflated number here
+    # would make learned ordering chase its own delays.
+    assert queued.observed_runtime_seconds < _CONTENDER_DEADLINE_SECONDS, (
         "observed runtime includes queue wait: "
         f"{queued.observed_runtime_seconds:.1f}s for a 1s lane"
     )
-    # The excluded wait is not discarded — it is reported separately.
-    # This lane provably queued behind the holder's ~11s token, so a
-    # real (multi-second) wait must appear in queue_wait_seconds: the
-    # dispatch-quality signal the gate log surfaces per lane.
-    assert queued.queue_wait_seconds > 2.0, (
-        "a lane that queued behind an 11s token reported "
+    # The excluded wait is not discarded — it is reported separately: the
+    # dispatch-quality signal the gate log surfaces per lane. The bound is
+    # the lane's own deadline, because this test held it queued for longer
+    # than that on purpose and measured how long.
+    assert queued.queue_wait_seconds > _CONTENDER_DEADLINE_SECONDS, (
+        f"a lane held queued for {queued_seconds:.1f}s — longer than its "
+        f"own {_CONTENDER_DEADLINE_SECONDS:.0f}s deadline — reported "
         f"queue_wait={queued.queue_wait_seconds:.1f}s"
     )
 
@@ -328,38 +420,53 @@ def test_higher_priority_lane_dispatches_first_from_a_contended_queue(
         )
         assert type(outcome) is LaneCompleted and outcome.exit_code == 0
 
+    def run_blocker() -> None:
+        outcome = CondorLaneExecutor(CondorTools.resolve()).run(
+            _holder_command(blocker_key, release, journal, "blocker", tmp_path),
+            LaneResources(
+                request_cpus=1, exclusive=("dispatchordertoken",), priority=0
+            ),
+        )
+        assert type(outcome) is LaneCompleted and outcome.exit_code == 0
+
+    release = tmp_path / "release-blocker"
     blocker_key = _unique_lane_key("contract.dispatch-blocker")
     low_key = _unique_lane_key("contract.dispatch-low")
     high_key = _unique_lane_key("contract.dispatch-high")
-    threads = [
-        threading.Thread(target=run_lane, args=(blocker_key, "blocker", 6.0, 0))
-    ]
-    threads[0].start()
+    launched: list[threading.Thread] = []
+
+    def launch(thread: threading.Thread) -> None:
+        thread.start()
+        launched.append(thread)
+
+    launch(threading.Thread(target=run_blocker))
     try:
-        # Both waits are on scheduler-observed state, not on a stagger
-        # (#7148): the contention this test needs exists once the blocker
-        # HOLDS the token and the low-priority lane is QUEUED behind it.
-        # Sleeping instead made the setup a race against dispatch latency,
-        # and losing it failed the priority assertion, not the setup.
+        # Every wait here is on scheduler-observed state, and the blocker
+        # holds the token until told otherwise (#7148 round 1). A blocker
+        # on its own 6s clock could free the token before the second
+        # contender was even queued, and the contest would then be decided
+        # by arrival — failing the priority assertion for a setup reason.
         _await_status(blocker_key, _RUNNING, _DISPATCH_BACKSTOP_SECONDS)
         # Deliberately submit the LOW-priority lane first: only the
         # priority hint, not arrival order, may decide who runs next.
-        threads.append(
-            threading.Thread(target=run_lane, args=(low_key, "low", 2.0, 1))
-        )
-        threads[1].start()
+        launch(threading.Thread(target=run_lane, args=(low_key, "low", 2.0, 1)))
         _await_status(low_key, _IDLE, _DISPATCH_BACKSTOP_SECONDS)
-        threads.append(
+        launch(
             threading.Thread(target=run_lane, args=(high_key, "high", 2.0, 100))
         )
-        threads[2].start()
+        # BOTH contenders must be queued before the token frees, or the
+        # scheduler never had a choice to make.
+        _await_status(high_key, _IDLE, _DISPATCH_BACKSTOP_SECONDS)
     finally:
-        # Joining is cleanup and belongs here; asserting is a verdict and
-        # does not — a verdict raised out of a ``finally`` would replace
-        # whatever failure sent us into it.
-        for thread in threads:
+        # Releasing and joining are cleanup and belong here; asserting is a
+        # verdict and does not — a verdict raised out of a ``finally``
+        # would replace whatever failure sent us into it.
+        release.write_text("go")
+        for thread in launched:
             thread.join(timeout=_LANE_JOIN_BACKSTOP_SECONDS)
-    for thread in threads:
+        for key in (blocker_key, low_key, high_key):
+            _release_batch(key)
+    for thread in launched:
         assert not thread.is_alive(), "a dispatch-order lane never concluded"
 
     started = [
