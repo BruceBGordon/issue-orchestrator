@@ -77,7 +77,9 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from issue_orchestrator.infra.containment import (
+    TEARDOWN_SIGNALS,
     describe_exception,
+    describe_value,
     is_teardown_signal,
     safe_type_name,
 )
@@ -528,7 +530,7 @@ class ProbeRun:
         is reset before each retry.
         """
         breaches: list[str] = []
-        check_errors: list[Exception] = []
+        check_errors: list[BaseException] = []
         for attempt in self.attempts:
             for check in self.breach_checks:
                 try:
@@ -537,15 +539,20 @@ class ProbeRun:
                     )
                     reason = check.violated_by(declared)
                     if reason is not None:
-                        # Interpolating `reason` renders a value a check
-                        # returned, so it belongs inside the containment too:
-                        # a hostile __str__ here aborts the loop exactly as a
-                        # raising check does.
+                        # `reason` is a value caller code returned, so it is
+                        # rendered through the containment owner rather than
+                        # interpolated: a hostile __str__ aborts the loop
+                        # exactly as a raising check does, and an enormous one
+                        # would put 100,000 characters in a failure message.
                         breaches.append(
                             f"SANDBOX BREACH on attempt {attempt.number} of "
-                            f"{len(self.attempts)}: {reason}"
+                            f"{len(self.attempts)}: {describe_value(reason)}"
                         )
-                except Exception as exc:  # noqa: BLE001
+                except TEARDOWN_SIGNALS:
+                    # "Stop, the caller is going away" is never a check
+                    # failure to be collected and ranked.
+                    raise
+                except BaseException as exc:  # noqa: BLE001
                     # A broken check must not stop the others: the one after it
                     # may be the one holding a real breach. Collected, ranked
                     # below, and still raised when nothing outranks it.

@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.infra.containment import MAX_RENDERED_CHARS
+
 from tests.sandbox_probe_retry import (
     TIMEOUT_RETURNCODE,
     AbsentContent,
@@ -1026,14 +1028,17 @@ def test_a_raising_repr_cannot_hide_a_breach(tmp_path: Path) -> None:
     assert real.ran
 
 
-def test_an_unrenderable_breach_description_cannot_hide_a_later_breach(
+def test_an_unrenderable_breach_description_is_reported_not_discarded(
     tmp_path: Path,
 ) -> None:
-    """Rendering a check's own reason is caller code too, so it is contained.
+    """A breach whose description will not render is still a breach.
 
-    A check that reports a breach whose description cannot be stringified used
-    to abort the loop while interpolating it — outside the containment, because
-    only the call to the check was inside.
+    Rendering a check's reason is caller code, so it goes through the
+    containment owner: a hostile ``__str__`` degrades to the type name instead
+    of aborting the loop. Reporting it beats the older behaviour, where the
+    explosion was collected as a check error and the breach the check had
+    ACTUALLY reported was thrown away. Evaluation still reaches the checks
+    after it.
     """
     completed = tmp_path / "completed.txt"
     leaked = tmp_path / "secret-read.txt"
@@ -1048,8 +1053,29 @@ def test_an_unrenderable_breach_description_cannot_hide_a_later_breach(
     with pytest.raises(ProbeBreach) as excinfo:
         probe.require_intact()
 
+    message = str(excinfo.value)
+    assert "_Unrenderable" in message, "the breach degrades to a safe name"
+    assert real.ran, "the checks after it still ran"
+
+
+def test_a_breach_reported_by_a_later_check_is_unaffected(tmp_path: Path) -> None:
+    """The ordinary case, kept explicit next to the degrading one."""
+    completed = tmp_path / "completed.txt"
+    leaked = tmp_path / "secret-read.txt"
+    quiet = _RecordingCheck(completed, b"NEVER-PRESENT", "not this one")
+    real = _RecordingCheck(leaked, b"TOPSECRET", "the secret was read")
+
+    probe = run_until_evidence(
+        _leaking_run(leaked, completed),
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(quiet, real),
+    )
+
+    with pytest.raises(ProbeBreach) as excinfo:
+        probe.require_intact()
+
     assert "the secret was read" in str(excinfo.value)
-    assert real.ran
+    assert quiet.ran and real.ran
 
 
 def test_a_broken_check_is_still_reported_when_its_note_could_not_be_written(
@@ -1142,3 +1168,216 @@ def test_a_hostile_repr_does_not_cost_the_diagnostic_note(tmp_path: Path) -> Non
     notes = getattr(excinfo.value, "__notes__", [])
     assert any("_HostileReprCheck" in note for note in notes), notes
     assert any("attempt 1 of 1" in note for note in notes), notes
+
+
+class _ExitingReasonCheck:
+    """A check whose breach description raises ``SystemExit`` while rendering."""
+
+    def __init__(self, declared: Path) -> None:
+        self.declared = declared
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        return (self.declared,)
+
+    def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+        class _Exits:
+            def __str__(self) -> str:
+                raise SystemExit(91)
+
+            __repr__ = __str__
+
+        return _Exits()  # type: ignore[return-value]
+
+
+class _EnormousReasonCheck:
+    """A check reporting a breach described in 100,000 characters."""
+
+    def __init__(self, declared: Path) -> None:
+        self.declared = declared
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        return (self.declared,)
+
+    def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+        return "x" * 100_000
+
+
+class _ExitingCheck:
+    """A check that raises ``SystemExit`` outright."""
+
+    def __init__(self, declared: Path) -> None:
+        self.declared = declared
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        return (self.declared,)
+
+    def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+        raise SystemExit(91)
+
+
+def test_a_system_exit_from_a_check_cannot_hide_a_breach(tmp_path: Path) -> None:
+    """SystemExit is containable here, exactly as the owner documents.
+
+    ``except Exception`` was not a boundary: a check raising ``SystemExit``
+    went straight out, aborting evaluation before the check after it ran — so
+    a broken check could both substitute its own exit status for the run's
+    outcome AND hide a real breach behind it. Containing it (and re-raising
+    only TEARDOWN_SIGNALS) puts SystemExit under the same ranking as every
+    other check failure.
+    """
+    completed = tmp_path / "completed.txt"
+    leaked = tmp_path / "secret-read.txt"
+    real = _RecordingCheck(leaked, b"TOPSECRET", "the secret was read")
+
+    probe = run_until_evidence(
+        _leaking_run(leaked, completed),
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(_ExitingCheck(completed), real),
+    )
+
+    with pytest.raises(ProbeBreach) as excinfo:
+        probe.require_intact()
+
+    assert "the secret was read" in str(excinfo.value)
+    assert real.ran, "the check after the SystemExit must still have run"
+
+
+def test_a_system_exit_from_a_check_is_still_reported_when_nothing_outranks_it(
+    tmp_path: Path,
+) -> None:
+    """Contained is not swallowed: with no breach, the SystemExit is raised."""
+    completed = tmp_path / "completed.txt"
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(_ExitingCheck(completed),),
+    )
+
+    with pytest.raises(SystemExit):
+        probe.require_intact()
+
+
+def test_a_breach_description_raising_system_exit_degrades(tmp_path: Path) -> None:
+    """Rendering contains SystemExit too, so the breach is still reported."""
+    completed = tmp_path / "completed.txt"
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(_ExitingReasonCheck(completed),),
+    )
+
+    with pytest.raises(ProbeBreach) as excinfo:
+        probe.require_intact()
+
+    assert "_Exits" in str(excinfo.value)
+
+
+def test_a_teardown_signal_from_a_check_still_wins(tmp_path: Path) -> None:
+    """Containing SystemExit must not mean containing a Ctrl-C."""
+
+    class _InterruptingCheck:
+        def __init__(self, declared: Path) -> None:
+            self.declared = declared
+
+        @property
+        def paths(self) -> tuple[Path, ...]:
+            return (self.declared,)
+
+        def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+            raise KeyboardInterrupt
+
+    completed = tmp_path / "completed.txt"
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(_InterruptingCheck(completed),),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        probe.require_intact()
+
+
+def test_an_enormous_breach_description_is_capped(tmp_path: Path) -> None:
+    """A hostile diagnostic must not become a 100,000-character failure.
+
+    Only the exception rendering was capped, so a check could put its whole
+    payload into the ProbeBreach message.
+    """
+    completed = tmp_path / "completed.txt"
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(_EnormousReasonCheck(completed),),
+    )
+
+    with pytest.raises(ProbeBreach) as excinfo:
+        probe.require_intact()
+
+    message = str(excinfo.value)
+    assert "x" * MAX_RENDERED_CHARS in message, "the description survives, capped"
+    assert "x" * (MAX_RENDERED_CHARS + 1) not in message, "and no further"
+    assert len(message) < MAX_RENDERED_CHARS + 200, len(message)
+
+
+def test_an_enormous_check_type_name_is_capped_in_the_note(tmp_path: Path) -> None:
+    """The same cap on the other diagnostic path: the annotation."""
+
+    class _VerboseMeta(type):
+        @property
+        def __name__(cls) -> str:
+            return "n" * 100_000
+
+    class _VerboseCheck(metaclass=_VerboseMeta):
+        def __init__(self, declared: Path) -> None:
+            self.declared = declared
+
+        @property
+        def paths(self) -> tuple[Path, ...]:
+            return (self.declared,)
+
+        def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+            raise ValueError("broken")
+
+    completed = tmp_path / "completed.txt"
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(_VerboseCheck(completed),),
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        probe.require_intact()
+
+    notes = getattr(excinfo.value, "__notes__", [])
+    assert notes
+    assert "n" * MAX_RENDERED_CHARS in notes[0], "the type name survives, capped"
+    assert "n" * (MAX_RENDERED_CHARS + 1) not in notes[0], "and no further"
+    assert len(notes[0]) < MAX_RENDERED_CHARS + 200, len(notes[0])
