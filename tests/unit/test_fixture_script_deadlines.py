@@ -279,6 +279,12 @@ _DOCSTRING_HOLDERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFuncti
 # The end-of-options marker, and the prefix of a long option. Python has no
 # long option that takes a script, so neither can introduce one.
 _OPTION_TERMINATOR = "--"
+# Where one command ends and the next begins. `--` scope is per command, so
+# these are what keep one command's terminator out of the next one's argv.
+_COMMAND_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "\n"})
+# A shell invocation carries another command string in its own -c argument.
+# Recursion reads it without having to recognise which programs are shells.
+_MAX_COMMAND_DEPTH = 3
 
 
 @dataclass(frozen=True)
@@ -392,7 +398,9 @@ def _candidate_sources(text: str, *, lone_element: bool = True) -> list[str]:
     ]
 
 
-def _scripts_in_command(text: str, *, lone_element: bool = True) -> list[str]:
+def _scripts_in_command(
+    text: str, *, lone_element: bool = True, depth: int = 0
+) -> list[str]:
     """Scripts this string would hand an interpreter with ``-c``.
 
     Structural, not lexical. Five rounds of review found five different
@@ -406,10 +414,20 @@ def _scripts_in_command(text: str, *, lone_element: bool = True) -> list[str]:
     quoting question, which is what it is for; walking the flag cluster with
     intent removes the greediness question, because nothing backtracks; and
     reading the cluster directly removes the cluster question.
+
+    Every script found is then read as a command string in its own right. A
+    shell handed a script is holding another command line -- ``sh -c 'python
+    -c ...'`` -- and recursing means never having to keep a list of which
+    programs are shells: ``env``, ``bash -lc``, a wrapper of your own, they
+    all just work. Recursing into a script that is only Python costs one
+    tokenize that finds no flags.
     """
     scripts: list[str] = []
     for elements in _argv_readings(text, lone_element=lone_element):
-        scripts.extend(_scripts_in_argv(elements))
+        for script in _scripts_in_argv(elements):
+            scripts.append(script)
+            if depth < _MAX_COMMAND_DEPTH:
+                scripts.extend(_scripts_in_command(script, depth=depth + 1))
     return scripts
 
 
@@ -422,6 +440,13 @@ def _argv_readings(text: str, *, lone_element: bool = True) -> list[list[str]]:
     rule is applied to each. The distinction survives as this step, rather
     than as two rule sets that drift apart.
 
+    A command string is a shell PROGRAM, not one argv: it can hold several
+    commands, and option scope -- which is to say ``--`` -- belongs to each of
+    them separately. So the token stream is cut on the shell's own command
+    separators and every segment is its own argv. Missing that is what made
+    ``: -- ; python -c ...`` invisible: the first command's terminator ended
+    scanning for the second.
+
     Unbalanced quoting keeps the naive split, which holds on to the separated
     forms. What it cannot recover is a multi-word script whose closing quote
     is missing, because nothing is left to say where the script ends -- and
@@ -429,14 +454,56 @@ def _argv_readings(text: str, *, lone_element: bool = True) -> list[list[str]]:
     it with "unexpected EOF", so there is no fixture there to miss. Over-
     inclusion buys a *possible* fixture at the cost of noise; this is not one.
     """
-    try:
-        shell_split = shlex.split(text)
-    except ValueError:
-        shell_split = text.split()
+    readings: list[list[str]] = []
+    for variant in dict.fromkeys((text, text.replace("\n", " ; "))):
+        tokens = _shell_tokens(variant)
+        if tokens is not None:
+            readings.extend(_command_segments(tokens))
+    if not readings:
+        readings.append(text.split())
     if not lone_element:
         # An element of a list is read as part of that list, above.
-        return [shell_split]
-    return [shell_split, [text]]
+        return readings
+    return [*readings, [text]]
+
+
+def _shell_tokens(text: str) -> list[str] | None:
+    """Shell tokens, with separators kept as tokens of their own.
+
+    ``punctuation_chars`` is what makes ``;`` and ``&&`` visible even when
+    nothing spaces them out, and the lexer stays quote-aware while doing it.
+    ``None`` means the text is not lexable at all.
+    """
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _command_segments(tokens: list[str]) -> list[list[str]]:
+    """One argv per command in the token stream.
+
+    Only separators end a command. Grouping tokens need no handling of their
+    own: ``(`` is an element that does not start with ``-``, so it is passed
+    over exactly like a program name, and ``( python -c ... )`` stays one
+    command. A newline is a separator too, but the lexer treats it as
+    whitespace, which is why the caller also offers a reading with newlines
+    rewritten as ``;``.
+    """
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _COMMAND_SEPARATORS:
+            if current:
+                segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
+    return segments
 
 
 def _scripts_in_argv(elements: list[str]) -> list[str]:
@@ -902,6 +969,99 @@ class TestTheStructuralRule:
         )
 
         assert {i.seconds for i in discover_fixture_lifetimes(tmp_path)} == {0.035}
+
+    @pytest.mark.parametrize(
+        ("shape", "build"),
+        [
+            pytest.param(
+                "terminator in an earlier command",
+                lambda command: f": -- ; {command}",
+                id="separator-after-terminator",
+            ),
+            pytest.param("sequence", lambda c: f"true ; {c}", id="semicolon"),
+            pytest.param("and-list", lambda c: f"true && {c}", id="and"),
+            pytest.param("or-list", lambda c: f"false || {c}", id="or"),
+            pytest.param("pipeline", lambda c: f"echo hi | {c}", id="pipe"),
+            pytest.param("newline", lambda c: f"true\n{c}", id="newline"),
+            pytest.param("subshell", lambda c: f"( {c} )", id="subshell"),
+            # Nothing spaces these out, so only a shell-aware tokenizer sees
+            # the boundary at all.
+            pytest.param("unspaced sequence", lambda c: f"true;{c}", id="unspaced-semicolon"),
+            pytest.param("unspaced and-list", lambda c: f"true&&{c}", id="unspaced-and"),
+            # The separator has to be a token in its own right for the next
+            # command to escape the previous one's `--`. Nothing spaces these,
+            # so a plain whitespace split glues them to the neighbour and the
+            # terminator swallows the rest of the line.
+            pytest.param(
+                "terminator then unspaced separator",
+                lambda c: f"true --;{c}",
+                id="terminator-then-unspaced-semicolon",
+            ),
+            pytest.param(
+                "terminator then unspaced and-list",
+                lambda c: f"true --&&{c}",
+                id="terminator-then-unspaced-and",
+            ),
+            # The separator must be a token of its own for the next command to
+            # escape the previous one's terminator. Here `--` stands alone and
+            # the separator is glued to what follows, so a plain whitespace
+            # split leaves `;python` unrecognised and the terminator swallows
+            # the rest of the program.
+            pytest.param(
+                "terminator, then a separator glued to the next command",
+                lambda c: f"true -- ;{c}",
+                id="terminator-then-glued-separator",
+            ),
+            # The terminator ends options for ITS command; the newline starts
+            # another one.
+            pytest.param(
+                "terminator before a newline",
+                lambda c: f"true --\n{c}",
+                id="terminator-then-newline",
+            ),
+            pytest.param(
+                "nested shell",
+                lambda c: shlex.join(["/bin/sh", "-c", c]),
+                id="nested-sh",
+            ),
+            pytest.param(
+                "twice-nested shell",
+                lambda c: shlex.join(
+                    ["/bin/sh", "-c", shlex.join(["/bin/sh", "-c", c])]
+                ),
+                id="nested-sh-twice",
+            ),
+        ],
+    )
+    def test_a_command_string_is_a_program_not_one_argv(
+        self, shape: str, build, tmp_path: Path
+    ) -> None:
+        """A shell string can hold several commands, and ``--`` is per command.
+
+        Reading the whole token stream as one argv let the first command's
+        terminator end scanning for the second — a regression this pins. Each
+        case is a program `/bin/sh` really runs, so anything discovery misses
+        here is a lifetime with no ceiling.
+        """
+        marker = Path(tempfile.mkdtemp()) / "ran"
+        ran = subprocess.run(
+            ["/bin/sh", "-c", build(shlex.join(
+                [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
+            ))],
+            capture_output=True, timeout=60, check=False,
+        )
+        assert marker.exists(), (
+            f"{shape}: the shell did not run it ({ran.stderr[-120:]!r})"
+        )
+
+        command = build(
+            shlex.join([sys.executable, "-c", "import time; time.sleep(0.051)"])
+        )
+        (tmp_path / "f.py").write_text(f"CMD = {command!r}\n", encoding="utf-8")
+
+        assert {i.seconds for i in discover_fixture_lifetimes(tmp_path)} == {0.051}, (
+            f"{shape}: a command a shell runs went undiscovered"
+        )
 
     def test_after_the_terminator_a_flag_is_a_filename(self, tmp_path: Path) -> None:
         """`--` ends the options, so nothing after it hands over a script.
