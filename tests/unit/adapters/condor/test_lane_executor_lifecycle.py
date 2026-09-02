@@ -759,22 +759,43 @@ def _assert_exception_chain_terminates(error: BaseException) -> None:
     ending is both the explicit ``__cause__`` of the second interrupt and
     the implicit context of the cleanup failure). A global "seen" set would
     reject that valid shape.
+
+    Iterative rather than recursive: a valid chain is not bounded by
+    anything this file controls, and a recursive walk raised RecursionError
+    on a 2,000-link acyclic chain — a helper failing on VALID input is the
+    same vacuity in the other direction. ``active`` is the current path
+    (the cycle test), ``completed`` is everything fully explored, which
+    both accepts diamonds without re-walking them and keeps this linear.
+    Both dicts hold the exceptions, not just their ids, so nothing can be
+    collected and have its id reused mid-traversal.
     """
-
-    def walk(node: BaseException, path: tuple[BaseException, ...]) -> None:
-        for name in ("__cause__", "__context__"):
-            link: BaseException | None = getattr(node, name)
-            if link is None:
-                continue
-            if any(step is link for step in path):
-                raise AssertionError(
-                    "exception chain cycles: "
-                    f"{type(link).__name__}{link.args} is reachable from "
-                    f"itself via {type(node).__name__}.{name}"
-                )
-            walk(link, (*path, link))
-
-    walk(error, (error,))
+    active: dict[int, BaseException] = {}
+    completed: dict[int, BaseException] = {}
+    # (node, parent, link name, entering?) — the exit frame pops the node
+    # off the current path, which is what makes the check path-local.
+    stack: list[tuple[BaseException, BaseException | None, str, bool]] = [
+        (error, None, "", True)
+    ]
+    while stack:
+        node, parent, name, entering = stack.pop()
+        if not entering:
+            del active[id(node)]
+            completed[id(node)] = node
+            continue
+        if id(node) in active:
+            raise AssertionError(
+                "exception chain cycles: "
+                f"{type(node).__name__}{node.args} is reachable from itself "
+                f"via {type(parent).__name__}.{name}"
+            )
+        if id(node) in completed:
+            continue
+        active[id(node)] = node
+        stack.append((node, parent, name, False))
+        for link_name in ("__cause__", "__context__"):
+            link: BaseException | None = getattr(node, link_name)
+            if link is not None:
+                stack.append((link, node, link_name, True))
 
 
 class _StderrThatFails:
@@ -996,6 +1017,69 @@ class TestTheChainAssertionCanActuallyFail:
         assert ending in reachable, (
             "following only the explicit link hides the implicit one"
         )
+
+    def test_termination_walks_the_CONTEXT_branch_past_a_valid_cause(
+        self,
+    ) -> None:
+        """The shape that can only pass if BOTH branches are walked.
+
+        The explicit cause terminates immediately, so a traversal that
+        follows ``__cause__ or __context__`` sees a clean chain and returns.
+        The cycle is on the context branch it never looks at. This is the
+        discriminating case: the reachability helper had one, the
+        termination helper did not, so the R9 regression could have come
+        back with all six of these tests still green.
+        """
+        root = KeyboardInterrupt("original ending")
+        terminator = ValueError("explicit and finished")
+        looper = RuntimeError("condor_rm exploded")
+        root.__cause__ = terminator
+        root.__context__ = looper
+        looper.__context__ = root
+
+        with pytest.raises(AssertionError, match="cycles"):
+            _assert_exception_chain_terminates(root)
+
+    def test_termination_walks_the_CAUSE_branch_past_a_valid_context(
+        self,
+    ) -> None:
+        """The mirror, so the property is stated in both directions."""
+        root = KeyboardInterrupt("original ending")
+        terminator = ValueError("implicit and finished")
+        looper = RuntimeError("condor_rm exploded")
+        root.__context__ = terminator
+        root.__cause__ = looper
+        looper.__cause__ = root
+
+        with pytest.raises(AssertionError, match="cycles"):
+            _assert_exception_chain_terminates(root)
+
+    def test_a_long_valid_chain_does_not_exhaust_the_stack(self) -> None:
+        """A helper must not fail on VALID input either.
+
+        Nothing bounds how long a real chain can get, and the recursive
+        version raised RecursionError at 2,000 links — vacuity in the other
+        direction: a green suite that would have gone red on a chain no one
+        had built yet.
+        """
+        chain = [RuntimeError(f"link {index}") for index in range(2_000)]
+        for parent, child in zip(chain, chain[1:], strict=False):
+            parent.__context__ = child
+
+        _assert_exception_chain_terminates(chain[0])
+        assert len(_reachable_exceptions(chain[0])) == len(chain)
+
+    def test_a_deep_chain_that_cycles_at_the_far_end_is_still_detected(
+        self,
+    ) -> None:
+        """Depth must not cost detection."""
+        chain = [RuntimeError(f"link {index}") for index in range(2_000)]
+        for parent, child in zip(chain, chain[1:], strict=False):
+            parent.__context__ = child
+        chain[-1].__context__ = chain[0]
+
+        with pytest.raises(AssertionError, match="cycles"):
+            _assert_exception_chain_terminates(chain[0])
 
     def test_an_ordinary_terminated_chain_passes(self) -> None:
         ending = KeyboardInterrupt("original ending")
