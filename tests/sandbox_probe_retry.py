@@ -59,7 +59,13 @@ sites, because the call sites are where it was got wrong:
 - A check is handed only the entries it declared (:class:`_DeclaredPaths`), so
   "declare what you inspect" is enforced rather than asked for. Reading an
   undeclared path raises instead of silently reporting a clean run over
-  evidence nothing captured.
+  evidence nothing captured. A check declaring NO paths is refused outright:
+  its whole input would be empty, so it could only ever report intact.
+- Every check runs, and the outcomes are then reported in priority order:
+  breach, then a broken check, then a timeout. One check blowing up must not
+  stop the check after it from finding a real breach — a contract error of
+  ours is still an error, but it never outranks the thing the probes exist to
+  detect.
 """
 
 from __future__ import annotations
@@ -147,6 +153,34 @@ class _DeclaredPaths(Mapping[Path, bytes | None]):
 
     def __len__(self) -> int:
         return len(self._entries)
+
+
+def _reject_zero_path_checks(checks: tuple["BreachCheck", ...]) -> None:
+    """Refuse a check that declares no paths, the way empty evidence is refused.
+
+    ``paths`` is the check's whole input: :meth:`BreachCheck.violated_by` gets
+    a view of exactly those entries and nothing else, so a check declaring none
+    is handed an empty view and can only ever report intact. It inspects
+    nothing while looking like coverage — the same vacuity as ``CreatedPaths(())``
+    and ``AllEvidence(())``, and there is no probe that legitimately needs it.
+    "This probe has no breach surface" is already spelled ``breach_checks=()``.
+
+    This closes one specific shape, not a class. A check declaring a real path
+    and unconditionally returning ``None`` is just as empty and stays
+    constructible; defending against that would mean sealing the callback
+    boundary against arbitrary caller code, which is not the threat model for a
+    test helper whose callers are test authors in this repo. The guard is here
+    because it is cheap and the shape is never legitimate, not because it makes
+    this module a security boundary against its own callers.
+    """
+    for check in checks:
+        if not check.paths:
+            raise ValueError(
+                f"breach check {check!r} declares no paths; it would be handed "
+                "an empty view and could only report intact. Declare what it "
+                "inspects, or pass breach_checks=() to say this probe has no "
+                "breach surface"
+            )
 
 
 @runtime_checkable
@@ -379,6 +413,13 @@ class ProbeRun:
     attempts: tuple[ProbeAttempt, ...]
     breach_checks: tuple[BreachCheck, ...] = ()
 
+    def __post_init__(self) -> None:
+        # Also enforced in run_until_evidence, which rejects before spending a
+        # live agent run rather than after. Repeated here because a ProbeRun can
+        # be constructed directly, and the rule belongs to whatever holds the
+        # checks.
+        _reject_zero_path_checks(self.breach_checks)
+
     @property
     def result(self) -> subprocess.CompletedProcess[str]:
         """The final attempt's process result."""
@@ -445,17 +486,43 @@ class ProbeRun:
         and which cannot be satisfied by a stale artifact, since the evidence
         is reset before each retry.
         """
+        breaches: list[str] = []
+        check_errors: list[Exception] = []
         for attempt in self.attempts:
             for check in self.breach_checks:
-                declared = _DeclaredPaths(
-                    {path: attempt.snapshot[path] for path in check.paths}
-                )
-                reason = check.violated_by(declared)
+                try:
+                    declared = _DeclaredPaths(
+                        {path: attempt.snapshot[path] for path in check.paths}
+                    )
+                    reason = check.violated_by(declared)
+                except Exception as exc:  # noqa: BLE001
+                    # A broken check must not stop the others: the one after it
+                    # may be the one holding a real breach. Collected, ranked
+                    # below, and still raised when nothing outranks it.
+                    exc.add_note(
+                        f"raised by breach check {check!r} while evaluating "
+                        f"attempt {attempt.number} of {len(self.attempts)}"
+                    )
+                    check_errors.append(exc)
+                    continue
                 if reason is not None:
-                    raise ProbeBreach(
+                    breaches.append(
                         f"SANDBOX BREACH on attempt {attempt.number} of "
                         f"{len(self.attempts)}: {reason}"
                     )
+
+        # Priority, not order of discovery. A breach outranks every other way
+        # this run can fail — including our own contract errors, which would
+        # otherwise let one broken check hide the breach a later check found.
+        # Oldest attempt first within each rank, so the earliest evidence is
+        # what gets reported.
+        if breaches:
+            raise ProbeBreach(breaches[0])
+        # No breach, so a broken check is now the most serious thing here: it
+        # means a check is not inspecting what it claims to, and staying quiet
+        # about that would leave a hole no one can see.
+        if check_errors:
+            raise check_errors[0]
         if not self.timed_out:
             return
         raise ProbeTimeout(
@@ -529,6 +596,9 @@ def run_until_evidence(
     # One tuple() at the entry makes the checks, the capture set, and the
     # ProbeRun all the same fixed list.
     checks = tuple(breach_checks)
+    # Before anything is spawned: a malformed check set is a caller bug, and
+    # finding it after a 180s live agent run helps nobody.
+    _reject_zero_path_checks(checks)
     # The union, deduplicated and order-stable: every breach path is captured
     # whether or not the caller also listed it, so the two declarations cannot
     # drift apart.

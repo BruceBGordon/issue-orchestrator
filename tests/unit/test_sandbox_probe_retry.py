@@ -565,20 +565,22 @@ def test_all_evidence_rejects_no_parts() -> None:
 
 
 class _ReachesBeyondItsDeclaration:
-    """A conforming check that declares nothing and inspects a secret anyway.
+    """A conforming check that declares one path and inspects a second.
 
     Not a strawman: ``BreachCheck`` is an open Protocol, so this satisfies it
     completely. While ``violated_by`` received the whole snapshot, this shape
-    reported a clean run over a path nothing had captured.
+    reported a clean run over a path nothing had captured. It declares a real
+    path because a check declaring none is now refused outright.
     """
 
-    def __init__(self, undeclared: Path) -> None:
+    def __init__(self, declared: Path, undeclared: Path) -> None:
+        self.declared = declared
         self.undeclared = undeclared
         self.saw: bytes | None | str = "never ran"
 
     @property
     def paths(self) -> tuple[Path, ...]:
-        return ()
+        return (self.declared,)
 
     def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
         self.saw = snapshot.get(self.undeclared)
@@ -594,7 +596,7 @@ def test_a_check_cannot_inspect_a_path_it_did_not_declare(tmp_path: Path) -> Non
     """
     secret_sink = tmp_path / "secret-read.txt"
     completed = tmp_path / "completed.txt"
-    rogue = _ReachesBeyondItsDeclaration(secret_sink)
+    rogue = _ReachesBeyondItsDeclaration(completed, secret_sink)
 
     def run_attempt() -> subprocess.CompletedProcess[str]:
         secret_sink.write_text("TOPSECRET", encoding="utf-8")
@@ -695,3 +697,206 @@ def test_require_intact_is_the_only_completion_entry_point() -> None:
     }
 
     assert entry_points == {"require_intact"}
+
+
+class _BrokenCheck:
+    """A check whose own contract is wrong: it reads a path it never declared."""
+
+    def __init__(self, declared: Path, undeclared: Path) -> None:
+        self.declared = declared
+        self.undeclared = undeclared
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        return (self.declared,)
+
+    def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+        return snapshot[self.undeclared] and None
+
+
+class _RecordingCheck:
+    """A real check that reports a breach, and remembers whether it ran."""
+
+    def __init__(self, path: Path, marker: bytes, detail: str) -> None:
+        self.path = path
+        self.marker = marker
+        self.detail = detail
+        self.ran = False
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        return (self.path,)
+
+    def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+        self.ran = True
+        if self.marker in (snapshot[self.path] or b""):
+            return self.detail
+        return None
+
+
+def test_a_broken_check_cannot_hide_a_breach_a_later_check_finds(
+    tmp_path: Path,
+) -> None:
+    """A contract error of ours must never outrank the breach it precedes.
+
+    Evaluation used to abort on the first raising check, so a real breach that
+    a later check would have caught was hidden behind an earlier check's own
+    bug — the same family as the completion-before-breach ordering already
+    fixed. Every check now runs; the outcomes are ranked afterwards.
+    """
+    completed = tmp_path / "completed.txt"
+    leaked = tmp_path / "secret-read.txt"
+    broken = _BrokenCheck(completed, tmp_path / "never-declared.txt")
+    real = _RecordingCheck(leaked, b"TOPSECRET", "the secret was read")
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        leaked.write_text("TOPSECRET", encoding="utf-8")
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        # The broken one is FIRST, so it is what aborted evaluation before.
+        breach_checks=(broken, real),
+    )
+
+    with pytest.raises(ProbeBreach) as excinfo:
+        probe.require_intact()
+
+    assert "the secret was read" in str(excinfo.value)
+    assert real.ran, "the check after the broken one must still have run"
+
+
+def test_a_broken_check_is_still_loud_when_there_is_no_breach(
+    tmp_path: Path,
+) -> None:
+    """Ranking below a breach is not the same as being swallowed.
+
+    With nothing to outrank it, a check that cannot inspect what it claims to
+    is the most serious thing in the run: it means coverage that looks present
+    is absent.
+    """
+    completed = tmp_path / "completed.txt"
+    clean = tmp_path / "secret-read.txt"
+    broken = _BrokenCheck(completed, tmp_path / "never-declared.txt")
+    real = _RecordingCheck(clean, b"TOPSECRET", "the secret was read")
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        clean.write_text("", encoding="utf-8")
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(broken, real),
+    )
+
+    with pytest.raises(UndeclaredBreachPath) as excinfo:
+        probe.require_intact()
+
+    assert real.ran, "the other check still ran before the error was reported"
+    notes = getattr(excinfo.value, "__notes__", [])
+    assert any("attempt 1 of 1" in note for note in notes), notes
+
+
+def test_a_broken_check_outranks_a_timeout(tmp_path: Path) -> None:
+    """Breach, then broken check, then timeout — the full order."""
+    completed = tmp_path / "completed.txt"
+    broken = _BrokenCheck(completed, tmp_path / "never-declared.txt")
+
+    probe = run_until_evidence(
+        lambda: (_ for _ in ()).throw(_timeout()),
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(broken,),
+    )
+
+    assert probe.timed_out
+    with pytest.raises(UndeclaredBreachPath):
+        probe.require_intact()
+
+
+def test_a_breach_outranks_a_broken_check_on_an_earlier_attempt(
+    tmp_path: Path,
+) -> None:
+    """Rank beats order of discovery, across attempts as well as within one."""
+    completed = tmp_path / "completed.txt"
+    leaked = tmp_path / "secret-read.txt"
+    broken = _BrokenCheck(completed, tmp_path / "never-declared.txt")
+    real = _RecordingCheck(leaked, b"TOPSECRET", "the secret was read")
+    attempts = 0
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            # Attempt 1: the broken check raises, nothing has leaked yet.
+            leaked.write_text("", encoding="utf-8")
+            raise _timeout()
+        leaked.write_text("TOPSECRET", encoding="utf-8")
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(broken, real),
+    )
+
+    with pytest.raises(ProbeBreach) as excinfo:
+        probe.require_intact()
+
+    assert "on attempt 2" in str(excinfo.value)
+
+
+def test_a_check_declaring_no_paths_is_refused(tmp_path: Path) -> None:
+    """Zero declared paths is the empty-evidence vacuity, one layer over.
+
+    ``paths`` is the check's entire input, so a check declaring none is handed
+    an empty view and can only report intact — coverage that is not there.
+    Refused where CreatedPaths(()) and AllEvidence(()) are refused.
+    """
+
+    class _DeclaresNothing:
+        @property
+        def paths(self) -> tuple[Path, ...]:
+            return ()
+
+        def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+            return None
+
+    completed = tmp_path / "completed.txt"
+
+    with pytest.raises(ValueError, match="declares no paths"):
+        run_until_evidence(
+            lambda: _completed(),
+            evidence=CreatedPaths((completed,)),
+            breach_checks=(_DeclaresNothing(),),
+        )
+
+    # Also refused on a directly constructed run, so the rule holds wherever
+    # the checks are held rather than only on the path that spawns a probe.
+    with pytest.raises(ValueError, match="declares no paths"):
+        ProbeRun(attempts=(), breach_checks=(_DeclaresNothing(),))
+
+
+def test_no_breach_checks_is_still_how_a_probe_says_it_has_no_surface(
+    tmp_path: Path,
+) -> None:
+    """Refusing a zero-path CHECK must not refuse zero CHECKS.
+
+    The in-worktree positive control legitimately has nothing to guard, and
+    says so with ``breach_checks=()``. That stays valid.
+    """
+    completed = tmp_path / "completed.txt"
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt, evidence=CreatedPaths((completed,)), breach_checks=()
+    )
+
+    probe.require_intact()
