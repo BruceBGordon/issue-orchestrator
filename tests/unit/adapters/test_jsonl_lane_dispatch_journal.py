@@ -779,3 +779,135 @@ def test_verdicts_do_not_depend_on_dimension_order(tmp_path: Path) -> None:
     _rewrite(path, {**_only_base(modern), "machine_state": "not an envelope"})
     with pytest.raises(LaneDispatchJournalError):
         journal.read_recent(10)
+
+
+def test_a_null_capped_column_is_corruption(tmp_path: Path) -> None:
+    """Finding 1 (#7136 journal review round 5): the presence check
+    covered this column but nothing checked its value, so an explicit
+    null read back as a perfectly good row — contradicting this
+    reader's own rule that only the two busy-cores columns may be null.
+
+    Presence and trust stay separate questions: the value is still
+    never read for meaning, because it is derived from the other three.
+    But presence has to mean a WELL-FORMED value, or 'present' means
+    nothing."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    _rewrite(path, {**modern, "cpu_request_capped": None})
+    with pytest.raises(LaneDispatchJournalError, match="not a boolean"):
+        journal.read_recent(10)
+
+
+def test_a_non_boolean_capped_column_is_corruption(tmp_path: Path) -> None:
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    for value in ("yes", 1, 0.5, [], {}):
+        _rewrite(path, {**modern, "cpu_request_capped": value})
+        with pytest.raises(LaneDispatchJournalError, match="not a boolean"):
+            journal.read_recent(10)
+
+
+def _malformed_rows(modern: dict[str, object]) -> dict[str, bytes]:
+    """Stored bytes that no writer of ours produces, by way it breaks."""
+    return {
+        # An absurd offset overflows the timezone normalization that
+        # every timestamp goes through — an OverflowError, which is not
+        # a ValueError, so no per-case clause had ever seen it.
+        "timestamp overflows normalization": _line(
+            {**modern, "recorded_at": "9999-12-31T23:59:59-23:59"}
+        ),
+        # Not a decode failure of one row: the whole file read fails,
+        # and UnicodeDecodeError is a ValueError rather than an OSError.
+        "file is not valid UTF-8": b"\xff\xfe not utf-8\n",
+        # Python refuses to convert absurdly long integer literals.
+        # Built from the row's own text rather than a guessed literal:
+        # anchoring on a value the fixture happens to use made this case
+        # silently not apply, and a fuzz table that quietly tests
+        # nothing is worse than no fuzz table.
+        "integer literal too long to convert": _line(
+            {**modern, "priority": _OversizedInt()}
+        ),
+        "row is a JSON array, not an object": b"[1, 2, 3]\n",
+        "raw control characters inside a string": b'{"work_key": "a\x01b"}\n',
+        "nesting deep enough to exhaust the stack": (
+            b"[" * 120_000 + b"]" * 120_000 + b"\n"
+        ),
+        "a single enormous line": b'{"work_key": "' + b"x" * 10_000_000 + b'"}\n',
+        "line is not JSON at all": b"} not json {\n",
+        "row is a bare JSON string": b'"just a string"\n',
+        "row is JSON null": b"null\n",
+    }
+
+
+class _OversizedInt:
+    """Serializes as an integer literal too long for Python to convert."""
+
+    def __repr__(self) -> str:
+        return "1" * 5000
+
+
+def _line(row: dict[str, object]) -> bytes:
+    # default=repr renders the marker above as a bare JSON number.
+    return (json.dumps(row, default=repr).replace('"' + "1" * 5000 + '"', "1" * 5000) + "\n").encode()
+
+
+def test_no_stored_bytes_can_escape_the_typed_error(tmp_path: Path) -> None:
+    """Finding 2 (#7136 journal review round 5): the port promises that
+    unreadable stored content surfaces as LaneDispatchJournalError, and
+    three ways out bypassed it — each from a case nobody had enumerated
+    in advance, which is exactly why the boundary is now ONE broad
+    catch rather than a clause per parser.
+
+    Every row here asserts the typed error AND that nothing else got
+    out: an escape of any other type fails this test by propagating.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    modern = _stored_row(JsonlLaneDispatchJournal(source), source / "lane-dispatch.jsonl")
+
+    for index, (label, raw) in enumerate(_malformed_rows(modern).items()):
+        directory = tmp_path / f"case-{index}"
+        directory.mkdir()
+        (directory / "lane-dispatch.jsonl").write_bytes(raw)
+        journal = JsonlLaneDispatchJournal(directory)
+        try:
+            journal.read_recent(10)
+        except LaneDispatchJournalError:
+            continue
+        except BaseException as escaped:  # noqa: BLE001 - that IS the assertion
+            raise AssertionError(
+                f"{label!r} escaped read_recent as "
+                f"{type(escaped).__name__}, not LaneDispatchJournalError"
+            ) from escaped
+        raise AssertionError(f"{label!r} was accepted as a readable journal")
+
+
+def test_our_own_bugs_are_not_disguised_as_corruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the boundary, and the reason it is a deny-list
+    rather than a bare except.
+
+    Catching broadly is right for anything the file's bytes provoke, and
+    wrong for a bug of ours: reporting 'the journal is corrupt' when the
+    reader itself is broken sends the operator to delete good history.
+    So the exceptions that can only mean this module is wrong keep
+    flying, unchanged."""
+    from issue_orchestrator.adapters import jsonl_lane_dispatch_journal as module
+
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    _stored_row(journal, path)
+
+    for programming_error in (AssertionError, AttributeError, NameError):
+        def explode(
+            fields: dict[str, object], _error: type[Exception] = programming_error
+        ) -> object:
+            raise _error("a bug in this module, not in the file")
+
+        monkeypatch.setattr(module, "_read_machine_state", explode)
+        with pytest.raises(programming_error):
+            journal.read_recent(10)
+        monkeypatch.undo()

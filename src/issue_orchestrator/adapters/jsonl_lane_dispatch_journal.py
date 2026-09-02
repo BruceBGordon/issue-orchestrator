@@ -21,6 +21,7 @@ from typing import cast
 
 from ..domain.lane_cpu_request import LaneCpuRequest
 from ..domain.lane_execution import LaneWorkKey
+from ..infra.containment import describe_exception
 from ..infra.machine_state import (
     MachineState,
     MachineStateEnvelopeError,
@@ -115,6 +116,35 @@ class _CpuFacts:
 
 class _ColumnError(Exception):
     """One column of a present dimension violates its own rule."""
+
+
+#: Exceptions that mean THIS MODULE is wrong, not that the file is.
+#:
+#: The port promises that unreadable stored content surfaces as
+#: LaneDispatchJournalError, so the row boundary converts what the
+#: file's own bytes can provoke — and the list of those is open-ended,
+#: which is why it is caught broadly rather than case by case
+#: (OverflowError from an absurd timestamp, UnicodeDecodeError from
+#: invalid bytes, ValueError from an integer too long to convert,
+#: RecursionError from nesting, and whatever a future parser adds).
+#:
+#: Catching broadly without this deny-list would hide our own bugs
+#: behind a corruption message that blames the operator's file — the
+#: trade this repository refuses. These four cannot be provoked by any
+#: JSON value once every value is type-checked before use: they mean a
+#: typo, a missing guard, a broken install, or a violated invariant of
+#: ours (this module raises AssertionError for exactly that), so they
+#: keep flying.
+#:
+#: Teardown signals need no entry: the boundary catches ``Exception``,
+#: and KeyboardInterrupt, GeneratorExit and asyncio.CancelledError are
+#: not Exceptions — see infra/containment.py for why they must get out.
+_PROGRAMMING_ERRORS: tuple[type[Exception], ...] = (
+    AssertionError,
+    AttributeError,
+    NameError,
+    ImportError,
+)
 
 
 _MachineStateDimension = MachineState | _DimensionAbsent | _DimensionCorrupt
@@ -225,25 +255,9 @@ class JsonlLaneDispatchJournal:
     def read_recent(self, limit: int) -> LaneDispatchHistory:
         if type(limit) is not int or limit < 1:
             raise ValueError("read_recent limit must be a positive integer")
-        try:
-            raw = self._path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            # Absence is the first run, never an error.
-            return LaneDispatchHistory(location=str(self._path), entries=())
-        except OSError as error:
-            raise LaneDispatchJournalError(
-                f"could not read the dispatch journal at {self._path}: {error}"
-            ) from error
-        # Number the lines before windowing so a parse failure names the
-        # line as it appears in the file, not as it appears in the tail.
-        numbered = [
-            (number, line)
-            for number, line in enumerate(raw.splitlines(), start=1)
-            if line.strip()
-        ]
         entries: list[LaneDispatchEntry] = []
         predating = 0
-        for number, line in numbered[-limit:]:
+        for number, line in self._numbered_lines()[-limit:]:
             try:
                 entries.append(self._parse(number, line))
             except _RowPredatesSchema:
@@ -253,11 +267,67 @@ class JsonlLaneDispatchJournal:
                 # unrepresentable, so counted and reported rather than
                 # dropped silently.
                 predating += 1
+            except LaneDispatchJournalError:
+                # Already typed, and already carrying the line context
+                # and the specific reason. Re-wrapping would bury both.
+                raise
+            except _PROGRAMMING_ERRORS:
+                raise
+            except Exception as error:
+                # ONE boundary for everything else the row's own bytes
+                # can provoke, instead of a clause per parser: the port
+                # promises unreadable content becomes this typed error,
+                # and every escape found so far (an absurd timestamp
+                # overflowing normalization, an integer too long to
+                # convert, nesting deep enough to exhaust the stack)
+                # came from a case nobody enumerated in advance. The
+                # exception is rendered without being trusted — it comes
+                # from parsing hostile input and may be enormous.
+                raise self._corrupt(
+                    number, f"row could not be read: {describe_exception(error)}"
+                ) from error
         return LaneDispatchHistory(
             location=str(self._path),
             entries=tuple(entries),
             predating_schema=predating,
         )
+
+    def _numbered_lines(self) -> list[tuple[int, str]]:
+        """Every non-blank stored line, paired with its file line number.
+
+        Owns reading the file AND the typed-error boundary around it,
+        which is a different boundary from the per-row one: a decode
+        failure condemns the whole file, not one row, and it is a
+        ValueError rather than an OSError, so the clause below it never
+        saw one (finding 2, #7136 journal review round 5).
+
+        An absent journal reads as no lines, exactly like an empty one:
+        both are the first run, and neither is an error.
+
+        Lines are numbered BEFORE the caller windows them, so a parse
+        failure names the line as it appears in the file rather than as
+        it appears in the tail.
+        """
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        except OSError as error:
+            raise LaneDispatchJournalError(
+                f"could not read the dispatch journal at {self._path}: {error}"
+            ) from error
+        except _PROGRAMMING_ERRORS:
+            raise
+        except Exception as error:
+            raise LaneDispatchJournalError(
+                f"the dispatch journal at {self._path} is not readable text: "
+                f"{describe_exception(error)}"
+            ) from error
+        return [
+            (number, line)
+            for number, line in enumerate(raw.splitlines(), start=1)
+            if line.strip()
+        ]
 
     def _parse(self, line_number: int, line: str) -> LaneDispatchEntry:
         """Translate one stored line, refusing anything malformed.
@@ -365,6 +435,14 @@ class JsonlLaneDispatchJournal:
                 f"{', '.join(repr(name) for name in present)} present"
             )
         try:
+            # Presence and trust are separate questions, but presence
+            # still has to mean a WELL-FORMED value: this column's shape
+            # is checked even though its meaning is deliberately never
+            # read back (finding 1, #7136 journal review round 5).
+            # Skipping the check let an explicit null — which this
+            # reader's own rule reserves for the two busy-cores columns
+            # — read back as a perfectly good row.
+            _require_boolean(fields, _CAPPED_FIELD)
             # LaneCpuRequest owns every invariant, the seed-and-ceiling
             # one included: a hand-edited row asking for more than it
             # declared is corrupt, and is refused here rather than
@@ -446,6 +524,20 @@ def _required_int(fields: dict[str, object], name: str) -> int:
     if type(value) is not int:
         raise _ColumnError(f"{name!r} is not an integer: {value!r}")
     return value
+
+
+def _require_boolean(fields: dict[str, object], name: str) -> None:
+    """A column that must hold a real boolean, and is read for nothing else.
+
+    Returns nothing on purpose: this column is derived from the others,
+    so its stored VALUE is never trusted (a hand-edited file must not be
+    able to disagree with itself). Its shape is still part of what the
+    dimension promises — a row carrying ``null`` here was not written by
+    any version of this writer.
+    """
+    value = fields[name]
+    if type(value) is not bool:
+        raise _ColumnError(f"{name!r} is not a boolean: {value!r}")
 
 
 def _nullable_cores(fields: dict[str, object], name: str) -> float | None:
