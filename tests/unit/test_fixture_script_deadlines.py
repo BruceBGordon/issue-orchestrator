@@ -75,6 +75,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from dataclasses import dataclass
@@ -275,34 +276,9 @@ _SCAN_HINTS = ("time.sleep(", "signal.alarm(", "LIFETIME_SECONDS", "MAX_SECONDS"
 # not a two-hour fixture, and reporting it would teach people to silence this.
 _DOCSTRING_HOLDERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
 
-# An interpreter being handed a script. The FLAG is matched, not the
-# interpreter: `python -c`, `python3.14 -c`, `env python -c`, a venv path,
-# `-uc` and `-u -c` are all the same instruction, and enumerating the ways an
-# interpreter can be spelled is a losing game whose losses are silent. Any
-# short-option cluster ending in `c` counts.
-#
-# The script may be separated from the flag by whitespace or attached to it
-# with no space at all -- `-c'...'`, `-uc"..."` -- which is a real invocation
-# Python accepts and an earlier version of this silently missed.
-# TestSpellingsPythonAccepts runs every form below through the real
-# interpreter, so this grammar cannot drift from what Python does.
-#
-# There is no long option: `--command` and `--c` are errors, so there is
-# nothing to widen toward.
-#
-# This pattern is the COMMAND-STRING rule (see the module docstring's two
-# contexts). Mid-string, after whitespace, the shell will split the text, so a
-# script attached without quotes cannot survive: `python -cimport time; ...`
-# reaches Python as `-cimport` plus stray words. The argv-element rule below
-# is where an attached script is real.
-_DASH_C_RE = re.compile(r"(?:^|\s)-[A-Za-z]*c(?:\s+|(?=[\"']))(.*)", re.DOTALL)
-# The ARGV-ELEMENT rule: the whole string is one element handed to the OS
-# verbatim, so nothing splits it and `-cimport time; time.sleep(9)` is an
-# invocation Python accepts. Anchored at the start of the string, because that
-# is what "this string IS the argument" looks like in the tree.
-_DASH_C_ATTACHED_RE = re.compile(r"^-[A-Za-z]*c(\S.*)", re.DOTALL)
-# The script when the command line continues past it: `-c 'script' marker`.
-_LEADING_QUOTED_RE = re.compile(r"^([\"'])(.*?)\1", re.DOTALL)
+# The end-of-options marker, and the prefix of a long option. Python has no
+# long option that takes a script, so neither can introduce one.
+_OPTION_TERMINATOR = "--"
 
 
 @dataclass(frozen=True)
@@ -333,10 +309,11 @@ def discover_fixture_lifetimes(tree: Path) -> tuple[DiscoveredLifetime, ...]:
         relative = str(path.relative_to(tree))
         module = ast.parse(text, filename=str(path))
         skip = _docstring_constants(module) | _fstring_fragments(module)
+        in_argv = _argv_sequence_members(module)
         for node in ast.walk(module):
             if id(node) in skip:
                 continue
-            found.extend(_lifetimes_in_node(node, relative))
+            found.extend(_lifetimes_in_node(node, relative, in_argv))
     return tuple(found)
 
 
@@ -356,6 +333,24 @@ def _docstring_constants(module: ast.Module) -> set[int]:
     return ids
 
 
+def _argv_sequence_members(module: ast.Module) -> set[int]:
+    """String constants that are elements of a list or tuple.
+
+    Their argv context is the sequence, not themselves: a lone element is the
+    whole command, but an element of a list has siblings — including, possibly,
+    a ``--`` that turns it into a filename.
+    """
+    ids: set[int] = set()
+    for node in ast.walk(module):
+        if isinstance(node, (ast.List, ast.Tuple)):
+            ids.update(
+                id(element)
+                for element in node.elts
+                if isinstance(element, ast.Constant) and isinstance(element.value, str)
+            )
+    return ids
+
+
 def _fstring_fragments(module: ast.Module) -> set[int]:
     """Constants that belong to an f-string, which is read as a whole."""
     ids: set[int] = set()
@@ -371,7 +366,7 @@ def _dotted_name(node: ast.expr) -> str | None:
     return None
 
 
-def _candidate_sources(text: str) -> list[str]:
+def _candidate_sources(text: str, *, lone_element: bool = True) -> list[str]:
     """The ways a spawned script hides inside one string.
 
     Three shapes, all present in this tree:
@@ -381,32 +376,110 @@ def _candidate_sources(text: str) -> list[str]:
     * the string is a *command line* running an interpreter with ``-c``, the
       script quoted inside it: ``f"{sys.executable} -c 'import time; ...'"``.
 
-    The third is read out of any string carrying the flag, with no check that
-    an interpreter is visible beside it. That is deliberate over-inclusion —
-    see the error model in the module docstring. Requiring a recognisable
-    interpreter is what made ``python3 -uc`` invisible, and an invocation that
-    hides behind a spelling is a lifetime with no ceiling.
+    The third is read structurally rather than by pattern — see
+    :func:`_scripts_in_command`. Every string is offered, with no check that an
+    interpreter is visible beside the flag: that is deliberate over-inclusion,
+    and requiring a recognisable interpreter is what once made ``python3 -uc``
+    invisible.
 
     Quotes alone are still not an argument boundary: ``"the run left
     'time.sleep(7200)' burning a core"`` names no flag and is not a command.
     """
-    candidates = [text, textwrap.dedent(text)]
-    attached = _DASH_C_ATTACHED_RE.match(text)
-    if attached is not None:
-        candidates.append(attached.group(1))
-    for match in _DASH_C_RE.finditer(text):
-        remainder = match.group(1)
-        candidates.append(remainder.strip("\"' "))
-        # The remainder is everything to the end of the string, which overshoots
-        # when the command line carries arguments after the script. Taking the
-        # balanced quoted run recovers the script in that case.
-        quoted = _LEADING_QUOTED_RE.match(remainder)
-        if quoted is not None:
-            candidates.append(quoted.group(2))
-    return candidates
+    return [
+        text,
+        textwrap.dedent(text),
+        *_scripts_in_command(text, lone_element=lone_element),
+    ]
 
 
-def _lifetimes_in_script(source: str) -> list[tuple[str, float]]:
+def _scripts_in_command(text: str, *, lone_element: bool = True) -> list[str]:
+    """Scripts this string would hand an interpreter with ``-c``.
+
+    Structural, not lexical. Five rounds of review found five different
+    lexical details wrong in the regex this replaces — whitespace after the
+    flag, an attached script, combined clusters, greediness across the letters
+    of the script, a quote as an argument boundary. Each fix was correct and
+    the next one was still waiting, because a pattern was being asked to be a
+    shell lexer and losing to it one detail at a time.
+
+    So the string is turned into argv and read as argv. ``shlex`` owns the
+    quoting question, which is what it is for; walking the flag cluster with
+    intent removes the greediness question, because nothing backtracks; and
+    reading the cluster directly removes the cluster question.
+    """
+    scripts: list[str] = []
+    for elements in _argv_readings(text, lone_element=lone_element):
+        scripts.extend(_scripts_in_argv(elements))
+    return scripts
+
+
+def _argv_readings(text: str, *, lone_element: bool = True) -> list[list[str]]:
+    """The ways this string could be argv — the two contexts, normalised.
+
+    A **command string** is what a shell splits; a lone **argv element** is
+    passed to the OS verbatim. A string constant in the tree could be either
+    and nothing distinguishes them, so both readings are produced and the same
+    rule is applied to each. The distinction survives as this step, rather
+    than as two rule sets that drift apart.
+
+    Unbalanced quoting keeps the naive split, which holds on to the separated
+    forms. What it cannot recover is a multi-word script whose closing quote
+    is missing, because nothing is left to say where the script ends -- and
+    that is the same category as the round-7 command string: `sh -c` refuses
+    it with "unexpected EOF", so there is no fixture there to miss. Over-
+    inclusion buys a *possible* fixture at the cost of noise; this is not one.
+    """
+    try:
+        shell_split = shlex.split(text)
+    except ValueError:
+        shell_split = text.split()
+    if not lone_element:
+        # An element of a list is read as part of that list, above.
+        return [shell_split]
+    return [shell_split, [text]]
+
+
+def _scripts_in_argv(elements: list[str]) -> list[str]:
+    """The ``-c`` scripts in one argv list.
+
+    ``-c`` is a short option: it may sit anywhere in a cluster, and it takes
+    the rest of its own element as the script, or the next element when its
+    own has nothing left. The first ``c`` wins, because at that point every
+    remaining character belongs to the script — which is exactly why a script
+    beginning with ``class`` is not a longer cluster.
+    """
+    found: list[str] = []
+    for index, element in enumerate(elements):
+        if element == _OPTION_TERMINATOR:
+            # Everything after it is an operand. Verified: `python -- -cSCRIPT`
+            # exits 2 looking for a file called `-cSCRIPT`, so there is no
+            # script here to give a deadline to.
+            break
+        if len(element) < 2 or not element.startswith("-"):
+            continue
+        if element.startswith(_OPTION_TERMINATOR):
+            continue
+        cluster = element[1:]
+        position = cluster.find("c")
+        if position < 0:
+            continue
+        attached = cluster[position + 1 :]
+        if attached:
+            found.append(attached)
+        elif index + 1 < len(elements):
+            found.append(elements[index + 1])
+    return found
+
+
+def _lifetimes_from(source: str) -> list[tuple[str, float]]:
+    """Lifetimes in one already-extracted script."""
+    tree = _parsed(source)
+    return [] if tree is None else _lifetimes_in_tree(tree)
+
+
+def _lifetimes_in_script(
+    source: str, *, lone_element: bool = True
+) -> list[tuple[str, float]]:
     """Durations a spawned script *executes*, not ones its text mentions.
 
     The string has to parse as Python and the call has to be a real ``Call``
@@ -419,7 +492,7 @@ def _lifetimes_in_script(source: str) -> list[tuple[str, float]]:
     documentation there too, and looking inside it would re-admit exactly the
     prose this excludes.
     """
-    for candidate in _candidate_sources(source):
+    for candidate in _candidate_sources(source, lone_element=lone_element):
         tree = _parsed(candidate)
         if tree is not None:
             return _lifetimes_in_tree(tree)
@@ -473,12 +546,29 @@ def _string_source(node: ast.AST) -> str | None:
     return "".join(parts)
 
 
-def _lifetimes_in_node(node: ast.AST, relative: str) -> list[DiscoveredLifetime]:
+def _lifetimes_in_node(
+    node: ast.AST, relative: str, argv_members: set[int]
+) -> list[DiscoveredLifetime]:
+    if isinstance(node, (ast.List, ast.Tuple)):
+        # The literal argv the reviewer's normalisation asks for: elements
+        # exactly as written, siblings and all.
+        elements = [
+            element.value
+            for element in node.elts
+            if isinstance(element, ast.Constant) and isinstance(element.value, str)
+        ]
+        return [
+            DiscoveredLifetime(relative, node.lineno, source, seconds)
+            for script in _scripts_in_argv(elements)
+            for source, seconds in _lifetimes_from(script)
+        ]
     source_text = _string_source(node)
     if source_text is not None:
         return [
             DiscoveredLifetime(relative, node.lineno, source, seconds)
-            for source, seconds in _lifetimes_in_script(source_text)
+            for source, seconds in _lifetimes_in_script(
+                source_text, lone_element=id(node) not in argv_members
+            )
         ]
     if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
         return []
@@ -725,6 +815,133 @@ class TestArgvElementsPythonAccepts:
         assert found == {PINNED_SECONDS}, (
             f"an accepted argv element hid its script: {element!r} -> {found}"
         )
+
+
+def _runs_the_script(argv: list[str]) -> bool:
+    """Whether this invocation actually EXECUTED the script.
+
+    Exit status alone is not enough: `python -c"..."` as a single element
+    exits 0 while merely evaluating a quoted string literal. A marker file is
+    the difference between "accepted" and "ran".
+    """
+    marker = Path(tempfile.mkdtemp()) / "ran"
+    probe = [
+        item.replace(_MARKER_SCRIPT, f"open({str(marker)!r}, 'w').close()")
+        for item in argv
+    ]
+    subprocess.run(probe, capture_output=True, timeout=60, check=False)
+    return marker.exists()
+
+
+_MARKER_SCRIPT = "<SCRIPT>"
+
+
+class TestTheStructuralRule:
+    """Argv in, scripts out — the shapes that beat five rounds of regex.
+
+    Each case is pinned the same way: the real interpreter is asked whether
+    the invocation runs, and the scan is asked whether it finds the lifetime.
+    Anything that runs must be found; anything that cannot run need not be.
+    """
+
+    @pytest.mark.parametrize("flag", ["-c", "-uc", "-Ic"])
+    def test_a_script_beginning_with_c_is_not_a_longer_cluster(
+        self, flag: str, tmp_path: Path
+    ) -> None:
+        """The greediness case: `class` starts with the flag letter."""
+        script = "class X: pass\nimport time; time.sleep(0.031)"
+
+        assert _runs_the_script([sys.executable, flag + _MARKER_SCRIPT])
+        (tmp_path / "f.py").write_text(
+            "import sys\nARGV = [sys.executable, %r]\n" % (flag + script),
+            encoding="utf-8",
+        )
+        assert {i.seconds for i in discover_fixture_lifetimes(tmp_path)} == {0.031}
+
+    def test_a_script_beginning_with_a_dash(self, tmp_path: Path) -> None:
+        """The script's own leading `-` is not another flag."""
+        script = "-1;import time;time.sleep(0.032)"
+
+        assert _runs_the_script([sys.executable, "-c" + _MARKER_SCRIPT])
+        (tmp_path / "f.py").write_text(
+            "import sys\nARGV = [sys.executable, %r]\n" % ("-c" + script),
+            encoding="utf-8",
+        )
+        assert {i.seconds for i in discover_fixture_lifetimes(tmp_path)} == {0.032}
+
+    def test_a_shell_quoted_whole_element(self, tmp_path: Path) -> None:
+        """`shlex.join` quotes the element; `shlex.split` gives it back."""
+        command = shlex.join([sys.executable, "-cimport time; time.sleep(0.033)"])
+
+        assert _runs_the_script(shlex.split(shlex.join([sys.executable, "-c" + _MARKER_SCRIPT])))
+        (tmp_path / "f.py").write_text(f"CMD = {command!r}\n", encoding="utf-8")
+        assert {i.seconds for i in discover_fixture_lifetimes(tmp_path)} == {0.033}
+
+    def test_the_flag_alone_takes_the_next_element(self, tmp_path: Path) -> None:
+        command = shlex.join([sys.executable, "-c", "import time; time.sleep(0.034)"])
+
+        (tmp_path / "f.py").write_text(f"CMD = {command!r}\n", encoding="utf-8")
+
+        assert {i.seconds for i in discover_fixture_lifetimes(tmp_path)} == {0.034}
+
+    def test_an_argv_element_bound_to_a_name(self, tmp_path: Path) -> None:
+        """The element is often not written inside the list.
+
+        ``FLAG_AND_SCRIPT = "-c..."`` then ``[sys.executable, FLAG_AND_SCRIPT]``
+        puts the element in its own constant, with no siblings to read it
+        against — so it is read as the whole argument it is.
+        """
+        script = "-cimport time; time.sleep(0.035)"
+        assert _runs_the_script([sys.executable, "-c" + _MARKER_SCRIPT])
+
+        (tmp_path / "f.py").write_text(
+            "import subprocess, sys\n"
+            f"FLAG_AND_SCRIPT = {script!r}\n"
+            "subprocess.run([sys.executable, FLAG_AND_SCRIPT], check=False)\n",
+            encoding="utf-8",
+        )
+
+        assert {i.seconds for i in discover_fixture_lifetimes(tmp_path)} == {0.035}
+
+    def test_after_the_terminator_a_flag_is_a_filename(self, tmp_path: Path) -> None:
+        """`--` ends the options, so nothing after it hands over a script.
+
+        Verified: `python -- -cSCRIPT` exits 2 looking for a file of that
+        name. Reporting it would not be over-inclusion — there is no fixture.
+        """
+        assert not _runs_the_script([sys.executable, "--", "-c" + _MARKER_SCRIPT])
+        (tmp_path / "f.py").write_text(
+            "import sys\nARGV = [sys.executable, '--', %r]\n"
+            % "-cimport time; time.sleep(7200)",
+            encoding="utf-8",
+        )
+
+        assert discover_fixture_lifetimes(tmp_path) == ()
+
+    def test_a_command_string_no_lexer_can_read(self, tmp_path: Path) -> None:
+        """Decision, with the reason: unparseable quoting is treated as prose.
+
+        `shlex.split` raises "No closing quotation", and `sh -c` refuses the
+        same string with "unexpected EOF". Nothing can say where the script
+        ends because nothing closes it, and nothing can run it either — the
+        round-7 category, where excluding costs no possible fixture. The
+        naive split still keeps such a string in reach for the separated
+        forms; only the multi-word unterminated script is out.
+        """
+        unterminated = "python -c 'import time; time.sleep(7200)"
+        with pytest.raises(ValueError, match="closing quotation"):
+            shlex.split(unterminated)
+        shell = subprocess.run(
+            ["/bin/sh", "-c", unterminated], capture_output=True, timeout=60,
+            check=False,
+        )
+        assert shell.returncode != 0, "a shell would run it after all"
+
+        (tmp_path / "f.py").write_text(
+            f"CMD = {unterminated!r}\n", encoding="utf-8"
+        )
+
+        assert discover_fixture_lifetimes(tmp_path) == ()
 
 
 def _argv_running_this_interpreter(spelling: str) -> list[str]:
