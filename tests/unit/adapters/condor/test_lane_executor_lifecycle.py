@@ -723,14 +723,58 @@ def test_a_second_interrupt_during_cleanup_wins(
         shutil.rmtree(directory, ignore_errors=True)
 
 
-def _exception_chain(error: BaseException) -> list[BaseException]:
-    """Every exception reachable from ``error`` by cause or context."""
-    chain: list[BaseException] = []
-    walker: BaseException | None = error
-    while walker is not None and not any(link is walker for link in chain):
-        chain.append(walker)
-        walker = walker.__cause__ or walker.__context__
-    return chain
+def _reachable_exceptions(error: BaseException) -> list[BaseException]:
+    """Every exception reachable from ``error`` by cause OR context.
+
+    Both branches, deliberately. ``__cause__ or __context__`` follows only
+    the explicit link when one exists, which would step straight past the
+    implicit context an explicitly chained exception still carries — and
+    round 6's shape has both.
+    """
+    found: list[BaseException] = []
+    pending: list[BaseException] = [error]
+    while pending:
+        node = pending.pop()
+        if any(seen is node for seen in found):
+            continue
+        found.append(node)
+        for link in (node.__cause__, node.__context__):
+            if link is not None:
+                pending.append(link)
+    return found
+
+
+def _assert_exception_chain_terminates(error: BaseException) -> None:
+    """Every cause/context path from ``error`` ends at ``None``.
+
+    The no-cycle contract, actually checked. A traversal that merely STOPS
+    on revisiting an exception cannot distinguish a cycle from a chain that
+    ended, so the previous helper accepted a hand-built
+    ending -> cleanup -> ending loop while every assertion in this file
+    still passed — a test that could not fail on the property it claimed.
+
+    Cycle detection is PATH-LOCAL: a node revisited on its own path is a
+    cycle, but the same exception reachable by two different paths is a
+    diamond, which is legitimate and is exactly what round 6 produces (the
+    ending is both the explicit ``__cause__`` of the second interrupt and
+    the implicit context of the cleanup failure). A global "seen" set would
+    reject that valid shape.
+    """
+
+    def walk(node: BaseException, path: tuple[BaseException, ...]) -> None:
+        for name in ("__cause__", "__context__"):
+            link: BaseException | None = getattr(node, name)
+            if link is None:
+                continue
+            if any(step is link for step in path):
+                raise AssertionError(
+                    "exception chain cycles: "
+                    f"{type(link).__name__}{link.args} is reachable from "
+                    f"itself via {type(node).__name__}.{name}"
+                )
+            walk(link, (*path, link))
+
+    walk(error, (error,))
 
 
 class _StderrThatFails:
@@ -811,7 +855,8 @@ def test_a_failure_while_RECORDING_does_not_become_the_ending(
     assert caught.value.__cause__ is None, (
         "the original ending is no longer directly readable as the ending"
     )
-    chain = _exception_chain(caught.value)
+    _assert_exception_chain_terminates(caught.value)
+    chain = _reachable_exceptions(caught.value)
     assert cleanup_failure in chain, (
         "the cleanup failure vanished: the report could not be written, so "
         "the exception chain was the only carrier left and it carried nothing"
@@ -864,11 +909,101 @@ def test_the_cleanup_failure_rides_the_chain_even_when_stderr_WORKS(
 
     assert caught.value is original
     assert caught.value.__cause__ is None
-    assert cleanup_failure in _exception_chain(caught.value)
+    _assert_exception_chain_terminates(caught.value)
+    assert cleanup_failure in _reachable_exceptions(caught.value)
     # ...and the stderr line still went out; the two are not exclusive.
     assert "cancellation cleanup gave up after" in capsys.readouterr().err
     for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
         shutil.rmtree(directory, ignore_errors=True)
+
+
+class TestTheChainAssertionCanActuallyFail:
+    """The helper that proves the no-cycle contract, proven itself.
+
+    Written after the previous walk turned out to be vacuous: it stopped on
+    revisiting an exception, so a deliberately built cycle satisfied every
+    chain assertion in this file. A helper that underwrites a contract has
+    to be shown failing on a violation of it.
+    """
+
+    def test_a_hand_built_cycle_is_detected(self) -> None:
+        """The exact shape round 8 rejected in favour of implicit chaining.
+
+        Assigning ``__context__`` by hand, where the cleanup failure's
+        context was already the ending, produces ending -> cleanup ->
+        ending. The old walk accepted it; this must not.
+        """
+        ending = KeyboardInterrupt("original ending")
+        cleanup = RuntimeError("condor_rm exploded")
+        ending.__context__ = cleanup
+        cleanup.__context__ = ending
+
+        with pytest.raises(AssertionError, match="cycles"):
+            _assert_exception_chain_terminates(ending)
+
+    def test_a_cycle_further_down_the_chain_is_detected(self) -> None:
+        """Not just a two-node loop, and not just at the root."""
+        ending = KeyboardInterrupt("original ending")
+        cleanup = RuntimeError("condor_rm exploded")
+        deeper = ValueError("stderr is gone")
+        ending.__context__ = cleanup
+        cleanup.__context__ = deeper
+        deeper.__context__ = cleanup
+
+        with pytest.raises(AssertionError, match="cycles"):
+            _assert_exception_chain_terminates(ending)
+
+    def test_a_cycle_reached_through_cause_is_detected(self) -> None:
+        """Both branches are walked, not just whichever one comes first."""
+        ending = KeyboardInterrupt("original ending")
+        cleanup = RuntimeError("condor_rm exploded")
+        ending.__cause__ = cleanup
+        cleanup.__cause__ = ending
+
+        with pytest.raises(AssertionError, match="cycles"):
+            _assert_exception_chain_terminates(ending)
+
+    def test_a_diamond_is_accepted(self) -> None:
+        """Round 6's real shape: one exception, two honest routes to it.
+
+        Path-local detection is what distinguishes this from a cycle. A
+        global seen-set would call it one and reject a chain the production
+        code legitimately builds.
+        """
+        ending = KeyboardInterrupt("original ending")
+        cleanup = RuntimeError("condor_rm exploded")
+        second = KeyboardInterrupt("second")
+        cleanup.__context__ = ending
+        second.__cause__ = ending
+        second.__context__ = cleanup
+
+        _assert_exception_chain_terminates(second)
+        assert ending in _reachable_exceptions(second)
+        assert cleanup in _reachable_exceptions(second)
+
+    def test_a_context_hidden_behind_a_cause_is_still_reached(self) -> None:
+        """``__cause__ or __context__`` would have stepped past this."""
+        ending = KeyboardInterrupt("original ending")
+        cleanup = RuntimeError("condor_rm exploded")
+        explicit = ValueError("explicit")
+        second = KeyboardInterrupt("second")
+        second.__cause__ = explicit
+        second.__context__ = cleanup
+        cleanup.__context__ = ending
+
+        reachable = _reachable_exceptions(second)
+        assert explicit in reachable
+        assert ending in reachable, (
+            "following only the explicit link hides the implicit one"
+        )
+
+    def test_an_ordinary_terminated_chain_passes(self) -> None:
+        ending = KeyboardInterrupt("original ending")
+        cleanup = RuntimeError("condor_rm exploded")
+        ending.__context__ = cleanup
+
+        _assert_exception_chain_terminates(ending)
+        assert _reachable_exceptions(ending) == [ending, cleanup]
 
 
 class _UnrenderableCleanupFailure(Exception):
@@ -934,6 +1069,11 @@ def test_an_interrupt_while_RECORDING_the_cleanup_is_chained_too(
         "raised in the recording handler cannot re-enter its sibling, so "
         "that stage needs its own guard"
     )
+    # This is the diamond: the ending is reachable both as the explicit
+    # __cause__ and through the cleanup failure's context. Legitimate, and
+    # it must not be mistaken for a cycle.
+    _assert_exception_chain_terminates(caught.value)
+    assert original in _reachable_exceptions(caught.value)
     for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
         shutil.rmtree(directory, ignore_errors=True)
 
