@@ -44,6 +44,25 @@ trade was made once already, by requiring a recognisable interpreter beside
 Tighten *shapes* (what counts as a docstring, what parses as code); do not
 tighten *reach* (which strings are examined at all) without moving the missed
 fixtures somewhere they are still caught.
+
+Two contexts, and they are not the same
+---------------------------------------
+
+A fixture spells its invocation one of two ways, and what counts as valid
+differs between them. Collapsing the two is how an accepted invocation got
+called impossible:
+
+* a **command string** -- ``f"{sys.executable} -c 'import time; ...'"`` -- is
+  split by a shell before Python sees it. A script attached with no quotes
+  cannot survive that split: ``python -cimport time; time.sleep(9)`` arrives
+  as ``-cimport`` plus stray words, and Python reports a SyntaxError.
+* an **argv element** -- ``[sys.executable, "-cimport time; time.sleep(9)"]``
+  -- is handed to the OS verbatim. Nothing splits it, so the attachment is
+  real and CPython runs it.
+
+The second was missed for exactly as long as the rejection was "proved" by
+running the first through ``shlex.split``. Both rules are pinned by tests that
+ask the real interpreter, in the shape the fixture would actually use.
 """
 
 from __future__ import annotations
@@ -268,12 +287,20 @@ _DOCSTRING_HOLDERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFuncti
 # TestSpellingsPythonAccepts runs every form below through the real
 # interpreter, so this grammar cannot drift from what Python does.
 #
-# Two forms are deliberately NOT matched, both because Python rejects them:
-# there is no long option (`--command` and `--c` are errors), and an attached
-# script with no quotes (`-cimport time; ...`) is split by the shell into
-# `-cimport` and stray words, which is a SyntaxError rather than an
-# invocation. Every script worth a deadline contains spaces, so it is quoted.
+# There is no long option: `--command` and `--c` are errors, so there is
+# nothing to widen toward.
+#
+# This pattern is the COMMAND-STRING rule (see the module docstring's two
+# contexts). Mid-string, after whitespace, the shell will split the text, so a
+# script attached without quotes cannot survive: `python -cimport time; ...`
+# reaches Python as `-cimport` plus stray words. The argv-element rule below
+# is where an attached script is real.
 _DASH_C_RE = re.compile(r"(?:^|\s)-[A-Za-z]*c(?:\s+|(?=[\"']))(.*)", re.DOTALL)
+# The ARGV-ELEMENT rule: the whole string is one element handed to the OS
+# verbatim, so nothing splits it and `-cimport time; time.sleep(9)` is an
+# invocation Python accepts. Anchored at the start of the string, because that
+# is what "this string IS the argument" looks like in the tree.
+_DASH_C_ATTACHED_RE = re.compile(r"^-[A-Za-z]*c(\S.*)", re.DOTALL)
 # The script when the command line continues past it: `-c 'script' marker`.
 _LEADING_QUOTED_RE = re.compile(r"^([\"'])(.*?)\1", re.DOTALL)
 
@@ -364,6 +391,9 @@ def _candidate_sources(text: str) -> list[str]:
     'time.sleep(7200)' burning a core"`` names no flag and is not a command.
     """
     candidates = [text, textwrap.dedent(text)]
+    attached = _DASH_C_ATTACHED_RE.match(text)
+    if attached is not None:
+        candidates.append(attached.group(1))
     for match in _DASH_C_RE.finditer(text):
         remainder = match.group(1)
         candidates.append(remainder.strip("\"' "))
@@ -608,16 +638,93 @@ ACCEPTED_SPELLINGS = (
     "python -c '{script}' /tmp/marker-after-the-script",
 )
 
-# Forms Python rejects, pinned so the grammar is not widened to chase them.
-REJECTED_SPELLINGS = (
+# Command strings Python rejects, pinned so the grammar is not widened to
+# chase them. The unquoted attachment is here only as a COMMAND STRING, where
+# the shell splits it apart; as a single argv element the same characters are
+# a valid invocation, which is what ACCEPTED_ARGV_ELEMENTS covers.
+REJECTED_COMMAND_STRINGS = (
     "python --command '{script}'",
     "python --c '{script}'",
     "python -c{script}",
 )
 
+# Spellings that arrive as ONE argv element, passed to the OS verbatim. The
+# shell never sees them, so a script attached to the flag with no quotes is a
+# real invocation here -- including as the last flag of a cluster.
+ACCEPTED_ARGV_ELEMENTS = (
+    "-c{script}",
+    "-uc{script}",
+    "-Ic{script}",
+)
+
 # Short, real, and instant: the interpreter check runs it for real.
 PINNED_SCRIPT = "import time; time.sleep(0.01)"
 PINNED_SECONDS = 0.01
+
+
+class TestArgvElementsPythonAccepts:
+    """The argv-element context: no shell, so the attachment is real.
+
+    Pinned twice like the command strings — the real interpreter runs it, and
+    the scan discovers it — because this is the class the scanner exists to
+    catch: an invocation that works, spelled a way the rule did not read.
+    """
+
+    @pytest.mark.parametrize("element", ACCEPTED_ARGV_ELEMENTS)
+    def test_the_interpreter_accepts_it(self, element: str) -> None:
+        argv = [sys.executable, element.format(script=PINNED_SCRIPT)]
+
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=60, check=False
+        )
+
+        assert completed.returncode == 0, (
+            f"{element!r} is not an invocation after all: "
+            f"{completed.stderr[-200:]}"
+        )
+
+    @pytest.mark.parametrize("element", ACCEPTED_ARGV_ELEMENTS)
+    def test_the_same_characters_in_a_command_string_are_not_a_fixture(
+        self, element: str, tmp_path: Path
+    ) -> None:
+        """The two contexts, pinned on the side that must stay quiet.
+
+        Mid-string the shell splits the text, so these characters cannot
+        invoke anything —
+        :meth:`TestSpellingsPythonAccepts.test_the_interpreter_rejects_these_command_strings`
+        proves that with the real interpreter. Reporting it anyway would not
+        be the accepted over-inclusion: over-inclusion buys a *possible*
+        fixture at the cost of noise, and there is no possible fixture here.
+
+        This is what the argv-element rule's anchor buys. Without it the rule
+        fires mid-string too and this file reads as a two-hour fixture.
+        """
+        command = f"python {element.format(script='import time; time.sleep(7200)')}"
+        (tmp_path / "note.py").write_text(
+            f"COMMAND = {command!r}\n", encoding="utf-8"
+        )
+
+        assert discover_fixture_lifetimes(tmp_path) == (), (
+            f"a command string that cannot spawn anything was reported: "
+            f"{command!r}"
+        )
+
+    @pytest.mark.parametrize("element", ACCEPTED_ARGV_ELEMENTS)
+    def test_the_scan_discovers_it(self, element: str, tmp_path: Path) -> None:
+        """Spelled as a fixture would spell it: an argv list, not a string."""
+        argument = element.format(script=PINNED_SCRIPT)
+        (tmp_path / "spawner.py").write_text(
+            f"import subprocess, sys\n"
+            f"ARGV = [sys.executable, {argument!r}]\n"
+            f"subprocess.run(ARGV, check=False)\n",
+            encoding="utf-8",
+        )
+
+        found = {item.seconds for item in discover_fixture_lifetimes(tmp_path)}
+
+        assert found == {PINNED_SECONDS}, (
+            f"an accepted argv element hid its script: {element!r} -> {found}"
+        )
 
 
 def _argv_running_this_interpreter(spelling: str) -> list[str]:
@@ -666,14 +773,21 @@ class TestSpellingsPythonAccepts:
             f"a real invocation hid behind its spelling: {spelling!r} -> {found}"
         )
 
-    @pytest.mark.parametrize("spelling", REJECTED_SPELLINGS)
-    def test_the_interpreter_rejects_the_forms_we_do_not_chase(
+    @pytest.mark.parametrize("spelling", REJECTED_COMMAND_STRINGS)
+    def test_the_interpreter_rejects_these_command_strings(
         self, spelling: str
     ) -> None:
-        """There is no long option, and an unquoted attached script is not one.
+        """Scoped to command strings, which is all this can prove.
 
-        If Python ever grows either, this fails and the grammar gets revisited
-        rather than silently missing it.
+        ``shlex.split`` models a shell, so this says what happens when the
+        text is split before Python sees it — and nothing at all about the
+        same characters arriving as one argv element. Reading it as the
+        stronger claim is what left the attached form undiscovered; that case
+        is now :meth:`TestArgvElementsPythonAccepts.test_the_interpreter_
+        accepts_it`, and it passes.
+
+        If Python ever grows a long option, this fails and the grammar gets
+        revisited rather than silently missing it.
         """
         argv = _argv_running_this_interpreter(spelling)
 
