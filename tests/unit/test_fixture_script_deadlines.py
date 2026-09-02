@@ -52,6 +52,7 @@ import ast
 import math
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -260,7 +261,21 @@ _DOCSTRING_HOLDERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFuncti
 # `-uc` and `-u -c` are all the same instruction, and enumerating the ways an
 # interpreter can be spelled is a losing game whose losses are silent. Any
 # short-option cluster ending in `c` counts.
-_DASH_C_RE = re.compile(r"(?:^|\s)-[A-Za-z]*c\s+(.*)", re.DOTALL)
+#
+# The script may be separated from the flag by whitespace or attached to it
+# with no space at all -- `-c'...'`, `-uc"..."` -- which is a real invocation
+# Python accepts and an earlier version of this silently missed.
+# TestSpellingsPythonAccepts runs every form below through the real
+# interpreter, so this grammar cannot drift from what Python does.
+#
+# Two forms are deliberately NOT matched, both because Python rejects them:
+# there is no long option (`--command` and `--c` are errors), and an attached
+# script with no quotes (`-cimport time; ...`) is split by the shell into
+# `-cimport` and stray words, which is a SyntaxError rather than an
+# invocation. Every script worth a deadline contains spaces, so it is quoted.
+_DASH_C_RE = re.compile(r"(?:^|\s)-[A-Za-z]*c(?:\s+|(?=[\"']))(.*)", re.DOTALL)
+# The script when the command line continues past it: `-c 'script' marker`.
+_LEADING_QUOTED_RE = re.compile(r"^([\"'])(.*?)\1", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -349,9 +364,15 @@ def _candidate_sources(text: str) -> list[str]:
     'time.sleep(7200)' burning a core"`` names no flag and is not a command.
     """
     candidates = [text, textwrap.dedent(text)]
-    candidates.extend(
-        match.group(1).strip("\"' ") for match in _DASH_C_RE.finditer(text)
-    )
+    for match in _DASH_C_RE.finditer(text):
+        remainder = match.group(1)
+        candidates.append(remainder.strip("\"' "))
+        # The remainder is everything to the end of the string, which overshoots
+        # when the command line carries arguments after the script. Taking the
+        # balanced quoted run recovers the script in that case.
+        quoted = _LEADING_QUOTED_RE.match(remainder)
+        if quoted is not None:
+            candidates.append(quoted.group(2))
     return candidates
 
 
@@ -565,6 +586,102 @@ def test_a_command_line_still_gives_up_its_script(tmp_path: Path) -> None:
     assert found == {11.0, 12.0, 22.0, 33.0, 44.0, 55.0, 66.0}, (
         f"an invocation spelling hid a spawned script: {found}"
     )
+
+
+# Every way of handing an interpreter a script that Python actually accepts.
+# Written as command-line text, the way a fixture spells it; ``shlex.split``
+# turns each into the argv a shell would produce, which is what makes the
+# acceptance check below a check on Python rather than on this list.
+ACCEPTED_SPELLINGS = (
+    "python -c '{script}'",
+    "python -c'{script}'",
+    'python -c"{script}"',
+    "python -uc '{script}'",
+    "python -uc'{script}'",
+    'python -Ic"{script}"',
+    "python -u -c '{script}'",
+    "python -X dev -c '{script}'",
+    "python -OO -c '{script}'",
+    "python3.14 -c '{script}'",
+    "/usr/bin/env python -c '{script}'",
+    "/repo/.venv/bin/python -c '{script}'",
+    "python -c '{script}' /tmp/marker-after-the-script",
+)
+
+# Forms Python rejects, pinned so the grammar is not widened to chase them.
+REJECTED_SPELLINGS = (
+    "python --command '{script}'",
+    "python --c '{script}'",
+    "python -c{script}",
+)
+
+# Short, real, and instant: the interpreter check runs it for real.
+PINNED_SCRIPT = "import time; time.sleep(0.01)"
+PINNED_SECONDS = 0.01
+
+
+def _argv_running_this_interpreter(spelling: str) -> list[str]:
+    """The argv a shell would build, pointed at the interpreter running us.
+
+    The interpreter token is the one substituted, which is argv[0] except for
+    ``env``, where the interpreter is its first argument. Replacing argv[0]
+    there would ask this Python to run a file called "python".
+    """
+    argv = shlex.split(spelling.format(script=PINNED_SCRIPT))
+    target = 1 if Path(argv[0]).name == "env" else 0
+    argv[target] = sys.executable
+    return argv
+
+
+class TestSpellingsPythonAccepts:
+    """Pin the flag grammar to the interpreter, not to my reading of it.
+
+    Each spelling is run by the real Python *and* fed to the scan. A spelling
+    the interpreter accepts must be discovered; the discovery rule cannot
+    quietly drift away from what actually spawns a process.
+    """
+
+    @pytest.mark.parametrize("spelling", ACCEPTED_SPELLINGS)
+    def test_the_interpreter_accepts_it(self, spelling: str) -> None:
+        argv = _argv_running_this_interpreter(spelling)
+
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=60, check=False
+        )
+
+        assert completed.returncode == 0, (
+            f"{spelling!r} is not an invocation after all: {completed.stderr[-200:]}"
+        )
+
+    @pytest.mark.parametrize("spelling", ACCEPTED_SPELLINGS)
+    def test_the_scan_discovers_it(self, spelling: str, tmp_path: Path) -> None:
+        command = spelling.format(script=PINNED_SCRIPT)
+        (tmp_path / "spawner.py").write_text(
+            f"COMMAND = {command!r}\n", encoding="utf-8"
+        )
+
+        found = {item.seconds for item in discover_fixture_lifetimes(tmp_path)}
+
+        assert found == {PINNED_SECONDS}, (
+            f"a real invocation hid behind its spelling: {spelling!r} -> {found}"
+        )
+
+    @pytest.mark.parametrize("spelling", REJECTED_SPELLINGS)
+    def test_the_interpreter_rejects_the_forms_we_do_not_chase(
+        self, spelling: str
+    ) -> None:
+        """There is no long option, and an unquoted attached script is not one.
+
+        If Python ever grows either, this fails and the grammar gets revisited
+        rather than silently missing it.
+        """
+        argv = _argv_running_this_interpreter(spelling)
+
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=60, check=False
+        )
+
+        assert completed.returncode != 0, f"{spelling!r} works and is not covered"
 
 
 def test_a_flagged_command_in_prose_is_accepted_noise(tmp_path: Path) -> None:
