@@ -281,10 +281,15 @@ _DOCSTRING_HOLDERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFuncti
 _OPTION_TERMINATOR = "--"
 # Where one command ends and the next begins. `--` scope is per command, so
 # these are what keep one command's terminator out of the next one's argv.
-_COMMAND_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "\n"})
+_NEWLINE_SEPARATOR = "\n"
+_COMMAND_SEPARATORS = frozenset({";", "&&", "||", "|", "&", _NEWLINE_SEPARATOR})
 # A shell invocation carries another command string in its own -c argument.
 # Recursion reads it without having to recognise which programs are shells.
+# The cap stops a pathological input from hanging the scan; reaching it is
+# reported rather than swallowed, because a command we declined to read is a
+# lifetime we cannot bound, and that is the same answer as an unbounded one.
 _MAX_COMMAND_DEPTH = 3
+_UNREADABLE_NESTING = f"nested commands deeper than {_MAX_COMMAND_DEPTH}"
 
 
 @dataclass(frozen=True)
@@ -372,7 +377,9 @@ def _dotted_name(node: ast.expr) -> str | None:
     return None
 
 
-def _candidate_sources(text: str, *, lone_element: bool = True) -> list[str]:
+def _candidate_sources(
+    text: str, *, lone_element: bool = True
+) -> tuple[list[str], bool]:
     """The ways a spawned script hides inside one string.
 
     Three shapes, all present in this tree:
@@ -391,16 +398,13 @@ def _candidate_sources(text: str, *, lone_element: bool = True) -> list[str]:
     Quotes alone are still not an argument boundary: ``"the run left
     'time.sleep(7200)' burning a core"`` names no flag and is not a command.
     """
-    return [
-        text,
-        textwrap.dedent(text),
-        *_scripts_in_command(text, lone_element=lone_element),
-    ]
+    scripts, truncated = _scripts_in_command(text, lone_element=lone_element)
+    return [text, textwrap.dedent(text), *scripts], truncated
 
 
 def _scripts_in_command(
     text: str, *, lone_element: bool = True, depth: int = 0
-) -> list[str]:
+) -> tuple[list[str], bool]:
     """Scripts this string would hand an interpreter with ``-c``.
 
     Structural, not lexical. Five rounds of review found five different
@@ -423,12 +427,28 @@ def _scripts_in_command(
     tokenize that finds no flags.
     """
     scripts: list[str] = []
+    truncated = False
     for elements in _argv_readings(text, lone_element=lone_element):
         for script in _scripts_in_argv(elements):
             scripts.append(script)
             if depth < _MAX_COMMAND_DEPTH:
-                scripts.extend(_scripts_in_command(script, depth=depth + 1))
-    return scripts
+                deeper, deeper_truncated = _scripts_in_command(
+                    script, depth=depth + 1
+                )
+                scripts.extend(deeper)
+                truncated = truncated or deeper_truncated
+            elif _holds_another_command(script):
+                truncated = True
+    return scripts, truncated
+
+
+def _holds_another_command(text: str) -> bool:
+    """Whether one more level of reading would find another command.
+
+    Asked only at the cap, and only one level deep, so declaring "there is
+    more here than I read" costs no further recursion.
+    """
+    return any(_scripts_in_argv(elements) for elements in _argv_readings(text))
 
 
 def _argv_readings(text: str, *, lone_element: bool = True) -> list[list[str]]:
@@ -454,11 +474,8 @@ def _argv_readings(text: str, *, lone_element: bool = True) -> list[list[str]]:
     it with "unexpected EOF", so there is no fixture there to miss. Over-
     inclusion buys a *possible* fixture at the cost of noise; this is not one.
     """
-    readings: list[list[str]] = []
-    for variant in dict.fromkeys((text, text.replace("\n", " ; "))):
-        tokens = _shell_tokens(variant)
-        if tokens is not None:
-            readings.extend(_command_segments(tokens))
+    tokens = _shell_tokens(text)
+    readings = [] if tokens is None else _command_segments(tokens)
     if not readings:
         readings.append(text.split())
     if not lone_element:
@@ -468,18 +485,40 @@ def _argv_readings(text: str, *, lone_element: bool = True) -> list[list[str]]:
 
 
 def _shell_tokens(text: str) -> list[str] | None:
-    """Shell tokens, with separators kept as tokens of their own.
+    """Shell tokens, with every separator kept as a token of its own.
 
     ``punctuation_chars`` is what makes ``;`` and ``&&`` visible even when
     nothing spaces them out, and the lexer stays quote-aware while doing it.
     ``None`` means the text is not lexable at all.
+
+    Newlines need the extra work here. The lexer treats one as whitespace, so
+    a top-level newline separating two commands would vanish and leave the
+    first command's ``--`` in scope for the second. Rewriting newlines in the
+    raw text was the earlier answer and it was wrong in the other direction:
+    it also rewrote the newlines *inside* a quoted multi-line script, turning
+    ``if True:`` into ``if True: ;``.
+
+    So the lexer is asked instead of the text. It counts lines as it consumes
+    them, and it knows which newlines are inside a token, so a newline it
+    consumed but the token does not contain is a real separator. It is charged
+    to the token it terminates, which is why the separator goes after.
     """
     lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
+    tokens: list[str] = []
     try:
-        return list(lexer)
+        while True:
+            line_before = lexer.lineno
+            token = lexer.get_token()
+            if token is None:
+                break
+            tokens.append(token)
+            consumed = lexer.lineno - line_before
+            if consumed - token.count("\n") > 0:
+                tokens.append(_NEWLINE_SEPARATOR)
     except ValueError:
         return None
+    return tokens
 
 
 def _command_segments(tokens: list[str]) -> list[list[str]]:
@@ -488,9 +527,8 @@ def _command_segments(tokens: list[str]) -> list[list[str]]:
     Only separators end a command. Grouping tokens need no handling of their
     own: ``(`` is an element that does not start with ``-``, so it is passed
     over exactly like a program name, and ``( python -c ... )`` stays one
-    command. A newline is a separator too, but the lexer treats it as
-    whitespace, which is why the caller also offers a reading with newlines
-    rewritten as ``;``.
+    command. Newline separators arrive as tokens from :func:`_shell_tokens`,
+    which is what keeps them distinct from the newlines inside a script.
     """
     segments: list[list[str]] = []
     current: list[str] = []
@@ -538,15 +576,20 @@ def _scripts_in_argv(elements: list[str]) -> list[str]:
     return found
 
 
-def _lifetimes_from(source: str) -> list[tuple[str, float]]:
-    """Lifetimes in one already-extracted script."""
-    tree = _parsed(source)
-    return [] if tree is None else _lifetimes_in_tree(tree)
+def _unreadable_nesting(relative: str, line: int) -> DiscoveredLifetime:
+    """A command the scan declined to read, reported as unbounded.
+
+    Not a silent cap: over-inclusion has to hold at the boundary too, or the
+    one place the scan gives up is the one place a lifetime can hide. An
+    infinite duration fails the budget with the reason in the source column,
+    and ``LIFETIME_ALLOWLIST`` is the way to say "read it, it is fine".
+    """
+    return DiscoveredLifetime(relative, line, _UNREADABLE_NESTING, math.inf)
 
 
 def _lifetimes_in_script(
     source: str, *, lone_element: bool = True
-) -> list[tuple[str, float]]:
+) -> tuple[list[tuple[str, float]], bool]:
     """Durations a spawned script *executes*, not ones its text mentions.
 
     The string has to parse as Python and the call has to be a real ``Call``
@@ -559,11 +602,12 @@ def _lifetimes_in_script(
     documentation there too, and looking inside it would re-admit exactly the
     prose this excludes.
     """
-    for candidate in _candidate_sources(source, lone_element=lone_element):
+    candidates, truncated = _candidate_sources(source, lone_element=lone_element)
+    for candidate in candidates:
         tree = _parsed(candidate)
         if tree is not None:
-            return _lifetimes_in_tree(tree)
-    return []
+            return _lifetimes_in_tree(tree), truncated
+    return [], truncated
 
 
 def _parsed(source: str) -> ast.Module | None:
@@ -617,26 +661,36 @@ def _lifetimes_in_node(
     node: ast.AST, relative: str, argv_members: set[int]
 ) -> list[DiscoveredLifetime]:
     if isinstance(node, (ast.List, ast.Tuple)):
-        # The literal argv the reviewer's normalisation asks for: elements
-        # exactly as written, siblings and all.
+        # The literal argv: elements exactly as written, siblings and all.
         elements = [
             element.value
             for element in node.elts
             if isinstance(element, ast.Constant) and isinstance(element.value, str)
         ]
-        return [
-            DiscoveredLifetime(relative, node.lineno, source, seconds)
-            for script in _scripts_in_argv(elements)
-            for source, seconds in _lifetimes_from(script)
-        ]
+        found: list[DiscoveredLifetime] = []
+        for script in _scripts_in_argv(elements):
+            # Read as a command in its own right, so a shell wrapper written
+            # as argv gets the same recursion a command string gets.
+            lifetimes, truncated = _lifetimes_in_script(script)
+            found.extend(
+                DiscoveredLifetime(relative, node.lineno, source, seconds)
+                for source, seconds in lifetimes
+            )
+            if truncated:
+                found.append(_unreadable_nesting(relative, node.lineno))
+        return found
     source_text = _string_source(node)
     if source_text is not None:
-        return [
+        lifetimes, truncated = _lifetimes_in_script(
+            source_text, lone_element=id(node) not in argv_members
+        )
+        found = [
             DiscoveredLifetime(relative, node.lineno, source, seconds)
-            for source, seconds in _lifetimes_in_script(
-                source_text, lone_element=id(node) not in argv_members
-            )
+            for source, seconds in lifetimes
         ]
+        if truncated:
+            found.append(_unreadable_nesting(relative, node.lineno))
+        return found
     if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
         return []
     value = node.value.value
@@ -1062,6 +1116,95 @@ class TestTheStructuralRule:
         assert {i.seconds for i in discover_fixture_lifetimes(tmp_path)} == {0.051}, (
             f"{shape}: a command a shell runs went undiscovered"
         )
+
+    def test_the_tokenizer_separates_only_top_level_newlines(self) -> None:
+        """The distinction, asserted where it is actually made.
+
+        End to end this is invisible — a spurious break only makes segments
+        finer, and a finer segment cannot split ``-c`` from the script that
+        follows it. So it is pinned on the tokenizer's own contract instead of
+        being left to a behaviour that does not discriminate.
+        """
+        separated = _shell_tokens("true\npython -c script")
+        assert separated is not None
+        assert _NEWLINE_SEPARATOR in separated
+
+        inside = _shell_tokens("python -c 'first\nsecond'")
+        assert inside is not None
+        assert _NEWLINE_SEPARATOR not in inside, (
+            "a newline inside a quoted script was read as a command separator"
+        )
+        assert inside[-1] == "first\nsecond", "the script lost its own newline"
+
+    def test_a_newline_inside_a_script_is_not_a_command_separator(
+        self, tmp_path: Path
+    ) -> None:
+        """Both newlines in one string, and they mean different things.
+
+        The top-level one ends a command, so the first command's ``--`` must
+        not reach the second. The ones inside the quoted script are the
+        script's own, and rewriting them (the earlier fix) turned ``if True:``
+        into ``if True: ;`` — a program the shell runs and the scan could not
+        read either way round.
+        """
+        script = "if True:\n    import time\n    time.sleep(0.091)\n"
+        marker = Path(tempfile.mkdtemp()) / "ran"
+        ran = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                ": --\n"
+                + shlex.join(
+                    [sys.executable, "-c", f"if True:\n    open({str(marker)!r}, 'w').close()\n"]
+                ),
+            ],
+            capture_output=True, timeout=60, check=False,
+        )
+        assert marker.exists(), f"the shell did not run it: {ran.stderr[-160:]!r}"
+
+        command = ": --\n" + shlex.join([sys.executable, "-c", script])
+        (tmp_path / "f.py").write_text(f"CMD = {command!r}\n", encoding="utf-8")
+
+        assert {i.seconds for i in discover_fixture_lifetimes(tmp_path)} == {0.091}
+
+    def test_nesting_past_the_cap_is_reported_not_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        """The scan stops reading somewhere; it must not go quiet there.
+
+        Four wrappers is past the cap. The command still runs, so a silent
+        empty result would be a lifetime with no ceiling hiding in the one
+        place the scan gave up. It is reported as unbounded instead, which the
+        budget rejects and the allowlist can excuse.
+        """
+        command = shlex.join([sys.executable, "-c", "import time; time.sleep(0.101)"])
+        for _ in range(4):
+            command = shlex.join(["/bin/sh", "-c", command])
+        assert subprocess.run(
+            ["/bin/sh", "-c", command], capture_output=True, timeout=60, check=False
+        ).returncode == 0, "the nesting under test does not run"
+
+        (tmp_path / "f.py").write_text(f"CMD = {command!r}\n", encoding="utf-8")
+
+        found = discover_fixture_lifetimes(tmp_path)
+        assert [item.source for item in found] == [_UNREADABLE_NESTING]
+        assert not math.isfinite(found[0].seconds), (
+            "a command the scan declined to read must not look bounded"
+        )
+
+    def test_a_shell_wrapper_written_as_argv_is_read_through(
+        self, tmp_path: Path
+    ) -> None:
+        """The argv-list path recurses too, not only the command-string path."""
+        inner = shlex.join([sys.executable, "-c", "import time; time.sleep(0.102)"])
+
+        (tmp_path / "f.py").write_text(
+            "import subprocess\nARGV = ['/bin/sh', '-c', %r]\n"
+            "subprocess.run(ARGV, check=False)\n" % inner,
+            encoding="utf-8",
+        )
+
+        assert {i.seconds for i in discover_fixture_lifetimes(tmp_path)} == {0.102}
 
     def test_after_the_terminator_a_flag_is_a_filename(self, tmp_path: Path) -> None:
         """`--` ends the options, so nothing after it hands over a script.
