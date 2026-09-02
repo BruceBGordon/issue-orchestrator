@@ -739,8 +739,16 @@ class _StderrThatFails:
 
 @pytest.mark.parametrize(
     "recording_failure",
-    [OSError("stderr is gone"), SystemExit(17)],
-    ids=["ordinary-failure", "system-exit"],
+    [
+        OSError("stderr is gone"),
+        SystemExit(17),
+        # The commonest real one, and the reason the catch here is broad
+        # rather than `except (OSError, SystemExit)`: writing to a CLOSED
+        # stream raises ValueError, which is not an OSError. A stream is
+        # caller code and may raise anything at all.
+        ValueError("I/O operation on closed file."),
+    ],
+    ids=["ordinary-failure", "system-exit", "closed-stream"],
 )
 def test_a_failure_while_RECORDING_does_not_become_the_ending(
     tmp_path: Path,

@@ -143,7 +143,12 @@ def _report_diagnostic(
         if chain_from is None:
             raise
         raise interrupt from chain_from
-    except BaseException:  # noqa: BLE001, S110
+    except BaseException:
+        # Deliberately everything else, and deliberately nothing done with
+        # it: this is the end of the reporting recursion described above.
+        # Narrowing to OSError would miss the commonest real case — writing
+        # to a closed stream raises ValueError, not OSError — and a stream
+        # object is caller code that can raise anything at all.
         pass
 
 
