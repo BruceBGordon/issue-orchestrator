@@ -76,6 +76,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from issue_orchestrator.infra.containment import (
+    describe_exception,
+    is_teardown_signal,
+    safe_type_name,
+)
+
 # Conventional shell exit code for "killed by a timeout". Synthesised for a
 # timed-out attempt so callers can print a returncode without pretending the
 # process exited on its own.
@@ -153,6 +159,41 @@ class _DeclaredPaths(Mapping[Path, bytes | None]):
 
     def __len__(self) -> int:
         return len(self._entries)
+
+
+def _annotate_check_failure(
+    error: BaseException, *, check: object, attempt: int, total: int
+) -> None:
+    """Attach context to a contained check failure, without trusting anything.
+
+    Every input is caller code. ``check`` may have a ``__repr__`` that raises,
+    ``error`` may have a ``__repr__`` that raises or returns megabytes, and
+    ``add_note`` is a method the exception object is free to override. This ran
+    uncontained and inside the collection loop, so any of the three aborted
+    evaluation and stopped a LATER check from reporting a real breach — the
+    exact masking the ranking above exists to prevent, recreated by the code
+    that annotates it.
+
+    The exception itself is the record and is raised in full either way; the
+    note is decoration, so losing it is acceptable where losing a breach is
+    not. Rendering goes through the repository's containment owner rather than
+    a second local implementation of the same idea: ``safe_type_name`` names
+    the check without calling its ``__repr__``, and ``describe_exception``
+    renders the failure through contained repr, then safe type name, then a
+    constant, capped in length.
+    """
+    try:
+        error.add_note(
+            f"raised by breach check {safe_type_name(check)} while evaluating "
+            f"attempt {attempt} of {total}: {describe_exception(error)}"
+        )
+    except BaseException as annotation_error:
+        # A teardown signal means the caller is going away and must still win.
+        # ``SystemExit`` is deliberately containable here: the owner documents
+        # that a best-effort side activity must never substitute its own exit
+        # status for the outcome of the work it observes.
+        if is_teardown_signal(annotation_error):
+            raise
 
 
 def _reject_zero_path_checks(checks: tuple["BreachCheck", ...]) -> None:
@@ -495,21 +536,27 @@ class ProbeRun:
                         {path: attempt.snapshot[path] for path in check.paths}
                     )
                     reason = check.violated_by(declared)
+                    if reason is not None:
+                        # Interpolating `reason` renders a value a check
+                        # returned, so it belongs inside the containment too:
+                        # a hostile __str__ here aborts the loop exactly as a
+                        # raising check does.
+                        breaches.append(
+                            f"SANDBOX BREACH on attempt {attempt.number} of "
+                            f"{len(self.attempts)}: {reason}"
+                        )
                 except Exception as exc:  # noqa: BLE001
                     # A broken check must not stop the others: the one after it
                     # may be the one holding a real breach. Collected, ranked
                     # below, and still raised when nothing outranks it.
-                    exc.add_note(
-                        f"raised by breach check {check!r} while evaluating "
-                        f"attempt {attempt.number} of {len(self.attempts)}"
+                    _annotate_check_failure(
+                        exc,
+                        check=check,
+                        attempt=attempt.number,
+                        total=len(self.attempts),
                     )
                     check_errors.append(exc)
                     continue
-                if reason is not None:
-                    breaches.append(
-                        f"SANDBOX BREACH on attempt {attempt.number} of "
-                        f"{len(self.attempts)}: {reason}"
-                    )
 
         # Priority, not order of discovery. A breach outranks every other way
         # this run can fail — including our own contract errors, which would

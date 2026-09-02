@@ -9,6 +9,7 @@ exercised here with no subprocess at all.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -900,3 +901,244 @@ def test_no_breach_checks_is_still_how_a_probe_says_it_has_no_surface(
     )
 
     probe.require_intact()
+
+
+class _UnannotatableError(Exception):
+    """An exception whose ``add_note`` raises.
+
+    ``add_note`` is a method the exception object is free to override, and the
+    exception object comes from a check — caller code. Annotating it inside the
+    collection loop meant this shape aborted evaluation.
+    """
+
+    def add_note(self, note: str) -> None:
+        raise RuntimeError("note annotation failed")
+
+
+class _HostileReprCheck:
+    """A check that raises, and whose ``__repr__`` raises while being blamed."""
+
+    def __init__(self, declared: Path) -> None:
+        self.declared = declared
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr exploded")
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        return (self.declared,)
+
+    def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+        raise ValueError("this check is broken")
+
+
+class _RaisesUnannotatable:
+    """A check that raises an exception which cannot be annotated."""
+
+    def __init__(self, declared: Path) -> None:
+        self.declared = declared
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        return (self.declared,)
+
+    def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+        raise _UnannotatableError("this check is broken")
+
+
+class _HostileReasonCheck:
+    """A check that reports a breach whose description cannot be rendered."""
+
+    def __init__(self, declared: Path) -> None:
+        self.declared = declared
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        return (self.declared,)
+
+    def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+        class _Unrenderable:
+            def __str__(self) -> str:
+                raise RuntimeError("str exploded")
+
+            __repr__ = __str__
+
+        return _Unrenderable()  # type: ignore[return-value]
+
+
+def _leaking_run(
+    leaked: Path, completed: Path
+) -> Callable[[], subprocess.CompletedProcess[str]]:
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        leaked.write_text("TOPSECRET", encoding="utf-8")
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    return run_attempt
+
+
+def test_a_failing_annotation_cannot_hide_a_breach(tmp_path: Path) -> None:
+    """The masking bug, recreated one level up by the code that annotates it.
+
+    The first check raises an exception whose ``add_note`` raises. Annotating
+    ran uncontained inside the collection loop, so that ``RuntimeError``
+    escaped, evaluation died, and the second check — holding a real breach —
+    was never invoked.
+    """
+    completed = tmp_path / "completed.txt"
+    leaked = tmp_path / "secret-read.txt"
+    real = _RecordingCheck(leaked, b"TOPSECRET", "the secret was read")
+
+    probe = run_until_evidence(
+        _leaking_run(leaked, completed),
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(_RaisesUnannotatable(completed), real),
+    )
+
+    with pytest.raises(ProbeBreach) as excinfo:
+        probe.require_intact()
+
+    assert "the secret was read" in str(excinfo.value)
+    assert real.ran, "the check after the unannotatable failure must still run"
+
+
+def test_a_raising_repr_cannot_hide_a_breach(tmp_path: Path) -> None:
+    """Naming the check must not call the check's own ``__repr__``.
+
+    ``safe_type_name`` gets the type's name without running caller code, so a
+    check that explodes while being blamed no longer takes the evaluation with
+    it.
+    """
+    completed = tmp_path / "completed.txt"
+    leaked = tmp_path / "secret-read.txt"
+    real = _RecordingCheck(leaked, b"TOPSECRET", "the secret was read")
+
+    probe = run_until_evidence(
+        _leaking_run(leaked, completed),
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(_HostileReprCheck(completed), real),
+    )
+
+    with pytest.raises(ProbeBreach) as excinfo:
+        probe.require_intact()
+
+    assert "the secret was read" in str(excinfo.value)
+    assert real.ran
+
+
+def test_an_unrenderable_breach_description_cannot_hide_a_later_breach(
+    tmp_path: Path,
+) -> None:
+    """Rendering a check's own reason is caller code too, so it is contained.
+
+    A check that reports a breach whose description cannot be stringified used
+    to abort the loop while interpolating it — outside the containment, because
+    only the call to the check was inside.
+    """
+    completed = tmp_path / "completed.txt"
+    leaked = tmp_path / "secret-read.txt"
+    real = _RecordingCheck(leaked, b"TOPSECRET", "the secret was read")
+
+    probe = run_until_evidence(
+        _leaking_run(leaked, completed),
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(_HostileReasonCheck(completed), real),
+    )
+
+    with pytest.raises(ProbeBreach) as excinfo:
+        probe.require_intact()
+
+    assert "the secret was read" in str(excinfo.value)
+    assert real.ran
+
+
+def test_a_broken_check_is_still_reported_when_its_note_could_not_be_written(
+    tmp_path: Path,
+) -> None:
+    """Losing the note is acceptable; losing the failure is not.
+
+    With no breach to outrank it, the unannotatable exception is still raised
+    in full — same object, same type — just without its context note.
+    """
+    completed = tmp_path / "completed.txt"
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(_RaisesUnannotatable(completed),),
+    )
+
+    with pytest.raises(_UnannotatableError):
+        probe.require_intact()
+
+
+def test_annotation_still_lets_a_teardown_signal_out(tmp_path: Path) -> None:
+    """Containment is for failures, never for "the caller is going away".
+
+    A ``KeyboardInterrupt`` raised while annotating must win, exactly as the
+    containment owner requires — the operator's Ctrl-C is not a contained
+    diagnostic failure.
+    """
+
+    class _InterruptingError(Exception):
+        def add_note(self, note: str) -> None:
+            raise KeyboardInterrupt
+
+    class _RaisesInterrupting:
+        def __init__(self, declared: Path) -> None:
+            self.declared = declared
+
+        @property
+        def paths(self) -> tuple[Path, ...]:
+            return (self.declared,)
+
+        def violated_by(self, snapshot) -> str | None:  # noqa: ANN001
+            raise _InterruptingError("broken")
+
+    completed = tmp_path / "completed.txt"
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(_RaisesInterrupting(completed),),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        probe.require_intact()
+
+
+def test_a_hostile_repr_does_not_cost_the_diagnostic_note(tmp_path: Path) -> None:
+    """Containing the explosion is not enough; the note must survive it.
+
+    Rendering the check as ``{check!r}`` and catching what that throws keeps
+    the loop alive but leaves the contained failure with NO context — the
+    annotation died before it was written. ``safe_type_name`` never runs the
+    check's ``__repr__``, so the note is still written and still says which
+    check broke.
+    """
+    completed = tmp_path / "completed.txt"
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_evidence(
+        run_attempt,
+        evidence=CreatedPaths((completed,)),
+        breach_checks=(_HostileReprCheck(completed),),
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        probe.require_intact()
+
+    notes = getattr(excinfo.value, "__notes__", [])
+    assert any("_HostileReprCheck" in note for note in notes), notes
+    assert any("attempt 1 of 1" in note for note in notes), notes
