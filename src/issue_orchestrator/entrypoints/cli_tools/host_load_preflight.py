@@ -209,6 +209,35 @@ def _abandon(stream: TextIO) -> None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
+def _release_output() -> None:
+    """Detach the report stream from interpreter shutdown.
+
+    The reactive repair in :func:`_abandon` can only fire on a failure it
+    sees. It cannot reach the last one: CPython flushes ``sys.stderr`` again
+    during finalisation, outside any handler, and exits **120** if that raises
+    -- and a stream whose first flush succeeded can still raise on its second.
+    Waiting for that failure is the wrong shape; by then there is nobody left
+    to catch it.
+
+    So this does not wait. The report has been written and nothing in this
+    process needs stderr again, so the name is rebound to something that
+    cannot fail and shutdown finds that instead. Rebinding rather than
+    ``dup2``-ing fd 2 keeps the change to this interpreter's own name: an
+    in-process caller's descriptors, and anything sharing them, are untouched.
+    """
+    stream = sys.stderr
+    if stream is None:
+        return
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    try:
+        stream.flush()
+    except (OSError, ValueError):
+        # Draining it here rather than leaving it for the finaliser keeps the
+        # "Exception ignored" noise off a gate log that is already reporting
+        # something worth reading.
+        _abandon(stream)
+
+
 def _descriptor_of(stream: TextIO) -> int | None:
     """The stream's descriptor, or ``None`` when it has no real one."""
     try:
@@ -246,12 +275,22 @@ def _redirect_to_devnull(descriptor: int) -> None:
 def main() -> None:
     """Report host load, then get out of the way.
 
-    Always exits 0. The only degradation this tolerates is a host that cannot
-    be sampled, and it says so on one line rather than falling silent. Every
-    way that can fail -- spawn, exit status, decode, parse, range, passwd
-    lookup -- arrives here as ``HostProbeError``, so the single typed handler
-    is the whole contract and no blanket ``except`` is needed to keep it.
+    Always exits 0, and the report stream is released before returning so that
+    stays true however the stream later misbehaves. The only degradation this
+    tolerates is a host that cannot be sampled, and it says so on one line
+    rather than falling silent. Every way that can fail -- spawn, exit status,
+    decode, parse, range, passwd lookup -- arrives here as ``HostProbeError``,
+    so the single typed handler is the whole contract and no blanket
+    ``except`` is needed to keep it.
     """
+    try:
+        _report()
+    finally:
+        _release_output()
+
+
+def _report() -> None:
+    """Write the report, or the one line saying why there isn't one."""
     if sys.platform != "darwin":
         emit(
             sys.stderr,

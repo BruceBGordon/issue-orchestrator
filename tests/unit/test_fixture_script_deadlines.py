@@ -214,16 +214,22 @@ _SCAN_HINTS = ("time.sleep(", "signal.alarm(", "LIFETIME_SECONDS", "MAX_SECONDS"
 #   * bare shell ``sleep N`` -- indistinguishable from a string *describing* a
 #     command. This very file's sibling asserts on "/bin/sleep 3600" as parser
 #     test data; scanning that shape would report it as an hour-long fixture.
-#   * ``time.sleep(<expression>)`` -- the two in this tree take their value from
-#     argv, and the constants that supply it are discovered by the rule above.
+#   * ``time.sleep(<expression>)`` -- a value computed at runtime is not a
+#     literal. Both in this tree take theirs from argv, and the constants that
+#     supply it are found by the constant rule above.
 
 # Docstrings are prose that happens to sit in a string constant. A module whose
 # only content is a docstring mentioning ``time.sleep(7200)`` is documentation,
 # not a two-hour fixture, and reporting it would teach people to silence this.
 _DOCSTRING_HOLDERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
 
-# A quoted run inside a command line: `python -c 'import time; time.sleep(30)'`.
-_QUOTED_RUN_RE = re.compile(r"""(['\"])(.*?)\1""", re.DOTALL)
+# An interpreter being handed a script: `python -c ...`, or the f-string that
+# builds one, where the interpreter is an expression rather than the word
+# "python" (`f"{sys.executable} -c ..."`). Reconstructing the f-string is what
+# makes that expression visible here — see _string_sources.
+_INTERPRETER_DASH_C_RE = re.compile(
+    r"(?:python[0-9.]*|executable)\b[^\n]*?\s-c(?:\s|$)", re.IGNORECASE
+)
 # The script argument of a ``python -c <script>`` command line.
 _DASH_C_RE = re.compile(r"-c\s+(.*)", re.DOTALL)
 
@@ -255,9 +261,9 @@ def discover_fixture_lifetimes(tree: Path) -> tuple[DiscoveredLifetime, ...]:
             continue
         relative = str(path.relative_to(tree))
         module = ast.parse(text, filename=str(path))
-        docstrings = _docstring_constants(module)
+        skip = _docstring_constants(module) | _fstring_fragments(module)
         for node in ast.walk(module):
-            if id(node) in docstrings:
+            if id(node) in skip:
                 continue
             found.extend(_lifetimes_in_node(node, relative))
     return tuple(found)
@@ -279,6 +285,15 @@ def _docstring_constants(module: ast.Module) -> set[int]:
     return ids
 
 
+def _fstring_fragments(module: ast.Module) -> set[int]:
+    """Constants that belong to an f-string, which is read as a whole."""
+    ids: set[int] = set()
+    for node in ast.walk(module):
+        if isinstance(node, ast.JoinedStr):
+            ids.update(id(part) for part in ast.walk(node) if part is not node)
+    return ids
+
+
 def _dotted_name(node: ast.expr) -> str | None:
     if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
         return f"{node.value.id}.{node.attr}"
@@ -286,27 +301,27 @@ def _dotted_name(node: ast.expr) -> str | None:
 
 
 def _candidate_sources(text: str) -> list[str]:
-    """The ways a spawned script hides inside one string constant.
+    """The ways a spawned script hides inside one string.
 
     Three shapes, all present in this tree:
 
     * the string is the script — ``"import time\\ntime.sleep(30)\\n"``;
     * the string is an indented block waiting for ``textwrap.dedent``;
-    * the string is a *command line* with the script quoted inside it, which is
-      what an f-string fragment like ``" -c 'import time; time.sleep(30)'"``
-      leaves behind once the placeholders are gone.
+    * the string is a *command line* running an interpreter with ``-c``, the
+      script quoted inside it: ``f"{sys.executable} -c 'import time; ...'"``.
 
-    Prose survives none of these: a sentence does not parse, dedenting a
-    sentence does not parse, and the quoted runs inside a sentence are words.
+    The third is the dangerous one, and it is gated rather than tried on
+    everything. Pulling quoted runs out of any string at all was the earlier
+    rule, and it meant a sentence like ``"the run left 'time.sleep(7200)'
+    burning a core"`` reported a two-hour fixture: the quotes in prose are
+    punctuation, not an argument boundary. So the quoted script is only read
+    out of a string that names an interpreter and passes it ``-c``.
     """
     candidates = [text, textwrap.dedent(text)]
-    candidates.extend(match.group(2) for match in _QUOTED_RUN_RE.finditer(text))
-    # ``-c`` takes the script as its argument, whatever quoting survived the
-    # f-string that built the command line. Cheaper and more reliable than
-    # trying to re-pair escaped quotes.
-    candidates.extend(
-        match.group(1).strip("\"' ") for match in _DASH_C_RE.finditer(text)
-    )
+    if _INTERPRETER_DASH_C_RE.search(text):
+        candidates.extend(
+            match.group(1).strip("\"' ") for match in _DASH_C_RE.finditer(text)
+        )
     return candidates
 
 
@@ -354,11 +369,35 @@ def _lifetimes_in_tree(tree: ast.Module) -> list[tuple[str, float]]:
     return found
 
 
+def _string_source(node: ast.AST) -> str | None:
+    """The text of a string node, f-strings reconstructed whole.
+
+    An f-string reaches ``ast.walk`` as fragments, and the fragment that
+    matters here is the one that lost the interpreter: ``f"{sys.executable} -c
+    '...'"`` leaves ``" -c '...'"``, which no longer looks like a command. So
+    the placeholders are put back as their own source text -- the reader only
+    needs to see that *something* names an interpreter, not what it evaluates
+    to.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if not isinstance(node, ast.JoinedStr):
+        return None
+    parts: list[str] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            parts.append(value.value)
+        elif isinstance(value, ast.FormattedValue):
+            parts.append(ast.unparse(value.value))
+    return "".join(parts)
+
+
 def _lifetimes_in_node(node: ast.AST, relative: str) -> list[DiscoveredLifetime]:
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+    source_text = _string_source(node)
+    if source_text is not None:
         return [
             DiscoveredLifetime(relative, node.lineno, source, seconds)
-            for source, seconds in _lifetimes_in_script(node.value)
+            for source, seconds in _lifetimes_in_script(source_text)
         ]
     if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
         return []
@@ -455,6 +494,41 @@ def test_documentation_is_not_a_fixture(tmp_path: Path) -> None:
     ], "documentation was mistaken for a fixture, or the real script was missed"
 
 
+def test_prose_that_quotes_a_call_is_not_a_fixture(tmp_path: Path) -> None:
+    """Quotes in a sentence are punctuation, not an argument boundary.
+
+    The earlier rule pulled every quoted run out of every string, so a note
+    *about* a leaked burner was reported as a two-hour fixture. The quoted
+    script is now only read out of a string that names an interpreter and
+    hands it ``-c``.
+    """
+    (tmp_path / "prose.py").write_text(
+        'NOTE = "the overnight run left \'time.sleep(7200)\' burning a core"\n'
+        'BANNER = \'we saw "signal.alarm(9000)" in the sweep output\'\n',
+        encoding="utf-8",
+    )
+
+    assert discover_fixture_lifetimes(tmp_path) == ()
+
+
+def test_a_command_line_still_gives_up_its_script(tmp_path: Path) -> None:
+    """The gate must not cost the fixtures the loose rule existed to find.
+
+    The interpreter is usually an f-string placeholder, so the reconstruction
+    is what makes the command shape visible at all.
+    """
+    (tmp_path / "spawner.py").write_text(
+        "import subprocess, sys\n"
+        'CMD = f"{sys.executable} -c \'import time; time.sleep(33)\'"\n'
+        'QUOTED = f\'{sys.executable} -c "import time; time.sleep(44)"\'\n',
+        encoding="utf-8",
+    )
+
+    found = {item.seconds for item in discover_fixture_lifetimes(tmp_path)}
+
+    assert found == {33.0, 44.0}, f"a spawned script went undiscovered: {found}"
+
+
 def test_the_scanner_recognises_every_shape_it_claims(tmp_path: Path) -> None:
     """Prove each pattern on synthetic source, including the decoys.
 
@@ -468,8 +542,10 @@ def test_the_scanner_recognises_every_shape_it_claims(tmp_path: Path) -> None:
         'ALARMED = "import signal\\nsignal.alarm(7)\\n"\n'
         # An indented block waiting for textwrap.dedent, and a command line
         # with the script quoted inside it: both real shapes in this tree.
+        # The interpreter is named the way the tree names it — the gate looks
+        # for that, so a placeholder called anything else is not a command.
         'INDENTED = \'\'\'\n    import time\n    time.sleep(64)\n\'\'\'\n'
-        'COMMAND = f"{EXE} -c \\"import time; time.sleep(81)\\""\n'
+        'COMMAND = f"{sys.executable} -c \\"import time; time.sleep(81)\\""\n'
         'def harness():\n'
         '    import time\n'
         '    time.sleep(0.25)\n',

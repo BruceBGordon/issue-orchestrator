@@ -57,6 +57,26 @@ def _wrapper(*, write_fails=False, flush_fails=False):
                 raise OSError(5, 'flush blew up')
 
     return io.TextIOWrapper(io.BufferedWriter(Raw()))
+
+
+# Healthy until the flush nobody in this module gets to see. fileno() is a real
+# descriptor, so a repair that only inspects the stream's shape sees nothing
+# wrong with it.
+class SecondFlushFails(io.TextIOWrapper):
+    def __init__(self):
+        super().__init__(io.BytesIO())
+        self._flushes = 0
+
+    def fileno(self):
+        return 2
+
+    def write(self, s):
+        return len(s)
+
+    def flush(self):
+        self._flushes += 1
+        if self._flushes >= 2:
+            raise OSError(5, 'shutdown flush blew up')
 """
 
 
@@ -279,6 +299,11 @@ class TestOutput:
                 id="raising-write",
             ),
             pytest.param(
+                "second-flush",
+                "import sys; sys.stderr = SecondFlushFails()",
+                id="second-flush",
+            ),
+            pytest.param(
                 "raising-final-flush",
                 "import sys; sys.stderr = _wrapper(flush_fails=True)",
                 id="raising-final-flush",
@@ -294,6 +319,12 @@ class TestOutput:
         cannot show what CPython does with a still-broken stream during
         interpreter shutdown, which is where the 120s come from — and it was a
         mock-stream test that let the ``closed-fd-2`` regression through.
+
+        ``second-flush`` is the one that reactive repair cannot pass: the
+        stream is healthy for every call this module makes and only fails on
+        the flush CPython performs after ``main`` has returned. Catching
+        failures is the wrong shape for it; releasing the stream is the right
+        one.
         """
         driver = _DRIVER_PREAMBLE + breakage + "\nh.main()\n"
 
