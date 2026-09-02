@@ -146,7 +146,9 @@ def test_submission_failure_retains_diagnostics_and_names_the_path(
 
     assert "submit refused" in str(caught.value)
     assert "diagnostics retained at" in str(caught.value)
-    retained = set(Path(tempfile.gettempdir()).glob("lane-lifecycle.submitfail*")) - before
+    retained = (
+        set(Path(tempfile.gettempdir()).glob("lane-lifecycle.submitfail*")) - before
+    )
     assert retained, "submission failure must retain the run directory"
     for directory in retained:
         assert (directory / "lane.sub").exists(), "the submit file is the diagnostic"
@@ -341,9 +343,7 @@ def test_a_cancelled_lane_also_collects_its_per_job_accounting(
     history = tmp_path / "per-job-history"
     history.mkdir()
     _unhurried_cancellation(monkeypatch)
-    tools = _cancellable_tools(
-        tmp_path, history=history, removal_writes_classad=True
-    )
+    tools = _cancellable_tools(tmp_path, history=history, removal_writes_classad=True)
     work_key = "lifecycle.cancelled"
     before = set(Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"))
     executor = CondorLaneExecutor(tools)
@@ -455,9 +455,7 @@ class _ToolThatRaises:
         return getattr(subprocess, name)
 
 
-def _interrupted_lane(
-    tools: CondorTools, tmp_path: Path, work_key: str
-) -> None:
+def _interrupted_lane(tools: CondorTools, tmp_path: Path, work_key: str) -> None:
     """Drive one lane whose poll loop is interrupted; never returns."""
     CondorLaneExecutor(tools).run(
         LaneCommand(
@@ -511,9 +509,7 @@ def test_a_second_interrupt_building_the_budget_still_chains(
     the same contract break round 3 fixed one statement later."""
     history = tmp_path / "per-job-history"
     history.mkdir()
-    tools = _cancellable_tools(
-        tmp_path, history=history, removal_writes_classad=False
-    )
+    tools = _cancellable_tools(tmp_path, history=history, removal_writes_classad=False)
     executor = CondorLaneExecutor(tools)
     first = KeyboardInterrupt("first")
     second = KeyboardInterrupt("second")
@@ -546,9 +542,7 @@ def test_a_system_exit_building_the_budget_is_contained_and_recorded(
     and must not vanish unrecorded."""
     history = tmp_path / "per-job-history"
     history.mkdir()
-    tools = _cancellable_tools(
-        tmp_path, history=history, removal_writes_classad=False
-    )
+    tools = _cancellable_tools(tmp_path, history=history, removal_writes_classad=False)
     executor = CondorLaneExecutor(tools)
     original = KeyboardInterrupt("the real ending")
     monkeypatch.setattr(
@@ -581,9 +575,7 @@ def test_the_cancellation_budget_also_bounds_the_removal(
     the removal draws from the same allowance as everything else."""
     history = tmp_path / "per-job-history"
     history.mkdir()
-    tools = _cancellable_tools(
-        tmp_path, history=history, removal_writes_classad=False
-    )
+    tools = _cancellable_tools(tmp_path, history=history, removal_writes_classad=False)
     tools.remove.write_text(f"#!/bin/sh\nexec sleep {_SLOW_LOOKUP_SECONDS:.0f}\n")
     tools.remove.chmod(0o755)
     work_key = "lifecycle.slowremoval"
@@ -623,9 +615,7 @@ def test_a_second_interrupt_during_the_removal_still_chains(
     __cause__, silently breaking the chaining contract round 2 added."""
     history = tmp_path / "per-job-history"
     history.mkdir()
-    tools = _cancellable_tools(
-        tmp_path, history=history, removal_writes_classad=False
-    )
+    tools = _cancellable_tools(tmp_path, history=history, removal_writes_classad=False)
     executor = CondorLaneExecutor(tools)
     first = KeyboardInterrupt("first")
     second = KeyboardInterrupt("second")
@@ -661,9 +651,7 @@ def test_a_system_exit_during_the_removal_is_contained_and_recorded(
     reports nothing is indistinguishable from a bug."""
     history = tmp_path / "per-job-history"
     history.mkdir()
-    tools = _cancellable_tools(
-        tmp_path, history=history, removal_writes_classad=False
-    )
+    tools = _cancellable_tools(tmp_path, history=history, removal_writes_classad=False)
     executor = CondorLaneExecutor(tools)
     original = KeyboardInterrupt("the real ending")
     monkeypatch.setattr(lane_executor_module, "time", _WaitsThatRaise(original))
@@ -708,15 +696,11 @@ def test_a_second_interrupt_during_cleanup_wins(
     _unhurried_cancellation(monkeypatch)
     # No ClassAd is ever written, so the collection reaches its own
     # file-wait - exactly where the second interrupt lands.
-    tools = _cancellable_tools(
-        tmp_path, history=history, removal_writes_classad=False
-    )
+    tools = _cancellable_tools(tmp_path, history=history, removal_writes_classad=False)
     work_key = "lifecycle.secondinterrupt"
     executor = CondorLaneExecutor(tools)
     second = KeyboardInterrupt("second")
-    monkeypatch.setattr(
-        lane_executor_module, "time", _WaitsThatRaise(original, second)
-    )
+    monkeypatch.setattr(lane_executor_module, "time", _WaitsThatRaise(original, second))
 
     with pytest.raises(KeyboardInterrupt) as caught:
         executor.run(
@@ -739,6 +723,73 @@ def test_a_second_interrupt_during_cleanup_wins(
         shutil.rmtree(directory, ignore_errors=True)
 
 
+class _UnrenderableCleanupFailure(Exception):
+    """An ordinary cleanup failure whose rendering raises a second interrupt.
+
+    Not contrived: ``describe_exception`` re-raises teardown signals instead of
+    eating them, so any exception whose ``__repr__`` touches an interrupted
+    resource can deliver one from inside the recording stage.
+    """
+
+    def __init__(self, interrupt: BaseException) -> None:
+        super().__init__("cleanup failed")
+        self._interrupt = interrupt
+
+    def __repr__(self) -> str:
+        raise self._interrupt
+
+
+@pytest.mark.parametrize(
+    "original",
+    [KeyboardInterrupt("first"), asyncio.CancelledError("cancelled")],
+    ids=["ctrl-c-then-ctrl-c", "cancellation-then-ctrl-c"],
+)
+def test_an_interrupt_while_RECORDING_the_cleanup_is_chained_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, original: BaseException
+) -> None:
+    """Round 6: the last stage chained like the three before it.
+
+    The cleanup fails ordinarily, so control reaches the handler that RECORDS
+    the failure — and rendering that failure raises the second interrupt. A
+    signal raised there cannot re-enter the sibling ``except TEARDOWN_SIGNALS``
+    above it, so it propagated with ``__cause__`` None: the interrupt still
+    won, but the record of why the lane was ending was gone from the chain,
+    which is exactly what round 3 fixed for the earlier stages.
+    """
+    history = tmp_path / "per-job-history"
+    history.mkdir()
+    _unhurried_cancellation(monkeypatch)
+    tools = _cancellable_tools(tmp_path, history=history, removal_writes_classad=False)
+    work_key = "lifecycle.recordinterrupt"
+    executor = CondorLaneExecutor(tools)
+    second = KeyboardInterrupt("second")
+    monkeypatch.setattr(
+        lane_executor_module,
+        "time",
+        _WaitsThatRaise(original, _UnrenderableCleanupFailure(second)),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        executor.run(
+            LaneCommand(
+                work_key=LaneWorkKey(work_key),
+                arguments=(sys.executable, "-c", "pass"),
+                working_directory=tmp_path,
+                deadline=LaneDeadline(300.0),
+            ),
+            LaneResources(request_cpus=1),
+        )
+
+    assert caught.value is second, "the interrupt raised while recording did not win"
+    assert caught.value.__cause__ is original, (
+        "the original ending vanished instead of being chained; a signal "
+        "raised in the recording handler cannot re-enter its sibling, so "
+        "that stage needs its own guard"
+    )
+    for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 def test_a_clean_lane_collects_nothing_and_keeps_nothing(tmp_path: Path) -> None:
     """The retention decision and the collection decision are one: a
     clean completion leaves no directory, so there is nothing to
@@ -747,7 +798,9 @@ def test_a_clean_lane_collects_nothing_and_keeps_nothing(tmp_path: Path) -> None
     history.mkdir()
     (history / f"history.{_JOB_ID}").write_text("ExitCode = 0\n")
     tools = _completing_tools(tmp_path, history_directory=str(history))
-    zero_exit = _TERMINATED_NONZERO_EVENT_LOG.replace("return value 3", "return value 0")
+    zero_exit = _TERMINATED_NONZERO_EVENT_LOG.replace(
+        "return value 3", "return value 0"
+    )
     submit = tools.submit
     submit.write_text(
         "#!/bin/sh\n"

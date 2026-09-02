@@ -168,9 +168,7 @@ class CondorLaneExecutor:
         except BaseException as unwinding:
             # Cancellation or supervisor death: the job must not outlive us.
             if job_id is not None and streams is not None:
-                self._wind_down_cancelled(
-                    job_id, streams, run_directory, unwinding
-                )
+                self._wind_down_cancelled(job_id, streams, run_directory, unwinding)
             raise
         finally:
             if retain_run_directory:
@@ -317,6 +315,13 @@ class CondorLaneExecutor:
         willing to wait for it, so it wins over the first — chained,
         never substituted in silence, so the original ending stays
         readable as ``__cause__`` even when both are interrupts.
+
+        "During cleanup" includes RECORDING the cleanup (round 6). That
+        stage renders a contained exception, rendering re-raises teardown
+        signals rather than eating them, and a signal raised inside one
+        handler cannot re-enter its sibling — so the recording carries
+        its own copy of the policy. Every stage of this method chains,
+        or none of them can be said to.
         """
         try:
             # Inside the boundary, not before it: NOTHING in this body
@@ -326,9 +331,7 @@ class CondorLaneExecutor:
             # exactly why it was easy to leave outside and exactly why
             # leaving it there was wrong — the guarantee is structural,
             # not a bet on which statements can throw.
-            budget = _CollectionBudget.lasting(
-                _CANCELLED_ACCOUNTING_WAIT_SECONDS
-            )
+            budget = _CollectionBudget.lasting(_CANCELLED_ACCOUNTING_WAIT_SECONDS)
             self._remove(job_id, budget.remaining_seconds())
             if not budget.exhausted():
                 streams.pump()
@@ -336,11 +339,24 @@ class CondorLaneExecutor:
         except TEARDOWN_SIGNALS as interrupt:
             raise interrupt from unwinding
         except BaseException as contained:
-            print(
-                "condor lane: cancellation cleanup gave up after "
-                f"{describe_exception(contained)}",
-                file=sys.stderr,
-            )
+            # Recording is a stage like the three above it, and carries the
+            # same policy. Two reasons it needs its OWN guard rather than
+            # relying on the one above: a signal raised in this handler
+            # cannot re-enter its sibling, and `describe_exception` re-raises
+            # teardown signals (infra/containment) rather than swallowing
+            # them, so rendering a hostile `__repr__` is a real place for a
+            # second interrupt to arrive. Without this, such an interrupt
+            # propagates with no `__cause__` — exactly the round-3 defect
+            # this method already fixed for the earlier stages, reappearing
+            # at the last one.
+            try:
+                print(
+                    "condor lane: cancellation cleanup gave up after "
+                    f"{describe_exception(contained)}",
+                    file=sys.stderr,
+                )
+            except TEARDOWN_SIGNALS as interrupt:
+                raise interrupt from unwinding
 
     def _collect_job_accounting(
         self,
@@ -425,9 +441,7 @@ class CondorLaneExecutor:
                 file=sys.stderr,
             )
 
-    def _per_job_history_directory(
-        self, budget: _CollectionBudget
-    ) -> Path | None:
+    def _per_job_history_directory(self, budget: _CollectionBudget) -> Path | None:
         """Where this pool drops each job's final ClassAd, or None.
 
         Read from the pool's own effective configuration rather than
@@ -477,9 +491,7 @@ class CondorLaneExecutor:
             )
         first_token = completed.stdout.split()
         if not first_token:
-            raise LaneExecutorError(
-                "lane job submission returned no job identifier"
-            )
+            raise LaneExecutorError("lane job submission returned no job identifier")
         return first_token[0]
 
     def _remove(self, job_id: str, timeout_seconds: float) -> None:
