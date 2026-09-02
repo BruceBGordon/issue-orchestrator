@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.domain.lane_cpu_request import LaneCpuRequest
 from issue_orchestrator.domain.lane_execution import LaneWorkKey
 from issue_orchestrator.execution.lane_backends import (
     BackendSource,
@@ -131,6 +132,11 @@ def _entry(
             observed_runtime_seconds=runtime,
             exit_code=exit_code,
             machine_state=_MACHINE_STATE,
+            # The snapshot summarizes runtimes and dispatch order, not
+            # the sizing decision, so these carry the shape a real
+            # record has rather than anything this file asserts on.
+            cpu_request=LaneCpuRequest.resolve(4, None),
+            observed_busy_cores=None,
         ),
     )
 

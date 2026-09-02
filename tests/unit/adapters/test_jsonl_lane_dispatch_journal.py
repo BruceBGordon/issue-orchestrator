@@ -193,6 +193,12 @@ def test_written_records_read_back_with_their_observation_facts(
     # part of what the lane reported, so it lives on the entry.
     assert first.worktree == Path.cwd().name
     assert first.recorded_at.tzinfo is not None
+    # Both widenings survive the round trip, and neither substitutes
+    # for the other: the contention the lane MET and the capacity it
+    # ASKED FOR are separate answers about the same run.
+    assert first.record.machine_state == _MACHINE_STATE
+    assert first.record.cpu_request == LaneCpuRequest.resolve(8, 6.2)
+    assert first.record.observed_busy_cores == 7.5
 
 
 def test_absent_journal_is_an_empty_history_not_an_error(tmp_path: Path) -> None:
@@ -438,7 +444,7 @@ def test_rows_written_before_the_envelope_are_skipped_and_counted(
     history = journal.read_recent(10)
 
     assert len(history.entries) == 1, "the readable row must survive"
-    assert history.predating_envelope == 2
+    assert history.predating_schema == 2
     assert history.entries[0].record.machine_state == _MACHINE_STATE
 
 
@@ -480,4 +486,153 @@ def test_a_window_of_only_legacy_rows_is_empty_not_broken(tmp_path: Path) -> Non
     history = journal.read_recent(10)
 
     assert history.entries == ()
-    assert history.predating_envelope == 3
+    assert history.predating_schema == 3
+
+
+def _rewrite(path: Path, *rows: dict[str, object]) -> None:
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+
+def _stored_row(journal: JsonlLaneDispatchJournal, path: Path) -> dict[str, object]:
+    journal.record(_record())
+    return json.loads(path.read_text().splitlines()[0])
+
+
+_CPU_COLUMNS = (
+    "declared_cpus",
+    "request_cpus",
+    "learned_busy_cores",
+    "observed_busy_cores",
+    "cpu_request_capped",
+)
+
+
+def test_rows_written_before_the_cpu_request_are_older_not_corrupt(
+    tmp_path: Path,
+) -> None:
+    """The SECOND instance of the rule #7138 established for the
+    machine-state envelope, and the reason that rule is not named after
+    its first instance.
+
+    A row written between #7135 and #7136 carries a perfectly good
+    envelope and no cpu columns. It was valid when written, and the
+    journal is shared by every worktree on the machine, so a worktree on
+    older code is appending such rows right now. Reading it as garbage
+    would fail the whole snapshot over history that is merely old."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    pre_cpu = {k: v for k, v in modern.items() if k not in _CPU_COLUMNS}
+    assert "machine_state" in pre_cpu, "this row must still carry the envelope"
+    _rewrite(path, pre_cpu, modern, pre_cpu)
+
+    history = journal.read_recent(10)
+
+    assert len(history.entries) == 1, "the readable row must survive"
+    assert history.predating_schema == 2
+    assert history.entries[0].record.cpu_request.declared_cpus == 8
+
+
+def test_a_row_predating_both_epochs_is_counted_once(tmp_path: Path) -> None:
+    """One count across every epoch: the operator asked how much of the
+    window was too old to read, and a row missing two dimensions is
+    still one row."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    ancient = {
+        k: v
+        for k, v in modern.items()
+        if k not in _CPU_COLUMNS and k != "machine_state"
+    }
+    _rewrite(path, ancient)
+
+    history = journal.read_recent(10)
+
+    assert history.entries == ()
+    assert history.predating_schema == 1
+
+
+def test_a_half_written_cpu_request_is_corruption(tmp_path: Path) -> None:
+    """Absent is an epoch; half-present is a writer bug. Guessing the
+    missing half would put a scheduling fact into the record that no
+    lane ever declared."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    half = {k: v for k, v in modern.items() if k != "request_cpus"}
+    _rewrite(path, half)
+
+    with pytest.raises(LaneDispatchJournalError, match="must\n?\\s*both be integers"):
+        journal.read_recent(10)
+
+
+def test_a_request_above_its_declaration_is_corruption(tmp_path: Path) -> None:
+    """The seed-and-ceiling invariant is enforced on the way IN too: a
+    hand-edited row asking for more than it declared is a decision no
+    policy could have produced, and must not read back as one."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    modern["request_cpus"] = 99
+    _rewrite(path, modern)
+
+    with pytest.raises(LaneDispatchJournalError, match="never exceed"):
+        journal.read_recent(10)
+
+
+def test_an_unmeasured_run_reads_back_as_unmeasured_never_zero(
+    tmp_path: Path,
+) -> None:
+    """Null is a recorded fact — the run was not measured — and must
+    stay distinguishable from a measured 0.0 through the round trip, or
+    a reader aggregating the column treats the lane as free."""
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    journal.record(
+        _record(
+            cpu_request=LaneCpuRequest.resolve(4, None),
+            observed_busy_cores=None,
+        )
+    )
+    (entry,) = journal.read_recent(10).entries
+    assert entry.record.observed_busy_cores is None
+    assert entry.record.cpu_request.learned_busy_cores is None
+    assert entry.record.cpu_request.request_cpus == 4
+
+
+def test_a_measured_zero_survives_as_a_measurement(tmp_path: Path) -> None:
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    journal.record(_record(observed_busy_cores=0.0))
+    (entry,) = journal.read_recent(10).entries
+    assert entry.record.observed_busy_cores == 0.0
+
+
+def test_the_derived_capped_column_is_not_read_back(tmp_path: Path) -> None:
+    """`cpu_request_capped` is a jq convenience derived from the other
+    three, so the record recomputes it rather than trusting the file: a
+    row whose stored flag disagrees with its own numbers must not be
+    able to assert the disagreement into the object."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    assert modern["cpu_request_capped"] is False
+    modern["cpu_request_capped"] = True
+    _rewrite(path, modern)
+
+    (entry,) = journal.read_recent(10).entries
+    assert entry.record.cpu_request.is_capped is False
+
+
+def test_integer_busy_cores_are_the_same_fact_as_floats(tmp_path: Path) -> None:
+    """JSON renders 2.0 as 2, so a whole-number reading must not read
+    back as corruption."""
+    path = tmp_path / "lane-dispatch.jsonl"
+    journal = JsonlLaneDispatchJournal(tmp_path)
+    modern = _stored_row(journal, path)
+    modern["observed_busy_cores"] = 2
+    modern["learned_busy_cores"] = 6
+    _rewrite(path, modern)
+
+    (entry,) = journal.read_recent(10).entries
+    assert entry.record.observed_busy_cores == 2.0
+    assert entry.record.cpu_request.learned_busy_cores == 6.0

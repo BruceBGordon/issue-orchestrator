@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
+from ..domain.lane_cpu_request import LaneCpuRequest
 from ..domain.lane_execution import LaneWorkKey
 from ..infra.machine_state import (
     MachineStateEnvelopeError,
@@ -35,6 +36,27 @@ from ..ports.lane_dispatch_journal import (
 
 _RECORDED_AT_FIELD = "recorded_at"
 _WORKTREE_FIELD = "worktree"
+_DECLARED_CPUS_FIELD = "declared_cpus"
+_REQUEST_CPUS_FIELD = "request_cpus"
+_LEARNED_BUSY_CORES_FIELD = "learned_busy_cores"
+_OBSERVED_BUSY_CORES_FIELD = "observed_busy_cores"
+
+
+class _RowPredatesSchema(Exception):
+    """One row is older than a dimension the record now requires.
+
+    Not corruption and not a fault — it was valid when it was written,
+    and the journal is shared by every worktree on the machine, so a
+    worktree on older code is appending such rows right now.
+
+    Deliberately ONE signal for every schema epoch. The machine-state
+    envelope (#7135) was the first, the cpu request (#7136) the second,
+    and each arrives the same way: valid JSON, missing a column that
+    :class:`LaneDispatchRecord` cannot do without. Giving each epoch its
+    own signal and its own counter would repeat this mechanism through
+    the port, the snapshot and the CLI for every dimension ever added,
+    to tell the operator something they cannot act on differently.
+    """
 
 
 class JsonlLaneDispatchJournal:
@@ -118,16 +140,17 @@ class JsonlLaneDispatchJournal:
         for number, line in numbered[-limit:]:
             try:
                 entries.append(self._parse(number, line))
-            except MachineStateEnvelopeMissing:
-                # Written before the envelope existed, or by a worktree
-                # still running code that predates it. Valid when
-                # written, so not corruption — but unrepresentable, so
-                # counted and reported rather than dropped silently.
+            except _RowPredatesSchema:
+                # Written before some dimension the record now requires,
+                # or by a worktree still running code that predates it.
+                # Valid when written, so not corruption — but
+                # unrepresentable, so counted and reported rather than
+                # dropped silently.
                 predating += 1
         return LaneDispatchHistory(
             location=str(self._path),
             entries=tuple(entries),
-            predating_envelope=predating,
+            predating_schema=predating,
         )
 
     def _parse(self, line_number: int, line: str) -> LaneDispatchEntry:
@@ -167,13 +190,25 @@ class JsonlLaneDispatchJournal:
                 # a runtime without it is exactly the ambiguity the
                 # envelope exists to end (#7127).
                 machine_state=machine_state_from_fields(fields),
+                # The capacity the lane asked for, restored — not
+                # re-decided. Rebuilding it through LaneCpuRequest.resolve
+                # would run TODAY's seed-and-ceiling policy over an OLD
+                # row and could yield a request the lane never submitted;
+                # what was recorded is what is returned. The stored
+                # `cpu_request_capped` column is deliberately not read
+                # back: it is derived from these three, so reading it
+                # would let a hand-edited file disagree with itself.
+                cpu_request=self._parse_cpu_request(line_number, fields),
+                observed_busy_cores=self._parse_optional_cores(
+                    line_number, _OBSERVED_BUSY_CORES_FIELD, fields
+                ),
             )
-        except MachineStateEnvelopeMissing:
-            # Not corruption — an older-schema row. Propagate the
-            # narrower signal so the caller can count it; catching the
-            # base class here would swallow the distinction and report
-            # every pre-envelope row as garbage.
-            raise
+        except MachineStateEnvelopeMissing as missing:
+            # Older-schema row, not corruption. Translated into the one
+            # signal every epoch shares so the caller counts them
+            # together; catching the base class here would instead
+            # report every pre-envelope row as garbage.
+            raise _RowPredatesSchema(str(missing)) from missing
         except MachineStateEnvelopeError as error:
             raise self._corrupt(line_number, str(error)) from error
         except ValueError as error:
@@ -207,6 +242,67 @@ class JsonlLaneDispatchJournal:
         if type(value) is float:
             return value
         raise self._corrupt(line_number, f"{field!r} is not a number")
+
+    def _parse_cpu_request(
+        self, line_number: int, fields: dict[str, object]
+    ) -> LaneCpuRequest:
+        """Restore the sizing decision this row recorded.
+
+        Absence of the columns is an epoch, not corruption: rows written
+        before #7136 have none. There is no honest value to invent for
+        them either — a fabricated ``declared_cpus`` would put a
+        scheduling fact into the record that no lane ever declared — so
+        the row is skipped and counted, exactly as a pre-envelope row is.
+        A row carrying SOME of the columns is a different thing: that is
+        a writer bug, and it is corrupt.
+        """
+        declared = fields.get(_DECLARED_CPUS_FIELD)
+        request = fields.get(_REQUEST_CPUS_FIELD)
+        learned_present = _LEARNED_BUSY_CORES_FIELD in fields
+        if declared is None and request is None and not learned_present:
+            raise _RowPredatesSchema(
+                f"row has no {_DECLARED_CPUS_FIELD!r}/{_REQUEST_CPUS_FIELD!r}: "
+                "written before the cpu request was recorded (#7136)"
+            )
+        if type(declared) is not int or type(request) is not int:
+            raise self._corrupt(
+                line_number,
+                f"{_DECLARED_CPUS_FIELD!r} and {_REQUEST_CPUS_FIELD!r} must "
+                "both be integers",
+            )
+        try:
+            # LaneCpuRequest owns every invariant, the seed-and-ceiling
+            # one included: a hand-edited row asking for more than it
+            # declared is corrupt, and is refused here rather than
+            # returned as a decision no policy could have produced.
+            return LaneCpuRequest(
+                declared_cpus=declared,
+                learned_busy_cores=self._parse_optional_cores(
+                    line_number, _LEARNED_BUSY_CORES_FIELD, fields
+                ),
+                request_cpus=request,
+            )
+        except ValueError as error:
+            raise self._corrupt(line_number, str(error)) from error
+
+    def _parse_optional_cores(
+        self, line_number: int, field: str, fields: dict[str, object]
+    ) -> float | None:
+        """A busy-cores column, where null is a recorded fact.
+
+        ``None`` means the run was not measured — a real observation,
+        distinct from a measured zero — so it round-trips as null rather
+        than being coerced into a number.
+        """
+        value = fields.get(field)
+        if value is None:
+            return None
+        # JSON renders 2.0 as 2, so an integer reading is the same fact.
+        if type(value) is int:
+            return float(value)
+        if type(value) is float:
+            return value
+        raise self._corrupt(line_number, f"{field!r} is not a number or null")
 
     def _corrupt(self, line_number: int, detail: str) -> LaneDispatchJournalError:
         return LaneDispatchJournalError(

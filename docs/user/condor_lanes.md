@@ -616,10 +616,14 @@ The mental model, top to bottom:
 - **IDLE** is how idle the host was when that runtime was measured, from
   the `machine_state` envelope above — a duration read without its
   contention is the ambiguity that envelope exists to end. Rows written
-  before the envelope existed (and rows a worktree on older code is
-  still appending to the shared journal) cannot be read back, so they
-  are skipped and the count is printed beside the scan total: the
-  history is thinner than the window, and saying so is the point.
+  before a column the record now requires (the envelope, or the cpu
+  request beside it) cannot be read back — and a worktree on older code
+  is still appending such rows to the shared journal — so they are
+  skipped and the count is printed beside the scan total: the history
+  is thinner than the window, and saying so is the point. The count is
+  deliberately one number across every such schema epoch rather than
+  one per epoch: those rows are gone either way, newer ones accrue, and
+  the remedy does not differ by which column was missing.
 - **FAULTS**, when present, means an input is broken rather than empty.
 
 Nothing is ever silently omitted. A machine with no pool prints

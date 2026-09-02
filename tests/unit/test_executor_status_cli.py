@@ -94,7 +94,7 @@ def _snapshot(
     journal_location: str = "/repo/.git/issue-orchestrator/lane-dispatch.jsonl",
     declarations: DeclarationsState | None = None,
     records_scanned: int | None = None,
-    records_predating_envelope: int = 0,
+    records_predating_schema: int = 0,
     backend=None,
 ) -> ExecutorStatusSnapshot:
     return ExecutorStatusSnapshot(
@@ -107,7 +107,7 @@ def _snapshot(
         journal_location=journal_location,
         lanes=lanes,
         records_scanned=len(lanes) if records_scanned is None else records_scanned,
-        records_predating_envelope=records_predating_envelope,
+        records_predating_schema=records_predating_schema,
         faults=faults,
     )
 
@@ -677,17 +677,24 @@ def test_contention_never_reorders_the_lanes() -> None:
 
 def test_history_thinned_by_older_rows_says_so() -> None:
     """Counting skipped rows into the scan total without saying they were
-    skipped would overstate the sample behind every runtime shown."""
+    skipped would overstate the sample behind every runtime shown.
+
+    Phrased by EFFECT — older than the current record schema — rather
+    than by which column is missing. There are now two epochs (#7135's
+    machine-state envelope, #7136's cpu request) and the operator's
+    remedy is identical for both: those rows are gone, newer ones
+    accrue. A message naming one epoch would be a falsehood about rows
+    skipped for the other, and would go stale at every widening."""
     rendered = render_executor_status(
         _snapshot(
             lanes=(_row("test-unit", history=_summary("test-unit")),),
             records_scanned=400,
-            records_predating_envelope=360,
+            records_predating_schema=360,
         )
     )
 
     assert "400 record(s) scanned" in rendered
-    assert "360 skipped as older than the machine-state envelope" in rendered
+    assert "360 skipped as older than the current record schema" in rendered
 
 
 def test_a_journal_with_nothing_older_says_nothing_extra() -> None:

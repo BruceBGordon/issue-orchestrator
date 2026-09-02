@@ -331,14 +331,17 @@ def _render_history(snapshot: ExecutorStatusSnapshot) -> list[str]:
     else:
         raise AssertionError("declarations state is a closed union")
     scanned = f"{snapshot.records_scanned} record(s) scanned"
-    if snapshot.records_predating_envelope:
+    if snapshot.records_predating_schema:
         # Say how thin the history really is. These rows are readable
-        # JSON that simply predates the machine-state envelope, so
+        # JSON that simply predates a column the record now requires, so
         # counting them silently would overstate the sample behind
-        # every runtime below.
+        # every runtime below. Phrased by EFFECT rather than by which
+        # column is missing: the operator's remedy is the same for every
+        # epoch — those rows are gone, newer ones accrue — and naming a
+        # specific one would go stale at the next widening.
         scanned += (
-            f", {snapshot.records_predating_envelope} skipped as older "
-            "than the machine-state envelope"
+            f", {snapshot.records_predating_schema} skipped as older than "
+            "the current record schema"
         )
     header = (
         f"{where}\n  dispatch journal: {snapshot.journal_location} ({scanned})"

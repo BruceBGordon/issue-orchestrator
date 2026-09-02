@@ -153,22 +153,30 @@ class LaneDispatchHistory:
 
     location: str
     entries: tuple[LaneDispatchEntry, ...]
-    #: Rows inside the scanned window that predate the machine-state
-    #: envelope (#7135) and so cannot be represented as records. Counted
-    #: rather than dropped in silence: the journal is shared by every
-    #: worktree on the machine, so a worktree on older code is still
-    #: appending such rows, and a reader that hid them would quietly
-    #: under-report how much history it actually looked at.
-    predating_envelope: int = 0
+    #: Rows inside the scanned window that predate some dimension this
+    #: record now requires, and so cannot be represented. Counted rather
+    #: than dropped in silence: the journal is shared by every worktree
+    #: on the machine, so a worktree on older code is still appending
+    #: such rows, and a reader that hid them would quietly under-report
+    #: how much history it actually looked at.
+    #:
+    #: Deliberately ONE count across every schema epoch, not one per
+    #: epoch (#7135's machine-state envelope, #7136's cpu request, and
+    #: whatever comes next). The operator's question is "how much of
+    #: this window was too old to read", and the answer to it does not
+    #: get better by being split by cause — while a counter per epoch
+    #: would repeat this whole mechanism through the port, the adapter,
+    #: the snapshot and the CLI every time a dimension is added.
+    predating_schema: int = 0
 
     def __post_init__(self) -> None:
         if type(self.location) is not str or not self.location:
             raise ValueError(
                 "LaneDispatchHistory.location must be a non-empty string"
             )
-        if type(self.predating_envelope) is not int or self.predating_envelope < 0:
+        if type(self.predating_schema) is not int or self.predating_schema < 0:
             raise ValueError(
-                "LaneDispatchHistory.predating_envelope must be non-negative"
+                "LaneDispatchHistory.predating_schema must be non-negative"
             )
         if type(self.entries) is not tuple or any(
             type(entry) is not LaneDispatchEntry for entry in self.entries
