@@ -713,17 +713,20 @@ def test_create_issues_for_untriaged_uses_row_scoped_agent_and_run_id(
     page.add_init_script("window.open = () => null;")
 
     _goto_dashboard_e2e_tab(page, str(web_server["url"]))
-    # Override ``dashboardData.agents`` AFTER the dashboard's inline
-    # script runs (an ``add_init_script`` write to dashboardData gets
-    # clobbered by the template's own ``window.dashboardData = ...``).
-    # The runs-list renderer reads ``dashboardData.agents`` at
-    # banner-render time, so this has to land before ``renderE2ERunsList``.
+    # The agent list is NOT injected here. ``dashboard/core.js`` replaces
+    # ``window.dashboardData`` wholesale on every ``refreshViewModel`` —
+    # boot, SSE open, and each refresh event — so anything a test writes
+    # into that global is reverted the moment the next refresh lands, and
+    # the banner that rendered on the wrong side of it silently loses its
+    # options (#7140: a 30 s ``select_option`` timeout, "did not find some
+    # options"). The two agents this test picks between come from the
+    # fixture repo's config (see ``FlowWebMockOrchestrator``), so the
+    # server's answer and the page's state agree at every instant.
+    # (``REPO_ROOT``/``CONFIG_NAME`` were seeded here too and never had any
+    # effect: both are top-level ``const`` bindings in ``e2e_runtime.js``,
+    # which a later ``window.X = ...`` cannot reach.)
     page.evaluate(
         f"""(payload) => {{
-            window.dashboardData = window.dashboardData || {{}};
-            window.dashboardData.agents = ['agent:web', 'agent:vscode'];
-            window.REPO_ROOT = window.REPO_ROOT || '/tmp/repo';
-            window.CONFIG_NAME = window.CONFIG_NAME || 'default.yaml';
             const container = document.querySelector('#panel-e2e')
                 || document.querySelector('main')
                 || document.body;
@@ -745,6 +748,11 @@ def test_create_issues_for_untriaged_uses_row_scoped_agent_and_run_id(
     # untracked-failures banner.
     row_a.locator("summary").first.click()
     expect(row_a.locator(".cvv-root")).to_be_visible(timeout=10_000)
+    # Force the view-model refresh that used to make this test flaky to
+    # land RIGHT HERE, between the two banner renders. Under load this is
+    # where the boot / SSE-open refresh naturally arrived; pinning it makes
+    # the previously racy interleaving a deterministic assertion.
+    page.evaluate("() => window.refreshViewModel({ reloadOnListChange: false })")
     row_b.locator("summary").first.click()
     expect(row_b.locator(".cvv-root")).to_be_visible(timeout=10_000)
 

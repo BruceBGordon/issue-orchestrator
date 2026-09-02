@@ -1961,11 +1961,13 @@ def test_latest_view_results_opens_formatted_passed_run_modal(
     _route_synthetic_passed_run_detail(page, str(base_url), run_id)
     _open_e2e_tab(page)
 
+    # ``e2eLastRun`` is a module-level ``let`` in ``dashboard/e2e_runtime.js``
+    # seeded from ``dashboardData`` once at load; that live binding is what
+    # the latest-run controls read, so setting it is what matters here.
+    # Mirroring it back onto ``window.dashboardData`` would be inert AND
+    # racy — ``refreshViewModel`` replaces that object wholesale (#7140).
     page.evaluate(
-        """(runId) => {
-            e2eLastRun = { id: runId, status: 'passed' };
-            window.dashboardData.e2eLastRun = e2eLastRun;
-        }""",
+        "(runId) => { e2eLastRun = { id: runId, status: 'passed' }; }",
         run_id,
     )
     latest_results = page.locator(".e2e-last-results-btn")

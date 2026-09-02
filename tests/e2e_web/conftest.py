@@ -2,29 +2,270 @@
 
 from __future__ import annotations
 
+import argparse
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta
+import os
+import re
+import shlex
 import socket
 import time
 from threading import Thread
+from typing import Final
 from unittest.mock import MagicMock
 
 import pytest
 import uvicorn
-from playwright.sync_api import Page
+from playwright.sync_api import ConsoleMessage, Page, Request
 
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.models import AgentConfig, Issue, Session
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
+from issue_orchestrator.entrypoints.cli_tools.validate_runner import (
+    find_worktree_root,
+    get_output_dir,
+)
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.execution.timeline_reader import DefaultTimelineReader
 from issue_orchestrator.execution.timeline_store import SqliteTimelineStore
+from issue_orchestrator.infra.config import Config
 import issue_orchestrator.entrypoints.web as web_module
 from issue_orchestrator.entrypoints.web import app
 from issue_orchestrator.ports.timeline_store import TimelineRecord
 from tests.fixtures.timeline_run_artifacts import write_available_timeline_run_manifest
 from tests.fixtures.web_contract_mocks import MockOrchestratorForWeb
+
+
+# ---------------------------------------------------------------------------
+# Browser evidence on failure (#7140)
+#
+# A browser flake that only reproduces under load is undiagnosable from a
+# pytest traceback: the traceback says "did not find some options" but not
+# what the page actually contained, which requests were in flight, or what
+# the console said. pytest-playwright already implements retain-on-failure
+# tracing and only-on-failure screenshots — it just defaults them off and
+# writes them to ``test-results/``. This section turns them on for the
+# browser lane and redirects the artifacts into the diagnostics tree the
+# gate's retention machinery already keeps, plus a plain-text console
+# sidecar so an agent can read the evidence without a trace viewer.
+#
+# Cost on a green run: the trace/screenshot are captured to a temp dir and
+# deleted at teardown, so nothing is retained and nothing is written to the
+# repo. Only failures leave artifacts behind.
+# ---------------------------------------------------------------------------
+
+_UNSAFE_PATH_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+_MAX_EVENT_LINES = 500
+
+@dataclass(frozen=True, slots=True)
+class ArtifactOption:
+    """One pytest-playwright artifact switch this lane has an opinion about.
+
+    ``flag`` is the CLI spelling the owning plugin registers for ``dest``;
+    ``test_declared_flags_match_the_live_parser`` pins that mapping against
+    a real parse so a rename cannot pass silently.
+    """
+
+    flag: str
+    failure_only: str
+    capturing: frozenset[str]
+
+
+ARTIFACT_OPTIONS: Final[Mapping[str, ArtifactOption]] = {
+    "tracing": ArtifactOption(
+        flag="--tracing",
+        failure_only="retain-on-failure",
+        capturing=frozenset({"on", "retain-on-failure"}),
+    ),
+    "screenshot": ArtifactOption(
+        flag="--screenshot",
+        failure_only="only-on-failure",
+        capturing=frozenset({"on", "only-on-failure"}),
+    ),
+}
+
+_UNSUPPLIED: Final = object()
+
+
+def registered_artifact_dests(config: pytest.Config) -> frozenset[str]:
+    """Which artifact options this pytest run actually has.
+
+    ``-p no:playwright`` leaves them unregistered: there is then nothing to
+    supply and nothing to default. ``Config.getoption`` answers this on the
+    public API — it returns the sentinel rather than raising for an option
+    it does not know.
+    """
+    return frozenset(
+        dest
+        for dest in ARTIFACT_OPTIONS
+        if config.getoption(dest, default=_UNSUPPLIED) is not _UNSUPPLIED
+    )
+
+
+def effective_pytest_args(config: pytest.Config) -> tuple[str, ...]:
+    """Every token pytest parsed options out of, from all supply channels.
+
+    ``Config.parse`` reads options from three places — the ``addopts`` ini
+    key, the ``PYTEST_ADDOPTS`` environment variable, and the invocation
+    argv — and merges them before parsing. Supplied-ness has to be judged
+    against that same union; the parsed *value* cannot answer it, because an
+    operator who explicitly asks for the default value is indistinguishable
+    from one who asked for nothing.
+    """
+    return (
+        *config.getini("addopts"),
+        *shlex.split(os.environ.get("PYTEST_ADDOPTS", "")),
+        *config.invocation_params.args,
+    )
+
+
+def supplied_option_dests(args: Sequence[str]) -> frozenset[str]:
+    """Which artifact options the operator actually spelled out in ``args``.
+
+    Re-parses the token stream with a probe parser whose defaults are a
+    private sentinel, so "seen" and "absent" stay distinguishable no matter
+    what value was given — which is the whole point, since the value an
+    operator asks for may equal the default. ``--opt value`` and
+    ``--opt=value`` parse identically to pytest because argparse is doing
+    the parsing.
+
+    A token that merely *looks* like one of these options (say, ``-k
+    --tracing``) counts as supplied. That errs toward leaving the operator's
+    configuration alone, which is the safe direction.
+    """
+    probe = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    for dest, spec in ARTIFACT_OPTIONS.items():
+        probe.add_argument(spec.flag, dest=dest, default=_UNSUPPLIED)
+    namespace, _ = probe.parse_known_args(list(args))
+    return frozenset(
+        dest for dest in ARTIFACT_OPTIONS if getattr(namespace, dest) is not _UNSUPPLIED
+    )
+
+
+def apply_failure_only_artifact_defaults(
+    option: argparse.Namespace,
+    *,
+    supplied: frozenset[str],
+    registered: frozenset[str],
+) -> None:
+    """Move registered-but-unsupplied artifact options to failure-only mode."""
+    for dest, spec in ARTIFACT_OPTIONS.items():
+        if dest in supplied or dest not in registered:
+            continue
+        setattr(option, dest, spec.failure_only)
+
+
+def captures_failure_evidence(option: argparse.Namespace) -> bool:
+    """Whether the resolved policy retains anything when a test fails.
+
+    False means every artifact is off, so this lane writes nothing at all —
+    including its own console sidecar.
+    """
+    return any(
+        getattr(option, dest, "off") in spec.capturing
+        for dest, spec in ARTIFACT_OPTIONS.items()
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Default the browser lane to failure-only Playwright artifacts.
+
+    Set here rather than in the Makefile so a bare
+    ``pytest tests/e2e_web/...`` captures the same evidence the gate does —
+    the reproduction loop for a browser flake is exactly that bare
+    invocation.
+
+    Only *unsupplied* options are defaulted. ``--tracing=off`` and "no
+    ``--tracing`` at all" both leave ``config.option.tracing == "off"``, so
+    supplied-ness is resolved from the token stream the option came from,
+    never from the value it ended up with — an operator who explicitly turns
+    an artifact off must not have it resolved back on.
+    """
+    apply_failure_only_artifact_defaults(
+        config.option,
+        supplied=supplied_option_dests(effective_pytest_args(config)),
+        registered=registered_artifact_dests(config),
+    )
+
+
+def browser_evidence_dir(nodeid: str) -> Path:
+    """Directory that holds one failing browser test's evidence.
+
+    Anchored on the same resolution ``validate_runner`` uses for pytest
+    text output (``ISSUE_ORCHESTRATOR_VALIDATION_OUTPUT_DIR`` when the
+    orchestrator runs the gate, ``<worktree>/.issue-orchestrator/diagnostics``
+    otherwise) so browser evidence is retained and pruned with everything
+    else from the same run.
+    """
+    root = get_output_dir(find_worktree_root()) / "e2e-web"
+    return root / _UNSAFE_PATH_CHARS.sub("-", nodeid).strip("-")
+
+
+@pytest.fixture
+def output_path(request: pytest.FixtureRequest) -> str:
+    """Redirect pytest-playwright's trace/screenshot into the diagnostics tree.
+
+    Overrides the plugin's own ``output_path`` fixture. Deliberately does
+    NOT change ``--output``: pytest-playwright ``rmtree()``s that directory
+    at session start, which must never point at the diagnostics tree.
+    """
+    return str(browser_evidence_dir(request.node.nodeid))
+
+
+def _format_console(message: ConsoleMessage) -> str:
+    location = message.location or {}
+    where = f"{location.get('url', '')}:{location.get('lineNumber', '')}"
+    return f"[console:{message.type}] {message.text}  ({where})"
+
+
+@pytest.fixture
+def page(page: Page, request: pytest.FixtureRequest) -> Iterator[Page]:
+    """pytest-playwright's page plus a failure-only console/network sidecar.
+
+    The Playwright trace already carries console + network, but a flat text
+    file is what an agent reading ``.issue-orchestrator/diagnostics`` can
+    actually grep. Events are held in memory and only written when the test
+    fails — and only when the resolved artifact policy retains anything at
+    all, so an operator who turned every artifact off gets no files from
+    this lane either.
+    """
+    events: list[str] = []
+
+    def _record(line: str) -> None:
+        if len(events) < _MAX_EVENT_LINES:
+            events.append(line)
+
+    def _on_request_failed(request_: Request) -> None:
+        _record(f"[requestfailed] {request_.method} {request_.url} — {request_.failure}")
+
+    def _persist_on_failure() -> None:
+        if not captures_failure_evidence(request.config.option):
+            return
+        # ``rep_call`` is set by pytest-playwright's own makereport hook;
+        # missing means the test blew up before/around the call phase, which
+        # is itself a failure worth keeping evidence for.
+        report = getattr(request.node, "rep_call", None)
+        if report is not None and not report.failed:
+            return
+        destination = browser_evidence_dir(request.node.nodeid)
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "console.log").write_text(
+            "\n".join(events) + "\n" if events else "(no console/network events)\n",
+            encoding="utf-8",
+        )
+        # Printed, not raised: this is the diagnostics path for a test that
+        # already failed, and it must never replace that failure.
+        print(f"\n[browser-evidence] {destination}")
+
+    page.on("console", lambda message: _record(_format_console(message)))
+    page.on("pageerror", lambda error: _record(f"[pageerror] {error}"))
+    page.on("requestfailed", _on_request_failed)
+    try:
+        yield page
+    finally:
+        _persist_on_failure()
 
 
 @dataclass(slots=True)
@@ -45,6 +286,28 @@ def find_free_port() -> int:
 
 class FlowWebMockOrchestrator(MockOrchestratorForWeb):
     """Minimal orchestrator state builder for dashboard smoke tests."""
+
+    def _create_mock_config(self) -> Config:
+        """Declare a SECOND agent so agent pickers have something to pick.
+
+        The agent list is server-owned: the dashboard template renders
+        ``config.agents`` keys into ``window.dashboardData``, and every
+        ``refreshViewModel`` (``dashboard/core.js``) replaces that whole
+        object with a fresh server payload — on boot, on SSE open, and on
+        every refresh event thereafter. A browser test that injects its own
+        agent list into that global is therefore racing the app's own
+        refresh: whichever lands last wins, and the loser is whichever
+        banner rendered on the wrong side of it (#7140). Declaring the
+        agents on the fixture repo makes the list identical on the initial
+        render and on every refresh, so no ordering can change it.
+        """
+        config = super()._create_mock_config()
+        config.agents["agent:vscode"] = AgentConfig(
+            prompt_path=Path("/tmp/vscode-prompt.txt"),
+            model="sonnet",
+            timeout_minutes=45,
+        )
+        return config
 
     def add_queue_issue(
         self,
