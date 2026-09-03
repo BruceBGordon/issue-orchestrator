@@ -2014,6 +2014,11 @@ def test_normalize_status_reason_drops_sync_noise() -> None:
     assert _normalize_status_reason("blocked by dependency #100") == "blocked by dependency #100"
 
 
+def test_normalize_status_reason_drops_none_and_blank_values() -> None:
+    assert _normalize_status_reason(None) is None
+    assert _normalize_status_reason("   ") is None
+
+
 def test_view_model_history_dedupes_latest_per_issue():
     config = _make_config()
     state = OrchestratorState(
