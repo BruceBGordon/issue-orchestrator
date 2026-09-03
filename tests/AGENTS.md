@@ -12,6 +12,43 @@
 
 ---
 
+## Spawned Processes Must Not Outlive the Run
+
+Whoever spawns a real process owns its death. On 2026-08-29 twenty leaked CPU
+burners spun for nine hours, flaked seven gates across four unrelated branches,
+and were misattributed twice (#7142). The cost lands on whoever runs the *next*
+gate, who cannot see the cause.
+
+Reach for `tests/load_fixture`:
+
+```python
+from tests.load_fixture import cpu_load, reap_marked_processes
+
+with cpu_load(workers=8, max_lifetime_seconds=60.0):
+    ...  # load is up here, and provably gone after the block
+
+try:
+    ...  # the system under test spawns a tree of its own
+finally:
+    reap_marked_processes(str(tmp_path))  # identity is the argv, not a remembered pid
+```
+
+For a live CLI under a timeout, `tests/process_group_run` is the owner.
+
+The rule, whichever helper you reach for:
+
+1. Own the group (`start_new_session=True`) so one signal reaches descendants.
+2. Reap in `finally` — not after the asserts, not in `except TimeoutExpired`. A
+   failing assert is exactly when the fixture is still alive.
+3. Escalate to SIGKILL. Fixtures worth writing often ignore SIGTERM on purpose.
+4. Give the spawned process its own deadline, so a killed harness still caps the
+   damage.
+
+Ad-hoc verification counts too: `python -m tests.load_fixture --workers 20
+--seconds 60`, never a shell loop of `python -c 'while True: pass'`.
+
+---
+
 ## Test Behavior, Not Implementation
 
 **The cardinal rule**: Tests should verify WHAT the code does, not HOW it does it.

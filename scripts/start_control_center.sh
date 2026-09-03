@@ -342,7 +342,10 @@ is_our_process() {
   # Check if a PID belongs to the orchestrator (python, uvicorn, or entry point)
   local pid="$1"
   local cmdline
-  cmdline=$(ps -p "${pid}" -o args= 2>/dev/null || echo "")
+  # Mirrors infra/process_table.ps_command/ps_env: -ww plus a scrubbed
+  # COLUMNS, because ps truncates args= to the terminal width even into a
+  # pipe and this cmdline decides whether we kill the process (#7142).
+  cmdline=$(env -u COLUMNS -u LINES ps -ww -p "${pid}" -o args= 2>/dev/null || echo "")
   if [[ -z "${cmdline}" ]]; then
     return 1  # Process already exited
   fi

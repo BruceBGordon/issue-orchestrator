@@ -922,6 +922,15 @@ lane-preflight:
 	$(call TIMED_RUN,lane-preflight,$(LANE_PREFLIGHT) --backend $(LANE_EXECUTOR))
 
 _validate-pr-impl:
+# Gate-entry host sanity check (#7142). Stray load from an earlier run is
+# invisible to the gate it poisons: on 2026-08-29 twenty orphaned burners cost
+# seven flaked gates across four branches and a day of misattribution before
+# anyone ran ps. Runs for every backend on purpose — the flake victim was the
+# host-side browser lane, which both modes run on this machine — and before
+# any phase, so the fact is in validation-stderr.log ahead of what it explains.
+# Diagnosis only: the tool never kills and always exits 0, and `-` keeps a
+# broken interpreter from failing the gate this check exists to protect.
+	-@$(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.host_load_preflight
 ifeq ($(LANE_EXECUTOR),condor)
 # Preflight is a GATE step, not a lane step: it runs exactly once here,
 # serially, before the fan — 10+ lanes must not each re-answer whether

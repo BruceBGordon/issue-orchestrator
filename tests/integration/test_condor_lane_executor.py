@@ -26,12 +26,42 @@ from issue_orchestrator.domain.lane_execution import (
     LaneWorkKey,
 )
 from issue_orchestrator.ports.lane_executor import LaneExecutor
+from tests.load_fixture import cpu_load, reap_marked_processes
 from tests.unit.lane_executor_contract import LaneExecutorContract
 
 pytestmark = [
     pytest.mark.timeout(600),
     pytest.mark.requires_infra,
 ]
+
+# Ceiling on the owner-load spike if every cleanup path fails: long enough to
+# cover the 180s suspension wait it has to outlast, short enough that an
+# escaped burner cannot become someone else's unexplained gate.
+_LOAD_SPIKE_MAX_SECONDS = 240.0
+
+# Ceiling on the setsid escapee, which no group signal can reach. Must outlast
+# this test's ~260s observation path; must not outlast the day.
+_ESCAPE_LIFETIME_SECONDS = 600.0
+
+# A double-forked, setsid-detached grandchild: what agent jobs spawn, and what
+# ADR-0001 says macOS cannot contain. Because nothing can signal it as a group,
+# its own deadline (argv[2]) is the last line of defence when the harness that
+# was going to sweep it dies first (#7142). Module scope so
+# tests/unit/test_fixture_script_deadlines can prove that deadline holds.
+_ESCAPE_SCRIPT = (
+    "import os, sys, time\n"
+    "deadline = time.monotonic() + float(sys.argv[2])\n"
+    "if os.fork() == 0:\n"
+    "    os.setsid()\n"
+    "    if os.fork() == 0:\n"
+    "        open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+    "        while time.monotonic() < deadline:\n"
+    "            time.sleep(0.5)\n"
+    "        os._exit(0)\n"
+    "    os._exit(0)\n"
+    "while time.monotonic() < deadline:\n"
+    "    time.sleep(0.5)\n"
+)
 
 
 class TestCondorLaneExecutorContract(LaneExecutorContract):
@@ -108,20 +138,9 @@ def test_detached_session_escape_states_the_platform_boundary(
     record here is what fails.
     """
     import os
-    import signal
     import time
 
     marker = tmp_path / "grandchild.pid"
-    escape = (
-        "import os, sys, time\n"
-        "if os.fork() == 0:\n"
-        "    os.setsid()\n"
-        "    if os.fork() == 0:\n"
-        "        open(sys.argv[1], 'w').write(str(os.getpid()))\n"
-        "        time.sleep(3600)\n"
-        "    os._exit(0)\n"
-        "time.sleep(3600)\n"
-    )
     executor = CondorLaneExecutor(CondorTools.resolve())
     import threading
 
@@ -132,7 +151,13 @@ def test_detached_session_escape_states_the_platform_boundary(
             executor.run(
                 LaneCommand(
                     work_key=LaneWorkKey("contract.session-escape"),
-                    arguments=(sys.executable, "-c", escape, str(marker)),
+                    arguments=(
+                        sys.executable,
+                        "-c",
+                        _ESCAPE_SCRIPT,
+                        str(marker),
+                        str(_ESCAPE_LIFETIME_SECONDS),
+                    ),
                     working_directory=tmp_path,
                     deadline=LaneDeadline(20.0),
                 ),
@@ -142,37 +167,43 @@ def test_detached_session_escape_states_the_platform_boundary(
 
     thread = threading.Thread(target=run_lane)
     thread.start()
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline and not marker.exists():
-        time.sleep(0.2)
-    assert marker.exists(), "escape grandchild never started"
-    grandchild = int(marker.read_text())
-    thread.join(timeout=180)
-    assert not thread.is_alive(), "lane did not conclude"
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.2)
+        assert marker.exists(), "escape grandchild never started"
+        grandchild = int(marker.read_text())
+        thread.join(timeout=180)
+        assert not thread.is_alive(), "lane did not conclude"
 
-    def alive() -> bool:
-        try:
-            os.kill(grandchild, 0)
-            return True
-        except ProcessLookupError:
-            return False
+        def alive() -> bool:
+            try:
+                os.kill(grandchild, 0)
+                return True
+            except ProcessLookupError:
+                return False
 
-    settle = time.monotonic() + 20
-    while time.monotonic() < settle and alive():
-        time.sleep(0.5)
-    survived = alive()
-    if survived:
-        os.kill(grandchild, signal.SIGKILL)
-    if sys.platform == "darwin":
-        assert survived, (
-            "macOS unexpectedly contained the setsid escape - if process "
-            "tracking gained this, update ADR-0001 and the pool scoping"
-        )
-    else:
-        assert not survived, (
-            "Linux cgroup tracking failed to contain the setsid escape - "
-            "the execution environment's core guarantee has regressed"
-        )
+        settle = time.monotonic() + 20
+        while time.monotonic() < settle and alive():
+            time.sleep(0.5)
+        survived = alive()
+        if sys.platform == "darwin":
+            assert survived, (
+                "macOS unexpectedly contained the setsid escape - if process "
+                "tracking gained this, update ADR-0001 and the pool scoping"
+            )
+        else:
+            assert not survived, (
+                "Linux cgroup tracking failed to contain the setsid escape - "
+                "the execution environment's core guarantee has regressed"
+            )
+    finally:
+        # #7142: this test spawns an hour-long escapee ON PURPOSE and asserts
+        # macOS cannot contain it, so the only thing standing between it and
+        # the next nine gates is cleanup that runs on every path. `setsid`
+        # puts it beyond any group signal; the argv is what still identifies
+        # it, and the lane parent that never exits is swept with it.
+        reap_marked_processes(str(marker))
 
 
 def test_queue_wait_is_never_billed_to_the_lane_deadline(tmp_path: Path) -> None:
@@ -657,34 +688,31 @@ def test_owner_load_spike_freezes_only_suspendable_lanes(tmp_path: Path) -> None
             target=run_lane, args=(exempt_key, LaneSuspendability.NEVER)
         ),
     ]
-    burners: list[subprocess.Popen[bytes]] = []
     try:
         for thread in threads:
             thread.start()
         _await_status(freezable_key, _RUNNING, 90.0)
         _await_status(exempt_key, _RUNNING, 90.0)
 
-        burner_count = (os.cpu_count() or 4) + 2
-        burners = [
-            subprocess.Popen([sys.executable, "-c", "while True: pass"])
-            for _ in range(burner_count)
-        ]
-        _await_status(freezable_key, _SUSPENDED_STATUS, 180.0)
-        assert _job_status(exempt_key) == _RUNNING, (
-            "the owner-load policy froze a lane that declared itself "
-            "not suspendable"
-        )
-        for burner in burners:
-            burner.kill()
-        burners = []
+        # The spike is scoped to the block that needs it: leaving the block is
+        # how the load clears. Reaping is the helper's guarantee (#7142) — the
+        # previous `while True: pass` burners had no deadline of their own, so
+        # an interrupt here left them spinning until someone found them.
+        with cpu_load(
+            workers=(os.cpu_count() or 4) + 2,
+            max_lifetime_seconds=_LOAD_SPIKE_MAX_SECONDS,
+        ):
+            _await_status(freezable_key, _SUSPENDED_STATUS, 180.0)
+            assert _job_status(exempt_key) == _RUNNING, (
+                "the owner-load policy froze a lane that declared itself "
+                "not suspendable"
+            )
         _await_status(freezable_key, _RUNNING, 300.0)
 
         for thread in threads:
             thread.join(timeout=300)
             assert not thread.is_alive(), "a backoff lane never concluded"
     finally:
-        for burner in burners:
-            burner.kill()
         _release_batch(freezable_key)
         _release_batch(exempt_key)
         for thread in threads:
