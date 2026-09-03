@@ -21,7 +21,7 @@ classifiers = [
 
 dependencies = [
     "pyyaml>=6.0",
-    "rich>=13.0",      # Nice terminal UI
+    "rich>=15.0.0",      # Nice terminal UI
     "textual>=0.40",   # TUI framework with keyboard input
     "fastapi>=0.104",  # Web dashboard
     "uvicorn>=0.24",   # ASGI server
