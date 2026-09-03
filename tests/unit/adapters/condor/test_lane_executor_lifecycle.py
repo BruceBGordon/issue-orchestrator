@@ -766,8 +766,16 @@ def _assert_exception_chain_terminates(error: BaseException) -> None:
     same vacuity in the other direction. ``active`` is the current path
     (the cycle test), ``completed`` is everything fully explored, which
     both accepts diamonds without re-walking them and keeps this linear.
-    Both dicts hold the exceptions, not just their ids, so nothing can be
-    collected and have its id reused mid-traversal.
+
+    Keyed by ``id``, holding the exceptions as the values, and those are
+    ONE decision rather than two. A cause/context graph is made of
+    references, so its nodes are distinguished by identity: keying on the
+    exceptions themselves would consult ``__eq__``, and two distinct
+    instances that compare equal would then read as a single node and
+    report a cycle that is not there. Identity keys are only safe while
+    the objects cannot be collected and have their ids reused, which is
+    exactly why the values are the exceptions — retaining them is what
+    makes keying on their ids sound.
     """
     active: dict[int, BaseException] = {}
     completed: dict[int, BaseException] = {}
@@ -1080,6 +1088,50 @@ class TestTheChainAssertionCanActuallyFail:
 
         with pytest.raises(AssertionError, match="cycles"):
             _assert_exception_chain_terminates(chain[0])
+
+    def test_nodes_are_distinguished_by_identity_not_equality(self) -> None:
+        """Two distinct exceptions that compare EQUAL are two nodes.
+
+        A cause/context graph is made of references, so identity is what
+        separates its nodes. Keying the traversal on the exceptions instead
+        of their ids consults ``__eq__``, collapses this chain to one node
+        and reports a cycle that does not exist.
+
+        Exceptions compare by identity by default, which is precisely why
+        no ordinary graph can discriminate the two implementations — the
+        mutation is invisible until something in the graph defines
+        ``__eq__``, so the case has to be built on purpose.
+        """
+
+        class _EqualByValue(Exception):
+            def __init__(self, label: str) -> None:
+                super().__init__(label)
+                self.label = label
+
+            def __eq__(self, other: object) -> bool:
+                return isinstance(other, _EqualByValue) and other.label == self.label
+
+            def __hash__(self) -> int:
+                return hash(self.label)
+
+        ending = KeyboardInterrupt("original ending")
+        first = _EqualByValue("condor_rm exploded")
+        second = _EqualByValue("condor_rm exploded")
+        assert first is not second, "the point is two DISTINCT instances"
+        assert first == second, "...that compare equal"
+        ending.__context__ = first
+        first.__context__ = second
+
+        # Acyclic: three separate objects in a line. An equality-keyed walk
+        # sees `second` already on the path and cries cycle.
+        _assert_exception_chain_terminates(ending)
+
+        reachable = _reachable_exceptions(ending)
+        assert len(reachable) == 3, (
+            "the two equal-but-distinct exceptions collapsed into one"
+        )
+        assert any(node is first for node in reachable)
+        assert any(node is second for node in reachable)
 
     def test_an_ordinary_terminated_chain_passes(self) -> None:
         ending = KeyboardInterrupt("original ending")
