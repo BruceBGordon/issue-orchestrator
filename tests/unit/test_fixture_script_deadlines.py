@@ -78,13 +78,14 @@ import sys
 import tempfile
 import textwrap
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from tests.integration.test_condor_lane_executor import _ESCAPE_SCRIPT
-from tests.unit.lane_executor_contract import _TREE_SCRIPT
+from tests.unit.lane_executor_contract import _TREE_SCRIPT, read_tree_pids
 
 # Short enough to keep this suite fast, long enough that the fixture is
 # provably alive while the harness is killed.
@@ -119,12 +120,26 @@ def _await_gone(pid: int, timeout: float) -> bool:
     return False
 
 
-def _await_recorded_pid(marker: Path) -> int:
+def _single_recorded_pid(marker: Path) -> int:
+    """A fixture that records one pid, its own."""
+    return int(marker.read_text())
+
+
+def _recorded_grandchild(marker: Path) -> int:
+    """The tree fixture records a tree; the orphan under test is its tip.
+
+    The format belongs to the module that owns the script, so this reads
+    it through that owner rather than re-parsing it here.
+    """
+    return read_tree_pids(marker).grandchild
+
+
+def _await_recorded_pid(marker: Path, parse: Callable[[Path], int]) -> int:
     """The pid the fixture wrote, once it is fully written."""
     deadline = time.monotonic() + _MARKER_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         try:
-            return int(marker.read_text())
+            return parse(marker)
         except (FileNotFoundError, ValueError):
             time.sleep(_POLL_SECONDS)
     raise AssertionError(f"fixture never recorded a pid at {marker}")
@@ -173,19 +188,21 @@ def _force_kill(*pids: int) -> None:
 
 
 @pytest.mark.parametrize(
-    ("script", "term_immune"),
+    ("script", "term_immune", "parse"),
     [
-        pytest.param(_TREE_SCRIPT, True, id="lane-contract-tree"),
-        pytest.param(_ESCAPE_SCRIPT, False, id="condor-setsid-escapee"),
+        pytest.param(_TREE_SCRIPT, True, _recorded_grandchild, id="lane-contract-tree"),
+        pytest.param(
+            _ESCAPE_SCRIPT, False, _single_recorded_pid, id="condor-setsid-escapee"
+        ),
     ],
 )
 def test_an_orphaned_fixture_expires_without_anyone_reaping_it(
-    tmp_path: Path, script: str, term_immune: bool
+    tmp_path: Path, script: str, term_immune: bool, parse: Callable[[Path], int]
 ) -> None:
     """Kill the supervisor outright; the orphan must still go away."""
     marker = tmp_path / "grandchild.pid"
     supervisor = _spawn(script, marker)
-    orphan = _await_recorded_pid(marker)
+    orphan = _await_recorded_pid(marker, parse)
     try:
         if term_immune:
             os.kill(orphan, signal.SIGTERM)
@@ -214,7 +231,7 @@ def test_a_cpu_load_burner_expires_when_its_harness_is_sigkilled(
     """``cpu_load``'s finally is not the last line of defence; the clock is."""
     marker = tmp_path / "burner.pid"
     harness = _spawn(_CPU_LOAD_HARNESS, marker, str(_REPO_ROOT))
-    burner = _await_recorded_pid(marker)
+    burner = _await_recorded_pid(marker, _single_recorded_pid)
     try:
         os.kill(harness.pid, signal.SIGKILL)
         harness.wait(timeout=EXPIRY_SLACK_SECONDS)
