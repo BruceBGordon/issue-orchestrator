@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -109,6 +110,48 @@ def _job_accounting_budget() -> _CollectionBudget:
     return _CollectionBudget.lasting(_JOB_ACCOUNTING_WAIT_SECONDS)
 
 
+def _report_diagnostic(
+    compose: Callable[[], str], *, chain_from: BaseException | None = None
+) -> None:
+    """Write a diagnostic to stderr without letting it become the ending.
+
+    Two places need this and they need exactly the same thing, so it lives
+    in one: the cancellation path recording what it contained, and the
+    ``finally`` saying where the diagnostics were retained.
+
+    A diagnostic must not rewrite why the lane ended (#7135 round 3). That
+    holds for the diagnostic's OWN failures too, which is the recursion this
+    function stops: stderr is the channel a containment reports to, so a
+    failure to write leaves nowhere to report the failure to write. Ordinary
+    failures and ``SystemExit`` are therefore swallowed here — the one place
+    in this file where a bare swallow is right, and only because there is no
+    remaining channel. The caller's ending survives untouched.
+
+    Teardown signals still get out, because they mean the operator is going
+    away rather than the pipe being broken. ``chain_from`` is the ending
+    already in flight, if there is one: a second interrupt chains from it so
+    the original stays readable as ``__cause__``.
+
+    ``compose`` is called INSIDE the guard, not before it. Composing renders
+    a contained exception, ``describe_exception`` re-raises teardown signals
+    rather than eating them, and a signal arriving while composing needs the
+    same treatment as one arriving while writing.
+    """
+    try:
+        print(compose(), file=sys.stderr)
+    except TEARDOWN_SIGNALS as interrupt:
+        if chain_from is None:
+            raise
+        raise interrupt from chain_from
+    except BaseException:
+        # Deliberately everything else, and deliberately nothing done with
+        # it: this is the end of the reporting recursion described above.
+        # Narrowing to OSError would miss the commonest real case — writing
+        # to a closed stream raises ValueError, not OSError — and a stream
+        # object is caller code that can raise anything at all.
+        pass
+
+
 class CondorLaneExecutor:
     """Submit each lane as one scheduler job and follow it to its end."""
 
@@ -168,16 +211,18 @@ class CondorLaneExecutor:
         except BaseException as unwinding:
             # Cancellation or supervisor death: the job must not outlive us.
             if job_id is not None and streams is not None:
-                self._wind_down_cancelled(
-                    job_id, streams, run_directory, unwinding
-                )
+                self._wind_down_cancelled(job_id, streams, run_directory, unwinding)
             raise
         finally:
             if retain_run_directory:
-                print(
-                    f"condor lane {command.work_key.value}: diagnostics "
-                    f"retained at {run_directory}",
-                    file=sys.stderr,
+                # Same policy, stronger reason: this runs in a
+                # ``finally``, so a failure here replaces EVERY ending,
+                # including a clean return.
+                _report_diagnostic(
+                    lambda: (
+                        f"condor lane {command.work_key.value}: "
+                        f"diagnostics retained at {run_directory}"
+                    )
                 )
             else:
                 shutil.rmtree(run_directory, ignore_errors=True)
@@ -317,6 +362,28 @@ class CondorLaneExecutor:
         willing to wait for it, so it wins over the first — chained,
         never substituted in silence, so the original ending stays
         readable as ``__cause__`` even when both are interrupts.
+
+        "During cleanup" includes RECORDING the cleanup (round 6). That
+        stage renders a contained exception, rendering re-raises teardown
+        signals rather than eating them, and a signal raised inside one
+        handler cannot re-enter its sibling — so the recording carries
+        its own copy of the policy. BOTH halves of it (round 7): a
+        second interrupt while recording chains, and an ordinary failure
+        or ``SystemExit`` from the write itself is contained, because a
+        lane that ended on Ctrl-C must not report that it ended on a
+        closed stderr. Every stage of this method chains, or none of
+        them can be said to.
+
+        And the ending carries the cleanup failure OUT (round 8). Writing
+        it to stderr protected the ending but not the evidence: when the
+        write failed there was nowhere left to put ``contained``, and it
+        vanished. The exception chain is the one carrier that always
+        exists, so the ending is re-raised from inside the handler and
+        implicit chaining records ``contained`` as its ``__context__`` —
+        unconditionally, not only when the report failed, so the
+        invariant does not depend on whether stderr happened to work.
+        The ORIGINAL is what escapes and its ``__cause__`` stays clear,
+        so it is still directly readable as the ending.
         """
         try:
             # Inside the boundary, not before it: NOTHING in this body
@@ -326,9 +393,7 @@ class CondorLaneExecutor:
             # exactly why it was easy to leave outside and exactly why
             # leaving it there was wrong — the guarantee is structural,
             # not a bet on which statements can throw.
-            budget = _CollectionBudget.lasting(
-                _CANCELLED_ACCOUNTING_WAIT_SECONDS
-            )
+            budget = _CollectionBudget.lasting(_CANCELLED_ACCOUNTING_WAIT_SECONDS)
             self._remove(job_id, budget.remaining_seconds())
             if not budget.exhausted():
                 streams.pump()
@@ -336,11 +401,32 @@ class CondorLaneExecutor:
         except TEARDOWN_SIGNALS as interrupt:
             raise interrupt from unwinding
         except BaseException as contained:
-            print(
-                "condor lane: cancellation cleanup gave up after "
-                f"{describe_exception(contained)}",
-                file=sys.stderr,
+            # Recording is a stage like the three above it, and carries the
+            # same policy. Two reasons it needs its OWN guard rather than
+            # relying on the one above: a signal raised in this handler
+            # cannot re-enter its sibling, and `describe_exception` re-raises
+            # teardown signals (infra/containment) rather than swallowing
+            # them, so rendering a hostile `__repr__` is a real place for a
+            # second interrupt to arrive. Without this, such an interrupt
+            # propagates with no `__cause__` — exactly the round-3 defect
+            # this method already fixed for the earlier stages, reappearing
+            # at the last one.
+            _report_diagnostic(
+                lambda: (
+                    "condor lane: cancellation cleanup gave up after "
+                    f"{describe_exception(contained)}"
+                ),
+                chain_from=unwinding,
             )
+            # Re-raise the ending from HERE, while `contained` is the
+            # exception being handled, so Python records it as the ending's
+            # __context__. That is the point: stderr may be gone, and the
+            # chain is the one carrier that cannot be. The same object the
+            # caller was already unwinding is what leaves — the ending is
+            # restored, not replaced — and its __cause__ stays clear, so it
+            # is still directly readable. CPython severs the reverse link
+            # while doing this, so the chain cannot become a cycle.
+            raise unwinding
 
     def _collect_job_accounting(
         self,
@@ -425,9 +511,7 @@ class CondorLaneExecutor:
                 file=sys.stderr,
             )
 
-    def _per_job_history_directory(
-        self, budget: _CollectionBudget
-    ) -> Path | None:
+    def _per_job_history_directory(self, budget: _CollectionBudget) -> Path | None:
         """Where this pool drops each job's final ClassAd, or None.
 
         Read from the pool's own effective configuration rather than
@@ -477,9 +561,7 @@ class CondorLaneExecutor:
             )
         first_token = completed.stdout.split()
         if not first_token:
-            raise LaneExecutorError(
-                "lane job submission returned no job identifier"
-            )
+            raise LaneExecutorError("lane job submission returned no job identifier")
         return first_token[0]
 
     def _remove(self, job_id: str, timeout_seconds: float) -> None:

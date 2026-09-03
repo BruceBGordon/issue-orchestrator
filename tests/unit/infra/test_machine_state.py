@@ -33,14 +33,10 @@ from issue_orchestrator.infra.machine_state import (
 from issue_orchestrator.ports.machine_state import MachineState, MachineStateSampler
 
 _PROC_STAT_BEFORE = (
-    "cpu  1000 0 500 8000 100 0 0 0 0 0\n"
-    "cpu0 500 0 250 4000 50 0 0 0 0 0\n"
-    "intr 12345\n"
+    "cpu  1000 0 500 8000 100 0 0 0 0 0\ncpu0 500 0 250 4000 50 0 0 0 0 0\nintr 12345\n"
 )
 _PROC_STAT_AFTER = (
-    "cpu  1150 0 600 8700 150 0 0 0 0 0\n"
-    "cpu0 575 0 300 4350 75 0 0 0 0 0\n"
-    "intr 12999\n"
+    "cpu  1150 0 600 8700 150 0 0 0 0 0\ncpu0 575 0 300 4350 75 0 0 0 0 0\nintr 12999\n"
 )
 
 
@@ -108,22 +104,20 @@ class TestPlatformProbeParsers:
     def test_linux_idle_is_the_delta_between_two_proc_stat_reads(self) -> None:
         # Total ticks moved 1000 (150 user + 100 system + 700 idle +
         # 50 iowait); idle+iowait is 750 of them.
-        assert (
-            parse_proc_stat_idle_percent(_PROC_STAT_BEFORE, _PROC_STAT_AFTER)
-            == 75.0
-        )
+        assert parse_proc_stat_idle_percent(_PROC_STAT_BEFORE, _PROC_STAT_AFTER) == 75.0
 
     def test_linux_identical_reads_report_nothing_rather_than_zero(self) -> None:
         """No elapsed ticks is no measurement — never '0% idle', which
         would read as a pegged machine."""
         assert (
-            parse_proc_stat_idle_percent(_PROC_STAT_BEFORE, _PROC_STAT_BEFORE)
-            is None
+            parse_proc_stat_idle_percent(_PROC_STAT_BEFORE, _PROC_STAT_BEFORE) is None
         )
 
     def test_linux_garbage_reports_nothing(self) -> None:
         assert parse_proc_stat_idle_percent("intr 1\n", "intr 2\n") is None
-        assert parse_proc_stat_idle_percent("cpu  a b c d e\n", _PROC_STAT_AFTER) is None
+        assert (
+            parse_proc_stat_idle_percent("cpu  a b c d e\n", _PROC_STAT_AFTER) is None
+        )
 
 
 class TestHostSampler:
@@ -321,6 +315,42 @@ class TestSamplingFailureNeverPropagates:
         assert state.probe_error is not None
         assert "no sampler for you" in state.probe_error
 
+    @pytest.mark.parametrize(
+        "signal_type", [KeyboardInterrupt, GeneratorExit, asyncio.CancelledError]
+    )
+    def test_a_teardown_signal_raised_while_RENDERING_keeps_its_provenance(
+        self, signal_type: type[BaseException]
+    ) -> None:
+        """The sibling-handler shape, checked here after it was a real
+        defect in the lane executor (round 6).
+
+        ``describe_exception`` re-raises teardown signals rather than eating
+        them, and it is called from the ``except BaseException`` handler —
+        a signal raised there cannot re-enter the ``except TEARDOWN_SIGNALS``
+        beside it. In the lane executor that lost an explicitly chained
+        ``__cause__``. Here there is no ``raise ... from ...`` contract to
+        break: the signal propagates, and the sampling failure it interrupted
+        stays readable as the implicit ``__context__``. Pinned so a future
+        change cannot drop that provenance quietly.
+        """
+
+        class _Unrenderable(Exception):
+            def __repr__(self) -> str:
+                raise signal_type()
+
+        failure = _Unrenderable()
+
+        class _Failing:
+            def sample(self) -> MachineState:
+                raise failure
+
+        with pytest.raises(signal_type) as caught:
+            sample_machine_state(_Failing())
+
+        assert caught.value.__context__ is failure, (
+            "the sampling failure the interrupt arrived during was lost"
+        )
+
     def test_a_teardown_signal_while_acquiring_still_propagates(self) -> None:
         def acquire() -> MachineStateSampler:
             raise KeyboardInterrupt()
@@ -340,6 +370,7 @@ class TestSamplingFailureNeverPropagates:
     def test_a_contained_failure_still_produces_a_full_envelope(self) -> None:
         """A failed probe must not change the record's SHAPE: the same
         keys, with nulls, so a query never has to special-case it."""
+
         class _Exploding:
             def sample(self) -> MachineState:
                 raise OSError("no")

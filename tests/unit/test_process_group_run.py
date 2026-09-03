@@ -24,7 +24,7 @@ from tests.process_group_run import (
     ProcessGroupUnsupportedError,
     run_in_process_group,
 )
-from tests.sandbox_probe_retry import decode_stream, run_until_paths_created
+from tests.sandbox_probe_retry import CreatedPaths, decode_stream, run_until_evidence
 
 
 def containment_behavior(test: Callable[..., None]) -> Callable[..., None]:
@@ -263,9 +263,9 @@ def test_a_surviving_grandchild_cannot_supply_the_next_attempt_s_evidence(
             )
         return run_in_process_group(["/bin/sh", "-c", "true"], cwd=tmp_path, timeout=30)
 
-    probe = run_until_paths_created(
+    probe = run_until_evidence(
         run_attempt,
-        expected_paths=(expected,),
+        evidence=CreatedPaths((expected,)),
         observed_paths=(expected,),
     )
 
