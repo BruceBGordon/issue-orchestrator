@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
+from ..domain.lane_cpu_request import LaneCpuRequest
 from ..domain.lane_execution import LaneWorkKey
 from .machine_state import MachineState
 
@@ -31,6 +32,17 @@ class LaneDispatchRecord:
     contention it ran under is the ambiguity this record exists to end
     (#7127). It is a measurement only — nothing may schedule, order or
     gate on it.
+
+    ``cpu_request`` carries the whole sizing decision (declared,
+    learned, submitted) rather than just the winning number, and
+    ``observed_busy_cores`` carries what the run then actually used.
+    Together they make the measured-vs-declared divergence readable
+    from the journal alone: a lane whose evidence is being capped, or
+    whose declaration is far above what it ever uses, is visible
+    without re-deriving either side. The two envelopes answer
+    different questions about the same run and neither substitutes for
+    the other: machine_state is the contention the lane MET, cpu_request
+    is the capacity it ASKED FOR.
     """
 
     work_key: LaneWorkKey
@@ -40,6 +52,8 @@ class LaneDispatchRecord:
     observed_runtime_seconds: float
     exit_code: int
     machine_state: MachineState
+    cpu_request: LaneCpuRequest
+    observed_busy_cores: float | None
 
     def __post_init__(self) -> None:
         if type(self.machine_state) is not MachineState:
@@ -48,6 +62,19 @@ class LaneDispatchRecord:
             )
         if type(self.work_key) is not LaneWorkKey:
             raise ValueError("LaneDispatchRecord.work_key must be a LaneWorkKey")
+        if type(self.cpu_request) is not LaneCpuRequest:
+            raise ValueError(
+                "LaneDispatchRecord.cpu_request must be a LaneCpuRequest"
+            )
+        if self.observed_busy_cores is not None and (
+            type(self.observed_busy_cores) is not float
+            or not math.isfinite(self.observed_busy_cores)
+            or self.observed_busy_cores < 0
+        ):
+            raise ValueError(
+                "LaneDispatchRecord.observed_busy_cores must be None or a "
+                "finite, non-negative float"
+            )
         if type(self.backend) is not str or not self.backend:
             raise ValueError(
                 "LaneDispatchRecord.backend must be a non-empty string"
@@ -126,22 +153,30 @@ class LaneDispatchHistory:
 
     location: str
     entries: tuple[LaneDispatchEntry, ...]
-    #: Rows inside the scanned window that predate the machine-state
-    #: envelope (#7135) and so cannot be represented as records. Counted
-    #: rather than dropped in silence: the journal is shared by every
-    #: worktree on the machine, so a worktree on older code is still
-    #: appending such rows, and a reader that hid them would quietly
-    #: under-report how much history it actually looked at.
-    predating_envelope: int = 0
+    #: Rows inside the scanned window that predate some dimension this
+    #: record now requires, and so cannot be represented. Counted rather
+    #: than dropped in silence: the journal is shared by every worktree
+    #: on the machine, so a worktree on older code is still appending
+    #: such rows, and a reader that hid them would quietly under-report
+    #: how much history it actually looked at.
+    #:
+    #: Deliberately ONE count across every schema epoch, not one per
+    #: epoch (#7135's machine-state envelope, #7136's cpu request, and
+    #: whatever comes next). The operator's question is "how much of
+    #: this window was too old to read", and the answer to it does not
+    #: get better by being split by cause — while a counter per epoch
+    #: would repeat this whole mechanism through the port, the adapter,
+    #: the snapshot and the CLI every time a dimension is added.
+    predating_schema: int = 0
 
     def __post_init__(self) -> None:
         if type(self.location) is not str or not self.location:
             raise ValueError(
                 "LaneDispatchHistory.location must be a non-empty string"
             )
-        if type(self.predating_envelope) is not int or self.predating_envelope < 0:
+        if type(self.predating_schema) is not int or self.predating_schema < 0:
             raise ValueError(
-                "LaneDispatchHistory.predating_envelope must be non-negative"
+                "LaneDispatchHistory.predating_schema must be non-negative"
             )
         if type(self.entries) is not tuple or any(
             type(entry) is not LaneDispatchEntry for entry in self.entries

@@ -194,11 +194,23 @@ class LaneCompleted:
     pole waiting here is exactly the waste the learned-priority loop
     exists to remove — so it must be observable without pool
     archaeology. The direct backend starts immediately and reports 0.
+
+    ``observed_busy_cores`` is the lane's measured CPU demand: total
+    CPU-seconds burned by its process tree divided by the runtime
+    above. ``None`` is a THIRD state, not zero: it means this backend
+    did not measure this run. Zero would be a claim ("the lane used no
+    CPU"); absence is the honest report when the measurement did not
+    happen — a lane killed before it could report, a runtime too
+    coarse to divide by, or a backend that deliberately abstains
+    because its measuring conditions do not match the consumer of the
+    number. Only a backend whose measurement conditions match the
+    consumer should populate it.
     """
 
     exit_code: int
     observed_runtime_seconds: float
     queue_wait_seconds: float
+    observed_busy_cores: float | None = None
 
     def __post_init__(self) -> None:
         if type(self.exit_code) is not int:
@@ -220,6 +232,15 @@ class LaneCompleted:
             raise ValueError(
                 "LaneCompleted.queue_wait_seconds must be finite and "
                 "non-negative"
+            )
+        if self.observed_busy_cores is not None and (
+            type(self.observed_busy_cores) is not float
+            or not math.isfinite(self.observed_busy_cores)
+            or self.observed_busy_cores < 0
+        ):
+            raise ValueError(
+                "LaneCompleted.observed_busy_cores must be None or a finite, "
+                "non-negative float"
             )
 
 

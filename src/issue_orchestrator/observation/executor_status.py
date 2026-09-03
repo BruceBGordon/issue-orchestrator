@@ -210,11 +210,13 @@ class ExecutorStatusSnapshot:
     lanes: tuple[LaneRow, ...]
     #: How many journal records were scanned to build ``lanes``.
     records_scanned: int
-    #: Of those, how many predate the machine-state envelope (#7135) and
+    #: Of those, how many predate a dimension the record now requires
+    #: (the machine-state envelope #7135, the cpu request #7136) and so
     #: could not be read back. Reported, never hidden: a reader that
     #: quietly dropped them would understate how thin the history it
-    #: summarized actually is.
-    records_predating_envelope: int
+    #: summarized actually is. One count across every epoch — see
+    #: LaneDispatchHistory.predating_schema for why it is not split.
+    records_predating_schema: int
     faults: tuple[SnapshotFault, ...]
 
     def __post_init__(self) -> None:
@@ -274,7 +276,7 @@ def build_executor_status_snapshot(
         journal_location=location,
         lanes=lanes,
         records_scanned=len(entries) + predating,
-        records_predating_envelope=predating,
+        records_predating_schema=predating,
         faults=tuple(faults),
     )
 
@@ -339,7 +341,7 @@ def _read_journal(
             SnapshotFault(source=FactSource.DISPATCH_JOURNAL, detail=str(error))
         )
         return (f"unreadable: {error}", (), 0)
-    return (history.location, history.entries, history.predating_envelope)
+    return (history.location, history.entries, history.predating_schema)
 
 
 def _lane_rows(

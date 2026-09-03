@@ -11,12 +11,18 @@ import pytest
 from issue_orchestrator.adapters.condor.tools import (
     PERSONAL_POOL_HOME_ENVIRONMENT_VARIABLE,
 )
+from issue_orchestrator.adapters.direct_lane_executor import (
+    DirectLaneExecutor,
+    DirectLaneTerminationPolicy,
+)
 from issue_orchestrator.adapters.json_lane_runtime_history import (
     JsonLaneRuntimeHistory,
 )
+from issue_orchestrator.domain.lane_cpu_request import LaneCpuRequest
 from issue_orchestrator.domain.lane_execution import (
     LaneCommand,
     LaneCompleted,
+    LaneDeadline,
     LaneOutcome,
     LaneResources,
     LaneSuspendability,
@@ -258,7 +264,7 @@ def test_learned_priority_crosses_the_port_boundary(
     priority — the whole learning loop, observed at the port."""
     key = LaneWorkKey("cli.test")
     for runtime in (30.0, 90.0, 60.0):
-        isolated_history.record_success(key, runtime)
+        isolated_history.record_success(key, runtime, None)
     executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
     assert _run("/usr/bin/true") == 0
     assert executor.resources[0].priority == 60
@@ -294,7 +300,7 @@ def test_completed_lane_journals_one_dispatch_record(
     runs without pool archaeology."""
     key = LaneWorkKey("cli.test")
     for runtime in (30.0, 90.0, 60.0):
-        isolated_history.record_success(key, runtime)
+        isolated_history.record_success(key, runtime, None)
     _capture(monkeypatch, LaneCompleted(0, 45.0, 12.0))
     assert _run("/usr/bin/true") == 0
     (record,) = fake_journal.records
@@ -306,7 +312,8 @@ def test_completed_lane_journals_one_dispatch_record(
     stderr = capsys.readouterr().err
     assert (
         "[lane-dispatch] cli.test backend=direct priority=60 "
-        "queue_wait=12.0s runtime=45.0s exit=0" in stderr
+        "queue_wait=12.0s runtime=45.0s exit=0 "
+        "request_cpus=1/1 busy_cores=unmeasured" in stderr
     )
 
 
@@ -449,3 +456,163 @@ def test_suspendability_domain_validation_rejects_non_enum() -> None:
         LaneResources(request_cpus=1).suspendability
         is LaneSuspendability.NEVER
     )
+
+
+def _declare(monkeypatch: pytest.MonkeyPatch, request_cpus: int) -> None:
+    monkeypatch.setattr(
+        lane_run_module,
+        "_load_declaration",
+        lambda work_key: LaneDeclaration(
+            request_cpus=request_cpus, memory_mb=1024, suspendability="never"
+        ),
+    )
+
+
+def test_empty_cpu_history_submits_the_declared_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Before anything is measured, lanes.yaml IS the request — the
+    naive run is byte-for-byte the pre-learning behavior."""
+    _declare(monkeypatch, 8)
+    executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
+    assert _run("/usr/bin/true") == 0
+    assert executor.resources[0].request_cpus == 8
+
+
+def test_measured_history_lowers_the_submitted_request(
+    monkeypatch: pytest.MonkeyPatch, isolated_history: JsonLaneRuntimeHistory
+) -> None:
+    """The learning loop observed at the port: a lane declared at 8
+    that keeps measuring ~2 busy cores submits 2, handing six cores
+    back to the pool."""
+    _declare(monkeypatch, 8)
+    key = LaneWorkKey("cli.test")
+    for cores in (1.8, 2.0, 1.9):
+        isolated_history.record_success(key, 30.0, cores)
+    executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
+    assert _run("/usr/bin/true") == 0
+    assert executor.resources[0].request_cpus == 2
+
+
+def test_measured_history_never_raises_the_request_above_the_declaration(
+    monkeypatch: pytest.MonkeyPatch, isolated_history: JsonLaneRuntimeHistory
+) -> None:
+    """The declaration is the ceiling as well as the seed. A lane
+    'measuring' sixteen cores is far likelier to be a broken
+    measurement than a lane that got eight times hungrier, and
+    granting it would drain the pool."""
+    _declare(monkeypatch, 2)
+    key = LaneWorkKey("cli.test")
+    for cores in (16.0, 16.0, 16.0):
+        isolated_history.record_success(key, 30.0, cores)
+    executor = _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
+    assert _run("/usr/bin/true") == 0
+    assert executor.resources[0].request_cpus == 2
+
+
+def test_a_measured_lane_teaches_its_cpu_demand(
+    monkeypatch: pytest.MonkeyPatch, isolated_history: JsonLaneRuntimeHistory
+) -> None:
+    """A backend that measured this run feeds both dimensions; the
+    next run consumes the CPU one."""
+    _declare(monkeypatch, 8)
+    _capture(monkeypatch, LaneCompleted(0, 42.0, 0.0, 3.5))
+    assert _run("/usr/bin/true") == 0
+    key = LaneWorkKey("cli.test")
+    assert isolated_history.learned_priority(key) == 42
+    assert isolated_history.learned_busy_cores(key) == 3.5
+
+
+def test_an_unmeasured_lane_teaches_only_its_runtime(
+    monkeypatch: pytest.MonkeyPatch, isolated_history: JsonLaneRuntimeHistory
+) -> None:
+    """The direct backend abstains from measuring CPU (its lanes run
+    under make's own parallelism, which deflates the figure). Its runs
+    must still teach dispatch order, and must not record a CPU number
+    nobody observed."""
+    _declare(monkeypatch, 8)
+    _capture(monkeypatch, LaneCompleted(0, 42.0, 0.0))
+    assert _run("/usr/bin/true") == 0
+    key = LaneWorkKey("cli.test")
+    assert isolated_history.learned_priority(key) == 42
+    assert isolated_history.learned_busy_cores(key) is None
+
+
+def test_a_failed_measured_lane_teaches_no_cpu_demand(
+    monkeypatch: pytest.MonkeyPatch, isolated_history: JsonLaneRuntimeHistory
+) -> None:
+    """Only successes teach, in both dimensions: a lane that died
+    halfway through burned a fraction of its real CPU."""
+    _declare(monkeypatch, 8)
+    _capture(monkeypatch, LaneCompleted(1, 5.0, 0.0, 0.4))
+    assert _run("/usr/bin/true") == 1
+    assert isolated_history.learned_busy_cores(LaneWorkKey("cli.test")) is None
+
+
+def test_dispatch_record_shows_the_measured_versus_declared_divergence(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_history: JsonLaneRuntimeHistory,
+    fake_journal: _FakeJournal,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Declared, learned, submitted, and actually-used all reach the
+    journal. A record carrying only the submitted number could not
+    distinguish 'no history' from 'history agrees', nor show that
+    evidence was capped."""
+    _declare(monkeypatch, 4)
+    key = LaneWorkKey("cli.test")
+    for cores in (1.2, 1.4, 1.3):
+        isolated_history.record_success(key, 30.0, cores)
+    _capture(monkeypatch, LaneCompleted(0, 45.0, 0.0, 1.35))
+    assert _run("/usr/bin/true") == 0
+    (record,) = fake_journal.records
+    assert record.cpu_request.declared_cpus == 4
+    assert record.cpu_request.learned_busy_cores == 1.3
+    assert record.cpu_request.request_cpus == 2
+    assert record.cpu_request.is_capped is False
+    assert record.observed_busy_cores == 1.35
+    assert (
+        "request_cpus=2/4 busy_cores=1.35" in capsys.readouterr().err
+    )
+
+
+def test_dispatch_record_marks_evidence_that_was_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_history: JsonLaneRuntimeHistory,
+    fake_journal: _FakeJournal,
+) -> None:
+    """A capped lane is the suspicious direction — the refusal must be
+    on the record, not inferable only by re-deriving the policy."""
+    _declare(monkeypatch, 2)
+    isolated_history.record_success(LaneWorkKey("cli.test"), 30.0, 9.0)
+    _capture(monkeypatch, LaneCompleted(0, 30.0, 0.0, 9.0))
+    assert _run("/usr/bin/true") == 0
+    (record,) = fake_journal.records
+    assert record.cpu_request.is_capped is True
+    assert record.cpu_request.request_cpus == 2
+
+
+def test_direct_backend_records_no_cpu_measurement() -> None:
+    """End to end through the real direct executor: it reports no
+    busy-cores figure at all, so nothing it runs can teach a deflated
+    number to a scheduler it never talks to."""
+    outcome = DirectLaneExecutor(DirectLaneTerminationPolicy(1.0)).run(
+        LaneCommand(
+            work_key=LaneWorkKey("cli.test"),
+            arguments=(sys.executable, "-c", "pass"),
+            working_directory=Path.cwd(),
+            deadline=LaneDeadline(60.0),
+        ),
+        LaneResources(request_cpus=1),
+    )
+    assert type(outcome) is LaneCompleted
+    assert outcome.observed_busy_cores is None
+
+
+def test_cpu_request_policy_has_exactly_one_home() -> None:
+    """The seed/ceiling asymmetry is arithmetic the CLI delegates, not
+    arithmetic it owns — so a second consumer cannot grow a second,
+    subtly different version of it."""
+    assert LaneCpuRequest.resolve(8, None).request_cpus == 8
+    assert LaneCpuRequest.resolve(8, 1.1).request_cpus == 2
+    assert LaneCpuRequest.resolve(8, 99.0).request_cpus == 8

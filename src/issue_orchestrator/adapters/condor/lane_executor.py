@@ -34,6 +34,7 @@ from .event_classifier import (
     LaneJobSuspended,
     classify_event_log,
 )
+from .rusage_report import measure_busy_cores
 from .submit_compiler import CompiledSubmitDescription, compile_submit_description
 from .tools import TOOL_TIMEOUT_SECONDS, CondorTools
 from .tools import TOOL_TIMEOUT_SECONDS, CondorTools
@@ -188,6 +189,10 @@ class CondorLaneExecutor:
             streams = _OutputStreamer(compiled)
             job_id = self._submit(submit_path)
             terminal = self._follow_job(command, compiled, job_id, streams)
+            # The CPU report is collected from the run directory like
+            # the event log, and BEFORE the finally clause deletes that
+            # directory on a clean completion.
+            terminal = self._with_measured_cpu(command, compiled, terminal)
             if type(terminal) is LaneCompleted and terminal.exit_code == 0:
                 retain_run_directory = False
             else:
@@ -226,6 +231,34 @@ class CondorLaneExecutor:
                 )
             else:
                 shutil.rmtree(run_directory, ignore_errors=True)
+
+    @staticmethod
+    def _with_measured_cpu(
+        command: LaneCommand,
+        compiled: CompiledSubmitDescription,
+        terminal: LaneOutcome,
+    ) -> LaneOutcome:
+        """Attach the shim's CPU measurement to a completed lane.
+
+        A removed lane (deadline) never reaches its shim's report, so
+        only completions can carry one. What counts as an unusable
+        report is the report module's rule, not this one's.
+        """
+        if type(terminal) is not LaneCompleted:
+            return terminal
+        measured = measure_busy_cores(
+            compiled.rusage_path,
+            terminal.observed_runtime_seconds,
+            command.work_key.value,
+        )
+        if measured is None:
+            return terminal
+        return LaneCompleted(
+            terminal.exit_code,
+            terminal.observed_runtime_seconds,
+            terminal.queue_wait_seconds,
+            measured,
+        )
 
     def _follow_job(
         self,

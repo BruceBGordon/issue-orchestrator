@@ -808,3 +808,95 @@ def test_cooperative_lanes_are_not_freeze_eligible_even_when_marked_safe(
             burner.kill()
         _release_batch(coop_key)
         _release_batch(control_key)
+
+
+# A fixed amount of arithmetic. Machine load stretches how long this
+# takes but never how much CPU it costs, so bounds on the measured CPU
+# stay meaningful on a busy pool.
+_CPU_WORK = "total = 0\nfor index in range(20_000_000):\n    total += index * index\n"
+
+
+def test_a_real_lane_reports_its_own_cpu_demand(tmp_path: Path) -> None:
+    """The mechanism end to end on a live pool.
+
+    The scheduler's own RemoteUserCpu/RemoteSysCpu read a flat 0.0 on
+    the macOS pool (no cgroups to account against), so the measurement
+    is taken by the exec shim instead. This is the test that would
+    fail if the shim stopped measuring, if the executor stopped
+    collecting the report before deleting the run directory, or if the
+    parser drifted from the shell's output format.
+    """
+    outcome = CondorLaneExecutor(CondorTools.resolve()).run(
+        LaneCommand(
+            work_key=LaneWorkKey("contract.cpu-demand"),
+            arguments=(sys.executable, "-c", _CPU_WORK),
+            working_directory=tmp_path,
+            deadline=LaneDeadline(300.0),
+        ),
+        LaneResources(request_cpus=1),
+    )
+    assert type(outcome) is LaneCompleted and outcome.exit_code == 0
+    measured = outcome.observed_busy_cores
+    assert measured is not None, (
+        "a completed lane reported no CPU measurement: the shim, the "
+        "collection, or the parser is broken"
+    )
+    # A single-threaded lane cannot exceed one core of real demand.
+    # The generous ceiling absorbs the event log's whole-second
+    # runtime granularity, which inflates the ratio for short lanes;
+    # anything far above it means a unit error (minutes multiplied in,
+    # or the shell's own line read instead of the children's).
+    assert 0.0 < measured < 3.0, measured
+
+
+def test_a_failed_lane_leaves_a_readable_cpu_report(tmp_path: Path) -> None:
+    """The artifact itself, on disk, from a real submission.
+
+    A failed lane retains its run directory, which is the one moment
+    the report can be read directly rather than through the outcome.
+    """
+    import glob as _glob
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    from issue_orchestrator.adapters.condor.rusage_report import (
+        RUSAGE_FILE_NAME,
+        read_cpu_seconds,
+    )
+
+    def lane_directories() -> set[str]:
+        return set(
+            _glob.glob(str(Path(_tempfile.gettempdir()) / "lane-contract.cpu-report*"))
+        )
+
+    before = lane_directories()
+    outcome = CondorLaneExecutor(CondorTools.resolve()).run(
+        LaneCommand(
+            work_key=LaneWorkKey("contract.cpu-report"),
+            arguments=(
+                sys.executable,
+                "-c",
+                f"{_CPU_WORK}raise SystemExit(3)\n",
+            ),
+            working_directory=tmp_path,
+            deadline=LaneDeadline(300.0),
+        ),
+        LaneResources(request_cpus=1),
+    )
+    assert type(outcome) is LaneCompleted and outcome.exit_code == 3
+    retained = list(lane_directories() - before)
+    assert retained, "failed lane did not retain its diagnostics"
+    try:
+        report = Path(retained[0]) / RUSAGE_FILE_NAME
+        assert report.exists(), (
+            f"the shim wrote no CPU report; run directory holds: "
+            f"{sorted(p.name for p in Path(retained[0]).iterdir())}"
+        )
+        cpu_seconds = read_cpu_seconds(report)
+        assert cpu_seconds is not None
+        # The fixed arithmetic above costs well over a tenth of a
+        # second of CPU on any machine that can run this pool.
+        assert cpu_seconds > 0.1, (report.read_text(), cpu_seconds)
+    finally:
+        for directory in retained:
+            _shutil.rmtree(directory, ignore_errors=True)
