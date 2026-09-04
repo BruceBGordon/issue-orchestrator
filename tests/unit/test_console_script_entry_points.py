@@ -163,6 +163,41 @@ def test_lane_run_dispatches_from_a_worktree_that_is_not_this_repository(
     assert (tmp_path / ".git" / "issue-orchestrator" / "lane-dispatch.jsonl").exists()
 
 
+def test_lane_run_dispatches_where_there_is_no_repository_at_all(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A caller need not be a git repo — only a directory with lanes.
+
+    Outside a repository there is nothing to share across invocations,
+    so the learning loop goes inert rather than failing or inventing a
+    home for its state: priority 0, recorded nowhere. The docs promise
+    this works; nothing pinned it until here.
+    """
+    _declare_lane(tmp_path, "no.repo.lane")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lane-run",
+            "--work-key",
+            "no.repo.lane",
+            "--timeout-seconds",
+            "60",
+            "--",
+            "/usr/bin/true",
+        ],
+    )
+
+    assert _invoke_lane_run_entry_point() == 0
+    # Inert means inert: neither artifact is written, and no repository
+    # is conjured to hold them. Named artifacts rather than a directory
+    # listing — shared fixtures put unrelated entries under tmp_path.
+    assert not (tmp_path / ".git").exists()
+    assert not list(tmp_path.rglob("lane-dispatch.jsonl"))
+    assert not list(tmp_path.rglob("lane-runtime-history"))
+
+
 def test_lane_run_refuses_a_work_key_the_caller_never_declared(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

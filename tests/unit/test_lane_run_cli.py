@@ -386,6 +386,16 @@ def test_missing_separator_is_a_usage_error() -> None:
     )
 
 
+def test_a_separator_with_no_command_after_it_is_a_usage_error() -> None:
+    """The exit code is the whole contract here.
+
+    Deliberately no assertion on the message: the diagnostic text is
+    not something callers may depend on, and pinning it would put back
+    the dependence on prose that this file spent three rounds removing.
+    """
+    assert main(["--work-key", "cli.test", "--timeout-seconds", "60", "--"]) == 78
+
+
 @pytest.mark.parametrize("flag", ["--help", "-h"])
 def test_help_survives_the_separator_rule(
     flag: str, capsys: pytest.CaptureFixture[str]
