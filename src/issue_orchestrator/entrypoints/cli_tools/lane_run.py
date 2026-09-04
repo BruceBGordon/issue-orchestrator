@@ -13,6 +13,12 @@ crashes unclassified. Backend faults are never disguised as lane
 results, so the mapping in `main` must stay total: any code this
 module produces outside that set would be read as the lane's.
 
+The converse does not hold and must not be forced: a lane owns the
+whole 0-255 space and may itself exit 70, 78 or 124, which are passed
+through unchanged rather than remapped — reporting a code the lane did
+not return would be the worse lie. The dispatch journal row, written
+for a completed lane and never for a fault, is what separates them.
+
 Callers outside this repository reach the same `main` through the
 installed `lane-run` console script (see docs/user/condor_lanes.md).
 """
@@ -89,6 +95,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     "your tests failed". Classifying it as 70 keeps the promise that
     backend faults are never disguised as lane results; the traceback
     is printed verbatim, so nothing is softened, only named.
+
+    Option-shape errors and ``--help`` stay argparse's: it exits
+    directly, and SystemExit is not an ``Exception``, so those verdicts
+    pass through this mapping rather than being restated by it.
     """
     try:
         return _dispatch(list(sys.argv[1:] if argv is None else argv))
@@ -101,13 +111,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _dispatch(raw: list[str]) -> int:
     separator = raw.index("--") if "--" in raw else None
     options = raw if separator is None else raw[:separator]
-    if "-h" in options or "--help" in options:
-        # On PATH this CLI's only discovery surface is --help, so the
-        # separator rule must not shadow it. A lane command's own
-        # --help sits after the separator and is never read here.
-        _build_parser().print_help()
-        return 0
     if separator is None:
+        if "-h" in options or "--help" in options:
+            # On PATH this CLI's only discovery surface is --help, and
+            # the separator rule would otherwise answer it with a usage
+            # error. The real options go to argparse rather than a bare
+            # print_help() so it still applies them IN ORDER: a
+            # malformed option before --help must lose to argparse, as
+            # it does when a separator is present. argparse exits for
+            # both verdicts; the usage error below is what a
+            # well-formed option list that merely forgot the separator
+            # falls through to.
+            _build_parser().parse_args(options)
         print(
             "lane-run: usage requires '--' before the lane command",
             file=sys.stderr,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -23,9 +24,12 @@ from issue_orchestrator.domain.lane_execution import (
     LaneCommand,
     LaneCompleted,
     LaneDeadline,
+    LaneExecutorError,
+    LaneExecutorUnavailableError,
     LaneOutcome,
     LaneResources,
     LaneSuspendability,
+    LaneTimedOut,
     LaneWorkKey,
 )
 from issue_orchestrator.entrypoints.cli_tools import lane_run as lane_run_module
@@ -41,7 +45,7 @@ from issue_orchestrator.execution.lane_backends import (
     BACKEND_ENVIRONMENT_VARIABLE,
 )
 from issue_orchestrator.ports.machine_state import MachineState
-from issue_orchestrator.entrypoints.cli_tools.lane_run import main
+from issue_orchestrator.entrypoints.cli_tools.lane_run import _build_parser, main
 
 pytestmark = pytest.mark.timeout(180)
 
@@ -164,6 +168,70 @@ def _capture(
     return executor
 
 
+def _fail(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """An executor that faults instead of completing."""
+
+    class _FailingExecutor:
+        def run(self, command: LaneCommand, resources: LaneResources) -> LaneOutcome:
+            del command, resources
+            raise error
+
+    monkeypatch.setattr(
+        lane_run_module, "build_lane_executor", lambda backend: _FailingExecutor()
+    )
+
+
+# What the DISPATCHER means by its own failures. A lane owns the whole
+# 0-255 space, so it can return these too — they are not reserved.
+_COLLIDING_CODES = (70, 78, 124)
+
+
+@pytest.mark.parametrize("code", _COLLIDING_CODES)
+def test_a_lane_returning_a_dispatcher_code_is_passed_through_and_journaled(
+    code: int, monkeypatch: pytest.MonkeyPatch, fake_journal: _FakeJournal
+) -> None:
+    """The exit-code space is NOT disjoint, and lane-run must not pretend.
+
+    Remapping a lane's own 70/78/124 onto some other value would lie
+    about what the lane returned and break make's view of the gate, so
+    the code passes through unchanged. What separates the two cases is
+    out of band: a completed lane always leaves a journal row.
+    """
+    _capture(monkeypatch, LaneCompleted(code, 1.0, 0.0))
+
+    assert _run("/usr/bin/true") == code
+    (record,) = fake_journal.records
+    assert record.exit_code == code
+
+
+@pytest.mark.parametrize(
+    ("code", "provoke"),
+    [
+        (78, lambda mp: _fail(mp, LaneExecutorUnavailableError("pool is down"))),
+        (70, lambda mp: _fail(mp, LaneExecutorError("backend broke mid-run"))),
+        (124, lambda mp: _capture(mp, LaneTimedOut(9.0))),
+    ],
+    ids=["unavailable", "backend-fault", "deadline"],
+)
+def test_a_dispatcher_failure_on_a_colliding_code_journals_nothing(
+    code: int,
+    provoke: Callable[[pytest.MonkeyPatch], object],
+    monkeypatch: pytest.MonkeyPatch,
+    fake_journal: _FakeJournal,
+) -> None:
+    """The other half of the discriminator the docs send callers to.
+
+    Same three exit codes as the test above, reached because the
+    dispatcher failed rather than because the lane did — and no journal
+    row is written. Row present means the lane returned the code; row
+    absent means the dispatcher did.
+    """
+    provoke(monkeypatch)
+
+    assert _run("/usr/bin/true") == code
+    assert not fake_journal.records
+
+
 def test_direct_backend_returns_the_lane_exit_code() -> None:
     assert _run(sys.executable, "-c", "raise SystemExit(0)") == 0
     assert _run(sys.executable, "-c", "raise SystemExit(9)") == 9
@@ -194,8 +262,59 @@ def test_help_survives_the_separator_rule(
 ) -> None:
     """Installed on PATH, --help is the only discovery surface a caller
     outside this repository has; the '--' requirement must not eat it."""
-    assert main([flag]) == 0
+    with pytest.raises(SystemExit) as exit_info:
+        main([flag])
+
+    assert exit_info.value.code == 0
     assert "--work-key" in capsys.readouterr().out
+
+
+# Every shape where -h/--help appears among the options, with and
+# without a separator and with a malformed option ahead of it.
+_HELP_INVOCATIONS = [
+    ["--help"],
+    ["-h"],
+    ["--backend", "condor", "--help"],
+    ["--help", "--", "/usr/bin/true"],
+    ["--backend", "not-a-backend", "--help"],
+    ["--backend", "not-a-backend", "--help", "--", "/usr/bin/true"],
+    ["--work-key", "--help"],
+    ["--work-key", "--help", "--", "/usr/bin/true"],
+]
+
+
+def _outcome(call: Callable[[], object]) -> tuple[str, object]:
+    """How the call ended, not just with what code.
+
+    ``returned 0`` and ``SystemExit(0)`` are different answers that
+    compare equal on the code alone, so the kind travels with it — a
+    pre-scan that answers help by returning 0 must not match argparse
+    exiting 0.
+    """
+    try:
+        return ("returned", call())
+    except SystemExit as exit_info:
+        return ("exited", exit_info.code)
+
+
+@pytest.mark.parametrize("argv", _HELP_INVOCATIONS, ids=" ".join)
+def test_help_never_outranks_parser_validation(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Membership of -h/--help routes to argparse; it never decides.
+
+    Pre-scanning argv for help and answering it directly reports a
+    malformed option list as a successful help request — exit 0 where
+    the parser says 2. The parser's own verdict on the same options is
+    the oracle, so the two cannot diverge again.
+    """
+    separator = argv.index("--") if "--" in argv else None
+    options = argv if separator is None else argv[:separator]
+
+    expected = _outcome(lambda: _build_parser().parse_args(options))
+    capsys.readouterr()
+
+    assert _outcome(lambda: main(list(argv))) == expected
 
 
 def test_a_lane_commands_own_help_is_not_intercepted(

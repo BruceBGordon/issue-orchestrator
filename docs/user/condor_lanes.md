@@ -56,17 +56,34 @@ no policy by absence.
 Depend on the exit codes, not the flags (the flag surface is
 `Experimental`, see [Stability](stability.md)):
 
-| Exit | Meaning |
+| Exit | What the dispatcher means by it |
 |---|---|
 | `124` | The lane exceeded `--timeout-seconds` |
 | `78` | Configuration: undeclared work key, unusable command, backend opted in but unavailable |
 | `70` | The dispatcher broke: a backend fault mid-run, or an unclassified crash |
 | anything else | The lane's own exit code |
 
-That mapping is total, so a caller can tell "your tests failed" from
-"the dispatcher broke" without parsing output. In particular a crash in
-the dispatcher is 70, never the 1 that an uncaught Python exception
-would otherwise produce and that a caller would read as a test failure.
+**These three codes are not reserved.** A lane's own exit code is
+passed through unchanged, `70`, `78` and `124` included: a lane owns
+the whole 0-255 space, so no code the dispatcher picks can be disjoint
+from it, and `lane-run` will not lie about what your command returned.
+For those three values the exit code alone therefore cannot tell "the
+lane failed" from "the dispatcher failed".
+
+Two out-of-band signals can, and both are always written:
+
+- A completed lane prints `[lane-dispatch] <work-key> … exit=<N>` to
+  stderr and appends a row to the dispatch journal at
+  `<git-common-dir>/issue-orchestrator/lane-dispatch.jsonl`. Either one
+  present means the lane ran and returned that code.
+- A dispatcher failure prints a `lane-run: …` message naming the fault
+  and writes no journal row.
+
+What the mapping being total does buy you is that an unclassified crash
+in the dispatcher exits `70` rather than the `1` an uncaught Python
+exception would otherwise produce — `1` being the commonest
+test-failure code of all, and so the one collision that would mislead
+every caller rather than a rare one.
 
 Prefer the console script to `python -m` outside this repo: `-m` puts
 the **caller's** working directory on `sys.path`, so a repo holding a
