@@ -7,18 +7,21 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import shlex
 import sys
 import tomllib
-from typing import Iterator
+from typing import Iterator, NamedTuple
 
 from ...domain.sandbox_scope import SandboxUnsupportedError
 from . import block_no_verify
 
 _RUNTIME_ROOT_ENV = "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT"
 _RUNTIME_LAYOUT_VERSION = "v2"
+
+logger = logging.getLogger(__name__)
 
 
 def _source_codex_home() -> Path:
@@ -61,33 +64,100 @@ def prepare_codex_runtime_home(*, untrusted_projects: Iterable[Path] = ()) -> Pa
         runtime_auth.symlink_to(source_auth)
     verify_codex_runtime_home(require_auth=False)
     projects = tuple(Path(path).resolve() for path in untrusted_projects)
-    if projects:
+    # Strip anything Codex wrote into its own home. Done here, in the mutating
+    # entry point every session launch goes through, rather than in verify:
+    # this is where a write belongs, and it is the path the review exchange
+    # actually takes (persistent_session_exchange -> get_command ->
+    # build_command -> prepare_codex_runtime_home).
+    repairable = _managed_untrusted_projects(
+        runtime_home / "config.toml"
+    ).repairable_keys
+    if repairable:
+        logger.warning(
+            "Codex wrote %s into the managed automation config; rewriting %s "
+            "from the managed project layers",
+            ", ".join(repairable),
+            runtime_home / "config.toml",
+        )
+    if projects or repairable:
         _record_untrusted_projects(runtime_home, projects)
         verify_codex_runtime_home(require_auth=False)
     return runtime_home
 
 
-def _managed_untrusted_projects(config_path: Path) -> set[str]:
+#: Top-level keys Codex writes into its own home during ordinary use. The
+#: runtime home IS a Codex home, so Codex persists state there: a released
+#: version recorded ``[tui] model_availability_nux`` after showing a new-model
+#: notice. These carry no sandbox authority, so stripping them is repair.
+#:
+#: Everything not listed here stays fatal, deliberately. ``mcp_servers`` and
+#: ``notify`` launch programs, ``model_providers`` redirects egress via
+#: ``base_url``, and ``shell_environment_policy`` reshapes the child
+#: environment — none may be silently rewritten away, because a guard that
+#: quietly repairs an escalation is worse than one that refuses. Add a key here
+#: only after establishing that Codex writes it itself and that it cannot
+#: affect the sandbox.
+_CODEX_SELF_WRITTEN_KEYS = frozenset({"tui"})
+
+
+class _ManagedConfig(NamedTuple):
+    """What the managed Codex config holds, and what Codex added to it."""
+
+    projects: frozenset[str]
+    #: Present keys from :data:`_CODEX_SELF_WRITTEN_KEYS`. Repairable by
+    #: rewriting; never dangerous. Any *other* unmanaged key raises instead of
+    #: reaching this field.
+    repairable_keys: tuple[str, ...]
+
+
+def _managed_untrusted_projects(config_path: Path) -> _ManagedConfig:
+    """Read the managed project layers, tolerating keys Codex wrote itself.
+
+    The runtime home is an isolated Codex home, so Codex treats it as its own
+    and persists ordinary state there — a released version wrote
+    ``[tui] model_availability_nux`` after showing a new-model notice. Treating
+    any unmanaged key as tampering turned that into a hard
+    ``SandboxUnsupportedError`` on every session that used the home, which
+    halted the review exchange for four issues in under an hour and marked each
+    ``blocked-failed`` after 15-82 minutes of agent work.
+
+    Only keys in :data:`_CODEX_SELF_WRITTEN_KEYS` are tolerated, and they are
+    reported for the caller to strip rather than accepted in place. Every other
+    unmanaged key still raises: this is a sandbox boundary, and repairing an
+    escalation silently would be worse than refusing.
+
+    Drift *inside* the managed data stays fatal too. A project layer whose
+    settings are anything but ``trust_level = "untrusted"`` is an escalation of
+    the boundary itself, not incidental CLI state, and must never be rewritten
+    away.
+    """
     if not config_path.exists():
-        return set()
+        return _ManagedConfig(frozenset(), ())
     try:
         document = tomllib.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
         raise SandboxUnsupportedError(
             f"Codex automation config is unreadable or invalid: {config_path}: {exc}"
         ) from exc
-    if set(document) != {"projects"} or not isinstance(
-        projects := document["projects"], dict
+    unmanaged = tuple(sorted(key for key in document if key != "projects"))
+    if unexpected := tuple(
+        key for key in unmanaged if key not in _CODEX_SELF_WRITTEN_KEYS
     ):
         raise SandboxUnsupportedError(
-            f"Codex automation config contains unmanaged settings: {config_path}"
+            f"Codex automation config contains unmanaged settings: {config_path} "
+            f"({', '.join(unexpected)})"
+        )
+    projects = document.get("projects", {})
+    if not isinstance(projects, dict):
+        raise SandboxUnsupportedError(
+            f"Codex automation config contains managed-project drift: {config_path}"
         )
     for project, settings in projects.items():
         if not isinstance(project, str) or settings != {"trust_level": "untrusted"}:
             raise SandboxUnsupportedError(
                 f"Codex automation config contains managed-project drift: {config_path}"
             )
-    return set(projects)
+    return _ManagedConfig(frozenset(projects), unmanaged)
 
 
 @contextmanager
@@ -105,7 +175,7 @@ def _runtime_config_lock(runtime_home: Path) -> Iterator[None]:
 def _record_untrusted_projects(runtime_home: Path, projects: Iterable[Path]) -> None:
     config_path = runtime_home / "config.toml"
     with _runtime_config_lock(runtime_home):
-        configured = _managed_untrusted_projects(config_path)
+        configured = set(_managed_untrusted_projects(config_path).projects)
         configured.update(str(project) for project in projects)
         lines = ["# Managed by issue-orchestrator; all project layers stay untrusted."]
         for project in sorted(configured):
@@ -122,6 +192,19 @@ def _record_untrusted_projects(runtime_home: Path, projects: Iterable[Path]) -> 
                 handle.write("\n".join(lines) + "\n")
             os.chmod(temp_path, 0o600)
             os.replace(temp_path, config_path)
+            # Re-read while the lock is still held. Outside it, a Codex write
+            # landing between the rename and the check would raise on a file we
+            # had just written correctly — and that write is *correlated* with
+            # this one, since the drift that triggers a repair is Codex
+            # persisting state. Measured at 16.3% spurious failures on the
+            # production-sized config when this check sat outside the lock.
+            residual = _managed_untrusted_projects(config_path)
+            if residual.repairable_keys:
+                raise SandboxUnsupportedError(
+                    "Codex automation config still contains unmanaged settings "
+                    f"after rewrite: {config_path} "
+                    f"({', '.join(residual.repairable_keys)})"
+                )
         finally:
             temp_path.unlink(missing_ok=True)
 
@@ -147,6 +230,10 @@ def verify_codex_runtime_home(*, require_auth: bool = True) -> Path:
         raise SandboxUnsupportedError(
             f"Codex automation home is not initialized; run setup-hooks: {runtime_home}"
         )
+    # Read-only: this raises on anything unmanaged that is not Codex's own
+    # state. Repair belongs to prepare_codex_runtime_home, the mutating entry
+    # point — a verify that writes would mutate the very home it is about to
+    # judge compromised, and doctor/reporting paths call this too.
     _managed_untrusted_projects(runtime_home / "config.toml")
     unexpected = [path for path in (runtime_home / "hooks.json",) if path.exists()]
     if unexpected:
