@@ -23,11 +23,22 @@ import pytest
 
 from tests.conftest import TERMINAL_TEST_COLUMNS
 
-# The exact tests that #7155 reported failing, across all three files.
+# The exact tests #7155 reported failing, named individually rather than by
+# file. The child run has to stay small: this test already runs inside a lane
+# that is itself under xdist, and a child pytest collecting three whole files
+# (131 tests) makes the guard sensitive to load rather than to the bug. Naming
+# the cases keeps the child at six tests and the signal about colour only.
 ORIGINALLY_FAILING = [
-    "tests/unit/test_ai_gate_cli.py",
-    "tests/unit/test_cli.py",
-    "tests/unit/test_trace_issue.py",
+    "tests/unit/test_ai_gate_cli.py::TestAiGateCLI"
+    "::test_setup_hooks_reports_invalid_codex_registration",
+    "tests/unit/test_ai_gate_cli.py::TestAiGateCLI"
+    "::test_setup_hooks_reports_flat_config_layout_error",
+    # Parametrized; the node id without a suffix runs both cases.
+    "tests/unit/test_ai_gate_cli.py::TestAiGateCLI"
+    "::test_setup_hooks_prints_actionable_ai_gate_failure_details",
+    "tests/unit/test_cli.py::TestCmdSetupGuardrails"
+    "::test_cmd_setup_guardrails_reports_flat_config_layout_error",
+    "tests/unit/test_trace_issue.py::TestCmdTrace::test_no_entries_found",
 ]
 
 
