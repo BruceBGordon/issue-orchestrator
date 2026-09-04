@@ -1,8 +1,32 @@
 """Shared fixtures and configuration for tests."""
 
+import os
+
+# Rich's rendering must be pinned BEFORE anything imports the CLI (#7155).
+#
+# ``entrypoints/cli.py`` builds its ``Console`` at module scope, and
+# ``Console.__init__`` reads ``COLUMNS`` straight into ``self._width``; the
+# colour system is then memoised on first render. Several test modules import
+# from ``entrypoints.cli`` at module scope too, so that console is constructed
+# during *collection* — before any fixture, autouse or not, has had a chance to
+# run. An autouse fixture alone fixes only the files that import the CLI lazily,
+# which is why ``test_ai_gate_cli.py`` passed in isolation while
+# ``test_trace_issue.py`` still failed.
+#
+# This block runs at conftest import, which precedes test-module collection, so
+# every console in the process is built against a fixed environment. The autouse
+# fixture below still exists to stop one test's changes leaking into the next.
+#
+# See the ``isolate_terminal_color_env`` docstring for the failure modes.
+TERMINAL_TEST_COLUMNS = "80"
+_COLOUR_FORCING_VARS = ("FORCE_COLOR", "CLICOLOR_FORCE", "CLICOLOR", "NO_COLOR")
+
+for _var in _COLOUR_FORCING_VARS:
+    os.environ.pop(_var, None)
+os.environ["COLUMNS"] = TERMINAL_TEST_COLUMNS
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import os
 import pytest
 
 from issue_orchestrator.control.tech_lead_run_ownership import (
@@ -118,6 +142,46 @@ def isolate_orchestrator_env(monkeypatch, tmp_path):
     safe_repo = tmp_path / "isolated-repo-root"
     safe_repo.mkdir(exist_ok=True)
     monkeypatch.setenv("ISSUE_ORCHESTRATOR_REPO_ROOT", str(safe_repo))
+
+
+@pytest.fixture(autouse=True)
+def isolate_terminal_color_env(monkeypatch):
+    """Pin rich's rendering so CLI assertions do not depend on the ambient shell.
+
+    ``entrypoints/cli.py`` and its siblings render through
+    ``rich.console.Console``, which reads the environment to decide *both*
+    whether to emit ANSI codes and how wide to wrap. Under pytest capture
+    stdout is not a terminal, so rich normally renders plain text at 80
+    columns — which is the format every existing substring assertion was
+    written against.
+
+    ``FORCE_COLOR`` exists precisely to override that not-a-terminal
+    detection, and agent shells export it (``FORCE_COLOR=3``). When set, six
+    unit tests across ``test_ai_gate_cli.py``, ``test_cli.py`` and
+    ``test_trace_issue.py`` fail two different ways:
+
+    * markup is styled, so ``config/modes/<mode>/`` renders with escape codes
+      between every fragment of ``<mode>``;
+    * rich adopts the real terminal width, so a line wraps mid-assertion and
+      ``hooks must be a JSON object`` arrives split across two segments.
+
+    The CLI is correct here — honouring ``FORCE_COLOR`` is what the variable
+    is for. The tests were the ones assuming an uncoloured ambient shell, an
+    assumption that held on a laptop and in CI and cost four agent sessions a
+    round of confusion each before it was written down (#7155).
+
+    Both halves are neutralised: the colour-forcing variables are stripped so
+    rich falls back to its own capture detection, and ``COLUMNS`` is pinned so
+    wrapping cannot vary with window size. Deleting ``NO_COLOR`` too is
+    deliberate — the goal is one fixed rendering for everyone, not merely a
+    rendering that happens to be plain.
+
+    A test that genuinely needs coloured output should build its own
+    ``Console(force_terminal=True)`` rather than relying on the environment.
+    """
+    for var in _COLOUR_FORCING_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("COLUMNS", TERMINAL_TEST_COLUMNS)
 
 
 @pytest.fixture(autouse=True)
