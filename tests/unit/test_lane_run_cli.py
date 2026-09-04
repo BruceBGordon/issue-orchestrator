@@ -41,6 +41,7 @@ from issue_orchestrator.ports.lane_dispatch_journal import (
     LaneDispatchJournalError,
     LaneDispatchRecord,
 )
+from issue_orchestrator.ports.lane_runtime_history import LaneRuntimeHistoryError
 from issue_orchestrator.execution.lane_backends import (
     BACKEND_ENVIRONMENT_VARIABLE,
 )
@@ -181,6 +182,57 @@ def _fail(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
     )
 
 
+class _BrokenJournal:
+    """Persists nothing and fails loudly — a fault AFTER the lane ran."""
+
+    def __init__(self) -> None:
+        self.persisted: list[LaneDispatchRecord] = []
+
+    def record(self, record: LaneDispatchRecord) -> None:
+        del record
+        raise LaneDispatchJournalError("disk gone")
+
+
+def _break_journal(monkeypatch: pytest.MonkeyPatch) -> _BrokenJournal:
+    journal = _BrokenJournal()
+    monkeypatch.setattr(lane_run_module, "_build_journal", lambda: journal)
+    return journal
+
+
+class _BrokenHistory:
+    """Reads fine, refuses to record — a fault after the row is written."""
+
+    def record_success(
+        self,
+        work_key: LaneWorkKey,
+        runtime_seconds: float,
+        busy_cores: float | None,
+    ) -> None:
+        del work_key, runtime_seconds, busy_cores
+        raise LaneRuntimeHistoryError("history unwritable")
+
+    def learned_priority(self, work_key: LaneWorkKey) -> int:
+        del work_key
+        return 0
+
+    def learned_busy_cores(self, work_key: LaneWorkKey) -> float | None:
+        del work_key
+        return None
+
+
+def _break_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        lane_run_module, "build_runtime_history", lambda: _BrokenHistory()
+    )
+
+
+def _refuse_declaration(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(work_key: str) -> LaneDeclaration:
+        raise LaneDeclarationError(f"lane {work_key!r} is not declared")
+
+    monkeypatch.setattr(lane_run_module, "_load_declaration", refuse)
+
+
 # What the DISPATCHER means by its own failures. A lane owns the whole
 # 0-255 space, so it can return these too — they are not reserved.
 _COLLIDING_CODES = (70, 78, 124)
@@ -194,8 +246,10 @@ def test_a_lane_returning_a_dispatcher_code_is_passed_through_and_journaled(
 
     Remapping a lane's own 70/78/124 onto some other value would lie
     about what the lane returned and break make's view of the gate, so
-    the code passes through unchanged. What separates the two cases is
-    out of band: a completed lane always leaves a journal row.
+    the code passes through unchanged. On the nominal path a completed
+    lane is also journaled — evidence a reader can corroborate against,
+    NOT a discriminator: the post-completion tests below construct both
+    a completed lane with no row and a fault with one.
     """
     _capture(monkeypatch, LaneCompleted(code, 1.0, 0.0))
 
@@ -219,17 +273,120 @@ def test_a_dispatcher_failure_on_a_colliding_code_journals_nothing(
     monkeypatch: pytest.MonkeyPatch,
     fake_journal: _FakeJournal,
 ) -> None:
-    """The other half of the discriminator the docs send callers to.
+    """The same three codes, reached because the dispatcher failed.
 
-    Same three exit codes as the test above, reached because the
-    dispatcher failed rather than because the lane did — and no journal
-    row is written. Row present means the lane returned the code; row
-    absent means the dispatcher did.
+    These faults all happen BEFORE the lane completes, so nothing is
+    journaled. That is the nominal shape the docs describe — and only
+    the nominal shape; the two tests below break it in both directions.
     """
     provoke(monkeypatch)
 
     assert _run("/usr/bin/true") == code
     assert not fake_journal.records
+
+
+def test_a_completed_lane_can_leave_no_journal_row(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Row ABSENCE proves nothing: the lane here really returned 70.
+
+    The fault lands after the lane completed and before its row is
+    written, so a completed lane leaves none — and the fault exit and
+    the lane's own exit are the same number. Any rule of the form "no
+    row means the dispatcher failed" misreads this run, which is why
+    the docs call the journal best-effort evidence and not a verdict.
+    """
+
+    journal = _break_journal(monkeypatch)
+    _capture(monkeypatch, LaneCompleted(70, 1.0, 0.0))
+
+    assert _run("/usr/bin/true") == 70
+    assert not journal.persisted
+    # The lane's own exit is still reported; it is simply not decisive.
+    assert "exit=70" in capsys.readouterr().err
+
+
+def test_a_dispatcher_fault_can_leave_a_row_that_disagrees_with_the_exit(
+    monkeypatch: pytest.MonkeyPatch, fake_journal: _FakeJournal
+) -> None:
+    """Row PRESENCE does not settle what the process returned.
+
+    The lane completed 0 and was journaled; recording what it taught
+    then failed, so lane-run exits 70 with a row on disk saying 0. A
+    row therefore attests that a completion was persisted — not that
+    the invocation as a whole succeeded, and not what it exited with.
+    """
+
+    _break_history(monkeypatch)
+    _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
+
+    assert _run("/usr/bin/true") == 70
+    (record,) = fake_journal.records
+    assert record.exit_code == 0
+
+
+@pytest.mark.parametrize(
+    ("expected", "provoke"),
+    [
+        (78, _refuse_declaration),
+        (78, lambda mp: _fail(mp, LaneExecutorUnavailableError("pool is down"))),
+        (70, lambda mp: _fail(mp, LaneExecutorError("backend broke mid-run"))),
+        (70, lambda mp: _fail(mp, MemoryError("unclassified"))),
+        (124, lambda mp: _capture(mp, LaneTimedOut(9.0))),
+        (70, _break_journal),
+        (70, _break_history),
+    ],
+    ids=[
+        "undeclared",
+        "unavailable",
+        "backend-fault",
+        "unclassified-crash",
+        "deadline",
+        "journal-fault",
+        "history-fault",
+    ],
+)
+def test_every_fault_lane_run_classifies_announces_itself_on_stderr(
+    expected: int,
+    provoke: Callable[[pytest.MonkeyPatch], object],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The one signal a caller can act on, pinned across every path.
+
+    The journal cannot settle whether a colliding 70/78/124 came from
+    the lane or the dispatcher, so what the docs tell callers to read
+    first is this line — INCLUDING the two post-completion faults,
+    where it is the only thing that says the dispatcher was involved.
+    Its absence is what carries the meaning: no such line means the
+    exit code is the lane's own.
+    """
+    # A lane that completes cleanly, so the post-completion faults have
+    # something to fault after; the executor-level cases replace it.
+    _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
+    provoke(monkeypatch)
+
+    assert _run("/usr/bin/true") == expected
+    announced = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("lane-run: ")
+    ]
+    assert announced, "the dispatcher failed without saying so"
+
+
+def test_a_lane_that_merely_fails_says_nothing_as_the_dispatcher(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other side of the signal above: a lane failing on its own
+    produces no `lane-run:` line, which is what makes the line's
+    absence readable as "this exit code is the lane's"."""
+    _capture(monkeypatch, LaneCompleted(1, 1.0, 0.0))
+
+    assert _run("/usr/bin/true") == 1
+    stderr = capsys.readouterr().err
+    assert "[lane-dispatch]" in stderr
+    assert "lane-run: " not in stderr
 
 
 def test_direct_backend_returns_the_lane_exit_code() -> None:

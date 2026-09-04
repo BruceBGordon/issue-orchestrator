@@ -70,14 +70,37 @@ from it, and `lane-run` will not lie about what your command returned.
 For those three values the exit code alone therefore cannot tell "the
 lane failed" from "the dispatcher failed".
 
-Two out-of-band signals can, and both are always written:
+Nothing else settles it either. The dispatch journal at
+`<git-common-dir>/issue-orchestrator/lane-dispatch.jsonl` is
+**best-effort evidence, not a verdict**:
 
-- A completed lane prints `[lane-dispatch] <work-key> … exit=<N>` to
-  stderr and appends a row to the dispatch journal at
-  `<git-common-dir>/issue-orchestrator/lane-dispatch.jsonl`. Either one
-  present means the lane ran and returned that code.
-- A dispatcher failure prints a `lane-run: …` message naming the fault
-  and writes no journal row.
+- A row matching your invocation proves a lane completed and that its
+  completion was persisted. It does not tell you what `lane-run` itself
+  exited with: a fault *after* the row is written still exits `70`,
+  leaving a row that says `"exit_code": 0`.
+- The absence of a row proves nothing. The dispatcher can fault after
+  the lane has finished and before the row is written, or be killed
+  outright in that window, and a lane that genuinely returned `70` then
+  leaves no row at all.
+
+The `[lane-dispatch] … exit=<N>` line on stderr carries the same
+caveat: it reports what the **lane** returned, which after a
+post-completion fault is not what the process returned.
+
+So, for an ambiguous `70`/`78`/`124`:
+
+- **Read the `lane-run: …` line on stderr first.** Every fault
+  `lane-run` classifies prints one naming what it hit, post-completion
+  faults included. A run with no such line exited with the lane's own
+  code — that absence is the one signal here you can rely on.
+- **Treat any non-zero exit as a failed lane and re-run it.** Whether
+  re-running is safe is a property of your command, not of `lane-run`.
+- **Use a journal row as corroboration when one is present**, never its
+  absence as a negative result.
+
+Separating the two cases reliably would take an invocation-correlated
+lifecycle record with an explicit indeterminate state. `lane-run` has
+no such record today, and this page will not pretend otherwise.
 
 What the mapping being total does buy you is that an unclassified crash
 in the dispatcher exits `70` rather than the `1` an uncaught Python

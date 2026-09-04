@@ -16,8 +16,17 @@ module produces outside that set would be read as the lane's.
 The converse does not hold and must not be forced: a lane owns the
 whole 0-255 space and may itself exit 70, 78 or 124, which are passed
 through unchanged rather than remapped — reporting a code the lane did
-not return would be the worse lie. The dispatch journal row, written
-for a completed lane and never for a fault, is what separates them.
+not return would be the worse lie.
+
+Nothing here separates the two reliably, and no code in this module
+should claim to. The journal row is best-effort evidence only: a fault
+after the lane completes can leave a completed lane with no row (the
+journal write itself failing), and a fault after the row is written
+exits 70 over a row recording the lane's own exit. A durable
+discriminator would need an invocation-correlated lifecycle record
+with an explicit indeterminate state, which this module does not have.
+What a caller can rely on is the `lane-run:` stderr line every
+classified fault emits: its ABSENCE means the exit code is the lane's.
 
 Callers outside this repository reach the same `main` through the
 installed `lane-run` console script (see docs/user/condor_lanes.md).
@@ -241,7 +250,13 @@ def _conclude_completed(
     decision in the gate log where a reader already is; the journal (a
     behavior-level port) owns persistence and its failure semantics.
     Failed lanes are journaled too — a kill's dispatch facts are
-    diagnosis, even though only successes feed the learning loop."""
+    diagnosis, even though only successes feed the learning loop.
+
+    Everything below runs AFTER the lane has already finished, so every
+    fault here returns 70 over a lane that completed. That is why the
+    journal row cannot be read as a verdict: a failure before the write
+    leaves a completed lane with no row, and one after it leaves a row
+    whose exit_code is not what this process returns."""
     request = dispatch.cpu_request
     print(
         f"[lane-dispatch] {dispatch.work_key.value} backend={dispatch.backend} "
