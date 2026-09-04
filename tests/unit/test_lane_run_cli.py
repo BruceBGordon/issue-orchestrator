@@ -226,13 +226,6 @@ def _break_history(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _refuse_declaration(monkeypatch: pytest.MonkeyPatch) -> None:
-    def refuse(work_key: str) -> LaneDeclaration:
-        raise LaneDeclarationError(f"lane {work_key!r} is not declared")
-
-    monkeypatch.setattr(lane_run_module, "_load_declaration", refuse)
-
-
 # What the DISPATCHER means by its own failures. A lane owns the whole
 # 0-255 space, so it can return these too — they are not reserved.
 _COLLIDING_CODES = (70, 78, 124)
@@ -246,10 +239,9 @@ def test_a_lane_returning_a_dispatcher_code_is_passed_through_and_journaled(
 
     Remapping a lane's own 70/78/124 onto some other value would lie
     about what the lane returned and break make's view of the gate, so
-    the code passes through unchanged. On the nominal path a completed
-    lane is also journaled — evidence a reader can corroborate against,
-    NOT a discriminator: the post-completion tests below construct both
-    a completed lane with no row and a fault with one.
+    the code passes through unchanged. This pins the passthrough, and
+    that a completed lane is journaled on the nominal path — nothing
+    about telling the two apart, which no signal here can do.
     """
     _capture(monkeypatch, LaneCompleted(code, 1.0, 0.0))
 
@@ -276,8 +268,9 @@ def test_a_dispatcher_failure_on_a_colliding_code_journals_nothing(
     """The same three codes, reached because the dispatcher failed.
 
     These faults all happen BEFORE the lane completes, so nothing is
-    journaled. That is the nominal shape the docs describe — and only
-    the nominal shape; the two tests below break it in both directions.
+    journaled. Together with the two tests below — which break it in
+    both directions — this is what "journal rows are best-effort"
+    means concretely.
     """
     provoke(monkeypatch)
 
@@ -293,8 +286,7 @@ def test_a_completed_lane_can_leave_no_journal_row(
     The fault lands after the lane completed and before its row is
     written, so a completed lane leaves none — and the fault exit and
     the lane's own exit are the same number. Any rule of the form "no
-    row means the dispatcher failed" misreads this run, which is why
-    the docs call the journal best-effort evidence and not a verdict.
+    row means the dispatcher failed" misreads this run.
     """
 
     journal = _break_journal(monkeypatch)
@@ -313,8 +305,8 @@ def test_a_dispatcher_fault_can_leave_a_row_that_disagrees_with_the_exit(
 
     The lane completed 0 and was journaled; recording what it taught
     then failed, so lane-run exits 70 with a row on disk saying 0. A
-    row therefore attests that a completion was persisted — not that
-    the invocation as a whole succeeded, and not what it exited with.
+    row attests that a completion was persisted — not that the
+    invocation succeeded, and not what it exited with.
     """
 
     _break_history(monkeypatch)
@@ -325,68 +317,49 @@ def test_a_dispatcher_fault_can_leave_a_row_that_disagrees_with_the_exit(
     assert record.exit_code == 0
 
 
-@pytest.mark.parametrize(
-    ("expected", "provoke"),
-    [
-        (78, _refuse_declaration),
-        (78, lambda mp: _fail(mp, LaneExecutorUnavailableError("pool is down"))),
-        (70, lambda mp: _fail(mp, LaneExecutorError("backend broke mid-run"))),
-        (70, lambda mp: _fail(mp, MemoryError("unclassified"))),
-        (124, lambda mp: _capture(mp, LaneTimedOut(9.0))),
-        (70, _break_journal),
-        (70, _break_history),
-    ],
-    ids=[
-        "undeclared",
-        "unavailable",
-        "backend-fault",
-        "unclassified-crash",
-        "deadline",
-        "journal-fault",
-        "history-fault",
-    ],
-)
-def test_every_fault_lane_run_classifies_announces_itself_on_stderr(
-    expected: int,
-    provoke: Callable[[pytest.MonkeyPatch], object],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+def test_a_lane_can_forge_the_dispatcher_prefix_on_its_inherited_stderr(
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """The one signal a caller can act on, pinned across every path.
+    """Why the docs promise nothing about the `lane-run:` prefix.
 
-    The journal cannot settle whether a colliding 70/78/124 came from
-    the lane or the dispatcher, so what the docs tell callers to read
-    first is this line — INCLUDING the two post-completion faults,
-    where it is the only thing that says the dispatcher was involved.
-    Its absence is what carries the meaning: no such line means the
-    exit code is the lane's own.
+    The lane inherits this process's stderr FILE DESCRIPTOR, so it can
+    print the dispatcher's own prefix. Here a real subprocess emits one
+    and exits 70 with no dispatcher fault anywhere - prefix present,
+    dispatcher fine, and the 70 is the lane's.
+
+    capfd, not capsys: the forgery arrives on fd 2 rather than through
+    this process's `sys.stderr`, which is the whole mechanism. A silent
+    fake lane shows none of this, which is how an earlier version of
+    these tests came to underwrite a false claim.
     """
-    # A lane that completes cleanly, so the post-completion faults have
-    # something to fault after; the executor-level cases replace it.
-    _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
-    provoke(monkeypatch)
-
-    assert _run("/usr/bin/true") == expected
-    announced = [
-        line
-        for line in capsys.readouterr().err.splitlines()
-        if line.startswith("lane-run: ")
-    ]
-    assert announced, "the dispatcher failed without saying so"
-
-
-def test_a_lane_that_merely_fails_says_nothing_as_the_dispatcher(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The other side of the signal above: a lane failing on its own
-    produces no `lane-run:` line, which is what makes the line's
-    absence readable as "this exit code is the lane's"."""
-    _capture(monkeypatch, LaneCompleted(1, 1.0, 0.0))
-
-    assert _run("/usr/bin/true") == 1
-    stderr = capsys.readouterr().err
+    assert _run("/bin/sh", "-c", 'echo "lane-run: forged by lane" >&2; exit 70') == 70
+    stderr = capfd.readouterr().err
+    assert "lane-run: forged by lane" in stderr
     assert "[lane-dispatch]" in stderr
-    assert "lane-run: " not in stderr
+
+
+def test_a_fault_while_announcing_still_returns_the_dispatcher_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unwritable stderr must not promote itself into the exit code.
+
+    The classified fault below cannot be printed; without a guard the
+    OSError escapes main and CPython exits 1 - a lane result code, and
+    the one collision the total mapping exists to remove.
+    """
+
+    class _DeadStderr:
+        def write(self, text: str) -> int:
+            del text
+            raise OSError(28, "No space left on device")
+
+        def flush(self) -> None:
+            pass
+
+    _fail(monkeypatch, LaneExecutorError("backend broke mid-run"))
+    monkeypatch.setattr(sys, "stderr", _DeadStderr())
+
+    assert _run("/usr/bin/true") == 70
 
 
 def test_direct_backend_returns_the_lane_exit_code() -> None:

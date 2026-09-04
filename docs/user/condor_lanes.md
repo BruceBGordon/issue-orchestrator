@@ -67,40 +67,29 @@ Depend on the exit codes, not the flags (the flag surface is
 passed through unchanged, `70`, `78` and `124` included: a lane owns
 the whole 0-255 space, so no code the dispatcher picks can be disjoint
 from it, and `lane-run` will not lie about what your command returned.
-For those three values the exit code alone therefore cannot tell "the
-lane failed" from "the dispatcher failed".
 
-Nothing else settles it either. The dispatch journal at
-`<git-common-dir>/issue-orchestrator/lane-dispatch.jsonl` is
-**best-effort evidence, not a verdict**:
+**No in-band signal distinguishes a dispatcher fault from a lane
+result** — not the exit code, not the journal, not the stderr prefix:
 
-- A row matching your invocation proves a lane completed and that its
-  completion was persisted. It does not tell you what `lane-run` itself
-  exited with: a fault *after* the row is written still exits `70`,
-  leaving a row that says `"exit_code": 0`.
-- The absence of a row proves nothing. The dispatcher can fault after
-  the lane has finished and before the row is written, or be killed
-  outright in that window, and a lane that genuinely returned `70` then
-  leaves no row at all.
+- Exit codes collide, as above.
+- Journal rows are best-effort in both directions. A fault after the
+  lane finishes and before its row is written leaves a completed lane
+  with no row; a fault after the write exits `70` over a row that says
+  `"exit_code": 0`.
+- The `lane-run: …` stderr prefix is neither guaranteed nor
+  unforgeable. A stderr that cannot be written emits nothing, and the
+  lane inherits stderr, so `echo "lane-run: …" >&2` from inside a lane
+  produces the prefix with no dispatcher fault anywhere.
 
-The `[lane-dispatch] … exit=<N>` line on stderr carries the same
-caveat: it reports what the **lane** returned, which after a
-post-completion fault is not what the process returned.
+So: **treat any non-zero exit as a failed lane.** Whether re-running is
+safe is a property of your command, not of `lane-run`. Everything
+`lane-run` writes is diagnostic — read it when it is there, never test
+for its absence.
 
-So, for an ambiguous `70`/`78`/`124`:
-
-- **Read the `lane-run: …` line on stderr first.** Every fault
-  `lane-run` classifies prints one naming what it hit, post-completion
-  faults included. A run with no such line exited with the lane's own
-  code — that absence is the one signal here you can rely on.
-- **Treat any non-zero exit as a failed lane and re-run it.** Whether
-  re-running is safe is a property of your command, not of `lane-run`.
-- **Use a journal row as corroboration when one is present**, never its
-  absence as a negative result.
-
-Separating the two cases reliably would take an invocation-correlated
-lifecycle record with an explicit indeterminate state. `lane-run` has
-no such record today, and this page will not pretend otherwise.
+Do not re-derive a discriminator from these signals. Each of the three
+above was documented on this page as one, and each was falsified.
+Doing it properly needs an invocation-correlated lifecycle record with
+an explicit indeterminate state, which `lane-run` does not have.
 
 What the mapping being total does buy you is that an unclassified crash
 in the dispatcher exits `70` rather than the `1` an uncaught Python
@@ -528,12 +517,16 @@ from its `declared_cpus` over successive runs while
 is stuck, not tuned. Delete that lane's file from the history
 directory to reset it to the declared seed.
 
-Every completed lane also reports its dispatch facts — the priority it
-ran with, how long it queued, how long it executed, what it requested
+A completed lane also reports its dispatch facts — the priority it ran
+with, how long it queued, how long it executed, what it requested
 against what was declared, and what it actually used — as a
-`[lane-dispatch]` line in the gate log and a row in
+`[lane-dispatch]` line in the gate log, then a row in
 `<git-common-dir>/issue-orchestrator/lane-dispatch.jsonl`, so dispatch
-quality is checkable without pool archaeology. Jobs additionally carry
+quality is checkable without pool archaeology. Both are diagnostic and
+neither is guaranteed: a failed journal write exits `70` with the line
+already printed and no row behind it, so read these records when they
+are present and never infer anything from a missing one (see
+[exit codes](#calling-lane-run-from-another-repository)). Jobs additionally carry
 their submitting worktree (`LaneSubmitter` in the queue), since the
 pool is shared and concurrent gates from different worktrees are
 normal.

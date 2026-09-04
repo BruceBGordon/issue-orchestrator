@@ -18,15 +18,15 @@ whole 0-255 space and may itself exit 70, 78 or 124, which are passed
 through unchanged rather than remapped — reporting a code the lane did
 not return would be the worse lie.
 
-Nothing here separates the two reliably, and no code in this module
-should claim to. The journal row is best-effort evidence only: a fault
-after the lane completes can leave a completed lane with no row (the
-journal write itself failing), and a fault after the row is written
-exits 70 over a row recording the lane's own exit. A durable
-discriminator would need an invocation-correlated lifecycle record
-with an explicit indeterminate state, which this module does not have.
-What a caller can rely on is the `lane-run:` stderr line every
-classified fault emits: its ABSENCE means the exit code is the lane's.
+NOTHING this module emits separates the two, and no code or doc here
+may claim otherwise — three such claims have already been falsified.
+Journal rows are best-effort in both directions (a fault before the
+write leaves a completed lane with no row; one after it exits 70 over
+a row recording the lane's own exit), and the `lane-run:` stderr
+prefix is neither guaranteed nor unforgeable — writes can fail, and
+the lane inherits this process's stderr, so it can print the prefix
+itself. A real discriminator needs an invocation-correlated lifecycle
+record with an explicit indeterminate state; this module has none.
 
 Callers outside this repository reach the same `main` through the
 installed `lane-run` console script (see docs/user/condor_lanes.md).
@@ -112,9 +112,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return _dispatch(list(sys.argv[1:] if argv is None else argv))
     except Exception:
+        _announce_internal_error()
+        return _BACKEND_FAULT_EXIT_CODE
+
+
+def _announce_internal_error() -> None:
+    """Report the crash without letting the report become one.
+
+    The exit code is the contract; the message is diagnostic. An
+    unwritable stderr (full disk, closed pipe) raising out of THIS
+    handler would escape `main` and exit 1 — a lane result code — so
+    the diagnostic is what gets dropped, never the classification.
+    """
+    try:
         print("lane-run: internal error:", file=sys.stderr)
         traceback.print_exc()
-        return _BACKEND_FAULT_EXIT_CODE
+    except OSError:
+        pass
 
 
 def _dispatch(raw: list[str]) -> int:
