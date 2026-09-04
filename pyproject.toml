@@ -54,7 +54,7 @@ dev = [
     "import-linter>=2.0",  # Architecture boundary enforcement
     "beautifulsoup4>=4.12",  # HTML parsing for template tests
     "lxml>=6.1.0",  # Fast HTML parser for BeautifulSoup
-    "playwright==1.57.0",  # Pinned to avoid 250MB browser re-downloads on version bumps
+    "playwright==1.62.0",  # Pinned to avoid 250MB browser re-downloads on version bumps
     "pytest-playwright>=0.7",  # Playwright pytest integration
     "hypothesis>=6.0",  # Property-based testing
 ]
