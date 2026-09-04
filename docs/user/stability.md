@@ -133,7 +133,18 @@ The console scripts installed by the package:
 | `reviewer-done` | Review agents | Supported |
 | `exchange-respond` | Review-exchange agents | Experimental |
 | `prepush-check` | Agents and git hooks | Supported |
+| `lane-run` | Validation-lane callers, in any repo | Experimental |
 | `verify-agent-sandbox` | Guardrail verification | Internal |
+
+`lane-run` is installed as a console script so a repository with no Python
+environment of its own can dispatch a validation lane without naming this
+package's interpreter by absolute path — see
+[HTCondor Validation Lanes](condor_lanes.md). It is `Experimental` because the
+flag surface has already moved once: `--request-cpus`, `--priority` and the
+rest became `.issue-orchestrator/lanes.yaml` rows, and a test now asserts those
+flags do *not* exist. The exit codes are the part worth depending on, and
+`tests/unit/test_console_script_entry_points.py` drives the declared entry
+point the way the generated wrapper does to keep them honest.
 
 ### Agent completion contracts — supported
 

@@ -8,8 +8,13 @@ outcome back into a process exit code for make.
 
 Exit codes: the lane's own exit code on completion; 124 on deadline;
 78 (configuration) when an opted-in backend is unavailable; 70
-(software) when the backend itself faults mid-run. Backend faults are
-never disguised as lane results.
+(software) when the backend faults mid-run or the dispatcher itself
+crashes unclassified. Backend faults are never disguised as lane
+results, so the mapping in `main` must stay total: any code this
+module produces outside that set would be read as the lane's.
+
+Callers outside this repository reach the same `main` through the
+installed `lane-run` console script (see docs/user/condor_lanes.md).
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import argparse
 import os
 import shutil
 import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -72,19 +78,46 @@ _BACKEND_FAULT_EXIT_CODE = 70
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    raw = list(sys.argv[1:] if argv is None else argv)
-    if "--" not in raw:
+    """Total owner of the exit-code contract, for every caller.
+
+    Both invocation forms — the installed ``lane-run`` console script
+    (``sys.exit(main())``) and ``python -m ...lane_run`` — enter here,
+    so the contract cannot differ between them and no wrapper may sit
+    on one path only. Totality is the reason there is no ``safe_main``:
+    an escaping exception would exit 1 under CPython, and 1 is a *lane*
+    result code, so an unclassified dispatcher crash would read as
+    "your tests failed". Classifying it as 70 keeps the promise that
+    backend faults are never disguised as lane results; the traceback
+    is printed verbatim, so nothing is softened, only named.
+    """
+    try:
+        return _dispatch(list(sys.argv[1:] if argv is None else argv))
+    except Exception:
+        print("lane-run: internal error:", file=sys.stderr)
+        traceback.print_exc()
+        return _BACKEND_FAULT_EXIT_CODE
+
+
+def _dispatch(raw: list[str]) -> int:
+    separator = raw.index("--") if "--" in raw else None
+    options = raw if separator is None else raw[:separator]
+    if "-h" in options or "--help" in options:
+        # On PATH this CLI's only discovery surface is --help, so the
+        # separator rule must not shadow it. A lane command's own
+        # --help sits after the separator and is never read here.
+        _build_parser().print_help()
+        return 0
+    if separator is None:
         print(
             "lane-run: usage requires '--' before the lane command",
             file=sys.stderr,
         )
         return _UNAVAILABLE_EXIT_CODE
-    separator = raw.index("--")
     command = raw[separator + 1 :]
     if not command:
         print("lane-run: no lane command after '--'", file=sys.stderr)
         return _UNAVAILABLE_EXIT_CODE
-    arguments = _parse_arguments(raw[:separator])
+    arguments = _build_parser().parse_args(options)
     arguments.command = command
     try:
         executor = build_lane_executor(str(arguments.backend))
@@ -254,7 +287,7 @@ def _format_busy_cores(measured: float | None) -> str:
     return f"{measured:.2f}"
 
 
-def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lane-run",
         description="Run one validation lane through the configured backend.",
@@ -274,7 +307,7 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
             f"${BACKEND_ENVIRONMENT_VARIABLE} or '{DIRECT_BACKEND}'."
         ),
     )
-    return parser.parse_args(argv)
+    return parser
 
 
 def _load_declaration(work_key: str) -> LaneDeclaration:

@@ -32,6 +32,60 @@ There is **no silent fallback**: if the backend is opted in but the pool
 is unreachable, lanes fail loudly with exit code 78 and a message
 pointing here. `scripts/condor-personal.sh status` shows pool health.
 
+## Calling `lane-run` from another repository
+
+The pool is shared, so the dispatcher has to be callable from repos that
+are not this one — including repos with no Python environment of their
+own. Installing this package puts `lane-run` on `PATH`:
+
+```bash
+# From a clone of this repo (not on PyPI); pipx install works the same way.
+uv tool install /path/to/issue-orchestrator
+
+cd /path/to/your-repo
+lane-run --work-key test-unit --timeout-seconds 900 -- npm test
+```
+
+Nothing about the invocation is issue-orchestrator-specific. `lane-run`
+resolves `.issue-orchestrator/lanes.yaml` relative to its **working
+directory**, so the calling repo declares its own lanes, and everything
+after `--` is the calling repo's own command. A work key with no row in
+that file fails with exit 78 rather than running unscheduled — there is
+no policy by absence.
+
+Depend on the exit codes, not the flags (the flag surface is
+`Experimental`, see [Stability](stability.md)):
+
+| Exit | Meaning |
+|---|---|
+| `124` | The lane exceeded `--timeout-seconds` |
+| `78` | Configuration: undeclared work key, unusable command, backend opted in but unavailable |
+| `70` | The dispatcher broke: a backend fault mid-run, or an unclassified crash |
+| anything else | The lane's own exit code |
+
+That mapping is total, so a caller can tell "your tests failed" from
+"the dispatcher broke" without parsing output. In particular a crash in
+the dispatcher is 70, never the 1 that an uncaught Python exception
+would otherwise produce and that a caller would read as a test failure.
+
+Prefer the console script to `python -m` outside this repo: `-m` puts
+the **caller's** working directory on `sys.path`, so a repo holding a
+top-level module named after one of this package's dependencies breaks
+the dispatcher — with exit 1, a lane result code. The console script
+imports from the install, and is unaffected.
+
+This repo's own callers — the Makefile and `docker/execenv/selftest.sh` —
+deliberately keep using
+`$(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_run`: naming
+the interpreter pins the gate to its own virtualenv, where a bare
+`lane-run` would resolve through `PATH` and could be another install —
+including one produced by the `uv tool install` above. The gate's
+working directory is this repo's root, which holds nothing that shadows
+one of this package's imports, so the `sys.path` hazard does not apply
+to it.
+`tests/unit/test_console_script_entry_points.py` asserts both forms name
+the same module, so the two cannot drift apart.
+
 ## Scope: validation lanes only on macOS
 
 The macOS personal pool tracks process **families**, not cgroups — a

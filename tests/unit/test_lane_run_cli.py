@@ -188,6 +188,55 @@ def test_missing_separator_is_a_usage_error() -> None:
     )
 
 
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_help_survives_the_separator_rule(
+    flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Installed on PATH, --help is the only discovery surface a caller
+    outside this repository has; the '--' requirement must not eat it."""
+    assert main([flag]) == 0
+    assert "--work-key" in capsys.readouterr().out
+
+
+def test_a_lane_commands_own_help_is_not_intercepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--help after the separator belongs to the lane, not to lane-run."""
+    executor = _capture(monkeypatch, LaneCompleted(0, 0.0, 0.0))
+
+    assert _run("/usr/bin/true", "--help") == 0
+    assert executor.resources, "the lane never ran - help was intercepted"
+
+
+def test_an_unclassified_crash_is_a_dispatcher_fault_not_a_lane_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CPython exits 1 on an escaping exception, and 1 is a lane result
+    code. A dispatcher bug reported as 1 would read as "your tests
+    failed", so main's mapping must be total: 70, with the traceback
+    intact so nothing is softened."""
+
+    def explode(work_key: str) -> LaneDeclaration:
+        del work_key
+        raise MemoryError("unclassified")
+
+    monkeypatch.setattr(lane_run_module, "_load_declaration", explode)
+
+    assert _run("/usr/bin/true") == 70
+    stderr = capsys.readouterr().err
+    assert "lane-run: internal error:" in stderr
+    assert "MemoryError: unclassified" in stderr
+
+
+def test_totality_does_not_swallow_argparse_exits() -> None:
+    """SystemExit is the parser rejecting input, not a dispatcher fault;
+    catching it would turn every usage error into a 70."""
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--work-key", "cli.test", "--", "/usr/bin/true"])
+
+    assert exit_info.value.code == 2
+
+
 def test_missing_lane_executable_fails_as_configuration_error() -> None:
     assert _run("definitely-not-a-real-binary-anywhere") == 78
 
