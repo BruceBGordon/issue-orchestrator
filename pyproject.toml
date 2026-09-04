@@ -66,6 +66,14 @@ reviewer-done = "issue_orchestrator.entrypoints.cli_tools.reviewer_done:safe_mai
 exchange-respond = "issue_orchestrator.entrypoints.cli_tools.exchange_respond:safe_main"
 verify-agent-sandbox = "issue_orchestrator.execution.sandbox_verify:main"
 prepush-check = "issue_orchestrator.entrypoints.cli_tools.prepush_check:main"
+# `main`, not a `safe_main` wrapper: `lane_run.main` is itself total over the
+# lane exit-code contract (124 deadline, 78 configuration, 70 dispatcher fault,
+# otherwise the lane's own code). A wrapper would guard this path only, so the
+# contract would differ from `python -m ...lane_run`, which the Makefile uses.
+# The agent-completion `safe_main`s exist to write a CompletionRecord on crash,
+# an obligation lane-run does not have; `exchange-respond`'s exits 1, which
+# here is a lane result code.
+lane-run = "issue_orchestrator.entrypoints.cli_tools.lane_run:main"
 issue-orchestrator-mcp = "issue_orchestrator.entrypoints.mcp_server:main"
 
 # Plugin entry points - third-party packages can add their own

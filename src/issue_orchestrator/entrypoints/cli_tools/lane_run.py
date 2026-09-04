@@ -8,8 +8,28 @@ outcome back into a process exit code for make.
 
 Exit codes: the lane's own exit code on completion; 124 on deadline;
 78 (configuration) when an opted-in backend is unavailable; 70
-(software) when the backend itself faults mid-run. Backend faults are
-never disguised as lane results.
+(software) when the backend faults mid-run or the dispatcher itself
+crashes unclassified. Backend faults are never disguised as lane
+results, so the mapping in `main` must stay total: any code this
+module produces outside that set would be read as the lane's.
+
+The converse does not hold and must not be forced: a lane owns the
+whole 0-255 space and may itself exit 70, 78 or 124, which are passed
+through unchanged rather than remapped — reporting a code the lane did
+not return would be the worse lie.
+
+NOTHING this module emits separates the two, and no code or doc here
+may claim otherwise — three such claims have already been falsified.
+Journal rows are best-effort in both directions (a fault before the
+write leaves a completed lane with no row; one after it exits 70 over
+a row recording the lane's own exit), and the `lane-run:` stderr
+prefix is neither guaranteed nor unforgeable — writes can fail, and
+the lane inherits this process's stderr, so it can print the prefix
+itself. A real discriminator needs an invocation-correlated lifecycle
+record with an explicit indeterminate state; this module has none.
+
+Callers outside this repository reach the same `main` through the
+installed `lane-run` console script (see docs/user/condor_lanes.md).
 """
 
 from __future__ import annotations
@@ -18,6 +38,7 @@ import argparse
 import os
 import shutil
 import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -72,19 +93,69 @@ _BACKEND_FAULT_EXIT_CODE = 70
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    raw = list(sys.argv[1:] if argv is None else argv)
-    if "--" not in raw:
+    """Total owner of the exit-code contract, for every caller.
+
+    Both invocation forms — the installed ``lane-run`` console script
+    (``sys.exit(main())``) and ``python -m ...lane_run`` — enter here,
+    so the contract cannot differ between them and no wrapper may sit
+    on one path only. Totality is the reason there is no ``safe_main``:
+    an escaping exception would exit 1 under CPython, and 1 is a *lane*
+    result code, so an unclassified dispatcher crash would read as
+    "your tests failed". Classifying it as 70 keeps the promise that
+    backend faults are never disguised as lane results; the traceback
+    is printed verbatim, so nothing is softened, only named.
+
+    Option-shape errors and ``--help`` stay argparse's: it exits
+    directly, and SystemExit is not an ``Exception``, so those verdicts
+    pass through this mapping rather than being restated by it.
+    """
+    try:
+        return _dispatch(list(sys.argv[1:] if argv is None else argv))
+    except Exception:
+        _announce_internal_error()
+        return _BACKEND_FAULT_EXIT_CODE
+
+
+def _announce_internal_error() -> None:
+    """Report the crash without letting the report become one.
+
+    The exit code is the contract; the message is diagnostic. An
+    unwritable stderr (full disk, closed pipe) raising out of THIS
+    handler would escape `main` and exit 1 — a lane result code — so
+    the diagnostic is what gets dropped, never the classification.
+    """
+    try:
+        print("lane-run: internal error:", file=sys.stderr)
+        traceback.print_exc()
+    except OSError:
+        pass
+
+
+def _dispatch(raw: list[str]) -> int:
+    separator = raw.index("--") if "--" in raw else None
+    options = raw if separator is None else raw[:separator]
+    if separator is None:
+        if "-h" in options or "--help" in options:
+            # On PATH this CLI's only discovery surface is --help, and
+            # the separator rule would otherwise answer it with a usage
+            # error. The real options go to argparse rather than a bare
+            # print_help() so it still applies them IN ORDER: a
+            # malformed option before --help must lose to argparse, as
+            # it does when a separator is present. argparse exits for
+            # both verdicts; the usage error below is what a
+            # well-formed option list that merely forgot the separator
+            # falls through to.
+            _build_parser().parse_args(options)
         print(
             "lane-run: usage requires '--' before the lane command",
             file=sys.stderr,
         )
         return _UNAVAILABLE_EXIT_CODE
-    separator = raw.index("--")
     command = raw[separator + 1 :]
     if not command:
         print("lane-run: no lane command after '--'", file=sys.stderr)
         return _UNAVAILABLE_EXIT_CODE
-    arguments = _parse_arguments(raw[:separator])
+    arguments = _build_parser().parse_args(options)
     arguments.command = command
     try:
         executor = build_lane_executor(str(arguments.backend))
@@ -193,7 +264,13 @@ def _conclude_completed(
     decision in the gate log where a reader already is; the journal (a
     behavior-level port) owns persistence and its failure semantics.
     Failed lanes are journaled too — a kill's dispatch facts are
-    diagnosis, even though only successes feed the learning loop."""
+    diagnosis, even though only successes feed the learning loop.
+
+    Everything below runs AFTER the lane has already finished, so every
+    fault here returns 70 over a lane that completed. That is why the
+    journal row cannot be read as a verdict: a failure before the write
+    leaves a completed lane with no row, and one after it leaves a row
+    whose exit_code is not what this process returns."""
     request = dispatch.cpu_request
     print(
         f"[lane-dispatch] {dispatch.work_key.value} backend={dispatch.backend} "
@@ -254,7 +331,7 @@ def _format_busy_cores(measured: float | None) -> str:
     return f"{measured:.2f}"
 
 
-def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lane-run",
         description="Run one validation lane through the configured backend.",
@@ -274,7 +351,7 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
             f"${BACKEND_ENVIRONMENT_VARIABLE} or '{DIRECT_BACKEND}'."
         ),
     )
-    return parser.parse_args(argv)
+    return parser
 
 
 def _load_declaration(work_key: str) -> LaneDeclaration:

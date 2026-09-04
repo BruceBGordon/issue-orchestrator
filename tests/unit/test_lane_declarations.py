@@ -209,7 +209,7 @@ def test_selftest_lane_run_calls_parse_against_the_current_cli() -> None:
     import shlex
 
     from issue_orchestrator.entrypoints.cli_tools.lane_run import (
-        _parse_arguments,
+        _build_parser,
     )
 
     text = (REPO_ROOT / "docker/execenv/selftest.sh").read_text()
@@ -217,7 +217,7 @@ def test_selftest_lane_run_calls_parse_against_the_current_cli() -> None:
     invocations = re.findall(r"\$LANE_RUN\s+(.*?)\s+--\s", joined)
     assert invocations, "selftest lane-run invocations not found - probe broken"
     for invocation in invocations:
-        parsed = _parse_arguments(shlex.split(invocation))
+        parsed = _build_parser().parse_args(shlex.split(invocation))
         assert str(parsed.work_key).startswith("execenv.")
 
 

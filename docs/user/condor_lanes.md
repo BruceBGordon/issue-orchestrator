@@ -32,6 +32,89 @@ There is **no silent fallback**: if the backend is opted in but the pool
 is unreachable, lanes fail loudly with exit code 78 and a message
 pointing here. `scripts/condor-personal.sh status` shows pool health.
 
+## Calling `lane-run` from another repository
+
+The pool is shared, so the dispatcher has to be callable from repos that
+are not this one — including repos with no Python environment of their
+own. Installing this package puts `lane-run` on `PATH`:
+
+```bash
+# From a clone of this repo (not on PyPI); pipx install works the same way.
+uv tool install /path/to/issue-orchestrator
+
+cd /path/to/your-repo
+lane-run --work-key test-unit --timeout-seconds 900 -- npm test
+```
+
+Nothing about the invocation is issue-orchestrator-specific. `lane-run`
+resolves `.issue-orchestrator/lanes.yaml` relative to its **working
+directory**, so the calling repo declares its own lanes, and everything
+after `--` is the calling repo's own command. A work key with no row in
+that file fails with exit 78 rather than running unscheduled — there is
+no policy by absence.
+
+Depend on the exit codes, not the flags (the flag surface is
+`Experimental`, see [Stability](stability.md)):
+
+| Exit | What the dispatcher means by it |
+|---|---|
+| `124` | The lane exceeded `--timeout-seconds` |
+| `78` | Configuration: undeclared work key, unusable command, backend opted in but unavailable |
+| `70` | The dispatcher broke: a backend fault mid-run, or an unclassified crash |
+| anything else | The lane's own exit code |
+
+**These three codes are not reserved.** A lane's own exit code is
+passed through unchanged, `70`, `78` and `124` included: a lane owns
+the whole 0-255 space, so no code the dispatcher picks can be disjoint
+from it, and `lane-run` will not lie about what your command returned.
+
+**No in-band signal distinguishes a dispatcher fault from a lane
+result** — not the exit code, not the journal, not the stderr prefix:
+
+- Exit codes collide, as above.
+- Journal rows are best-effort in both directions. A fault after the
+  lane finishes and before its row is written leaves a completed lane
+  with no row; a fault after the write exits `70` over a row that says
+  `"exit_code": 0`.
+- The `lane-run: …` stderr prefix is neither guaranteed nor
+  unforgeable. A stderr that cannot be written emits nothing, and the
+  lane inherits stderr, so `echo "lane-run: …" >&2` from inside a lane
+  produces the prefix with no dispatcher fault anywhere.
+
+So: **treat any non-zero exit as a failed lane.** Whether re-running is
+safe is a property of your command, not of `lane-run`. Everything
+`lane-run` writes is diagnostic — read it when it is there, never test
+for its absence.
+
+Do not re-derive a discriminator from these signals. Each of the three
+above was documented on this page as one, and each was falsified.
+Doing it properly needs an invocation-correlated lifecycle record with
+an explicit indeterminate state, which `lane-run` does not have.
+
+What the mapping being total does buy you is that an unclassified crash
+in the dispatcher exits `70` rather than the `1` an uncaught Python
+exception would otherwise produce — `1` being the commonest
+test-failure code of all, and so the one collision that would mislead
+every caller rather than a rare one.
+
+Prefer the console script to `python -m` outside this repo: `-m` puts
+the **caller's** working directory on `sys.path`, so a repo holding a
+top-level module named after one of this package's dependencies breaks
+the dispatcher — with exit 1, a lane result code. The console script
+imports from the install, and is unaffected.
+
+This repo's own callers — the Makefile and `docker/execenv/selftest.sh` —
+deliberately keep using
+`$(PYTHON) -m issue_orchestrator.entrypoints.cli_tools.lane_run`: naming
+the interpreter pins the gate to its own virtualenv, where a bare
+`lane-run` would resolve through `PATH` and could be another install —
+including one produced by the `uv tool install` above. The gate's
+working directory is this repo's root, which holds nothing that shadows
+one of this package's imports, so the `sys.path` hazard does not apply
+to it.
+`tests/unit/test_console_script_entry_points.py` asserts both forms name
+the same module, so the two cannot drift apart.
+
 ## Scope: validation lanes only on macOS
 
 The macOS personal pool tracks process **families**, not cgroups — a
@@ -434,12 +517,16 @@ from its `declared_cpus` over successive runs while
 is stuck, not tuned. Delete that lane's file from the history
 directory to reset it to the declared seed.
 
-Every completed lane also reports its dispatch facts — the priority it
-ran with, how long it queued, how long it executed, what it requested
+A completed lane also reports its dispatch facts — the priority it ran
+with, how long it queued, how long it executed, what it requested
 against what was declared, and what it actually used — as a
-`[lane-dispatch]` line in the gate log and a row in
+`[lane-dispatch]` line in the gate log, then a row in
 `<git-common-dir>/issue-orchestrator/lane-dispatch.jsonl`, so dispatch
-quality is checkable without pool archaeology. Jobs additionally carry
+quality is checkable without pool archaeology. Both are diagnostic and
+neither is guaranteed: a failed journal write exits `70` with the line
+already printed and no row behind it, so read these records when they
+are present and never infer anything from a missing one (see
+[exit codes](#calling-lane-run-from-another-repository)). Jobs additionally carry
 their submitting worktree (`LaneSubmitter` in the queue), since the
 pool is shared and concurrent gates from different worktrees are
 normal.

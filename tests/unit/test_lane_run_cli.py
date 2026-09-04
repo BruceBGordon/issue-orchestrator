@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -23,9 +24,12 @@ from issue_orchestrator.domain.lane_execution import (
     LaneCommand,
     LaneCompleted,
     LaneDeadline,
+    LaneExecutorError,
+    LaneExecutorUnavailableError,
     LaneOutcome,
     LaneResources,
     LaneSuspendability,
+    LaneTimedOut,
     LaneWorkKey,
 )
 from issue_orchestrator.entrypoints.cli_tools import lane_run as lane_run_module
@@ -37,11 +41,12 @@ from issue_orchestrator.ports.lane_dispatch_journal import (
     LaneDispatchJournalError,
     LaneDispatchRecord,
 )
+from issue_orchestrator.ports.lane_runtime_history import LaneRuntimeHistoryError
 from issue_orchestrator.execution.lane_backends import (
     BACKEND_ENVIRONMENT_VARIABLE,
 )
 from issue_orchestrator.ports.machine_state import MachineState
-from issue_orchestrator.entrypoints.cli_tools.lane_run import main
+from issue_orchestrator.entrypoints.cli_tools.lane_run import _build_parser, main
 
 pytestmark = pytest.mark.timeout(180)
 
@@ -164,6 +169,199 @@ def _capture(
     return executor
 
 
+def _fail(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """An executor that faults instead of completing."""
+
+    class _FailingExecutor:
+        def run(self, command: LaneCommand, resources: LaneResources) -> LaneOutcome:
+            del command, resources
+            raise error
+
+    monkeypatch.setattr(
+        lane_run_module, "build_lane_executor", lambda backend: _FailingExecutor()
+    )
+
+
+class _BrokenJournal:
+    """Persists nothing and fails loudly — a fault AFTER the lane ran."""
+
+    def __init__(self) -> None:
+        self.persisted: list[LaneDispatchRecord] = []
+
+    def record(self, record: LaneDispatchRecord) -> None:
+        del record
+        raise LaneDispatchJournalError("disk gone")
+
+
+def _break_journal(monkeypatch: pytest.MonkeyPatch) -> _BrokenJournal:
+    journal = _BrokenJournal()
+    monkeypatch.setattr(lane_run_module, "_build_journal", lambda: journal)
+    return journal
+
+
+class _BrokenHistory:
+    """Reads fine, refuses to record — a fault after the row is written."""
+
+    def record_success(
+        self,
+        work_key: LaneWorkKey,
+        runtime_seconds: float,
+        busy_cores: float | None,
+    ) -> None:
+        del work_key, runtime_seconds, busy_cores
+        raise LaneRuntimeHistoryError("history unwritable")
+
+    def learned_priority(self, work_key: LaneWorkKey) -> int:
+        del work_key
+        return 0
+
+    def learned_busy_cores(self, work_key: LaneWorkKey) -> float | None:
+        del work_key
+        return None
+
+
+def _break_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        lane_run_module, "build_runtime_history", lambda: _BrokenHistory()
+    )
+
+
+# What the DISPATCHER means by its own failures. A lane owns the whole
+# 0-255 space, so it can return these too — they are not reserved.
+_COLLIDING_CODES = (70, 78, 124)
+
+
+@pytest.mark.parametrize("code", _COLLIDING_CODES)
+def test_a_lane_returning_a_dispatcher_code_is_passed_through_and_journaled(
+    code: int, monkeypatch: pytest.MonkeyPatch, fake_journal: _FakeJournal
+) -> None:
+    """The exit-code space is NOT disjoint, and lane-run must not pretend.
+
+    Remapping a lane's own 70/78/124 onto some other value would lie
+    about what the lane returned and break make's view of the gate, so
+    the code passes through unchanged. This pins the passthrough, and
+    that a completed lane is journaled on the nominal path — nothing
+    about telling the two apart, which no signal here can do.
+    """
+    _capture(monkeypatch, LaneCompleted(code, 1.0, 0.0))
+
+    assert _run("/usr/bin/true") == code
+    (record,) = fake_journal.records
+    assert record.exit_code == code
+
+
+@pytest.mark.parametrize(
+    ("code", "provoke"),
+    [
+        (78, lambda mp: _fail(mp, LaneExecutorUnavailableError("pool is down"))),
+        (70, lambda mp: _fail(mp, LaneExecutorError("backend broke mid-run"))),
+        (124, lambda mp: _capture(mp, LaneTimedOut(9.0))),
+    ],
+    ids=["unavailable", "backend-fault", "deadline"],
+)
+def test_a_dispatcher_failure_on_a_colliding_code_journals_nothing(
+    code: int,
+    provoke: Callable[[pytest.MonkeyPatch], object],
+    monkeypatch: pytest.MonkeyPatch,
+    fake_journal: _FakeJournal,
+) -> None:
+    """The same three codes, reached because the dispatcher failed.
+
+    These faults all happen BEFORE the lane completes, so nothing is
+    journaled. Together with the two tests below — which break it in
+    both directions — this is what "journal rows are best-effort"
+    means concretely.
+    """
+    provoke(monkeypatch)
+
+    assert _run("/usr/bin/true") == code
+    assert not fake_journal.records
+
+
+def test_a_completed_lane_can_leave_no_journal_row(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Row ABSENCE proves nothing: the lane here really returned 70.
+
+    The fault lands after the lane completed and before its row is
+    written, so a completed lane leaves none — and the fault exit and
+    the lane's own exit are the same number. Any rule of the form "no
+    row means the dispatcher failed" misreads this run.
+    """
+
+    journal = _break_journal(monkeypatch)
+    _capture(monkeypatch, LaneCompleted(70, 1.0, 0.0))
+
+    assert _run("/usr/bin/true") == 70
+    assert not journal.persisted
+    # The lane's own exit is still reported; it is simply not decisive.
+    assert "exit=70" in capsys.readouterr().err
+
+
+def test_a_dispatcher_fault_can_leave_a_row_that_disagrees_with_the_exit(
+    monkeypatch: pytest.MonkeyPatch, fake_journal: _FakeJournal
+) -> None:
+    """Row PRESENCE does not settle what the process returned.
+
+    The lane completed 0 and was journaled; recording what it taught
+    then failed, so lane-run exits 70 with a row on disk saying 0. A
+    row attests that a completion was persisted — not that the
+    invocation succeeded, and not what it exited with.
+    """
+
+    _break_history(monkeypatch)
+    _capture(monkeypatch, LaneCompleted(0, 1.0, 0.0))
+
+    assert _run("/usr/bin/true") == 70
+    (record,) = fake_journal.records
+    assert record.exit_code == 0
+
+
+def test_a_lane_can_forge_the_dispatcher_prefix_on_its_inherited_stderr(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Why the docs promise nothing about the `lane-run:` prefix.
+
+    The lane inherits this process's stderr FILE DESCRIPTOR, so it can
+    print the dispatcher's own prefix. Here a real subprocess emits one
+    and exits 70 with no dispatcher fault anywhere - prefix present,
+    dispatcher fine, and the 70 is the lane's.
+
+    capfd, not capsys: the forgery arrives on fd 2 rather than through
+    this process's `sys.stderr`, which is the whole mechanism. A silent
+    fake lane shows none of this, which is how an earlier version of
+    these tests came to underwrite a false claim.
+    """
+    assert _run("/bin/sh", "-c", 'echo "lane-run: forged by lane" >&2; exit 70') == 70
+    stderr = capfd.readouterr().err
+    assert "lane-run: forged by lane" in stderr
+    assert "[lane-dispatch]" in stderr
+
+
+def test_a_fault_while_announcing_still_returns_the_dispatcher_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unwritable stderr must not promote itself into the exit code.
+
+    The classified fault below cannot be printed; without a guard the
+    OSError escapes main and CPython exits 1 - a lane result code, and
+    the one collision the total mapping exists to remove.
+    """
+
+    class _DeadStderr:
+        def write(self, text: str) -> int:
+            del text
+            raise OSError(28, "No space left on device")
+
+        def flush(self) -> None:
+            pass
+
+    _fail(monkeypatch, LaneExecutorError("backend broke mid-run"))
+    monkeypatch.setattr(sys, "stderr", _DeadStderr())
+
+    assert _run("/usr/bin/true") == 70
+
+
 def test_direct_backend_returns_the_lane_exit_code() -> None:
     assert _run(sys.executable, "-c", "raise SystemExit(0)") == 0
     assert _run(sys.executable, "-c", "raise SystemExit(9)") == 9
@@ -186,6 +384,116 @@ def test_missing_separator_is_a_usage_error() -> None:
         )
         == 78
     )
+
+
+def test_a_separator_with_no_command_after_it_is_a_usage_error() -> None:
+    """The exit code is the whole contract here.
+
+    Deliberately no assertion on the message: the diagnostic text is
+    not something callers may depend on, and pinning it would put back
+    the dependence on prose that this file spent three rounds removing.
+    """
+    assert main(["--work-key", "cli.test", "--timeout-seconds", "60", "--"]) == 78
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_help_survives_the_separator_rule(
+    flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Installed on PATH, --help is the only discovery surface a caller
+    outside this repository has; the '--' requirement must not eat it."""
+    with pytest.raises(SystemExit) as exit_info:
+        main([flag])
+
+    assert exit_info.value.code == 0
+    assert "--work-key" in capsys.readouterr().out
+
+
+# Every shape where -h/--help appears among the options, with and
+# without a separator and with a malformed option ahead of it.
+_HELP_INVOCATIONS = [
+    ["--help"],
+    ["-h"],
+    ["--backend", "condor", "--help"],
+    ["--help", "--", "/usr/bin/true"],
+    ["--backend", "not-a-backend", "--help"],
+    ["--backend", "not-a-backend", "--help", "--", "/usr/bin/true"],
+    ["--work-key", "--help"],
+    ["--work-key", "--help", "--", "/usr/bin/true"],
+]
+
+
+def _outcome(call: Callable[[], object]) -> tuple[str, object]:
+    """How the call ended, not just with what code.
+
+    ``returned 0`` and ``SystemExit(0)`` are different answers that
+    compare equal on the code alone, so the kind travels with it — a
+    pre-scan that answers help by returning 0 must not match argparse
+    exiting 0.
+    """
+    try:
+        return ("returned", call())
+    except SystemExit as exit_info:
+        return ("exited", exit_info.code)
+
+
+@pytest.mark.parametrize("argv", _HELP_INVOCATIONS, ids=" ".join)
+def test_help_never_outranks_parser_validation(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Membership of -h/--help routes to argparse; it never decides.
+
+    Pre-scanning argv for help and answering it directly reports a
+    malformed option list as a successful help request — exit 0 where
+    the parser says 2. The parser's own verdict on the same options is
+    the oracle, so the two cannot diverge again.
+    """
+    separator = argv.index("--") if "--" in argv else None
+    options = argv if separator is None else argv[:separator]
+
+    expected = _outcome(lambda: _build_parser().parse_args(options))
+    capsys.readouterr()
+
+    assert _outcome(lambda: main(list(argv))) == expected
+
+
+def test_a_lane_commands_own_help_is_not_intercepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--help after the separator belongs to the lane, not to lane-run."""
+    executor = _capture(monkeypatch, LaneCompleted(0, 0.0, 0.0))
+
+    assert _run("/usr/bin/true", "--help") == 0
+    assert executor.resources, "the lane never ran - help was intercepted"
+
+
+def test_an_unclassified_crash_is_a_dispatcher_fault_not_a_lane_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CPython exits 1 on an escaping exception, and 1 is a lane result
+    code. A dispatcher bug reported as 1 would read as "your tests
+    failed", so main's mapping must be total: 70, with the traceback
+    intact so nothing is softened."""
+
+    def explode(work_key: str) -> LaneDeclaration:
+        del work_key
+        raise MemoryError("unclassified")
+
+    monkeypatch.setattr(lane_run_module, "_load_declaration", explode)
+
+    assert _run("/usr/bin/true") == 70
+    stderr = capsys.readouterr().err
+    assert "lane-run: internal error:" in stderr
+    assert "MemoryError: unclassified" in stderr
+
+
+def test_totality_does_not_swallow_argparse_exits() -> None:
+    """SystemExit is the parser rejecting input, not a dispatcher fault;
+    catching it would turn every usage error into a 70."""
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--work-key", "cli.test", "--", "/usr/bin/true"])
+
+    assert exit_info.value.code == 2
 
 
 def test_missing_lane_executable_fails_as_configuration_error() -> None:
