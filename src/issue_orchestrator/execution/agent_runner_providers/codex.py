@@ -6,7 +6,6 @@ Previously in ``_vendor/agent_runner/providers/codex.py``.
 """
 
 from collections.abc import Mapping
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
