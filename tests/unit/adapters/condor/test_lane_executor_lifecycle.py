@@ -606,7 +606,36 @@ def test_the_cancellation_budget_also_bounds_the_removal(
         lane_executor_module, "time", _WaitsThatRaise(KeyboardInterrupt())
     )
 
-    started = time.monotonic()
+    # Record the ORDER of the two decisions this test is about, and the
+    # arguments each was given: when the budget is created, and what allowance
+    # the removal is handed. Together they state the property — "the wind-down
+    # owns the whole operation, so the removal draws from the same allowance as
+    # everything else" — without consulting a clock. `_remove`'s own docstring
+    # names the bug this catches: a removal "that quietly took the general tool
+    # timeout instead".
+    #
+    # The previous form asserted `elapsed < budget * 4`, which is the same
+    # wall-clock shape that made this test's sibling flaky: it failed at 14.74s
+    # against a 2s budget inside a loaded condor lane while the implementation
+    # was entirely correct. A duration measures the machine; these arguments
+    # measure the code.
+    decisions: list[tuple[str, float]] = []
+    original_lasting = lane_executor_module._CollectionBudget.lasting
+    original_remove = CondorLaneExecutor._remove
+
+    def _record_budget(seconds: float):  # type: ignore[no-untyped-def]
+        decisions.append(("budget", seconds))
+        return original_lasting(seconds)
+
+    def _record_remove(self, job_id: str, timeout_seconds: float) -> None:  # type: ignore[no-untyped-def]
+        decisions.append(("remove", timeout_seconds))
+        return original_remove(self, job_id, timeout_seconds)
+
+    monkeypatch.setattr(
+        lane_executor_module._CollectionBudget, "lasting", _record_budget
+    )
+    monkeypatch.setattr(CondorLaneExecutor, "_remove", _record_remove)
+
     with pytest.raises(KeyboardInterrupt):
         executor.run(
             LaneCommand(
@@ -617,12 +646,22 @@ def test_the_cancellation_budget_also_bounds_the_removal(
             ),
             LaneResources(request_cpus=1),
         )
-    elapsed = time.monotonic() - started
 
     budget = lane_executor_module._CANCELLED_ACCOUNTING_WAIT_SECONDS
-    assert elapsed < budget * 4, (
-        "the cancellation budget did not span the job removal: "
-        f"{elapsed:.2f}s for a {budget:.0f}s budget"
+    assert [name for name, _ in decisions] == ["budget", "remove"], (
+        "the budget must be created BEFORE the removal, or the removal runs "
+        f"outside it entirely — which is the bug: {decisions}"
+    )
+    assert decisions[0][1] == budget
+    # Bounded from ABOVE only, deliberately. `remaining_seconds()` is derived
+    # from the clock, so its exact value shrinks as the wind-down proceeds and
+    # moves with load — but it can never EXCEED the budget it was drawn from,
+    # and that ceiling is precisely what separates it from the general tool
+    # timeout. Asserting a lower bound too would put the clock back in.
+    assert decisions[1][1] <= budget, (
+        "the removal did not draw from the cancellation budget: given "
+        f"{decisions[1][1]}s against a {budget}s budget (the general tool "
+        f"timeout is {tools_module.TOOL_TIMEOUT_SECONDS}s)"
     )
     for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
         shutil.rmtree(directory, ignore_errors=True)
