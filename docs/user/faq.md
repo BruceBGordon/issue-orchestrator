@@ -161,7 +161,16 @@ This is mainly for development/testing. Use `ui.instances` with `claims.enabled:
 A: Use `review.max_rework_cycles` to cap rework (default: 5). When review is enabled, a coder agent produces changes, then a reviewer agent evaluates them. If the reviewer requests changes, the orchestrator opens a rework cycle. This repeats until the reviewer approves or the max is reached, at which point the issue is escalated.
 
 **Q22: How do I manage issue dependencies, and what restrictions apply?**
-A: Put dependency lines in the issue body using `Depends-on:`. An issue is runnable only when **all** dependencies are closed.
+A: Put typed dependency directives in the successor issue body. Choose the type
+from the required start time and branch base:
+
+| Required behavior | Directive | Work starts when | Successor base and merge order |
+|---|---|---|---|
+| The predecessor must land before successor work starts | `Depends-on: #123` | The predecessor issue is closed | Start from the updated default branch |
+| The successor may run before the predecessor merges and must build on its changes | `Stack-after: #123` | The predecessor has a usable, validated, agent-reviewed branch | Base on the predecessor branch; remain merge-blocked until the predecessor merges |
+
+`Stack-after:` removes the human merge from the agent-start path; it does not
+remove human review or ordered merging.
 
 There are two ways to reference a dependency:
 
@@ -169,8 +178,16 @@ There are two ways to reference a dependency:
 |---|---|---|
 | `Depends-on: #123` | Direct GitHub issue number lookup | Any issue by number |
 | `Depends-on: M2-010` | External ID lookup — finds the issue with `[M2-010]` in its title | Milestone-scoped key |
+| `Stack-after: #123` | Direct GitHub issue number lookup with stack gates | An unmerged predecessor branch |
+| `Stack-after: M2-010` | External ID lookup with stack gates | A milestone-keyed stack predecessor |
 
-Both formats are subject to the **same milestone restriction**: the dependency must be in the **same milestone** as the depending issue, or in the **foundation milestone** (configured via `milestones.foundation`, default `M0`). The `#` vs bare ID difference is only about how the issue is *located*, not which milestones are allowed. Cross-milestone dependencies are flagged `CROSS_MILESTONE` and block the issue.
+Normal dependencies are subject to the **same milestone restriction**: the
+dependency must be in the **same milestone** as the depending issue, or in the
+**foundation milestone** (configured via `milestones.foundation`, default
+`M0`). The `#` vs bare ID difference is only about how the issue is *located*.
+Cross-milestone normal dependencies are flagged `CROSS_MILESTONE` and block the
+issue. An explicitly discoverable stack chain may span milestones without
+weakening this rule for normal edges.
 
 **Identity key uniqueness**: The full external ID string is the key. `M1-010` and `M2-010` are different identities — the sequence number (`010`) is scoped to its milestone prefix, not globally unique.
 
@@ -180,9 +197,18 @@ Examples:
 Depends-on: #123                    # GitHub issue #123 (same milestone or M0)
 Depends-on: org/other-repo#456      # Cross-repo dependency
 Depends-on: M2-010                  # Issue with [M2-010] in its title
+Stack-after: #789                   # Build on issue #789's ready branch
 ```
 
 If a dependency violates the milestone rule, the issue is marked blocked with a dependency reason in the UI.
+
+Stack fan-out is automatic. If B and C each contain `Stack-after: #A`, they
+become eligible together when A's branch is ready and can run concurrently up
+to `max_concurrent_sessions`; neither waits for A to merge. Fan-in is not
+automatic: a D with both `Stack-after: #B` and `Stack-after: #C` has competing
+unmerged base branches and is blocked as `AMBIGUOUS_STACK_BASE`. Use normal
+dependencies to wait for both siblings to close, or reshape the work into a
+linear stack with one explicit base.
 
 **Q23: What are common dependency syntax mistakes?**
 A: Watch out for these:
@@ -192,6 +218,8 @@ A: Watch out for these:
 | `Depends-on: [M2-010]` | **Silently ignored** — brackets are not part of the dependency syntax | `Depends-on: M2-010` (no brackets) |
 | `Depends-on: #010` | Resolves to GitHub issue **#10** (leading zeros stripped) — probably not what you meant if you were thinking of external ID `M?-010` | Use `Depends-on: M1-010` for external IDs, `Depends-on: #10` for issue numbers |
 | `Depends-on: 123` | **Silently ignored** — bare numbers without `#` or `M` prefix don't match | `Depends-on: #123` |
+| `follows #123` or prose saying “depends on #123” | **Ignored** — prose is not machine state | Put `Depends-on: #123` or `Stack-after: #123` on its own line |
+| `Stack-after: gibberish` | Blocks with `MALFORMED_REFERENCE` | Use `#123`, `owner/repo#123`, or a bare external ID |
 
 The brackets `[...]` are only used in the **title prefix** (e.g., `[M2-010] Fix bug`). In `Depends-on:` lines, always write the external ID bare: `Depends-on: M2-010`.
 
@@ -222,6 +250,8 @@ A: There are two levels.
 3. **Sequence** — the `nnn` from that title prefix.
 4. **Issue number** — ascending, as the final tie-breaker.
 
-An issue is only *eligible* in the first place once its `Depends-on:` dependencies are closed (see Q22).
+An issue is only *eligible* once its dependency work gate opens: normal
+`Depends-on:` predecessors must be closed, while `Stack-after:` predecessors
+must expose a usable, validated, agent-reviewed branch (see Q22).
 
 **Gotcha:** the `priority:high` / `priority:medium` / `priority:low` **labels do not affect this order** — they exist for human/tech lead organization. Scheduling priority comes from the milestone and the `[P<n>-nnn]` title prefix, not the labels. So two issues in the same milestone with no `[P…]` prefix run in **issue-number order**, regardless of their priority labels — a newer issue (higher number) runs later even if it's labeled `priority:high`.
