@@ -44,8 +44,8 @@ from .persistent_round_failures import (
     PersistentRoundTimeoutError,
 )
 from .composer_readiness import (
+    ComposerGate,
     LiveComposerScreen,
-    wait_for_ready_composer,
 )
 from .persistent_round_io import drain_pty_output_until_quiet
 from .persistent_round_interactions import (
@@ -116,15 +116,10 @@ _PTY_WRITE_HEARTBEAT_SECONDS = 5.0
 # bootstrap turn, whose busy footer cleared at 38.4s: the agent runs its
 # argv-delivered setup prompt before the first round is injected, and that is
 # the window this exists to cover.
-_READY_COMPOSER_WAIT_SECONDS = 180.0
 _READY_POLL_INTERVAL_SECONDS = 0.25
 # Per-poll pump: read whatever the PTY has and let the screen apply it. Short,
 # because the loop re-enters immediately; this is a read, not a settle.
 _READY_PUMP_QUIET_SECONDS = 0.05
-# How long a silent agent gets before we accept it has no TUI. Only reached
-# when NOTHING has been painted; an agent that has drawn a busy footer keeps
-# the full wait above.
-_READY_UNDRAWN_GRACE_SECONDS = 15.0
 
 
 @dataclass
@@ -410,13 +405,11 @@ def _submit_prompt_with_enter(
     # timed out (#7104). The screen is the only surface that can tell — see
     # composer_readiness for why byte activity provably cannot.
     if session.composer_screen is not None:
-        # Bounded by the ROUND's own budget as well as its own ceiling:
-        # getting ready must never eat the turn it is preparing for. A round
-        # given five seconds cannot spend fifteen deciding whether to start.
-        ready_wait = min(_READY_COMPOSER_WAIT_SECONDS, timeout_seconds * 0.5)
-        ready_grace = min(_READY_UNDRAWN_GRACE_SECONDS, timeout_seconds * 0.25)
-        ready = wait_for_ready_composer(
+        outcome = ComposerGate.for_round(
             session.composer_screen,
+            round_timeout_seconds=timeout_seconds,
+            poll_interval_seconds=_READY_POLL_INTERVAL_SECONDS,
+        ).await_ready(
             pump=lambda: drain_pty_output_until_quiet(
                 session,
                 quiet_seconds=_READY_PUMP_QUIET_SECONDS,
@@ -424,23 +417,16 @@ def _submit_prompt_with_enter(
                 now=now,
                 sleep=sleep,
             ),
-            timeout_seconds=ready_wait,
-            poll_interval_seconds=_READY_POLL_INTERVAL_SECONDS,
-            undrawn_grace_seconds=ready_grace,
             now=now,
             sleep=sleep,
         )
-        if not ready:
-            busy, holding = session.composer_screen.sample()
+        if not outcome.ready:
             # Still write: a doomed prompt beats failing a round that might
-            # work, and the poll loop's own diagnostics take it from here. But
-            # say so NOW, so this stops being a ten-minute mystery timeout.
+            # work, and the poll loop's diagnostics take it from here. But name
+            # the cause NOW, so this stops being a ten-minute mystery timeout.
             logger.warning(
-                "[send_round] composer not ready after %.0fs (busy=%s "
-                "holding_unsent_text=%s); writing anyway and the prompt may "
-                "strand (#7104) role=%s pid=%d",
-                ready_wait, busy, holding, label,
-                session.proc.pid,
+                "[send_round] %s role=%s pid=%d",
+                outcome.describe(), label, session.proc.pid,
             )
 
     written = _write_prompt_with_timeout_diagnostics(
@@ -458,11 +444,12 @@ def _submit_prompt_with_enter(
         sleep=sleep,
     )
     if not settled:
-        # Submitting anyway is still the best available move — the alternative
-        # is failing a round that might yet work — but this is the moment the
-        # composer is most likely to strand the text, so it is recorded HERE
-        # rather than inferred from a screen replay ten minutes later.
-        logger.warning(
+        # Expected against a TUI that repaints forever: codex never produces a
+        # 0.3s gap, so this fires on every successful round (measured: 10/10
+        # micro-harness passes all reported it). Readiness is guarded upstream
+        # by ComposerGate, so this is a debug detail about the echo settle, not
+        # a warning — logging it louder would train people to ignore the line.
+        logger.debug(
             "[send_round] TUI never went quiet within %.0fs; submitting Enter "
             "anyway and the prompt may strand in the composer (#7104) "
             "role=%s pid=%d",

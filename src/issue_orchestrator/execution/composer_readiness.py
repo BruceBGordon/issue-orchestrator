@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
 
 from ..infra.terminal_viewport import TerminalViewport
 from .session_interactions import normalize_terminal_text
@@ -133,47 +135,139 @@ class LiveComposerScreen:
         return not busy and not holding
 
 
-def wait_for_ready_composer(
-    screen: LiveComposerScreen,
-    *,
-    pump: Callable[[], None],
-    timeout_seconds: float,
-    poll_interval_seconds: float,
-    undrawn_grace_seconds: float,
-    now: Callable[[], float],
-    sleep: Callable[[float], None],
-) -> bool:
-    """Pump output until the screen says the agent will accept typing.
+class ComposerReadinessReason(str, Enum):
+    """Why the gate stopped waiting. Every outcome names its own cause."""
 
-    ``pump`` drains pending PTY output into the screen; this function owns only
-    the decision, so tests drive it with no PTY at all.
+    #: The agent worked, finished, and left an empty composer.
+    READY = "ready"
+    #: Nothing ever looked busy within the grace period, so there is no turn
+    #: to wait out — a plain stdin agent, or a TUI that never started one.
+    NO_TUI_TURN = "no_tui_turn"
+    #: Gave up while the agent was still working.
+    STILL_BUSY = "still_busy"
+    #: Gave up with unsent text sitting in the composer, which means an
+    #: EARLIER prompt never went in.
+    HOLDING_UNSENT = "holding_unsent"
 
-    ``undrawn_grace_seconds`` is the one concession to agents that are not
-    TUIs at all: if nothing has been painted by then, there is no composer for
-    a prompt to strand in and waiting longer would be a stall this probe
-    invented. It is deliberately NOT the same as being ready — an agent that
-    has drawn a busy footer keeps the full ``timeout_seconds``.
 
-    Returns True once ready (or once the grace period settles an undrawn
-    screen), False if ``timeout_seconds`` passes first. False does not mean
-    "do not send" — the caller may still prefer a doomed write to a failed
-    round — it means "say so", which is what turns a ten-minute mystery
-    timeout into a line in the log at the moment it happens.
-    """
-    started = now()
-    deadline = started + timeout_seconds
-    grace_ends = started + undrawn_grace_seconds
-    while True:
-        pump()
-        if screen.is_ready():
-            return True
-        if not screen.seen_busy and now() >= grace_ends:
-            logger.debug(
-                "[composer] agent never looked busy within %.1fs (drawn=%s); "
-                "treating as an agent with no turn to finish and proceeding",
-                undrawn_grace_seconds, screen.has_drawn(),
+@dataclass(frozen=True)
+class ComposerReadiness:
+    """What the gate decided, and the evidence it decided on."""
+
+    ready: bool
+    reason: ComposerReadinessReason
+    waited_seconds: float
+    busy: bool
+    holding: bool
+
+    def describe(self) -> str:
+        """One log-ready sentence. The caller adds role and pid."""
+        if self.reason is ComposerReadinessReason.READY:
+            return f"composer ready after {self.waited_seconds:.1f}s"
+        if self.reason is ComposerReadinessReason.NO_TUI_TURN:
+            return (
+                f"no TUI turn seen in {self.waited_seconds:.1f}s; treating the "
+                "agent as having nothing to finish"
             )
-            return True
-        if now() >= deadline:
-            return False
-        sleep(poll_interval_seconds)
+        if self.reason is ComposerReadinessReason.HOLDING_UNSENT:
+            return (
+                f"composer still holds unsent text after "
+                f"{self.waited_seconds:.1f}s — an earlier prompt never "
+                "submitted; writing anyway and it may strand (#7104)"
+            )
+        return (
+            f"agent still working after {self.waited_seconds:.1f}s; writing "
+            "anyway and the prompt may strand in the composer (#7104)"
+        )
+
+
+@dataclass(frozen=True)
+class ComposerGate:
+    """Wait until a TUI will accept typing. The whole of that decision.
+
+    Deliberately knows nothing about PTYs: it is handed a screen and a
+    ``pump``, so every branch is reachable in a unit test with a fake clock
+    and no subprocess. The bounds arithmetic lives in :meth:`for_round` for
+    the same reason — it used to sit inline in ``send_round``, where the only
+    way to exercise it was to spawn an agent.
+    """
+
+    screen: LiveComposerScreen
+    max_wait_seconds: float
+    undrawn_grace_seconds: float
+    poll_interval_seconds: float = 0.25
+
+    #: Ceilings for a real agent. A codex bootstrap turn was measured clearing
+    #: its busy footer at 38.4s, so the wait must comfortably exceed that.
+    DEFAULT_MAX_WAIT_SECONDS = 180.0
+    DEFAULT_UNDRAWN_GRACE_SECONDS = 15.0
+
+    @classmethod
+    def for_round(
+        cls,
+        screen: LiveComposerScreen,
+        *,
+        round_timeout_seconds: float,
+        poll_interval_seconds: float = 0.25,
+    ) -> "ComposerGate":
+        """Bound the wait by the round's budget as well as the ceilings.
+
+        Getting ready must never eat the turn it is preparing for: a round
+        given five seconds cannot spend fifteen deciding whether to start.
+        Without this, the gate timed out 14 round-runner tests whose rounds
+        are shorter than the grace period.
+        """
+        if round_timeout_seconds <= 0:
+            raise ValueError("round_timeout_seconds must be positive")
+        return cls(
+            screen=screen,
+            max_wait_seconds=min(
+                cls.DEFAULT_MAX_WAIT_SECONDS, round_timeout_seconds * 0.5
+            ),
+            undrawn_grace_seconds=min(
+                cls.DEFAULT_UNDRAWN_GRACE_SECONDS, round_timeout_seconds * 0.25
+            ),
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+    def await_ready(
+        self,
+        *,
+        pump: Callable[[], None],
+        now: Callable[[], float],
+        sleep: Callable[[float], None],
+    ) -> ComposerReadiness:
+        """Pump output until the screen says typing will be accepted.
+
+        Never raises and never refuses to return: a caller that cannot type is
+        usually still better off writing than failing the round outright, so
+        the outcome is advice plus evidence rather than a veto.
+        """
+        started = now()
+        deadline = started + self.max_wait_seconds
+        grace_ends = started + self.undrawn_grace_seconds
+        while True:
+            pump()
+            busy, holding = self.screen.sample()
+            if self.screen.is_ready():
+                return ComposerReadiness(
+                    True, ComposerReadinessReason.READY, now() - started, busy, holding
+                )
+            if not self.screen.seen_busy and now() >= grace_ends:
+                return ComposerReadiness(
+                    True,
+                    ComposerReadinessReason.NO_TUI_TURN,
+                    now() - started,
+                    busy,
+                    holding,
+                )
+            if now() >= deadline:
+                reason = (
+                    ComposerReadinessReason.HOLDING_UNSENT
+                    if holding
+                    else ComposerReadinessReason.STILL_BUSY
+                )
+                return ComposerReadiness(
+                    False, reason, now() - started, busy, holding
+                )
+            sleep(self.poll_interval_seconds)
