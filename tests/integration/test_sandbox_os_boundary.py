@@ -1344,6 +1344,7 @@ def test_generated_codex_profile_is_enforced_by_seatbelt(tmp_path: Path) -> None
     assert inside.read_text(encoding="utf-8") == "ok"
 
 
+@pytest.mark.live_codex
 @pytest.mark.skipif(not _codex_available(), reason="codex CLI not installed")
 @pytest.mark.skipif(
     sys.platform.startswith("win"),
@@ -1351,6 +1352,22 @@ def test_generated_codex_profile_is_enforced_by_seatbelt(tmp_path: Path) -> None
 )
 @pytest.mark.usefixtures("isolated_codex_home")
 def test_generated_codex_profile_enforced_by_os(tmp_path: Path) -> None:
+    """Live-agent probe of the same boundary. Marked ``live_codex``.
+
+    This drives a real authenticated Codex session over the network, which is
+    the definition of the ``live_codex`` lane — it was previously collected by
+    the pre-push gate, where it could neither be run offline nor be trusted to
+    isolate a regression in the code under test.
+
+    Its property is also narrower than it appears. OS enforcement is proven
+    deterministically by ``test_generated_codex_profile_is_enforced_by_seatbelt``
+    above, which drives seatbelt directly. What remains here is *model*
+    behaviour: whether a live agent, handed the generated profile, attempts the
+    breach at all. Since Codex 0.153.4 that answer changed — the model now
+    declines up front, so the boundary is never reached and the probe fails
+    without either proving or disproving enforcement. Re-premising it so the
+    model attempts the command is tracked in #7157.
+    """
     isolated_home = Path(os.environ["CODEX_HOME"])
     if not (isolated_home / "auth.json").is_file():
         pytest.skip("codex is not authenticated on this host")
