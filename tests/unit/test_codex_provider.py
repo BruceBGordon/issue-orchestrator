@@ -1,12 +1,13 @@
 """Unit tests for ``CodexProvider.build_command``.
 
-Sandbox-clean: no subprocess, no network. Asserts on the assembled
-argv only.
+Sandbox-clean: no subprocess, no network. Asserts on the assembled argv, and
+on the managed Codex config the build writes into an isolated ``CODEX_HOME``.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+import tomllib
 
 import pytest
 
@@ -15,6 +16,33 @@ from issue_orchestrator.execution.agent_runner_providers.codex import CodexProvi
 
 
 _TEST_WORKING_DIRECTORY = Path("/tmp/io-codex-provider-test-worktree")
+
+
+def _managed_config_path(cmd: list[str]) -> Path:
+    """Return the managed config.toml for the CODEX_HOME this argv exports."""
+    home = next(
+        arg.removeprefix("CODEX_HOME=") for arg in cmd if arg.startswith("CODEX_HOME=")
+    )
+    return Path(home) / "config.toml"
+
+
+def _managed_config_text(cmd: list[str]) -> str:
+    return _managed_config_path(cmd).read_text(encoding="utf-8")
+
+
+def _managed_project_trust(cmd: list[str]) -> dict[str, str]:
+    """Project -> trust_level, as Codex will actually read it.
+
+    Project trust used to be asserted against a ``-c projects.*`` argv entry.
+    That override is gone — Codex 0.153.4 rejects it under ``--strict-config``
+    — so the invariant is now checked where it lives, which is also where
+    Codex reads it from.
+    """
+    document = tomllib.loads(_managed_config_text(cmd))
+    return {
+        project: settings["trust_level"]
+        for project, settings in document.get("projects", {}).items()
+    }
 
 
 def _cmd(**kwargs: str) -> list[str]:
@@ -156,14 +184,22 @@ class TestCodexBaseCommand:
         assert cmd[0] == "env"
         assert cmd[1].startswith("CODEX_HOME=")
         assert cmd[2] == "codex"
-        assert (
-            f'projects."{(tmp_path / "worktree").resolve()}".trust_level="untrusted"'
-            in cmd
+        assert _managed_project_trust(cmd) == {
+            str((tmp_path / "worktree").resolve()): "untrusted"
+        }
+        # Codex 0.153.4 rejects `projects.*` as a `-c` override, and we pass
+        # --strict-config, so re-adding this duplicate would abort every
+        # orchestrated session before it starts.
+        assert not [arg for arg in cmd if arg.startswith("projects.")], (
+            "project trust must be carried only by the managed config file"
         )
 
     def test_linked_worktree_also_marks_primary_checkout_untrusted(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv(
+            "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT", str(tmp_path / "runtime")
+        )
         primary = tmp_path / "primary"
         worktree = tmp_path / "reviewer"
         git_dir = primary / ".git" / "worktrees" / "reviewer"
@@ -176,10 +212,17 @@ class TestCodexBaseCommand:
             working_directory=worktree,
         )
 
-        assert f'projects."{worktree}".trust_level="untrusted"' in cmd
-        assert f'projects."{primary}".trust_level="untrusted"' in cmd
+        assert _managed_project_trust(cmd) == {
+            str(worktree): "untrusted",
+            str(primary): "untrusted",
+        }
 
-    def test_project_trust_key_preserves_non_bmp_path(self, tmp_path: Path) -> None:
+    def test_project_trust_key_preserves_non_bmp_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT", str(tmp_path / "runtime")
+        )
         worktree = tmp_path / "reviewer-😀"
 
         cmd = CodexProvider().build_command(
@@ -187,8 +230,10 @@ class TestCodexBaseCommand:
             working_directory=worktree,
         )
 
-        assert f'projects."{worktree}".trust_level="untrusted"' in cmd
-        assert "\\ud83d" not in " ".join(cmd)
+        # The emoji must survive into the config as itself, not as a surrogate
+        # escape pair, or Codex reads a path that does not exist.
+        assert _managed_project_trust(cmd) == {str(worktree): "untrusted"}
+        assert "\\ud83d" not in _managed_config_text(cmd)
 
     def test_orchestrated_command_rejects_yolo(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="cannot use approval_mode=yolo"):

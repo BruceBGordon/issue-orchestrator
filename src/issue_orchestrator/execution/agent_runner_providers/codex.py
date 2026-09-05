@@ -207,24 +207,24 @@ class CodexProvider(CLIProvider):
                 else (project_directory,)
             )
         )
-        project_trust_argv = []
         project_paths = _codex_project_trust_paths(project_directory)
-        for project_path in project_paths:
-            project_trust_argv.extend(
-                [
-                    "-c",
-                    "projects."
-                    f"{json.dumps(str(project_path), ensure_ascii=False)}"
-                    '.trust_level="untrusted"',
-                ]
-            )
+        # Project trust is recorded ONCE, in the managed config.toml that
+        # prepare_codex_runtime_home writes into CODEX_HOME below. It used to
+        # also be passed as `-c projects."<path>".trust_level="untrusted"`,
+        # which was redundant with that file and is now fatal: Codex 0.153.4
+        # rejects `projects.*` as a `-c` override, and we pass --strict-config,
+        # so the process exits before starting with
+        #   Error loading config.toml: unknown configuration field `projects."..."`
+        #
+        # Sending the same state twice is what turned their schema change into
+        # our outage — one copy lived somewhere stable (the file, still
+        # accepted) and the other in a surface with no compatibility contract.
         runtime_home = prepare_codex_runtime_home(untrusted_projects=project_paths)
         prefix = ["env", f"CODEX_HOME={runtime_home}"]
         cmd = [
             *prefix,
             self.executable,
             *session_hook_argv,
-            *project_trust_argv,
             *scope_argv,
         ]
         if sandbox_scope is None:
