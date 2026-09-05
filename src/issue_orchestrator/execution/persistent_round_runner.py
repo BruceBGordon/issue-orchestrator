@@ -62,7 +62,39 @@ _DEFAULT_PTY_WRITE_TIMEOUT_SECONDS = 30.0
 _DEFAULT_PROMPT_ACCEPTANCE_IDLE_SECONDS = 120.0
 # Echo-settle window between writing the prompt text and the standalone
 # Enter ("\r") that submits it — see the two-write contract in send_round.
+#
+# NOT a readiness signal, and it cannot be made into one. Measured from a
+# stranded codex 0.153.4 reviewer recording, 6074 output frames over 600s:
+#
+#     inter-frame gap  p50=0.104s  p90=0.106s  p99=0.106s  max=0.42s
+#     gaps >1.0s: 0
+#
+# The TUI repaints at ~10Hz continuously, including after the agent said it
+# was waiting for a turn — so no quiet window distinguishes "idle at an empty
+# composer" from "mid-turn". Below the 0.42s worst case this is satisfied by
+# chance gaps (which is what it does today, i.e. barely a wait at all); above
+# it, it is never satisfied and every round pays the full backstop before
+# submitting anyway. Raising it was tried and is worse: a 60s stall per round
+# ending in "Could not write 1 bytes to PTY within deadline".
+#
+# Gating injection on a READY COMPOSER is the fix, read from the rendered
+# screen the way execution/composer_state.py already classifies it after the
+# fact. Tracked in #7104; this constant stays where it was until then.
 _ENTER_SETTLE_QUIET_SECONDS = 0.3
+# Backstop on that settle, NOT the mechanism.
+#
+# This used to be an implicit `max(quiet_seconds, 1.0)` inside the drain: with
+# a 0.3s window, a flat one second — a cap SHORTER than the event it bounded,
+# so no settle longer than a second was expressible at all. Making it explicit
+# is what allowed the window above to be measured rather than assumed.
+#
+# Honest about what this does NOT do: it does not fix #7104. With the window
+# at 0.3s the backstop is never reached, so this changes no behaviour today.
+# Its value is the return flag it enables — `send_round` now says at the
+# moment of submission that it is about to Enter into a TUI that never went
+# quiet, instead of that being reconstructed from a screen replay after a
+# ten-minute timeout.
+_ENTER_SETTLE_MAX_WAIT_SECONDS = 60.0
 
 # Heartbeat cadence for the ``send_round`` poll loop. Without this, a
 # wedged agent shows up as 17 minutes of total log silence (#6160 e2e
@@ -331,9 +363,24 @@ def _submit_prompt_with_enter(
         timeout_seconds=timeout_seconds,
         write_timeout_seconds=write_timeout_seconds,
     )
-    drain_pty_output_until_quiet(
-        session, quiet_seconds=_ENTER_SETTLE_QUIET_SECONDS, now=now, sleep=sleep,
+    settled = drain_pty_output_until_quiet(
+        session,
+        quiet_seconds=_ENTER_SETTLE_QUIET_SECONDS,
+        max_wait_seconds=_ENTER_SETTLE_MAX_WAIT_SECONDS,
+        now=now,
+        sleep=sleep,
     )
+    if not settled:
+        # Submitting anyway is still the best available move — the alternative
+        # is failing a round that might yet work — but this is the moment the
+        # composer is most likely to strand the text, so it is recorded HERE
+        # rather than inferred from a screen replay ten minutes later.
+        logger.warning(
+            "[send_round] TUI never went quiet within %.0fs; submitting Enter "
+            "anyway and the prompt may strand in the composer (#7104) "
+            "role=%s pid=%d",
+            _ENTER_SETTLE_MAX_WAIT_SECONDS, label, session.proc.pid,
+        )
     try:
         written += _write_prompt_with_timeout_diagnostics(
             session, b"\r",
