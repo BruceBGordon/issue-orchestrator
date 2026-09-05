@@ -1272,6 +1272,79 @@ def test_generated_sandbox_settings_enforced_by_os(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not _codex_available(), reason="codex CLI not installed")
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="seatbelt is macOS-only")
+@pytest.mark.usefixtures("isolated_codex_home")
+def test_generated_codex_profile_is_enforced_by_seatbelt(tmp_path: Path) -> None:
+    """The generated profile is enforced by the OS, proven without a model.
+
+    ``codex sandbox`` runs a command under seatbelt directly, so no agent is in
+    the loop. That matters: the live-agent probe below asks a model to run the
+    breach command, and Codex 0.153.4 now *declines* it ("I can't run this
+    command because it attempts to read an explicitly denied path") instead of
+    attempting it. A polite refusal demonstrates model compliance, not OS
+    enforcement — the boundary is never reached, so the property goes
+    unverified while the test still appears to cover it.
+
+    Driving seatbelt directly removes that dependence: the kernel either
+    permits the syscall or it does not, and no change in model behaviour can
+    alter the outcome. It also needs no authentication and no network, and
+    finishes in about a second rather than minutes with retries.
+
+    Both directions are asserted deliberately. A profile that denied
+    everything would satisfy a breach-only check while breaking every real
+    session.
+    """
+    worktree = tmp_path / "seatbelt-worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=worktree, check=True)
+
+    outside = tmp_path / "outside-the-workspace.txt"
+    inside = worktree / "inside.txt"
+
+    agent = AgentConfig(
+        prompt_path=Path(".prompts/backend.md"),
+        prompt_relative=".prompts/backend.md",
+        provider="codex",
+        sandbox=True,
+    )
+    scope = compute_session_scope(
+        agent, SandboxScopeContext(task_kind="code", worktree=worktree)
+    )
+    assert scope is not None
+
+    # `codex sandbox` rejects --strict-config. It governs how unknown config
+    # keys are treated rather than forming part of the permissions profile, so
+    # dropping it leaves the generated enforcement exactly intact.
+    scope_argv = [
+        arg for arg in CodexProvider().apply_scope(scope) if arg != "--strict-config"
+    ]
+    script = (
+        f"printf breach > {shlex.quote(str(outside))} 2>/dev/null; echo outside=$?; "
+        f"printf ok > {shlex.quote(str(inside))} 2>/dev/null; echo inside=$?"
+    )
+    result = subprocess.run(
+        ["codex", *scope_argv, "sandbox", "--", "/bin/sh", "-c", script],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+
+    assert "outside=0" not in combined, (
+        f"write outside the workspace was permitted; profile not enforced:\n{combined}"
+    )
+    assert not outside.exists(), (
+        f"breach file exists outside the workspace: {outside}\n{combined}"
+    )
+    assert "inside=0" in combined, (
+        "write inside the workspace was refused; the profile is too strict for "
+        f"real sessions:\n{combined}"
+    )
+    assert inside.read_text(encoding="utf-8") == "ok"
+
+
+@pytest.mark.skipif(not _codex_available(), reason="codex CLI not installed")
 @pytest.mark.skipif(
     sys.platform.startswith("win"),
     reason="the raw TCP probe uses /bin/bash; native Windows needs a PowerShell probe",
