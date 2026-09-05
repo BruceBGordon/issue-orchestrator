@@ -43,6 +43,10 @@ from .persistent_round_failures import (
     PersistentRoundError,
     PersistentRoundTimeoutError,
 )
+from .composer_readiness import (
+    LiveComposerScreen,
+    wait_for_ready_composer,
+)
 from .persistent_round_io import drain_pty_output_until_quiet
 from .persistent_round_interactions import (
     PersistentInteractionState,
@@ -81,20 +85,21 @@ _DEFAULT_PROMPT_ACCEPTANCE_IDLE_SECONDS = 120.0
 # screen the way execution/composer_state.py already classifies it after the
 # fact. Tracked in #7104; this constant stays where it was until then.
 _ENTER_SETTLE_QUIET_SECONDS = 0.3
-# Backstop on that settle, NOT the mechanism.
+# Backstop on the echo settle, NOT the mechanism, and deliberately SHORT.
 #
-# This used to be an implicit `max(quiet_seconds, 1.0)` inside the drain: with
-# a 0.3s window, a flat one second — a cap SHORTER than the event it bounded,
-# so no settle longer than a second was expressible at all. Making it explicit
-# is what allowed the window above to be measured rather than assumed.
+# It used to be an implicit `max(quiet_seconds, 1.0)` computed at entry — a cap
+# shorter than the event it bounded, so no longer settle was expressible.
+# Making it explicit is what let the window be measured instead of assumed.
 #
-# Honest about what this does NOT do: it does not fix #7104. With the window
-# at 0.3s the backstop is never reached, so this changes no behaviour today.
-# Its value is the return flag it enables — `send_round` now says at the
-# moment of submission that it is about to Enter into a TUI that never went
-# quiet, instead of that being reconstructed from a screen replay after a
-# ten-minute timeout.
-_ENTER_SETTLE_MAX_WAIT_SECONDS = 60.0
+# It must stay short. The readiness gate above is what answers "is the agent
+# busy"; this only covers the echo of the text just written. Codex repaints at
+# ~10Hz forever, so the 0.3s window is often never satisfied, and a generous
+# backstop here becomes a stall on EVERY round: at 60s the Enter arrived a
+# minute late and the PTY had stopped accepting it —
+#   "Could not write 1 bytes to PTY fd=3 (0 bytes accepted before timeout)"
+# — turning a working round into a timeout. Measured: 0/5 micro-harness runs
+# passed at 60s.
+_ENTER_SETTLE_MAX_WAIT_SECONDS = 2.0
 
 # Heartbeat cadence for the ``send_round`` poll loop. Without this, a
 # wedged agent shows up as 17 minutes of total log silence (#6160 e2e
@@ -103,6 +108,23 @@ _ENTER_SETTLE_MAX_WAIT_SECONDS = 60.0
 # us *which* step is wedged instead of just "something hung."
 _SEND_ROUND_HEARTBEAT_SECONDS = 30.0
 _PTY_WRITE_HEARTBEAT_SECONDS = 5.0
+
+# Readiness gate before typing a turn into a live TUI (#7104).
+#
+# The wait is on the EVENT — the rendered screen showing an idle agent and an
+# empty composer — and these bound it. Sized against a measured codex 0.153.4
+# bootstrap turn, whose busy footer cleared at 38.4s: the agent runs its
+# argv-delivered setup prompt before the first round is injected, and that is
+# the window this exists to cover.
+_READY_COMPOSER_WAIT_SECONDS = 180.0
+_READY_POLL_INTERVAL_SECONDS = 0.25
+# Per-poll pump: read whatever the PTY has and let the screen apply it. Short,
+# because the loop re-enters immediately; this is a read, not a settle.
+_READY_PUMP_QUIET_SECONDS = 0.05
+# How long a silent agent gets before we accept it has no TUI. Only reached
+# when NOTHING has been painted; an agent that has drawn a busy footer keeps
+# the full wait above.
+_READY_UNDRAWN_GRACE_SECONDS = 15.0
 
 
 @dataclass
@@ -118,6 +140,9 @@ class PersistentSession:
     log_writer: MirroredTerminalRecordingWriter | None = None
     interaction_state: PersistentInteractionState | None = None
     output_observer: Callable[[bytes], None] | None = None
+    #: Live rendered screen used to decide whether the agent will accept
+    #: typing. None for sessions built by tests that never open a PTY.
+    composer_screen: LiveComposerScreen | None = None
     closed: bool = False
 
     @property
@@ -184,12 +209,36 @@ def open_persistent_session(
         command[0] if command else "?",
         proc.pid,
     )
+    # The readiness screen rides the output the runner already reads, so it
+    # costs one grid update per chunk and never opens a second reader on the
+    # PTY. Chained ahead of the interaction observer rather than replacing it.
+    #
+    # Only for the TUI shapes, keyed off the same command detection that
+    # decides whether a session has startup interactions at all: those rules
+    # exist for interactive claude and interactive codex, which are exactly
+    # the agents that HAVE a composer to strand a prompt in. A plain
+    # stdin-reading agent has none, and gating it would add the readiness
+    # grace period to every round for no benefit — which is what made 14
+    # round-runner tests time out when this applied unconditionally.
+    composer_screen = (
+        LiveComposerScreen(rows=rows, cols=cols)
+        if interaction_state is not None
+        else None
+    )
+
+    def _observe(chunk: bytes) -> None:
+        if composer_screen is not None:
+            composer_screen.feed(chunk)
+        if interaction_state is not None:
+            interaction_state.observe(chunk)
+
     session = PersistentSession(
         proc=proc,
         master_fd=master_fd,
         log_writer=log_writer,
         interaction_state=interaction_state,
-        output_observer=interaction_state.observe if interaction_state else None,
+        output_observer=_observe,
+        composer_screen=composer_screen,
     )
     if interaction_state is not None:
         bind_interaction_sender(session, interaction_state)
@@ -356,6 +405,44 @@ def _submit_prompt_with_enter(
     the Enter write). The response file is authoritative — the same tolerance
     as the poll loop's exited-after-answering path.
     """
+    # Do not type at an agent that is mid-turn. The Enter that follows would
+    # not submit, and the prompt would sit in the composer until the round
+    # timed out (#7104). The screen is the only surface that can tell — see
+    # composer_readiness for why byte activity provably cannot.
+    if session.composer_screen is not None:
+        # Bounded by the ROUND's own budget as well as its own ceiling:
+        # getting ready must never eat the turn it is preparing for. A round
+        # given five seconds cannot spend fifteen deciding whether to start.
+        ready_wait = min(_READY_COMPOSER_WAIT_SECONDS, timeout_seconds * 0.5)
+        ready_grace = min(_READY_UNDRAWN_GRACE_SECONDS, timeout_seconds * 0.25)
+        ready = wait_for_ready_composer(
+            session.composer_screen,
+            pump=lambda: drain_pty_output_until_quiet(
+                session,
+                quiet_seconds=_READY_PUMP_QUIET_SECONDS,
+                max_wait_seconds=_READY_PUMP_QUIET_SECONDS,
+                now=now,
+                sleep=sleep,
+            ),
+            timeout_seconds=ready_wait,
+            poll_interval_seconds=_READY_POLL_INTERVAL_SECONDS,
+            undrawn_grace_seconds=ready_grace,
+            now=now,
+            sleep=sleep,
+        )
+        if not ready:
+            busy, holding = session.composer_screen.sample()
+            # Still write: a doomed prompt beats failing a round that might
+            # work, and the poll loop's own diagnostics take it from here. But
+            # say so NOW, so this stops being a ten-minute mystery timeout.
+            logger.warning(
+                "[send_round] composer not ready after %.0fs (busy=%s "
+                "holding_unsent_text=%s); writing anyway and the prompt may "
+                "strand (#7104) role=%s pid=%d",
+                ready_wait, busy, holding, label,
+                session.proc.pid,
+            )
+
     written = _write_prompt_with_timeout_diagnostics(
         session, payload,
         response_file=response_file, write_deadline=write_deadline,
