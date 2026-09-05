@@ -6,6 +6,7 @@ Hermetic: scheduler tools are shell stubs, no pool required.
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import subprocess
 import sys
@@ -280,6 +281,65 @@ def _unhurried_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         lane_executor_module, "_CANCELLED_ACCOUNTING_WAIT_SECONDS", 30.0
     )
+
+
+# The default configuration stub is a shell script whose entire job is to
+# echo a constant this file already knows.
+_CONSTANT_ECHO_STUB = re.compile(r"\A#!/bin/sh\necho '(?P<value>[^']*)'\n\Z")
+
+
+@pytest.fixture(autouse=True)
+def answer_constant_configuration_lookups_in_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop forking a shell to learn a constant.
+
+    Every cancellation test here runs `condor_config_val PER_JOB_HISTORY_DIR`
+    on the way to the thing it actually asserts, and for all but one of them
+    the stub behind it is `#!/bin/sh\\necho '<path>'` — a fork, an exec and a
+    pipe read to obtain a string the test wrote moments earlier.
+
+    That fork is what makes this file load-fragile. It is bounded by the
+    caller's collection budget rather than a generous tool timeout, which is
+    correct in production and merciless in a test: on a machine running the
+    unit suite at twelve xdist workers alongside other tenants, that stub has
+    been measured taking 16.3s and 18.1s, and the tests that depend on it fail
+    with `TimeoutExpired` while asserting nothing about timing at all. Three
+    separate tests failed that way in one gate run — for interrupt ordering
+    and accounting collection, neither of which is a question about how the
+    history directory is discovered.
+
+    So the constant lookup is answered in process. A stub with any other body
+    still forks for real, which keeps
+    `test_the_cancellation_budget_bounds_the_whole_collection` — the one test
+    that IS about a slow lookup — exercising the real path.
+
+    This is the local half of #7162. The general fix is for the adapter to
+    execute through the `CommandRunner` port instead of `subprocess` directly,
+    at which point no test here needs a real process at all.
+    """
+    original = CondorTools.read_configuration
+
+    def _read_configuration(  # type: ignore[no-untyped-def]
+        self: CondorTools,
+        *query: str,
+        timeout_seconds: float = tools_module.TOOL_TIMEOUT_SECONDS,
+    ):
+        try:
+            body = Path(self.config_query).read_text(encoding="utf-8")
+        except OSError:
+            body = ""
+        constant = _CONSTANT_ECHO_STUB.match(body)
+        if constant is None:
+            return original(self, *query, timeout_seconds=timeout_seconds)
+        return subprocess.CompletedProcess(
+            args=[str(self.config_query), *query],
+            returncode=0,
+            stdout=f"{constant.group('value')}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(CondorTools, "read_configuration", _read_configuration)
 
 
 def _cancellable_tools(

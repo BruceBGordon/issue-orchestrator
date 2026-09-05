@@ -26,6 +26,34 @@ def _stub(path: Path, body: str) -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def take_the_production_backstop_out_of_these_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """None of these tests is about the ten-second backstop, so none of
+    them should be able to lose a race against it.
+
+    `_CHIRP_TIMEOUT_SECONDS` bounds a chirp invocation in production, where
+    ten seconds is generous for a binary that sets one job attribute. In a
+    unit test it bounds a `#!/bin/sh` stub that appends a line to a file, and
+    on a loaded machine that fork is not reliably faster than the backstop:
+    `test_resolution_falls_back_to_the_pools_libexec` failed in the gate with
+    `publish(False)` returning False, having asserted nothing about timing.
+    Sibling stubs in the lane-executor suite were measured taking 16-18s under
+    the same conditions.
+
+    Raising it here costs no coverage, because nothing in this module asserts
+    the backstop's behaviour — there is no test that a slow chirp is abandoned
+    after `_CHIRP_TIMEOUT_SECONDS`, which is a real gap and worth writing
+    separately with an injected clock rather than a real sleep.
+
+    Same intent as `_unhurried_cancellation` in the lane-executor suite: take
+    the clock out of the tests that are not about it. The lasting fix is
+    #7162, which removes the fork.
+    """
+    monkeypatch.setattr(chirp_module, "_CHIRP_TIMEOUT_SECONDS", 300.0)
+
+
 def test_publications_carry_the_attribute_and_report_acknowledgment(
     tmp_path: Path,
 ) -> None:
