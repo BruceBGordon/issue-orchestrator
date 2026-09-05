@@ -397,7 +397,20 @@ def test_the_cancellation_budget_bounds_the_whole_collection(
         lane_executor_module, "time", _WaitsThatRaise(KeyboardInterrupt())
     )
 
-    started = time.monotonic()
+    # Record every allowance the collection asks for. THAT is the property —
+    # "one budget spans the whole collection, including the configuration
+    # lookup" — and it contains no clock at all: the values are the arguments
+    # the code passes, so they are identical on an idle laptop and a saturated
+    # CI box.
+    allowances: list[float] = []
+    original_lasting = lane_executor_module._CollectionBudget.lasting
+
+    def _record(seconds: float):  # type: ignore[no-untyped-def]
+        allowances.append(seconds)
+        return original_lasting(seconds)
+
+    monkeypatch.setattr(lane_executor_module._CollectionBudget, "lasting", _record)
+
     with pytest.raises(KeyboardInterrupt):
         executor.run(
             LaneCommand(
@@ -408,15 +421,24 @@ def test_the_cancellation_budget_bounds_the_whole_collection(
             ),
             LaneResources(request_cpus=1),
         )
-    elapsed = time.monotonic() - started
-
-    # Generous against the budget (four times it, for the process spawns
-    # and scheduler jitter of a loaded parallel suite), still nowhere
-    # near the twenty seconds an unbounded lookup costs.
+    # Assert the ALLOWANCES, never a duration.
+    #
+    # This was `elapsed < budget * 4`, and it was flaky for a reason no
+    # threshold can fix. Elapsed is the 2s budget plus process spawns and
+    # scheduler contention, and under a loaded parallel gate those dominate.
+    # Measured on this suite: correct code takes ~2-3s on an idle machine but
+    # 19.66s under the gate, while the bug — a second budget built inside the
+    # accounting stage — takes 20.26s. The outcomes overlap almost exactly, so
+    # elapsed has no discriminating power in the environment that matters, and
+    # moving the threshold only changes which mode it lies about.
+    #
+    # Exactly one budget must be built for the whole collection, and it must be
+    # the cancellation one. A stage that builds its own is precisely the defect
+    # (Round 2 finding 1), and it shows up here as a second, larger allowance.
     budget = lane_executor_module._CANCELLED_ACCOUNTING_WAIT_SECONDS
-    assert elapsed < budget * 4, (
-        "the cancellation budget did not span the configuration lookup: "
-        f"{elapsed:.2f}s for a {budget:.0f}s budget"
+    assert allowances == [budget], (
+        "the collection did not run on one cancellation-scoped budget: "
+        f"allowances {allowances} against a {budget:.0f}s cancellation budget"
     )
     retained = set(Path(tempfile.gettempdir()).glob(f"lane-{work_key}*")) - before
     assert retained, "a cancelled lane must retain its diagnostics"
