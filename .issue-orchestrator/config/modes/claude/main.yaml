@@ -145,11 +145,16 @@ cleanup:
     remove_worktrees: true
 
 validation:
+  # TEMPORARILY on the direct backend — see #7163. The condor backend runs
+  # the unit lane at UNIT_PARALLEL=12 inside a 3-CPU reservation, and the
+  # resulting oversubscription fails condor's own forking adapter tests.
+  # Restore LANE_EXECUTOR=condor once the reservation and the worker count
+  # are decided together; see modes/default/main.yaml for the detail.
   quick:
-    cmd: LANE_EXECUTOR=condor make validate-quick
+    cmd: LANE_EXECUTOR=direct make validate-quick
     timeout_seconds: 600
   publish:
-    cmd: LANE_EXECUTOR=condor make validate-pr-raw
+    cmd: LANE_EXECUTOR=direct make validate-pr-raw
     # This repo's local publish gate runs the full PR validation slice
     # (unit/integration/web/vscode) and routinely exceeds 300s on busy machines,
     # even without any live agent work in the loop.
