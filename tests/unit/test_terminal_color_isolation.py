@@ -15,13 +15,14 @@ this process can observe it.
 from __future__ import annotations
 
 import os
-import subprocess
+import re
 import sys
 from pathlib import Path
 
 import pytest
 
 from tests.conftest import TERMINAL_TEST_COLUMNS
+from tests.process_group_run import run_in_process_group
 
 # The exact tests #7155 reported failing, named individually rather than by
 # file. The child run has to stay small: this test already runs inside a lane
@@ -40,8 +41,7 @@ ORIGINALLY_FAILING = [
     "::test_cmd_setup_guardrails_reports_flat_config_layout_error",
     "tests/unit/test_trace_issue.py::TestCmdTrace::test_no_entries_found",
 ]
-
-
+# Five node ids, one of them parametrized with two cases.
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -85,20 +85,61 @@ def test_rich_renders_plain_text_at_the_pinned_width() -> None:
 def test_cli_suites_pass_with_force_color_set_in_the_environment() -> None:
     """The actual #7155 reproduction: a child pytest carrying FORCE_COLOR=3.
 
-    A negative control for the fixture as a whole — deleting
-    ``isolate_terminal_color_env`` from ``tests/conftest.py`` makes this fail
-    with the original ``assert 'config/modes/<mode>/' in ...`` error, which is
-    what stops the guard from silently rotting into a test that would pass
-    with or without the fix.
+    What this DOES prove: the CLI suites are immune to a colour-forcing
+    ambient environment, which is the bug that cost four sessions a round of
+    confusion each.
+
+    What it does NOT prove, despite an earlier version of this docstring
+    claiming so: that the autouse fixture is load-bearing. Deleting
+    ``isolate_terminal_color_env`` leaves every other test in this file
+    passing — verified, not reasoned. The child imports the same
+    ``tests/conftest.py``, whose MODULE-LEVEL block pops the colour variables
+    and pins ``COLUMNS`` before collection, so the child is protected with or
+    without the fixture.
+
+    The two mechanisms cover different things and both are wanted: the
+    module-level block fixes consoles built during collection (which is most
+    of them, since test modules import the CLI at module scope), and the
+    fixture stops one test's environment changes leaking into the next. The
+    fixture's own behaviour is asserted by
+    ``test_the_fixture_restores_an_environment_a_test_dirties`` below, which
+    is a real control for it.
     """
     env = dict(os.environ)
+    # Strip the options this process was invoked with. `PYTEST_ADDOPTS` rides
+    # in the ENVIRONMENT, and the child disables xdist and the cache provider,
+    # so `PYTEST_ADDOPTS="-n 2"` makes the child exit 4 with `unrecognized
+    # arguments: -n`. (A command-line `-n`, which is how this repo's gate
+    # supplies it, does not reach the child — the vector is the env var.)
+    #
+    # The `PYTEST_XDIST_*` vars go too. The unit lane runs at `-n 12`, so the
+    # child would inherit `PYTEST_XDIST_WORKER=gwN` while itself running
+    # `-p no:xdist`; `control/isolation.py` keys the orchestrator IPC socket
+    # path off exactly that name, so an inherited value points a child at a
+    # live worker's socket. Not reproduced by these six cases — stripped
+    # because a child pretending to be a worker it is not is a hazard, not
+    # because it has bitten yet.
+    for inherited in (
+        "PYTEST_ADDOPTS",
+        "PYTEST_PLUGINS",
+        "PYTEST_CURRENT_TEST",
+        "PYTEST_XDIST_WORKER",
+        "PYTEST_XDIST_WORKER_COUNT",
+        "PYTEST_XDIST_TESTRUNUID",
+    ):
+        env.pop(inherited, None)
     env["FORCE_COLOR"] = "3"
     # A width narrow enough to force the wrap that split "hooks must be a JSON
     # object"; the fixture must override it rather than merely strip colour.
     env["COLUMNS"] = "60"
     env.pop("NO_COLOR", None)
 
-    completed = subprocess.run(
+    # A1: the repo's process-lifecycle owner, per tests/AGENTS.md. A bare
+    # `subprocess.run` timeout kills only the pytest leader; collection,
+    # fixtures and the CLI tests themselves can leave descendants behind, and
+    # a second partial lifecycle implementation is exactly what that rule
+    # exists to prevent.
+    completed = run_in_process_group(
         [
             sys.executable,
             "-m",
@@ -113,8 +154,6 @@ def test_cli_suites_pass_with_force_color_set_in_the_environment() -> None:
         ],
         cwd=_repo_root(),
         env=env,
-        capture_output=True,
-        text=True,
         timeout=600,
     )
 
@@ -122,4 +161,88 @@ def test_cli_suites_pass_with_force_color_set_in_the_environment() -> None:
         "CLI suites must be immune to FORCE_COLOR in the ambient environment.\n"
         f"stdout tail:\n{completed.stdout[-4000:]}\n"
         f"stderr tail:\n{completed.stderr[-2000:]}"
+    )
+    # A child that ran FEWER cases than asked proves less than it appears to.
+    #
+    # Read the SUMMARY LINE, not the whole stream. `log_cli = true`
+    # (pyproject.toml) makes the child print a node id per test even under
+    # `-q`, so a parametrize id is free text in this output: an id containing
+    # the words "6 passed" satisfied a naive `re.search(r"(\d+) passed")`
+    # while only five of the six cases ran — the exact vacuity this guard
+    # exists to prevent.
+    #
+    # The count itself is NOT pinned. Tying it to a constant means a
+    # legitimate new param case in an unrelated CLI file fails this test with
+    # a message about stale node ids, which is a lie. What must hold is that
+    # nothing was silently dropped: every case either passed, or the run is
+    # not evidence.
+    summary = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
+    assert "deselected" not in summary and "skipped" not in summary, (
+        "cases were dropped from the child run, so it is not evidence about "
+        f"colour at all: {summary!r}\n"
+        f"stdout tail:\n{completed.stdout[-2000:]}"
+    )
+    passed = re.search(r"(\d+) passed", summary)
+    assert passed and int(passed.group(1)) >= len(ORIGINALLY_FAILING), (
+        f"expected at least {len(ORIGINALLY_FAILING)} cases (one per node id, "
+        f"more when a case is parametrized); summary was {summary!r}\n"
+        f"stdout tail:\n{completed.stdout[-2000:]}"
+    )
+
+
+def test_the_fixture_restores_an_environment_a_test_dirties() -> None:
+    """A real control for the autouse fixture, which the child run is not.
+
+    The module-level scrub runs ONCE, at conftest import, so it cannot undo
+    anything a test sets afterwards. That is the fixture's job and the only
+    thing that distinguishes it from the block above it.
+
+    This invokes the ACTUAL fixture body via ``__wrapped__`` rather than
+    re-implementing it: a copy of the logic would pass whether or not the
+    fixture existed, which is a trap this file has already fallen into once.
+
+    BOTH variables are dirtied on purpose. Asserting `COLUMNS` without having
+    changed it passed even with the fixture's `setenv` deleted, because the
+    module-level block had already pinned it — an assertion that could only
+    ever succeed.
+    """
+    from tests import conftest as shared_conftest
+
+    os.environ["FORCE_COLOR"] = "3"
+    os.environ["COLUMNS"] = "17"
+    patcher = pytest.MonkeyPatch()
+    try:
+        shared_conftest.isolate_terminal_color_env.__wrapped__(patcher)
+
+        assert "FORCE_COLOR" not in os.environ, (
+            "the fixture did not strip a colour variable a test had set"
+        )
+        assert os.environ["COLUMNS"] == TERMINAL_TEST_COLUMNS, (
+            "the fixture did not re-pin a width a test had changed"
+        )
+    finally:
+        patcher.undo()
+        os.environ.pop("FORCE_COLOR", None)
+        os.environ["COLUMNS"] = TERMINAL_TEST_COLUMNS
+
+
+def test_the_colour_fixture_is_registered_autouse() -> None:
+    """Registration, not just behaviour.
+
+    The test above pins what the fixture DOES; it calls the function directly,
+    so it keeps passing if `autouse=True` is dropped. Autouse is the entire
+    reason the fixture protects tests that never mention it, so it is asserted
+    separately — verified by mutation: removing `autouse=True` leaves the
+    body test green and fails this one.
+    """
+    from tests import conftest as shared_conftest
+
+    # pytest 8 exposes the decorator's arguments here; `__wrapped__` (used by
+    # the test above) deliberately hands back the undecorated function, which
+    # is why that one cannot see this.
+    marker = shared_conftest.isolate_terminal_color_env._fixture_function_marker
+
+    assert marker.autouse is True, (
+        "the colour fixture is no longer autouse, so it protects only tests "
+        "that request it by name — which is none of them"
     )

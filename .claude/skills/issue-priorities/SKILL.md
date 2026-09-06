@@ -86,14 +86,55 @@ to people; never report that setting one changed scheduling.
 `pick_next_batch` then takes from the front, after any explicit
 `priority_overrides` (issue numbers, jumped to the head of the batch).
 
-### The ordering trap: prerequisites filed later
+### Ordering is not gating
 
 Because ties break by **ascending issue number**, a prerequisite filed *after*
 its dependent sorts *behind* it. Filing #7160 as a blocker for #7152 puts the
 blocker second by default.
 
-Explicit sequence numbers are the only fix — give the prerequisite the lower
-`-nnn`.
+**Ordering does not stop the dependent from starting.** Sorting only decides
+who is picked first among issues that are already eligible. With two free
+slots, `pick_next_batch` takes both — so the dependent can start before its
+prerequisite is finished no matter how they sort.
+
+**To gate, declare the dependency.** Put it in the dependent's body:
+
+```
+Depends-on: #7160
+```
+
+An issue is runnable only when **all** its `Depends-on:` dependencies are
+closed, so this holds #7152 back until #7160 is done, whatever the numbers or
+sequence say. `Depends-on: M1-010` resolves the same way via the external ID
+in the title.
+
+(`Stack-after:` is a different edge with a weaker condition — a predecessor
+unblocks on a usable branch rather than on closure. Use `Depends-on:` when you
+mean "not until that is finished"; see ADR-0029 for the stacked-work case.)
+
+One restriction, and it bites in three ways. The dependency must be in the
+**same milestone** as the dependent, or in the foundation milestone
+(`milestones.foundation`, default `M0`). Otherwise it is `CROSS_MILESTONE`,
+which **blocks** the issue rather than ordering it:
+
+| Situation | Result |
+|---|---|
+| Dependency in another milestone | `CROSS_MILESTONE` — blocked |
+| **Dependent itself has no milestone** | `CROSS_MILESTONE` — blocked, because the edge cannot be evaluated at all |
+| Dependency has no milestone, dependent does | `CROSS_MILESTONE` — blocked |
+
+The middle row is the one that surprises people, and it interacts with the
+"no milestone" note above: an unmilestoned issue with no dependencies merely
+sorts last, but an unmilestoned issue carrying a `Depends-on:` line is hard
+blocked. Filing a follow-up without a milestone and adding a dependency to it
+is the usual way to reach that state.
+
+See [FAQ Q22](../../../docs/user/faq.md) and
+[ADR-0029](../../../docs/architecture/ADR/0029-stacked-work-via-typed-dependency-edges.md).
+
+Sequence numbers remain useful, but for what they are: choosing the order
+among eligible issues. Use them when you want a stable running order, not
+when you need one issue to wait for another.
 
 ## How to do it
 
@@ -158,10 +199,21 @@ wording.
 In order, stopping at the first hit:
 
 1. No `agent:*` label → invisible to the planner. This is nearly always it.
-2. No milestone → sorts behind every milestoned issue.
+2. No milestone → sorts behind every milestoned issue, and if the issue also
+   carries a `Depends-on:` line it is BLOCKED outright, not merely last (see
+   item 5).
 3. A blocking label (`blocked`, `blocked-*`, `needs-human`) → held deliberately;
    see the `troubleshooting` skill.
-4. Ordered correctly but behind a long queue → check tier and sequence, and
+4. An **unmet dependency** → `Depends-on:` in the body naming an issue that is
+   still open. The issue is not runnable until every dependency is closed, and
+   this looks exactly like "never picked up" because nothing about its labels
+   or ordering is wrong.
+5. A **`CROSS_MILESTONE` dependency** → the edge cannot be evaluated against
+   the milestone rules. Three ways in: the named issue is in another
+   milestone; the named issue has no milestone while this one does; or **this
+   issue has no milestone at all**, which makes every `Depends-on:` on it
+   unevaluable. All three BLOCK rather than order.
+6. Ordered correctly but behind a long queue → check tier and sequence, and
    confirm `max_concurrent_sessions` is not saturated.
 
 ## Reference
@@ -172,6 +224,7 @@ In order, stopping at the first hit:
 | Tier / sequence regexes | same file — `_get_priority_value`, `_get_sequence_value` |
 | Milestone strategy | same file — `MilestoneNumberStrategy`, `DueDateStrategy` |
 | Batch selection and overrides | same file — `pick_next_batch` |
+| Dependency gating and milestone rules | `docs/user/faq.md` Q22, ADR-0029 |
 | Default tier | `src/issue_orchestrator/infra/settings_schema.py` — `default_priority_tier` |
 | Label families and provisioning | `src/issue_orchestrator/control/label_manager.py` |
 | Agent routing keys | `.issue-orchestrator/config/modes/<mode>/main.yaml` — `agents:` |
