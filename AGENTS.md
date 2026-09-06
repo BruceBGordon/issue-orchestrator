@@ -138,6 +138,7 @@ Skills in `.claude/skills/` are automatically invoked when working on relevant a
 | `architecture` | Working on ports, adapters, DI, bootstrap |
 | `troubleshooting` | Debugging sessions, hooks, locks |
 | `review-workflow` | Code review pipeline, tech lead, rework |
+| `issue-dependency-stacking` | Creating runnable issue graphs, choosing `Depends-on:` versus `Stack-after:`, or diagnosing dependency gates |
 | `session-replay` | Session artifact capture, replay endpoints, timeline/session correlation, and emulator-backed session viewing |
 | `schema-updates` | Updating UI contracts, SSE payloads, or config schemas |
 | `github-token-rotation` | Rotating expiring GitHub PATs or identifying the repo-scoped auth source issue-orchestrator uses |
