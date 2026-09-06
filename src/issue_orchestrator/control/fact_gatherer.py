@@ -46,10 +46,11 @@ from .tech_lead_artifact_retention import (
     clear_discovered_facts as _clear_discovered_facts,
     tech_lead_problem_artifact_hold_issue_numbers,
 )
-from .tech_lead_proposals import (
-    observe_approval_backlog,
-    observe_gated_tech_lead_proposals,
+from .tech_lead_approval_scope import (
+    approval_refresh_due,
+    observe_approval_backlog_or_none,
 )
+from .tech_lead_proposals import observe_gated_tech_lead_proposals
 from .tech_lead_reaction import storm_possible
 
 # Compatibility export: this policy lived in fact_gatherer before it gained a
@@ -77,6 +78,7 @@ if TYPE_CHECKING:
     from .tech_lead_board import TechLeadBoardPublisher
 
 logger = logging.getLogger(__name__)
+
 
 
 def _pr_labels(pr: Any) -> list[str]:
@@ -413,20 +415,16 @@ class FactGatherer:
         batch_armed = bool(watch_label)
         tech_lead_workflow_enabled = self.config.tech_lead_enabled
         health_armed = health_review_interval_minutes(self.config) > 0
-        # A storm can fire an anchor on a tick the interval is NOT due — and a
-        # storm-only configuration (interval_minutes=0) is never due at all.
-        # Arming the scan on the storm predicate is what keeps
-        # ``existing_health_review_issue`` trustworthy on those ticks; without
-        # it the dedup fact is unconditionally None and every storm mints a
-        # duplicate anchor. Pure state/config math, so it costs no API call.
+        # A storm can fire an anchor on a tick the interval is NOT due, and a
+        # storm-only config (interval_minutes=0) is never due at all. Arming on
+        # the storm predicate keeps ``existing_health_review_issue`` trustworthy
+        # there; without it every storm mints a duplicate anchor. No API call.
         storm_armed = storm_possible(state, self.config)
 
-        # The act-level PROPOSAL machinery is armed by having a tech lead agent, so
-        # it reconciles INDEPENDENT of the batch review threshold (#6779 R12):
-        # approved gated proposals must execute and terminal/absent proposals
-        # must be surfaced for cleanup even when threshold=0 (batch disabled).
-        # The local op ledger (no GitHub call) says whether there is anything to
-        # reconcile — an empty ledger produces no facts and no scan.
+        # The act-level PROPOSAL machinery reconciles INDEPENDENT of the batch
+        # threshold (#6779 R12): approved proposals must execute and absent ones
+        # be surfaced even at threshold=0. The local op ledger (no GitHub call)
+        # says whether there is anything to reconcile.
         ops = (
             dict(self.tech_lead_authority.list_ops())
             if tech_lead_workflow_enabled and self.tech_lead_authority is not None
@@ -443,18 +441,20 @@ class FactGatherer:
             target=self.promotion_target,
             read_budget=self.promotion_read_budget,
         )
-        # LABEL truth about the approval backlog, read off the board the tick
-        # already fetched (#7014). Every gated-proposal producer attaches the
-        # gate; only act-level ops leave a ledger row, so this — not ``ops`` —
-        # is what can say how many approvals are pending. It also ARMS fact
-        # production: a board holding gated proposals must publish a board that
-        # shows them even when nothing else about tech_lead is active.
+        # LABEL truth about the approval backlog (#7014): only act-level ops
+        # leave a ledger row, so ``ops`` cannot say what is pending. Also ARMS
+        # fact production.
         gated_proposals = observe_gated_tech_lead_proposals(board_issues)
-        # A backlog that just EMPTIED must still publish: clearing the last gate
-        # is exactly when nothing else arms production.
+        # A just-EMPTIED backlog must still publish: clearing the last gate is
+        # when nothing else arms production.
         backlog_cleared = state.tech_lead_gated_backlog_seen and not gated_proposals
+        # Arms independently; tech_lead_approval_scope says why.
+        approval_due = approval_refresh_due(
+            self.config, state, now_ts, self.tech_lead_authority
+        )
         if (
-            not backlog_cleared
+            not approval_due
+            and not backlog_cleared
             and not batch_armed
             and not health_armed
             and not ops
@@ -485,13 +485,10 @@ class FactGatherer:
         case_files_scanned, scan_observations = False, cast(Sequence["Issue"], ())
         if batch_armed or ops or due or storm_armed:
             # The ONE exhaustive open tech-lead-agent scan classifies batch +
-            # health anchors, open proposals, approved ops, and absent-ledger
-            # cleanup candidates in a single reconcile (#6778/#6779).
-            # It runs when the batch trigger is armed OR the ledger has ops to
-            # reconcile — decoupling proposal advancement from the batch
-            # threshold. A due health review also needs this scan so its board
-            # snapshot includes every open pattern case file (#6781), and a
-            # possible storm needs it to dedup its anchor (#6780).
+            # health anchors, open proposals, approved ops and absent-ledger
+            # cleanup candidates in a single reconcile (#6778/#6779). It also
+            # feeds the health snapshot's case files (#6781) and the storm
+            # anchor dedup (#6780).
             (
                 batch_anchor,
                 existing_health_review_issue,
@@ -509,10 +506,13 @@ class FactGatherer:
         prs = self._fetch_tech_lead_prs(watch_label) if batch_armed else []
         all_labels, source_milestones = self._collect_pr_metadata(prs)
 
-        # Complete observation, not the partial sets this tick happens to hold.
-        gated_proposals = observe_approval_backlog(
+        # None means the scope was unobservable; see tech_lead_approval_scope.
+        gated_proposals = observe_approval_backlog_or_none(
             self.repository_host, self.config, board_issues, scan_observations
         )
+        if gated_proposals is None:
+            return None
+        state.tech_lead_approval_scan_at = now_ts
 
         # Lets the next tick tell "still empty" from "just emptied".
         state.tech_lead_gated_backlog_seen = bool(gated_proposals)

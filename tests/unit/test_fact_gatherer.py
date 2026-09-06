@@ -30,6 +30,21 @@ from issue_orchestrator.ports import PRInfo
 from issue_orchestrator.ports.event_sink import InMemoryEventSink
 from tests.unit.session_run_helpers import make_session_run_assets
 
+
+def _host_sees_gated(mock_repository_host, *gated) -> None:
+    """Answer the GATE query with these issues and the anchor scan with none.
+
+    A single `return_value` hands the same list to both queries, so a test
+    using one cannot tell which observation produced the backlog. It also
+    describes an impossible state once the gate query decides membership: a
+    board showing a gated issue that the exhaustive gate query says is absent.
+    """
+    def _list(**kwargs):
+        labels = kwargs.get("labels") or []
+        return list(gated) if "proposed-tech-lead" in labels else []
+
+    mock_repository_host.list_issues.side_effect = _list
+
 def _anchor_scan_calls(mock_repository_host) -> list:
     """The ANCHOR scan calls only, ignoring the approval-scope query.
 
@@ -1495,8 +1510,13 @@ class TestGatedProposalScanClassification:
         mock_config.tech_lead.health_review.interval_minutes = 0
         gatherer = self._gatherer_batch_disabled(mock_config, mock_repository_host, [])
 
-        assert gatherer.gather_tech_lead_facts(sample_state, board_issues=[]) is None
-        mock_repository_host.list_issues.assert_not_called()
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
+
+        # Approval discovery arms on its own cadence, so facts exist; the
+        # exhaustive ANCHOR scan is what an empty ledger must not trigger.
+        assert facts is not None
+        assert facts.gated_proposals == ()
+        assert _anchor_scan_calls(mock_repository_host) == []
 
 
 class TestCaseFileScanClassification:
@@ -1702,6 +1722,7 @@ class TestApprovalBacklogFacts:
     def test_gated_board_issues_become_backlog_facts(
         self, mock_config, mock_repository_host, sample_state
     ) -> None:
+        _host_sees_gated(mock_repository_host, self._gated(6922, "oldest"))
         gatherer = self._gatherer(mock_config, mock_repository_host)
 
         facts = gatherer.gather_tech_lead_facts(
@@ -1723,6 +1744,7 @@ class TestApprovalBacklogFacts:
         """Nothing else armed, so before #7014 this tick produced NO facts —
         and therefore never published a board that could show the backlog. The
         board is already in hand, so arming on it costs zero GitHub calls."""
+        _host_sees_gated(mock_repository_host, self._gated(6922))
         gatherer = self._gatherer(mock_config, mock_repository_host)
 
         facts = gatherer.gather_tech_lead_facts(
@@ -1740,12 +1762,20 @@ class TestApprovalBacklogFacts:
     def test_an_ungated_board_arms_nothing(
         self, mock_config, mock_repository_host, sample_state
     ) -> None:
+        _host_sees_gated(mock_repository_host)  # the gate query finds nothing
         gatherer = self._gatherer(mock_config, mock_repository_host)
 
-        assert gatherer.gather_tech_lead_facts(
+        facts = gatherer.gather_tech_lead_facts(
             sample_state,
             board_issues=[Issue(number=7, title="plain", labels=["agent:backend"])],
-        ) is None
+        )
+
+        # Facts ARE produced now: approval discovery arms on its own cadence,
+        # because a board with no gated issues is not evidence that none are
+        # pending — that board is the blind spot the gate query exists to
+        # cover. What an ungated board must still mean is an EMPTY backlog.
+        assert facts is not None
+        assert facts.gated_proposals == ()
 
     def test_master_switch_still_suppresses_the_backlog(
         self, mock_config, mock_repository_host, sample_state
@@ -1777,6 +1807,9 @@ class TestApprovalBacklogFacts:
             InMemoryTechLeadAuthorityStore,
         )
 
+        _host_sees_gated(
+            mock_repository_host, self._gated(6922, "[P1-003] fix the seam")
+        )
         publisher = TechLeadBoardPublisher(
             board_path=tech_lead_board_path(tmp_path),
             authority=InMemoryTechLeadAuthorityStore(),
@@ -1939,6 +1972,7 @@ class TestTheApprovalBacklogIsObservedCompletelyAndCleared:
         mock_config.tech_lead_review_threshold = 0
         mock_config.tech_lead.health_review.interval_minutes = 0
 
+        _host_sees_gated(mock_repository_host, self._gated(8000))
         first = gatherer.gather_tech_lead_facts(
             sample_state, board_issues=[self._gated(8000)]
         )
@@ -1946,8 +1980,9 @@ class TestTheApprovalBacklogIsObservedCompletelyAndCleared:
         assert [p.issue_number for p in first.gated_proposals] == [8000]
         assert sample_state.tech_lead_gated_backlog_seen is True
 
-        # The operator approves it: the gate is gone, so nothing is pending
-        # and nothing else is armed.
+        # The operator approves it: the gate is gone everywhere, including the
+        # authoritative query, so nothing is pending and nothing else is armed.
+        _host_sees_gated(mock_repository_host)
         second = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert second is not None, (
@@ -2048,4 +2083,77 @@ class TestTheBacklogSeesWhatOnlyItsOwnScopeCanSee:
         assert [p.issue_number for p in facts.gated_proposals] == [8100], (
             "a gated issue that only the approval-scope query can see never "
             "reached the board, so the operator is not told it is waiting"
+        )
+
+
+class TestApprovalDiscoveryDoesNotDependOnTheBoard:
+    """F2 round 3: the query must be REACHABLE when only hidden approvals exist.
+
+    Adding the complete query is not enough if the only path to it runs
+    through an early return armed by the worker board — the very fetch whose
+    blind spot the query exists to cover. A repo whose only tech-lead activity
+    is worker-labelled proposals outside that board armed nothing, queried
+    nothing, and showed nothing, indefinitely.
+    """
+
+    def test_only_hidden_approvals_still_reach_the_board_from_startup(
+        self, mock_config, sample_state
+    ) -> None:
+        """Startup, batch and health disabled, empty ledger, empty board."""
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead_review_threshold = 0
+        mock_config.tech_lead.health_review.interval_minutes = 0
+        hidden = Issue(
+            number=8100,
+            title="Promoted finding: condor lane forks a shell",
+            labels=["agent:backend", "proposed-tech-lead"],
+        )
+        host = _LabelAwareIssueHost(anchor=[], approval=[hidden])
+        gatherer = FactGatherer(
+            config=mock_config,
+            repository_host=host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+        # `tech_lead_approval_scan_at` is 0.0 on a fresh state, so the very
+        # first tick is due — no prior sighting required.
+        facts = gatherer.gather_tech_lead_facts(
+            sample_state, board_issues=[], now=1000.0
+        )
+
+        assert facts is not None, (
+            "nothing armed the tick, so the approval query never ran and a "
+            "pending approval invisible to the worker board can never surface"
+        )
+        assert [p.issue_number for p in facts.gated_proposals] == [8100]
+
+    def test_the_refresh_is_bounded_rather_than_every_tick(
+        self, mock_config, sample_state
+    ) -> None:
+        """Cost control: the cadence, not the tick, decides when to re-observe."""
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead_review_threshold = 0
+        mock_config.tech_lead.health_review.interval_minutes = 0
+        host = _LabelAwareIssueHost(anchor=[], approval=[])
+        gatherer = FactGatherer(
+            config=mock_config,
+            repository_host=host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+        gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=1000.0)
+        queries_after_first = len(host.calls)
+        gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=1001.0)
+
+        assert len(host.calls) == queries_after_first, (
+            "the approval scope was re-queried one second later; the cadence "
+            "is not bounding the cost"
         )

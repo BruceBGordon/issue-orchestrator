@@ -1906,6 +1906,11 @@ class OrchestratorState:
     # approval" forever. In-memory like the fields around it: GitHub labels
     # remain the crash-safe truth, so a restart costs one stale board until
     # the next armed tick, never a wrong decision.
+    # #7014 F2: when the approval scope was last observed. Approval discovery
+    # cannot be armed by the worker board — that fetch is the blind spot the
+    # gate query exists to cover, so "the board saw nothing" is not evidence
+    # that nothing is pending. 0.0 means never, which arms it on startup.
+    tech_lead_approval_scan_at: float = 0.0
     tech_lead_gated_backlog_seen: bool = False
     tech_lead_expedited: list[int] = field(default_factory=list)
     tech_lead_expedite_pending: list[int] = field(default_factory=list)

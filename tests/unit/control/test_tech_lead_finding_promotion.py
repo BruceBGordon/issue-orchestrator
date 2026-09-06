@@ -1591,8 +1591,16 @@ class TestFactGatheringAndPlanning:
             _state(), board_issues=[]
         )
 
-        # Nothing armed: no facts at all, and no cross-repo read was attempted.
-        assert facts is None
+        # The PROMOTION lane is what must stay quiet here, and it does: no
+        # promotable findings, no updates, and no cross-repo read attempted.
+        # Facts themselves are produced because approval discovery arms on its
+        # own cadence (#7014 F2) — a board with no gated issues is not evidence
+        # that no approvals are pending, so that observation cannot be gated on
+        # this lane being active.
+        assert facts is not None
+        assert facts.promotable_findings == ()
+        assert facts.promotion_updates == ()
+        assert facts.settled_promotions == ()
 
     def test_gathered_facts_become_filing_update_and_settlement_actions(self):
         from issue_orchestrator.control.tech_lead_finding_promotion import (

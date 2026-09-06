@@ -1730,3 +1730,63 @@ class TestALaterObservationCanRetireAnEarlierOne:
         observed = observe_gated_tech_lead_proposals([gated], [unrelated])
 
         assert [p.issue_number for p in observed] == [9000]
+
+
+class TestTheAuthoritativeQueryDecidesMembership:
+    """F4: absence in the complete set retires an entry a partial set held.
+
+    Appending an exhaustive gate-filtered query to a union does not make it
+    authoritative. Its verdict on a retired proposal is ABSENCE, and absence
+    supersedes nothing in a union — so a proposal approved between the worker
+    fetch and the gate query stayed advertised on the strength of the older,
+    narrower observation.
+    """
+
+    class _Host:
+        def __init__(self, approval):
+            self._approval = approval
+
+        def list_issues(self, **_kwargs):
+            return list(self._approval)
+
+    @staticmethod
+    def _issue(number: int, *, gated: bool = True):
+        from issue_orchestrator.domain.models import Issue
+
+        labels = ["agent:backend"] + (["proposed-tech-lead"] if gated else [])
+        return Issue(number=number, title="Proposal", labels=labels)
+
+    @staticmethod
+    def _config():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(filtering=SimpleNamespace(label=""))
+
+    def test_an_empty_authoritative_result_retires_a_partial_entry(self) -> None:
+        from issue_orchestrator.control.tech_lead_approval_scope import (
+            observe_approval_backlog,
+        )
+
+        observed = observe_approval_backlog(
+            self._Host([]), self._config(), [self._issue(9000)]
+        )
+
+        assert observed == (), (
+            "the complete observation says #9000 is not pending, but the "
+            "older worker fetch kept it on the board"
+        )
+
+    def test_an_authoritative_result_for_a_different_issue_also_retires_it(
+        self,
+    ) -> None:
+        from issue_orchestrator.control.tech_lead_approval_scope import (
+            observe_approval_backlog,
+        )
+
+        observed = observe_approval_backlog(
+            self._Host([self._issue(9001)]),
+            self._config(),
+            [self._issue(9000)],
+        )
+
+        assert [p.issue_number for p in observed] == [9001]
