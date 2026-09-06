@@ -4246,14 +4246,41 @@ class StopOwnerStatus(StrEnum):
     STOP_IN_PROGRESS  = "stop_in_progress" # another reservation holds this generation
     REPO_MISMATCH     = "repo_mismatch"    # the engine serves a different repository
     REMOTE_HOST       = "remote_host"      # not ours to stop
-    STOP_FAILED       = "stop_failed"      # the lifecycle owner reported failure
+    STOP_FAILED       = "stop_failed"      # lifecycle or post-dispatch observation failed
 
 
 @dataclass(frozen=True, slots=True)
 class StopOwnerOutcome:
     status: StopOwnerStatus
-    observed_owner: ClaimOwnerFact | None   # what the re-read actually found
+    observed_owner: ClaimOwnerFact | None   # observation provenance is specified below
     message: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, StopOwnerStatus):
+            raise ValueError("stop-owner status must be a StopOwnerStatus")
+        if not isinstance(self.message, str) or not self.message.strip():
+            raise ValueError("every stop-owner outcome requires a display message")
+        if self.observed_owner is not None:
+            if not isinstance(self.observed_owner, ClaimOwnerFact):
+                raise ValueError("observed owner must be a typed claim-owner fact")
+            if not isinstance(self.observed_owner.engine, EngineIdentity):
+                raise ValueError("observed owner requires a typed engine")
+            if type(self.observed_owner.owner_fence) is not int or self.observed_owner.owner_fence < 0:
+                raise ValueError("observed owner requires a non-negative integer fence")
+            if not isinstance(self.observed_owner.stop_availability, EngineStopAvailability):
+                raise ValueError("observed owner requires enumerated stop availability")
+
+        match self.status:
+            case StopOwnerStatus.NO_SUCH_RECORD | StopOwnerStatus.NOT_OWNED | StopOwnerStatus.RECORD_UNAVAILABLE:
+                if self.observed_owner is not None:
+                    raise ValueError("this status has no trustworthy observed owner")
+            case StopOwnerStatus.STOPPED | StopOwnerStatus.STOP_IN_PROGRESS | StopOwnerStatus.REMOTE_HOST | StopOwnerStatus.STOP_FAILED:
+                if self.observed_owner is None:
+                    raise ValueError("this status requires the observed owner it describes")
+            case StopOwnerStatus.OWNER_CHANGED | StopOwnerStatus.REPO_MISMATCH:
+                pass  # the exact optional-owner meanings are stated in the matrix
+            case _:
+                assert_never(self.status)
 
 
 class ValidatedWorkOwnerStopCoordinator(Protocol):
@@ -4275,8 +4302,52 @@ display explanation. The Control Center endpoint maps this to HTTP 503 and its
 typed OpenAPI response; the UI shows unavailable facts and no guarded action.
 No reservation or lifecycle call occurs. `NO_SUCH_RECORD` is instead HTTP 404 and
 means a successful supported-schema lookup found no row. Neither the handler nor
-coordinator converts database/worker failure into absence or parses error messages
+coordinator converts database/access failure into absence or parses error messages
 to select policy.
+
+**Stop results have an exhaustive payload and observation contract (F29/A23).**
+`observed_owner` always contains a fact actually read from the record/reservation,
+never the unverified engine echoed by the caller. It is not a promise that the
+engine is still alive when the response arrives. Every response includes the
+`observed_owner` field; absent facts are explicit JSON `null`, not omitted fields.
+
+| Status | `observed_owner` | Meaning and HTTP mapping |
+|---|---|---|
+| `STOPPED` | required | The owner matched by the successful reservation, including its fence. Its expected process stopped; this does not claim the record is still owned by it. HTTP 200. |
+| `NO_SUCH_RECORD` | must be `None` | A trustworthy supported-schema read found no record. HTTP 404. |
+| `RECORD_UNAVAILABLE` | must be `None` | The pre-reservation read is unavailable; no reservation/lifecycle call occurred and old/cached owners cannot be attached. HTTP 503. |
+| `NOT_OWNED` | must be `None` | A trustworthy admission read found the record unowned. HTTP 409. |
+| `OWNER_CHANGED` | current fact or `None` | Admission/recheck found a different owner/fence; `None` means that successful recheck found the record unowned or gone. Post-dispatch read failure is `STOP_FAILED`, not an absent-owner fact. HTTP 409. |
+| `STOP_IN_PROGRESS` | required | The owner and fence whose existing reservation prevented this request. HTTP 409. |
+| `REPO_MISMATCH` | fact or `None` | `None` when route/configured-repository validation refused before record lookup; otherwise the owner observed on the record that failed repository binding. Never echo a body-supplied owner. HTTP 409. |
+| `REMOTE_HOST` | required | The observed record owner is not targetable from this host. HTTP 409; zero lifecycle effects. |
+| `STOP_FAILED` | required | The reservation-matched owner whose lifecycle attempt or post-dispatch observation failed. HTTP 503; the attempt may already have requested shutdown. |
+
+The lifecycle-result mapper receives the typed `StopEngineOutcome`, reservation
+and previously read `ClaimOwnerFact` whose engine/fence the reservation matched.
+It requires those engine/fence fields to agree before mapping; an internal
+disagreement is an invariant failure, never a reconstructed owner. `STOPPED`, `FAILED` and
+`REMOTE_HOST` map respectively to `STOPPED`, `STOP_FAILED` and `REMOTE_HOST` with
+that saved owner. `TARGET_CHANGED` performs an exact reader recheck and returns
+`OWNER_CHANGED` with the record's current owner or `None` on a successful absent
+read; a typed post-dispatch access failure returns `STOP_FAILED` with the
+reservation-matched owner and an observation-failure explanation. That earlier
+observation is not represented as the record's current owner. `RECORD_UNAVAILABLE`
+is exclusively pre-reservation, preserving its zero-dispatch promise. No
+mapper guesses an owner from a replacement supervisor advertisement. Every path
+still releases its own reservation in `finally`, and rechecking never authorizes
+another stop.
+
+The internal constructor above, the strict Pydantic public response variants in
+`contracts/public.py`, and the separately authored UI OpenAPI response components
+enforce the same matrix. Public variants discriminate on status, require a
+non-blank message, forbid unknown fields, and require either an owner object,
+explicit null, or the stated union as appropriate. Generate public and OpenAPI
+artifacts through their respective pipelines; a dataclass declaration alone does
+not generate either contract. The endpoint maps the validated owner outcome once
+through that public boundary and applies the table's HTTP status without further
+record reads or message parsing. New enum members must fail exhaustive matching
+and schema/mapping tests until their payload, provenance and HTTP result are defined.
 
 #### A read-then-stop is not a guard: the reservation interlock
 
@@ -4309,6 +4380,16 @@ class StopReservationRefusal:
     status: StopOwnerStatus       # one of the pre-stop refusals below
     observed_owner: ClaimOwnerFact | None
     message: str
+
+    def __post_init__(self) -> None:
+        # Reuse the outcome invariant; do not invent another owner/payload rule.
+        StopOwnerOutcome(self.status, self.observed_owner, self.message)
+        if self.status not in {
+            StopOwnerStatus.NO_SUCH_RECORD, StopOwnerStatus.NOT_OWNED,
+            StopOwnerStatus.OWNER_CHANGED, StopOwnerStatus.REPO_MISMATCH,
+            StopOwnerStatus.REMOTE_HOST, StopOwnerStatus.STOP_IN_PROGRESS,
+        }:
+            raise ValueError("reservation refusal must be a pre-stop refusal")
 
 
 class ValidatedWorkStopReservations(Protocol):
@@ -4355,7 +4436,9 @@ try:
     outcome = lifecycle.stop_engine(StopEngineCommand(
         engine=reservation.engine, actor=command.actor, reason=command.reason,
     ))
-    return map_stop_outcome(outcome)  # TARGET_CHANGED -> OWNER_CHANGED; FAILED -> STOP_FAILED
+    return map_stop_outcome(outcome, reservation, matched_owner, reader)
+    # matched_owner is the prior reader fact validated against the reservation.
+    # TARGET_CHANGED rechecks via the reader; it never targets that new owner.
 finally:
     reservations.release_owner_stop(reservation)
 ```
@@ -4416,15 +4499,13 @@ class ValidatedWorkRecordReader(Protocol):
         self, repo_root: str, record_id: str
     ) -> ValidatedWorkSnapshot | None: ...
     """None iff a successful supported-schema read found no such row.
-    Raises ReadOnlySqliteAccessError for access/schema/worker failures."""
+    Raises ReadOnlySqliteAccessError for access/schema/deadline failures."""
 
 
 class ReadOnlySqliteFailure(StrEnum):
     DATABASE_ABSENT = "database_absent"
-    UNREADABLE = "unreadable"          # permissions, corruption, missing sidecars, lock failure
+    UNREADABLE = "unreadable"          # permissions, corruption, lock/access failure
     UNSUPPORTED_SCHEMA = "unsupported_schema"
-    UNSUPPORTED_PROFILE = "unsupported_profile"
-    WORKER_UNAVAILABLE = "worker_unavailable"
     TIMEOUT = "timeout"
 
 
@@ -4474,94 +4555,67 @@ class ValidatedWorkDiscovery:
             raise ValueError("discovery includes only unresolved or retained-owner records")
 ```
 
-`SqliteValidatedWorkRecordReader` implements it through the **new** shared strict
+`SqliteValidatedWorkRecordReader` implements it through the **new** shared
 read-only access profile below, not today's write-capable `open_sqlite()`.
 It reads `state/validated_work.sqlite` without engine HTTP, performs no record
 writes and takes no claim.
 
 **Shared read-only SQLite access is implementation scope (F27/A21).** Add
-`open_sqlite_readonly(path: Path, *, timeout: float, row_factory: Callable)` to
-`infra/sqlite_connection.py`, exposed only inside the isolated observer described
-below. The existing `open_sqlite()` stays the writer profile; disabling its
-pragmas does **not** make ordinary `sqlite3.connect(str(path))` read-only/no-create.
+`open_sqlite_readonly(path: Path, *, timeout: float, row_factory: Callable)
+-> sqlite3.Connection` to `infra/sqlite_connection.py`. Its guarantee is **no
+missing main-database creation and no application/schema/state writes**, not
+zero SQLite coordination I/O. The existing `open_sqlite()` stays the writer
+profile; disabling its pragmas does **not** make ordinary
+`sqlite3.connect(str(path))` read-only/no-create.
 The new helper converts a configured absolute filesystem `Path` with `as_uri()`
 (escaping `?`, `#`, `%`, spaces and Unicode), then appends fixed parameters
-`mode=ro&readonly_shm=1&vfs=unix&cache=private` and uses `uri=True`. It accepts no
-caller-supplied URI/query/VFS. It skips durability, checkpoint and schema-migration
+`mode=ro&cache=private` and uses `uri=True` with the normal supported platform VFS.
+It accepts no caller-supplied URI/query/VFS. It skips durability, checkpoint and schema-migration
 pragmas; bounded busy timeout, connection-local `query_only=ON` and
 `temp_store=MEMORY` are allowed. All schema/version and record/evidence reads share
-one explicit read transaction, closed before returning the detached typed facts.
+one explicit read transaction, with rollback/end and connection close in `finally`
+before returning detached typed facts. Bound lock waits through the connection
+timeout and query execution through a deadline-backed SQLite progress handler;
+timeout is a typed unavailable read, never cached success.
 
-**A URI alone does not enforce file-level observation.** SQLite's default Unix
-VFS can create WAL/SHM files for a read-only database, and process-local SHM mappings
-can be reused from a writable connection. `readonly_shm=1` avoids writable SHM
-opening but does not prevent an absent WAL from being created. `immutable=1`,
-`nolock=1`, raw live-file copies and check-exists-then-open are forbidden: they do
-not provide a locked coherent live snapshot with race-safe no-create behavior.
-See SQLite's [WAL read-only rules](https://www.sqlite.org/wal.html#readonly),
-[URI semantics](https://www.sqlite.org/uri.html), and
-[Unix VFS SHM implementation](https://sqlite.org/src/artifact/410185df49).
+**SQLite-owned WAL/SHM coordination is permitted.** Normal read locking, sidecar
+creation/update/removal and WAL-index recovery by SQLite are not application
+writes. In particular, the last writer can checkpoint and remove both sidecars on
+clean close; a subsequent read may recreate coordination files and must still
+return `AVAILABLE` for supported preserved records. Sidecar absence is **not** an
+admission check or an error by itself. The reader never manually creates or edits
+sidecars, executes DML/DDL or write-affecting pragmas, repairs a database, or opens
+the main database writable. Existing directory/coordination-file access needed by
+SQLite is allowed; genuine permission/corruption errors remain unavailable. See
+SQLite's [WAL file lifecycle](https://www.sqlite.org/walformat.html#file_lifecycles)
+and [read-only URI semantics](https://www.sqlite.org/uri.html).
 
-The supported strict profile therefore includes a small **native Unix VFS I/O
-guard**, installed via `xSetSystemCall` in the observer **before any repository
-database is opened**. It uses the same loaded SQLite library/VFS as the Python
-connection; startup verifies that binding and the supported runtime/VFS profile.
-Its native `open` callback rejects `O_CREAT`, `O_TRUNC`, `O_RDWR` and `O_WRONLY`
-with `EACCES`; it never silently rewrites access flags. SQLite may then perform
-its own read-only WAL fallback; absent sidecars fail rather than being created.
-The guard denies unlink, truncation, chmod/chown and other write-affecting VFS
-syscalls, and denies writable **shared** mappings. It preserves read calls and
-kernel advisory locks, and permits private heap memory used for a read-only
-WAL-index. Native callbacks own their lifetime and `errno`; Python `ctypes`
-callbacks or a pathname preflight are not substitutes. The helper cannot expose
-a connection unless the complete guard is installed; partial installation exits
-the worker. The exact registered syscall inventory is part of the certified
-SQLite/VFS profile, checked by complete `xNextSystemCall` enumeration and required
-interception checks; unknown profiles fail closed before repository access.
-Certification is limited to the plain **local POSIX Unix VFS**, not network,
-proxy-locking (including `SQLITE_FORCE_PROXY_LOCKING`), exclusive or no-lock
-profiles. Those can contain I/O outside the certified interception surface and
-are refused. The writer's local-filesystem requirement is unchanged.
+No native VFS guard, testing-hook interception, special VFS certification or
+isolated worker is required or claimed. `readonly_shm=1`, `immutable=1`, `nolock=1`,
+raw live-file copies and check-exists-then-ordinary-connect are not used. The shared
+helper owns no-create/application-read-only access policy; the validated-work
+reader contains no private connection recipe. It uses the helper directly in
+Control Center and adds stop availability through its injected local lifecycle
+probe. Writable reservation connections remain separate connections with their
+existing transaction owner. This works without Repository Engine HTTP or a live
+writer and does not narrow ordinary supported Python/SQLite builds to an optional
+VFS testing interface. Other existing read-only consumers need not migrate here.
 
-`ReadOnlySqliteObserver` owns a fresh **exec/spawn**, never fork-inherited, worker
-with no writable SQLite connection, no elevated/root identity, and no inherited
-database descriptors. This isolation is necessary because Unix VFS syscall hooks
-and SHM nodes are process-local shared state: installing the guard in Control
-Center would also interfere with its writable reservation adapter. The worker
-serves only typed `discover_repository`/`snapshot_record` reads through the shared
-helper; repository roots are resolved by the parent registry, not browser input.
-The worker returns only schema-checked durable record/evidence facts; the reader's
-shared snapshot mapper runs in Control Center and adds stop availability through
-its injected local lifecycle probe. No lifecycle callback, writable connection or
-claim secret is serialized to the worker. Control Center sends bounded typed
-requests over pipe IPC and maps startup,
-timeout, worker loss and unsupported-profile failures to `UNREADABLE` with an
-explicit explanation and no records/actions. A five-second end-to-end request
-budget bounds startup/open/query; expiry terminates and reaps the read-only worker,
-never returns cached success, and does not affect the separate writer/stop owner.
-The helper and guard own access policy once; the validated-work reader contains
-no private SQLite URI, syscall or connection recipe. This native backend and its
-packaging/certification are required in slice 7, not assumed existing facilities
-or deferred work. Other existing read-only consumers need not migrate in this PR.
-
-Absent database paths return `DATABASE_ABSENT` without creating DB/WAL/SHM files.
-Present-but-unreadable files, absent/unreadable WAL sidecars, corruption, lock
-timeouts and unavailable strict profiles return `UNREADABLE`; a successfully read
-but unsupported schema/version returns `UNSUPPORTED_SCHEMA`. Only a successful
-supported-schema transaction may return `AVAILABLE`, including an empty result.
+Missing **main database** paths return `DATABASE_ABSENT` without creating that
+database or its parent directory, including disappearance between a diagnostic
+stat and the actual `mode=ro` open. A present database whose SQLite read fails due
+to permissions, corruption or lock/deadline exhaustion is `UNREADABLE`; a
+successfully read but unsupported schema/version is `UNSUPPORTED_SCHEMA`. A clean
+supported database without sidecars is `AVAILABLE`, not `UNREADABLE`. Only a
+successful supported-schema transaction can produce `AVAILABLE`, including empty.
 Open-error classification belongs to the shared access boundary and is carried
 as `ReadOnlySqliteAccessError.reason`, never inferred by the UI from SQLite message
 text. `discover_repository()` catches this typed error: `DATABASE_ABSENT` and
 `UNSUPPORTED_SCHEMA` map to their matching discovery statuses; all remaining reasons
 map to `UNREADABLE`. Exact `snapshot_record()` propagates it to the coordinator's
-`RECORD_UNAVAILABLE` mapping above rather than returning `None`. The
-observer never creates directories, repairs/checkpoints databases, changes
-permissions or deletes sidecars. “No file mutation” means no observer-attributable
-content, existence, size, ownership, mode or modification-time change to database
-or sidecar files; ordinary read-induced access-time updates and kernel advisory
-locks are explicitly excluded. Tests separate writer-attributable WAL changes
-from observer activity rather than comparing a live writer's whole directory
-without controlling its schedule.
+`RECORD_UNAVAILABLE` mapping above rather than returning `None`. Tests verify
+unchanged application rows/schema/authority with writer barriers; they do not
+mistake SQLite-managed coordination changes for forbidden disposition mutations.
 
 **Cold discovery is a required read path, not a deep-link prerequisite.** On the
 initial Control Center repository-list load and each existing repository refresh,
@@ -4585,15 +4639,13 @@ replacement process as the claim owner. A stale or missing engine stays visible
 as such. Unowned records appear in the repository's preserved-work section with
 no stop action. The query owner never reserves a stop or publishes work.
 
-**The public projection is a complete typed contract.** The following types live
-in `contracts/public.py` and are generated into the public/OpenAPI schemas. They
-are not dictionaries assembled by handlers. `EngineIdentity`, `ClaimOwnerFact`
-and `ValidatedWorkAuthoritySnapshot` below denote their field-for-field public
-counterparts; serializers preserve the complete incarnation, fence and authority.
-Discriminators and status/payload shapes are reflected in JSON Schema
-(`oneOf`/required fields). Relational constraints such as matching owner fences
-and uniqueness across groups are enforced by the typed constructors and strict
-transport parsers; JSON Schema alone is not claimed to prove those equalities.
+**The internal projection and its transports are different contracts.** The
+following standard-library dataclasses remain internal control/query types, outside
+`contracts/public.py`. They enforce ownership, availability and grouping rules;
+they do not generate JSON Schema or OpenAPI. `EngineIdentity`, `ClaimOwnerFact`
+and `ValidatedWorkAuthoritySnapshot` here are the existing domain facts. The two
+actual transport pipelines and their shared mapping boundary are specified after
+these internal types. Handlers never assemble projection dictionaries themselves.
 
 ```python
 class RecoveryRowsStatus(StrEnum):
@@ -4779,8 +4831,127 @@ only after authenticated actor and confirmation reason are added. Neither
 recovery nor abandonment mutation controls are invented on this Control Center
 projection; those retain their separately defined issue command surfaces.
 
-The repository-list view model gains `validated_work: ControlCenterRecoveryRows`
-through this query owner; the authenticated read endpoint
+#### Two explicit schema pipelines and one transport mapper (F26/A20)
+
+The existing generators have different sources of truth:
+
+| Surface | Canonical source | Required artifact generation |
+|---|---|---|
+| Public view-model contract | Pydantic models in `contracts/public.py`; `PUBLIC_CONTRACTS` accepts `type[BaseModel]` and invokes `model_json_schema()` | `python scripts/generate_public_contracts.py` → `contracts/public/*.json` |
+| UI HTTP response/server/client types | `docs/api/ui-openapi.json` | `python scripts/generate_ui_contracts.py` → `contracts/ui_openapi_models.py` and `static/js/ui-contracts.d.ts` |
+
+Neither generator consumes the internal dataclasses, and the public-schema script
+does not update UI OpenAPI. Implementation updates **both canonical sources** and
+regenerates each pipeline; generated artifacts are never edited by hand.
+
+**Public Pydantic family.** Existing `ContractBase` deliberately uses
+`ConfigDict(extra="allow")`; inheriting it unchanged would accept precisely the
+unknown owner/action fields these commands must reject. Add a narrowly scoped
+`StrictRecoveryContract(BaseModel)` with `ConfigDict(extra="forbid")`, leaving
+unrelated public contracts permissive. All recovery nested object models derive
+from that strict base: process identity, engine identity, authority, record fact,
+claim owner, stop action, owned/unowned row and engine group. They are distinct
+`...Contract` types with the exact fields of their internal counterparts; no
+`dict[str, Any]`, embedded stdlib dataclass, or permissive `ContractBase` leaf is
+allowed inside this strict family. In particular the unowned model has only
+`kind: Literal["unowned"]` and `work`, so `owner`/`stop_action` are rejected.
+
+The outer Pydantic variants are explicit rather than one enum plus unconstrained
+collections (all shown fields are required):
+
+```python
+class StrictRecoveryContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class RecoveryAvailableContract(StrictRecoveryContract):
+    repo_key: str = Field(min_length=1)
+    status: Literal["available"]
+    engine_groups: list[RecoveryEngineGroupContract]
+    unowned_records: list[UnownedRecoveryRecordContract]
+    message: str = Field(min_length=1)
+
+
+class RecoveryEmptyContract(StrictRecoveryContract):
+    repo_key: str = Field(min_length=1)
+    status: Literal["empty"]
+    engine_groups: list[RecoveryEngineGroupContract] = Field(max_length=0)
+    unowned_records: list[UnownedRecoveryRecordContract] = Field(max_length=0)
+    message: str = Field(min_length=1)
+
+
+class RecoveryUnavailableContract(StrictRecoveryContract):
+    repo_key: str = Field(min_length=1)
+    status: Literal["database_absent", "unreadable", "unsupported_schema"]
+    engine_groups: list[RecoveryEngineGroupContract] = Field(max_length=0)
+    unowned_records: list[UnownedRecoveryRecordContract] = Field(max_length=0)
+    message: str = Field(min_length=1)
+
+
+class ControlCenterRecoveryRowsContract(RootModel[
+    Annotated[
+        RecoveryAvailableContract | RecoveryEmptyContract | RecoveryUnavailableContract,
+        Field(discriminator="status"),
+    ]
+]):
+    pass
+```
+
+`RootModel` is a `BaseModel` subclass and is the value registered as
+`PUBLIC_CONTRACTS["control_center.validated_work"]`; its JSON representation is
+the selected variant directly, with no extra `root` wrapper. Extra-field policy
+belongs on each variant/leaf, not on `RootModel` itself. The repository view-model
+uses `validated_work: ControlCenterRecoveryRowsContract`. Matching nested
+Pydantic fields use literals/enums and explicit nullable fields, integer
+`Field(strict=True, ge=0)` for fences, and `min_length=1` for engine-group records.
+
+**Canonical UI OpenAPI family.** Add separately authored named components
+`RecoveryAvailablePayload`, `RecoveryEmptyPayload`, `RecoveryUnavailablePayload`
+with the same required properties; `status` is respectively a field `const`, a
+field `const`, or the three-value enum. `ControlCenterRecoveryRowsPayload` is a
+pure `oneOf` of their `$ref`s, with no sibling `properties`. Every nested object
+gets a named strict `...Payload` component and is reached by `$ref`:
+`RecoveryProcessIdentityPayload`, `RecoveryEngineIdentityPayload`,
+`RecoveryAuthorityPayload`, `RecoveryRecordFactPayload`, `RecoveryClaimOwnerPayload`,
+`GuardedRecoveryStopActionPayload`, `OwnedRecoveryRecordPayload`,
+`UnownedRecoveryRecordPayload`, and `RecoveryEngineGroupPayload`. Each sets
+`additionalProperties: false`, including process/owner/action leaves. Empty and
+unavailable arrays specify `maxItems: 0`; group records specify `minItems: 1`.
+Owned rows require explicit `stop_action`, a `$ref` or `null`; unowned rows declare
+neither `owner` nor `stop_action`. Collections reference their one named row type,
+not an inline object or an inline union array.
+
+These choices match `ui_openapi_generator.py`: field `const`/enum become
+`Literal`, pure `oneOf` components become Python/TypeScript union aliases,
+and `additionalProperties: false` generates `extra="forbid"`. It rejects
+components mixing `oneOf` with `properties`; inline object fields become generic
+dictionaries, so they cannot carry this strict contract. The generator currently
+does **not** translate array cardinalities into Pydantic checks: slice 7 must add
+the bounded `minItems`→`Field(min_length=...)` and
+`maxItems`→`Field(max_length=...)` mapping for array properties, with generator
+tests. Do not claim those constraints work in generated Python before this change.
+Union aliases are validated with `TypeAdapter`, not `.model_validate()` on an
+alias. The refresh route uses generated
+`response_model=ControlCenterRecoveryRowsPayload`; the canonical repository-list
+response component references that same union for its `validated_work` property.
+
+**One mapper, with relational validation kept at its owner.**
+`ControlCenterRecoveryTransportMapper.to_contract(rows)` accepts only the internal
+`ControlCenterRecoveryRows`, creates the matching strict Pydantic variant and
+returns `ControlCenterRecoveryRowsContract`. First paint and authenticated refresh
+both call this one method on the query result and serialize its
+`model_dump(mode="json")`; neither builds an alternative payload. Refresh then
+passes the identical wire shape through the generated response model. Its companion
+`parse_contract(payload)` first validates the strict Pydantic transport and then
+reconstructs the internal leaf/group/row constructors to enforce the existing
+relational rules. Generated OpenAPI models enforce shape; they are not a second
+owner for availability, cross-group uniqueness or record/engine/fence equality.
+`AVAILABLE` having at least one record across two collections is likewise checked
+by the internal constructor, not misrepresented as an automatic generator feature.
+No transport normalization may erase an unknown field before strict validation.
+
+The repository-list view model gains the strict Pydantic `validated_work` field
+through this mapper and query owner; the authenticated read endpoint
 `GET /api/control-center/repositories/{repo_key}/validated-work` exposes the same
 projection for refresh. Both are served by Control Center even if every engine
 HTTP request fails. Register the payload/endpoint in the public contracts and UI
@@ -4802,8 +4973,7 @@ fails before any lifecycle call. The connection holds no transaction during stop
 
 ```
 lifecycle = SupervisorRepositoryEngineLifecycle(incarnation_stop) # exact process effects
-observer = ReadOnlySqliteObserver(strict_readonly_profile)        # isolated, certified worker
-reader = SqliteValidatedWorkRecordReader(observer, lifecycle.stop_availability)
+reader = SqliteValidatedWorkRecordReader(lifecycle.stop_availability) # shared read-only helper
 reservations = SqliteValidatedWorkStopReservations()               # narrow durable CAS
 coordinator = ValidatedWorkOwnerStopCoordinator(reader, reservations, lifecycle)
 recovery_queries = ControlCenterRecoveryQueries(repository_registry, supervisor_status, reader)
@@ -5130,6 +5300,9 @@ sweeps above:
 | §8.4 stop engine (producer) | Discovery snapshots → `ControlCenterRecoveryRows` → rendered engine/record → guarded request: the native stop control posts the selected record's exact rendered engine and fence. Cover multiple records and engine incarnations so selection cannot mix facts. Issue detail shows facts and typed navigation only, never an engine control; absence of deep-link context does not hide discovered records/actions. |
 | §8.4 cold discovery | Open a cold Control Center with **no query parameters**, real SQLite records and supervisor state, and an unavailable engine HTTP server. The configured repository list discovers records, groups full owner identities, renders the selected recovery action and dispatches its exact snapshot to the guarded coordinator without any engine HTTP request. Cover unowned work, retained claims, multiple/replaced engines, and a replacement supervisor advertisement that must not relabel an old owner. Absent/unreadable/unsupported databases visibly report their typed status and never masquerade as success-empty or get created by a read. |
 | §8.4 stop engine (handler) | Guarded request → reservation port → lifecycle → `IncarnationStopPort.stop_expected(command)`: assert exact repository, named or `default` instance, process incarnation, actor/reason and explicit timeout/force policy. One case per `StopOwnerStatus` enum member: pre-reservation refusals have zero lifecycle calls; `STOP_FAILED` follows the typed lifecycle failure; lifecycle `TARGET_CHANGED` maps to `OWNER_CHANGED` without a stop effect. Missing process identity/fence is rejected, never filled from current state. |
+| §8.4 stop result construction (F29/A23) | Construct each `StopOwnerStatus` with both `None` and a typed owner, and enforce the exhaustive payload matrix: absent-owner statuses reject any owner, owner-dependent statuses reject `None`, `OWNER_CHANGED`/`REPO_MISMATCH` accept only their documented optional owner shapes. Reject raw-string/unknown status, blank/non-string message, untyped owner/engine, negative/Boolean fence and unknown availability. `StopReservationRefusal` reuses the same invariant and rejects post-stop/unavailable statuses. |
+| §8.4 stop result provenance/mapping | Map every lifecycle result using the reservation-matched reader owner and assert full engine/fence preservation. `TARGET_CHANGED` rechecks into current owner, successfully unowned/gone, or typed read failure: respectively `OWNER_CHANGED(owner)`, `OWNER_CHANGED(None)`, `STOP_FAILED(reservation_matched_owner)`, never a claimed current owner from a supervisor replacement or failed read. Post-dispatch observation failure issues no second stop; `RECORD_UNAVAILABLE(None)` remains exclusively pre-reservation with zero dispatch. Mismatched reserved/read owner is an invariant failure. Every successful reservation is conditionally released even when mapping/recheck fails. |
+| §8.4 stop response contracts | Internal outcome → strict public Pydantic response → HTTP → UI follows the status/payload/HTTP matrix for every enum member. Invalid constructions are also rejected by the public parser and separately generated OpenAPI schema: null where an owner is required, owner where null is required, missing `observed_owner`, blank message, unknown status/fields and malformed owner. Verify `RECORD_UNAVAILABLE` is 503 with explicit null and unavailable UI, `NO_SUCH_RECORD` is 404/null, `STOPPED` is 200/owner, and each remaining status uses its declared mapping. No message parsing or endpoint reread supplies missing owner facts. New enum members fail exhaustive mapping/contract tests until specified. |
 | §8.4 reservation | Pause after `reserve_owner_stop()` succeeds and attempt hand-back: `relinquish_claim()` returns `False`, the live owner keeps its claim, and a successor cannot acquire. Mirror case: move the claim before reservation, including relinquish/reacquire by the same process with a new fence; admission refuses `OWNER_CHANGED` with zero lifecycle calls. |
 | §8.4 reservation concurrency | Two overlapping identical requests never share a reservation: the second returns `STOP_IN_PROGRESS` with zero writes/calls. After the first fails and releases, a new request gets a fresh id; replaying the old release returns `False` and leaves the new reservation intact. Concurrent transactions use the real SQLite store, not a serialized mock. |
 | §8.4 reservation cleanup | Conditional release runs in `finally` after every successful reservation, including lifecycle failure, refusal and exception; reservation refusals have no token to release. A killed coordinator leaves `STOP_IN_PROGRESS` and prevents relinquish; the UI explains the existing independently authorized engine stop route. Owner death still permits acquisition, atomically clears the old reservation and advances the fence; a stale release cannot affect a successor's reservation. |
@@ -5137,14 +5310,18 @@ sweeps above:
 | §8.4 stop policy | One case per `StopEngineStatus`: graceful exit, successful force and already-gone all yield `STOPPED`; replacement yields `TARGET_CHANGED`; stop/identity-proof failure yields `FAILED`; remote target yields `REMOTE_HOST` without a call. The new adapter produces each message explicitly; no log parsing or message extraction from a Boolean. Assert command timeout/force values and confirmation text stating graceful-then-force and engine-wide scope. |
 | §8.4 stop capability | Linux pidfd integration covers SIGTERM handler shutdown, timeout SIGKILL and handle exit observation without HTTP, process-group effects or advertisement deletion. On macOS or unavailable pidfd, `EXACT_TARGET_UNAVAILABLE` reaches both snapshot and Control Center rendering: no guarded stop button, explanatory text and working navigation to the existing independent stop control with its own scope confirmation. Capability loss after render yields `FAILED` and zero effects, releases the reservation, and never delegates to pid/port-based legacy helpers. |
 | §8.4 stop engine (wedged) | The Control Center succeeds while the Repository Engine serves no HTTP: read through `SqliteValidatedWorkRecordReader`, reserve/release through the writable `SqliteValidatedWorkStopReservations` adapter against the same real database, then stop through the exact-process capability. Database admission failure causes zero lifecycle calls. This proves the full interlock, not just the snapshot, works out of process. |
-| §8.4 strict SQLite observer (F27/A21) | Shared helper → fresh guarded worker → read transaction → typed reader result. Absent DB creates no DB/WAL/SHM/directory. Present DB with absent sidecars, including disappearance between preflight and open, fails without file creation. Paths containing spaces, Unicode, `?`, `#` and `%` cannot inject URI parameters. Missing native guard, partial syscall installation, unknown SQLite/VFS, proxy/network profile and elevated worker fail before repository access. No mode fallback, writable connection or inherited SHM mapping is permitted. |
-| §8.4 exact read unavailable | Successful supported-schema lookup with no row yields `None` → `NO_SUCH_RECORD`/404. Absent DB, unreadable/corrupt/unsupported DB, missing native guard, worker startup/loss and timeout raise the declared typed reason → `RECORD_UNAVAILABLE`/503 with no observed owner, reservation call, lifecycle call or mutation. Every discovery-error mapping is separately asserted; none can become AVAILABLE-empty. |
-| §8.4 live WAL observation | With writer barriers and an independent worker, read committed WAL-only rows; hold one read transaction across a writer commit and assert coherent old record/evidence facts, then a second observation sees the new commit. Exercise writer close/checkpoint, dead/crash-stale SHM, missing/unreadable sidecars, corruption, unsupported schema, timeout and last-reader close. Attribute observer I/O separately: no content/existence/inode/size/ownership/mode/mtime changes to DB/WAL/SHM; only read-induced atime and advisory locks are excluded. An ordinary `mode=ro` reader and a URI-only `readonly_shm=1` reader fail this guardrail. Native backend tests verify denied syscall flags, errno, read-only WAL fallback and writable-shared-mapping rejection. |
+| §8.4 shared read-only SQLite (F27/A21) | Shared helper → one read transaction → typed reader result. Missing main DB returns DATABASE_ABSENT without creating it or directories, including disappearance before open. Paths containing spaces, Unicode, `?`, `#` and `%` cannot inject URI parameters. Trace connection setup: fixed `mode=ro`, `uri=True`, no DML/DDL/durability/checkpoint pragma or writable fallback. Attempted application/schema writes are rejected; rows/schema/authority stay unchanged. SQLite-managed WAL/SHM coordination is explicitly permitted. |
+| §8.4 clean-close discovery | Persist PARKED and FAILED records; close the last writer cleanly and assert SQLite has removed WAL/SHM. Cold Control Center with no engine HTTP/query context still discovers those records as AVAILABLE through the shared helper, and public/rendered output exposes their proper actions. Read-only access may recreate coordination files. No native guard, worker, special VFS or fabricated writer is necessary. |
+| §8.4 exact read unavailable | Successful supported-schema lookup with no row yields `None` → `NO_SUCH_RECORD`/404. Missing main DB, unreadable/corrupt/unsupported DB and lock/query timeout raise the declared typed reason → `RECORD_UNAVAILABLE`/503 with no observed owner, reservation call, lifecycle call or disposition mutation. Every discovery-error mapping is separately asserted; none can become AVAILABLE-empty. |
+| §8.4 live WAL observation | With writer barriers and separate connections, read committed WAL-only rows; hold one read transaction across a writer commit and assert coherent old record/evidence facts, then a second observation sees the new commit. Exercise clean writer close, checkpoint, concurrent reservations, crash-stale SHM, genuine permission/corruption errors, unsupported schema and lock/query deadlines. SQLite-owned sidecar changes are allowed; application rows, schema and authority are never changed by the reader. No immutable/no-lock/file-copy substitute is permitted. |
 | §8.4 stop engine (identity) | All four identities must agree: route (`repo_key`/`instance_key`), rendered body engine, record repository, and current claim owner. A body whose engine contradicts the path is `REPO_MISMATCH` with zero effect — the duplicated path value is checked, not ignored — and `instance_key` round-trips `default` ↔ `None` through the shared navigation/route encoder. |
 | §8.4 navigation producer and real click | Shell URL builder → two Dashboard/Settings hops preserve `cc_origin` and `theme` → typed navigation result → actual keyboard/click activation inside the iframe → parent receiver selects the repositories view and focuses the requested labelled engine/record region. Assert the top-level shell changes view, the iframe does not navigate/nest Control Center, and no engine mutation occurs. Wrong source/origin/repository, retired frame and malformed command produce zero navigation/effects. |
 | §8.4 standalone identity (F23/A17) | Top-level contexts with valid localhost/IPv4/IPv6 origins, the actual configured Control Center port, an otherwise-valid **unrelated loopback port**, a copied embedded URL, and no origin all produce `UNAVAILABLE`: visible manual instructions, no anchor, no dispatch and no identifier disclosure to any listener. `LOCAL_LINK` is absent from the result union; the parser cannot mint a trusted standalone capability. Cold manual discovery remains usable. |
 | §8.4 navigation rejection | Parser and rendered-output cases for missing/duplicate origin, `javascript:`, `data:`, protocol-relative URL, hostile hostname, credentials, path, query/fragment (including empty delimiters), backslash, whitespace/control characters and encoded/noncanonical hostname. Assert `UNAVAILABLE`, visible instructions, **no anchor or dispatch handler**, and no network/navigation on activation. A false `embedded=1` on a top-level page cannot select parent messaging. |
 | §8.4 discovery transport | Initial repository view model and authenticated `GET /api/control-center/repositories/{repo_key}/validated-work` share `ControlCenterRecoveryQueries` and typed `ControlCenterRecoveryRows` with generated public/OpenAPI contracts. Assert configured-repository resolution, no caller-controlled filesystem root, every discovery status, accessible empty/error/unowned/owned rendering, and no repository-engine client dependency. |
+| §8.4 two transport pipelines (F26/A20) | Register the strict Pydantic `ControlCenterRecoveryRowsContract` RootModel in PUBLIC_CONTRACTS and generate public schemas; independently author named OpenAPI variants and generate server/client types. Assert public JSON Schema's discriminator/oneOf, OpenAPI's disjoint const/enum oneOf, and required explicit nullable fields. Empty/unavailable collections reject records; unknown fields at every nesting level, especially unowned owner/action fields, fail both public validation and generated OpenAPI TypeAdapter validation. Do not call model_json_schema on a dataclass or model_validate on a union alias. Run test_public_contract_schemas.py, test_ui_openapi_generated.py and test_ui_openapi_payloads.py. |
+| §8.4 schema constraint generation | The bounded array-constraint generator change emits minItems/maxItems as min_length/max_length Field checks while preserving required-vs-optional semantics; generated tests reject an empty engine group and any nonempty EMPTY/unavailable collection. Native JSON Schema and generated Python must agree. Generated artifacts are regenerated, never patched by hand. |
+| §8.4 shared transport mapper | For each valid internal projection, first paint and refresh use ControlCenterRecoveryTransportMapper.to_contract and emit identical JSON. Validate that JSON through both contract pipelines, then parse_contract reconstructs the same internal facts. Tampered available-empty, duplicate groups/records, wrong action/fence/engine and mismatched capability fail the relational constructors even when shape validation alone would accept them. The UI renders the resulting typed variants and never repairs/normalizes invalid payloads before validation. |
 | §8.4 discovery construction (F26) | Construct every `WorkDiscoveryStatus` with empty and nonempty records. Only `AVAILABLE` permits nonempty records; successful empty discovery is valid. Reject raw-string/unknown status, non-tuple or untyped records, duplicates, empty message, and resolved records lacking a retained owner. `UNREADABLE` explicitly covers unavailable read-only access and never carries stale records. |
 | §8.4 projection construction (F26) | Construct every `RecoveryRowsStatus` value and every owned/unowned mix. Reject `AVAILABLE` without rows, `EMPTY` or any unavailable status with rows, duplicate records across/between groups and unowned rows, empty engine groups, mixed owner incarnations, repeated full-engine groups, resolved unowned rows, and malformed leaf facts. A source disposition with an empty reason maps unchanged to a valid fact and still renders its state label. For every `EngineStopAvailability`, require a stop action iff `AVAILABLE`; reject action record/engine/fence mismatch, invalid fence and unknown availability. Strict public parsers reject owner/action fields on the unowned variant. |
 | §8.4 projection mapping (F26) | Drive each discovery status through query owner → public payload → initial/refresh HTTP → rendered state. Empty `AVAILABLE` maps only to `EMPTY`; each unavailable status remains distinct and action-free. Map multiple incarnations and unowned work once each, preserving authority/owner/fence byte-for-byte. Cross `OBSERVED`/`MISSING`/`REPLACED`/`UNKNOWN` presentation with stop availability: presentation never replaces the owner or manufactures capability. The rendered exact stop payload maps to the coordinator command only after authenticated actor and confirmation reason are added. |
@@ -5483,13 +5660,18 @@ Ordered so each slice is independently shippable and leaves the tree green.
    `ValidatedWorkOwnerStopCoordinator` with its `reserve_owner_stop` interlock,
    `snapshot_record()` on the owner port, the Control Center-side
    `ValidatedWorkRecordReader.discover_repository()`, the shared
-   `open_sqlite_readonly()` profile, native certified Unix VFS I/O guard and isolated
-   `ReadOnlySqliteObserver` worker/typed IPC (including packaging, unsupported-profile
-   refusals and no-file-mutation/live-WAL tests), `ControlCenterRecoveryQueries`
+   `open_sqlite_readonly()` no-main-DB-create/application-read-only profile and
+   its missing-main-DB, clean-last-writer-close and live-WAL coherence tests
+   (SQLite coordination sidecars allowed), `ControlCenterRecoveryQueries`
    and the complete `ControlCenterRecoveryRows` contract (status-checked discovery,
    explicit empty/unavailable results, owned/unowned rows, full-identity groups and
    exact action/availability invariants) with constructor and mapping regression
-   coverage on the repository-list projection/authenticated GET, writable
+   coverage on the repository-list projection/authenticated GET. Keep the dataclasses
+   internal; implement the strict Pydantic public family/RootModel registry and the
+   separately authored named OpenAPI family, regenerate both pipelines, and add
+   the bounded minItems/maxItems generator support and parity/drift tests. One
+   `ControlCenterRecoveryTransportMapper` serves first paint and refresh and
+   reuses relational constructors after strict transport parsing. Include writable
    `ValidatedWorkStopReservations` adapter sharing store-owned transactions, and
    composition root, the
    `stop-validated-work-owner` endpoint with its OpenAPI/auth wiring, the

@@ -386,6 +386,19 @@ Four concrete mechanisms in today's code destroy or strand the work:
    real-process tests and capability-unavailable UI tests are required; migrating
    existing stop consumers remains out of scope.
 
+   `StopOwnerOutcome` has an exhaustive status/owner matrix enforced by its
+   constructor and the separate public/OpenAPI contracts. Missing-record,
+   unowned-record and unavailable-read results require an explicit null owner;
+   stopped, stop-failed, remote-host and stop-in-progress results require the
+   observed owner they describe. Owner-changed may carry null only after a
+   successful recheck found no current owner. Pre-reservation failed reads are
+   unavailable/null with zero dispatch; post-dispatch observation failure is
+   stop-failed with the previously matched owner, never an invented current
+   observation or another stop. Lifecycle results preserve the
+   reservation-matched owner, while changed targets recheck without authorizing a
+   new stop. Raw statuses, blank messages and impossible payload combinations are
+   rejected before HTTP/UI mapping.
+
    A reservation leaked by a dead Control Center prevents graceful hand-back and
    subsequent guarded stops until the owner exits. The UI reports `STOP_IN_PROGRESS`
    and points to the existing independently authorized engine stop control.
@@ -435,17 +448,16 @@ Four concrete mechanisms in today's code destroy or strand the work:
    absent/unreadable/unsupported databases are explicit statuses, not empty success.
    No deep link or engine HTTP response is needed to discover and invoke recovery.
 
-   Read-only discovery requires a **new shared strict connection profile**, not
-   the current `open_sqlite()` writer helper. Safe `mode=ro` URI construction and
-   skipped write pragmas are necessary but insufficient: even a read-only SQLite
-   connection can create WAL/SHM files. Slice 7 therefore includes an isolated,
-   non-elevated observer worker and native certified local Unix VFS I/O guard,
-   enforcing no write/create operations while preserving live-WAL read locking.
-   Missing sidecars or unsupported guard/runtime profiles are explicit unavailable
-   results, never an unsafe fallback. Tests prove no observer-attributable database
-   or sidecar changes, including writer-close races; atime and advisory locks are
-   excluded from that file-mutation definition. This access-policy owner stays
-   separate from the writable stop-reservation adapter.
+   Read-only discovery requires a **new shared application-read-only profile**,
+   not the current `open_sqlite()` writer helper: safely encoded `mode=ro` URI,
+   no missing main-database creation, no application/schema/state writes or write
+   pragmas, and one coherent read transaction. SQLite-owned WAL/SHM coordination
+   is allowed. A clean last-writer close normally removes those files; a cold
+   reader must still discover preserved work as AVAILABLE. Missing main DB and
+   genuine access/schema failures remain typed refusals. Required tests cover
+   clean close, absent main DB and live-WAL coherence. No native VFS testing hook,
+   special certification or isolated observer is needed; the shared helper stays
+   separate from the writable stop-reservation connection/transaction owner.
 
    One shared frame-aware navigation owner validates the transported `cc_origin`
    as a canonical local HTTP(S) origin before constructing any link or message.
@@ -511,9 +523,16 @@ Four concrete mechanisms in today's code destroy or strand the work:
    owned/unowned records and groups by complete engine identity; its constructors
    bind each offered stop action to the row's exact owner and fence and forbid
    actions when capability is unavailable. The query owner produces these values
-   for both initial and refreshed views, and public schemas/strict parsers preserve
-   their discriminators and invariants. Constructor-rejection and producer-to-UI
-   mapping tests are required alongside the happy paths.
+   for both initial and refreshed views. These dataclasses remain internal:
+   `ControlCenterRecoveryTransportMapper` maps them to a narrowly strict Pydantic
+   public family and registered discriminated RootModel, without changing the
+   permissive ContractBase used elsewhere. Separately authored named OpenAPI
+   variants generate the HTTP server/client types. Both canonical pipelines are
+   updated/regenerated; neither derives from the internal dataclasses or from the
+   other pipeline. The mapper/parser preserves one relational owner, while shape
+   schemas reject unknown nested owner/action fields and invalid status payloads.
+   Array-cardinality generation, schema parity/drift, constructor-rejection and
+   first-paint/refresh producer-to-UI tests are required alongside happy paths.
 
 12. **This owner writes exactly one label of its own.** A failed disposition keeps
    `recovery-pending` and registers its escalation through the needs-human owner's
