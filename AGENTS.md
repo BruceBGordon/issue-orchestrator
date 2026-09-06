@@ -142,6 +142,7 @@ Skills in `.claude/skills/` are automatically invoked when working on relevant a
 | `session-replay` | Session artifact capture, replay endpoints, timeline/session correlation, and emulator-backed session viewing |
 | `schema-updates` | Updating UI contracts, SSE payloads, or config schemas |
 | `github-token-rotation` | Rotating expiring GitHub PATs or identifying the repo-scoped auth source issue-orchestrator uses |
+| `issue-priorities` | Prioritizing or queueing an issue, triaging the backlog, or asking why an issue is never picked up |
 
 ## Directory Context (AGENTS.md)
 
