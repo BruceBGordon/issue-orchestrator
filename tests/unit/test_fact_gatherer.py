@@ -30,6 +30,27 @@ from issue_orchestrator.ports import PRInfo
 from issue_orchestrator.ports.event_sink import InMemoryEventSink
 from tests.unit.session_run_helpers import make_session_run_assets
 
+def _anchor_scan_calls(mock_repository_host) -> list:
+    """The ANCHOR scan calls only, ignoring the approval-scope query.
+
+    The invariant these assertions protect is that anchor classification and
+    proposal reconciliation share ONE exhaustive scan (#6779 R4) — not that the
+    tick makes exactly one GitHub call ever. The approval backlog needs a query
+    for the GATE label, because promoted findings carry the target's WORKER
+    agent label (`promotion_issue_labels`: "DISCOVERABLE the moment the gate
+    comes off") and so are structurally invisible to an agent-label scan.
+
+    Counting total calls would have made this a choice between a complete
+    backlog and a guarded invariant; counting the anchor calls keeps both.
+    """
+    return [
+        call
+        for call in mock_repository_host.list_issues.call_args_list
+        if "proposed-tech-lead" not in (call.kwargs.get("labels") or [])
+    ]
+
+
+
 
 @pytest.fixture
 def mock_config():
@@ -671,7 +692,7 @@ class TestFactGathererHealthReviewFacts:
         # No PR fetch when batch is disabled — health review costs only the
         # single exhaustive anchor/case-file scan.
         mock_repository_host.get_prs_with_label.assert_not_called()
-        mock_repository_host.list_issues.assert_called_once()
+        assert len(_anchor_scan_calls(mock_repository_host)) == 1
         assert mock_repository_host.list_issues.call_args.kwargs["exhaustive"] is True
 
     def test_not_due_within_interval(
@@ -850,7 +871,7 @@ class TestFactGathererHealthReviewFacts:
         assert result.existing_health_review_issue == 200
         # The marker-labeled anchor must NOT be misread as a batch anchor.
         assert result.existing_tech_lead_issue is None
-        mock_repository_host.list_issues.assert_called_once()
+        assert len(_anchor_scan_calls(mock_repository_host)) == 1
 
     def test_both_triggers_share_one_issue_scan(
         self, fact_gatherer, sample_state, mock_config, mock_repository_host
@@ -878,7 +899,7 @@ class TestFactGathererHealthReviewFacts:
         assert result.existing_tech_lead_issue == 100
         assert result.existing_health_review_issue == 200
         assert result.watch_label == "code-reviewed"
-        mock_repository_host.list_issues.assert_called_once()
+        assert len(_anchor_scan_calls(mock_repository_host)) == 1
 
     def test_marker_issue_outside_filter_label_ignored(
         self, fact_gatherer, sample_state, mock_config, mock_repository_host
@@ -922,7 +943,10 @@ class TestFactGathererHealthReviewFacts:
         # projection instead of wiping it with the empty tuple (#6781 R2).
         assert result.case_files_scanned is False
         assert result.open_case_files == ()
-        mock_repository_host.list_issues.assert_not_called()
+        # The APPROVAL-SCOPE query still runs: the board is written from these
+        # facts, so an incomplete backlog would be published as fact. What must
+        # not happen on a cheap tick is the exhaustive ANCHOR scan.
+        assert _anchor_scan_calls(mock_repository_host) == []
         mock_repository_host.get_prs_with_label.assert_not_called()
 
     def test_marker_anchor_beyond_first_page_is_deduped(
@@ -962,9 +986,20 @@ class TestFactGathererHealthReviewFacts:
         # The due health review uses the shared exhaustive tech-lead-agent scan,
         # which both finds the anchor beyond the first page and supplies open
         # case files to the health-review snapshot (#6781).
-        assert tracker.calls == [
+        assert [call for call in tracker.calls if "proposed-tech-lead" not in call["labels"]] == [
             {
                 "labels": ["agent:tech-lead"],
+                "state": "open",
+                "limit": 2000,
+                "exhaustive": True,
+            }
+        ]
+        # The approval-scope query is a SEPARATE observation, by gate label
+        # rather than agent label, because promoted findings carry the target's
+        # worker agent label and no agent-scoped scan can see them.
+        assert [call for call in tracker.calls if "proposed-tech-lead" in call["labels"]] == [
+            {
+                "labels": ["proposed-tech-lead"],
                 "state": "open",
                 "limit": 2000,
                 "exhaustive": True,
@@ -1303,7 +1338,7 @@ class TestGatedProposalScanClassification:
         assert approved.op.target_issue_number == 13
         assert facts.existing_tech_lead_issue == 7
         # Exactly one issue scan was made for anchors + proposals.
-        assert mock_repository_host.list_issues.call_count == 1
+        assert len(_anchor_scan_calls(mock_repository_host)) == 1
 
     def test_still_gated_proposal_yields_nothing_and_never_becomes_anchor(
         self, mock_config, mock_repository_host, sample_state
@@ -1513,7 +1548,7 @@ class TestCaseFileScanClassification:
         # The anchor scan ran, so the projection is authoritative this tick.
         assert facts.case_files_scanned is True
         # Still just one issue scan for anchors + proposals + case files.
-        assert mock_repository_host.list_issues.call_count == 1
+        assert len(_anchor_scan_calls(mock_repository_host)) == 1
 
     def test_board_publisher_receives_facts_and_health_review_timestamp(
         self, mock_config, mock_repository_host, sample_state
@@ -1616,7 +1651,9 @@ class TestCaseFileScanClassification:
         assert not_scanned.case_files_scanned is False
         assert not_scanned.open_case_files == ()
         # Zero GitHub calls on the frugal tick (GitHub API discipline).
-        mock_repository_host.list_issues.assert_not_called()
+        # The approval-scope query still runs (the board is written from these
+        # facts); the exhaustive ANCHOR scan is what this tick must skip.
+        assert _anchor_scan_calls(mock_repository_host) == []
         # The projection the board snapshot builder reads is preserved, not
         # wiped by the empty tuple the frugal tick carried.
         assert [cf.issue_number for cf in publisher.case_files()] == [800]
@@ -1694,7 +1731,10 @@ class TestApprovalBacklogFacts:
 
         assert facts is not None
         assert [p.issue_number for p in facts.gated_proposals] == [6922]
-        mock_repository_host.list_issues.assert_not_called()
+        # The APPROVAL-SCOPE query still runs: the board is written from these
+        # facts, so an incomplete backlog would be published as fact. What must
+        # not happen on a cheap tick is the exhaustive ANCHOR scan.
+        assert _anchor_scan_calls(mock_repository_host) == []
         mock_repository_host.get_prs_with_label.assert_not_called()
 
     def test_an_ungated_board_arms_nothing(
@@ -1943,4 +1983,69 @@ class TestTheApprovalBacklogIsObservedCompletelyAndCleared:
         assert [p.issue_number for p in facts.gated_proposals] == [8000], (
             "a gated issue the tick had already fetched was dropped from the "
             "backlog because it was absent from the filtered worker board"
+        )
+
+
+class _LabelAwareIssueHost:
+    """A host that answers each query with only what that query could see.
+
+    A single `return_value` stub hands the SAME issues to the anchor scan and
+    the approval-scope query, so a test using one cannot tell whether the
+    backlog came from the query it claims to be about. That is why the
+    existing coverage could not detect the approval query being removed.
+    """
+
+    def __init__(self, *, anchor: list, approval: list) -> None:
+        self._anchor = anchor
+        self._approval = approval
+        self.calls: list[dict] = []
+
+    def list_issues(self, **kwargs):
+        self.calls.append(kwargs)
+        labels = kwargs.get("labels") or []
+        return list(self._approval if "proposed-tech-lead" in labels else self._anchor)
+
+    def get_prs_with_label(self, *_a, **_k):
+        return []
+
+
+class TestTheBacklogSeesWhatOnlyItsOwnScopeCanSee:
+    """The completeness property, tested where it can actually fail."""
+
+    def test_a_worker_labelled_gated_issue_reaches_the_board(
+        self, mock_config, sample_state
+    ) -> None:
+        """A promoted finding carries the TARGET'S worker agent label.
+
+        `promotion_issue_labels` attaches it deliberately, so the issue is
+        "DISCOVERABLE the moment the gate comes off". The consequence is that
+        no agent-scoped scan can see it while it is still gated, and the
+        filtered worker board need not either — so the only observation that
+        finds it is a query for the gate label itself.
+        """
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead_review_threshold = 5
+        mock_config.code_reviewed_label = "code-reviewed"
+        promoted = Issue(
+            number=8100,
+            title="Promoted finding: condor lane forks a shell",
+            labels=["agent:backend", "proposed-tech-lead"],
+        )
+        host = _LabelAwareIssueHost(anchor=[], approval=[promoted])
+        gatherer = FactGatherer(
+            config=mock_config,
+            repository_host=host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
+
+        assert facts is not None
+        assert [p.issue_number for p in facts.gated_proposals] == [8100], (
+            "a gated issue that only the approval-scope query can see never "
+            "reached the board, so the operator is not told it is waiting"
         )

@@ -1671,3 +1671,62 @@ def test_end_to_end_gated_reset_proposal_executes_once() -> None:
         [approved_issue], ops=dict(ops.list_ops())
     ).approved
     assert plan_approved_tech_lead_op_executions(leftover) == []
+
+
+class TestALaterObservationCanRetireAnEarlierOne:
+    """F3: "last observation wins" must include observing that it is done.
+
+    The observer filtered on `_awaits_approval` BEFORE resolving duplicate
+    issue numbers, so a later observation without the gate was discarded
+    rather than superseding the earlier gated one. Connecting a second source
+    made that reachable: an issue approved between the worker fetch and the
+    anchor scan stayed advertised as pending despite fresher evidence in the
+    very same tick.
+    """
+
+    @staticmethod
+    def _issue(number: int, *, labels: list[str], state: str = "open"):
+        from issue_orchestrator.domain.models import Issue
+
+        return Issue(number=number, title="Proposal", labels=labels, state=state)
+
+    def test_a_later_ungated_observation_removes_the_proposal(self) -> None:
+        from issue_orchestrator.control.tech_lead_proposals import (
+            observe_gated_tech_lead_proposals,
+        )
+
+        gated = self._issue(9000, labels=["agent:tech-lead", "proposed-tech-lead"])
+        approved = self._issue(9000, labels=["agent:tech-lead"])
+
+        assert observe_gated_tech_lead_proposals([gated], [approved]) == ()
+
+    def test_a_later_closed_observation_removes_the_proposal(self) -> None:
+        from issue_orchestrator.control.tech_lead_proposals import (
+            observe_gated_tech_lead_proposals,
+        )
+
+        gated = self._issue(9000, labels=["agent:tech-lead", "proposed-tech-lead"])
+        closed = self._issue(
+            9000, labels=["agent:tech-lead", "proposed-tech-lead"], state="closed"
+        )
+
+        assert observe_gated_tech_lead_proposals([gated], [closed]) == ()
+
+    def test_the_earlier_observation_still_wins_when_nothing_supersedes_it(
+        self,
+    ) -> None:
+        """The fix must not make a proposal vanish for being absent elsewhere.
+
+        Absence from a later set is not an observation of that issue; only an
+        actual later observation of the SAME issue may retire it.
+        """
+        from issue_orchestrator.control.tech_lead_proposals import (
+            observe_gated_tech_lead_proposals,
+        )
+
+        gated = self._issue(9000, labels=["agent:tech-lead", "proposed-tech-lead"])
+        unrelated = self._issue(9001, labels=["agent:tech-lead"])
+
+        observed = observe_gated_tech_lead_proposals([gated], [unrelated])
+
+        assert [p.issue_number for p in observed] == [9000]

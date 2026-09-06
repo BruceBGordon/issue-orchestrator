@@ -365,6 +365,72 @@ def reconcile_tech_lead_proposals(
     )
 
 
+def observe_approval_backlog(
+    repository_host: "RepositoryHost",
+    config: "Config",
+    *partial: Sequence["Issue"],
+) -> tuple[GatedTechLeadProposal, ...]:
+    """The backlog as the board should publish it: complete, and this tick's.
+
+    Composes the two halves so no caller has to remember to do both. The sets
+    a tick already holds go in first (free, and the freshest evidence about
+    the issues they cover), and the authoritative gate-label query goes last
+    so it decides the ones only it can see.
+
+    Complete on purpose, because the board is written straight from the
+    result. The alternative — publishing a partial observation and retaining
+    what it missed — trades erasing a pending approval for advertising one
+    the operator already approved, which is the failure ``_build_view``'s
+    docstring warns about and #7014's own symptom.
+    """
+    return observe_gated_tech_lead_proposals(
+        *partial, discover_open_gated_proposals(repository_host, config)
+    )
+
+
+def discover_open_gated_proposals(
+    repository_host: "RepositoryHost", config: "Config"
+) -> list["Issue"]:
+    """AUTHORITATIVE observation of the approval backlog, in its own scope.
+
+    The backlog is defined by a LABEL, so the only complete observation of it
+    is a query for that label. Everything the tick already holds is a query
+    for something else that merely overlaps:
+
+    - the worker board is narrowed by configured agents, milestones, exclusion
+      filters and a fetch limit — it fetches runnable work, not approvals;
+    - the anchor scan queries the TECH-LEAD agent label, while a promoted
+      finding carries the TARGET'S worker agent label so it is
+      "DISCOVERABLE the moment the gate comes off"
+      (:func:`~.tech_lead_finding_promotion.promotion_issue_labels`) — and is
+      therefore structurally invisible to an agent-scoped scan.
+
+    Joining those two does not produce a complete set; it produces two
+    incomplete ones. This costs one labelled query on ticks that already do
+    tech-lead work, and it is what lets the board be written straight from
+    the facts: a complete observation needs no retention, and retention is
+    what would let an approved proposal linger (the warning in
+    ``_build_view``'s own docstring).
+
+    ``exhaustive`` for the same reason the anchor scan is (#6779 R17): a
+    dropped page must RAISE rather than return a silently partial set a caller
+    would read as "fewer approvals pending".
+    """
+    from .health_review_trigger import _scoped_issues
+
+    issues = repository_host.list_issues(
+        labels=[
+            value
+            for value in (PROPOSED_TECH_LEAD_LABEL, config.filtering.label)
+            if value
+        ],
+        state="open",
+        limit=TECH_LEAD_PROPOSAL_SCAN_LIMIT,
+        exhaustive=True,
+    )
+    return _scoped_issues(issues, config.filtering.label)
+
+
 def observe_gated_tech_lead_proposals(
     *observed: Sequence["Issue"],
 ) -> tuple[GatedTechLeadProposal, ...]:
@@ -396,10 +462,18 @@ def observe_gated_tech_lead_proposals(
     """
     # One issue can appear in several observed sets; the LAST observation of it
     # wins, so a set gathered later in the tick refreshes an earlier snapshot.
+    # Resolve the LATEST observation of each issue FIRST, then judge approval
+    # state. Filtering first meant a later observation that does NOT await
+    # approval was discarded instead of superseding the earlier one, so an
+    # issue approved or closed between two of this tick's fetches stayed
+    # advertised as pending despite fresher evidence in the same tick. "Last
+    # observation wins" has to include observing that it is no longer waiting.
+    latest: dict[int, "Issue"] = {
+        issue.number: issue for issues in observed for issue in issues
+    }
     backlog: dict[int, GatedTechLeadProposal] = {
-        issue.number: _gated_proposal_summary(issue)
-        for issues in observed
-        for issue in issues
+        number: _gated_proposal_summary(issue)
+        for number, issue in latest.items()
         if _awaits_approval(issue)
     }
     return tuple(backlog[number] for number in sorted(backlog))

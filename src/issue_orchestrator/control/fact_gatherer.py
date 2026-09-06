@@ -25,7 +25,7 @@ import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, TYPE_CHECKING
+from typing import Any, Callable, Optional, TYPE_CHECKING, cast
 
 from ..infra.config import Config
 from ..events import EventName
@@ -46,7 +46,10 @@ from .tech_lead_artifact_retention import (
     clear_discovered_facts as _clear_discovered_facts,
     tech_lead_problem_artifact_hold_issue_numbers,
 )
-from .tech_lead_proposals import observe_gated_tech_lead_proposals
+from .tech_lead_proposals import (
+    observe_approval_backlog,
+    observe_gated_tech_lead_proposals,
+)
 from .tech_lead_reaction import storm_possible
 
 # Compatibility export: this policy lived in fact_gatherer before it gained a
@@ -447,9 +450,8 @@ class FactGatherer:
         # production: a board holding gated proposals must publish a board that
         # shows them even when nothing else about tech_lead is active.
         gated_proposals = observe_gated_tech_lead_proposals(board_issues)
-        # A backlog that just EMPTIED must still publish: clearing the last
-        # gate is exactly when nothing else arms production, so an early
-        # return would leave the board asserting stale approvals forever.
+        # A backlog that just EMPTIED must still publish: clearing the last gate
+        # is exactly when nothing else arms production.
         backlog_cleared = state.tech_lead_gated_backlog_seen and not gated_proposals
         if (
             not backlog_cleared
@@ -480,7 +482,7 @@ class FactGatherer:
         # anchor scan actually observed the ledger (#6781 R2). A frugal tick
         # (health armed but not due, no batch, empty ledger) leaves this False
         # and its empty ``case_files`` must NOT wipe the retained projection.
-        case_files_scanned = False
+        case_files_scanned, scan_observations = False, cast(Sequence["Issue"], ())
         if batch_armed or ops or due or storm_armed:
             # The ONE exhaustive open tech-lead-agent scan classifies batch +
             # health anchors, open proposals, approved ops, and absent-ledger
@@ -499,17 +501,18 @@ class FactGatherer:
                 scanned_issues,
             ) = self._classify_tech_lead_anchor_scan(ops)
             case_files_scanned = True
-            # Refresh with the exhaustive scan: `board_issues` is the filtered
-            # WORKER fetch, not the approval scope (see the observer).
-            gated_proposals = observe_gated_tech_lead_proposals(
-                board_issues, scanned_issues
-            )
+            scan_observations = scanned_issues
             # Batch anchor classification stays gated on batch_armed: a batch
             # anchor is meaningless while the batch trigger is off.
             if batch_armed:
                 existing_tech_lead_issue = batch_anchor
         prs = self._fetch_tech_lead_prs(watch_label) if batch_armed else []
         all_labels, source_milestones = self._collect_pr_metadata(prs)
+
+        # Complete observation, not the partial sets this tick happens to hold.
+        gated_proposals = observe_approval_backlog(
+            self.repository_host, self.config, board_issues, scan_observations
+        )
 
         # Lets the next tick tell "still empty" from "just emptied".
         state.tech_lead_gated_backlog_seen = bool(gated_proposals)
@@ -682,8 +685,7 @@ class FactGatherer:
             remaining, self.config.filtering.label
         )
         # `existing` is returned UNFILTERED: reconciliation drops gate-labeled
-        # issues from anchor candidates, so they must reach the backlog
-        # observer by this path or go unseen.
+        # issues from anchor candidates.
         return (
             batch,
             health,
