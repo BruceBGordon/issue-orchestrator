@@ -44,10 +44,15 @@ from .persistent_round_failures import (
     PersistentRoundTimeoutError,
 )
 from .composer_readiness import (
-    ComposerGate,
     LiveComposerScreen,
+    await_ready_before_typing,
 )
 from .persistent_round_io import drain_pty_output_until_quiet
+from .persistent_round_write import (
+    drain_pty_output,
+    safe_recording_size,
+    submit_prompt_with_enter,
+)
 from .persistent_round_interactions import (
     PersistentInteractionState,
     bind_interaction_sender,
@@ -64,42 +69,6 @@ _DEFAULT_RESPONSE_DRAIN_SECONDS = 0.1
 _DEFAULT_TERMINATE_GRACE_SECONDS = 5.0
 _DEFAULT_PTY_WRITE_TIMEOUT_SECONDS = 30.0
 _DEFAULT_PROMPT_ACCEPTANCE_IDLE_SECONDS = 120.0
-# Echo-settle window between writing the prompt text and the standalone
-# Enter ("\r") that submits it — see the two-write contract in send_round.
-#
-# NOT a readiness signal, and it cannot be made into one. Measured from a
-# stranded codex 0.153.4 reviewer recording, 6074 output frames over 600s:
-#
-#     inter-frame gap  p50=0.104s  p90=0.106s  p99=0.106s  max=0.42s
-#     gaps >1.0s: 0
-#
-# The TUI repaints at ~10Hz continuously, including after the agent said it
-# was waiting for a turn — so no quiet window distinguishes "idle at an empty
-# composer" from "mid-turn". Below the 0.42s worst case this is satisfied by
-# chance gaps (which is what it does today, i.e. barely a wait at all); above
-# it, it is never satisfied and every round pays the full backstop before
-# submitting anyway. Raising it was tried and is worse: a 60s stall per round
-# ending in "Could not write 1 bytes to PTY within deadline".
-#
-# Gating injection on a READY COMPOSER is the fix, read from the rendered
-# screen the way execution/composer_state.py already classifies it after the
-# fact. Tracked in #7104; this constant stays where it was until then.
-_ENTER_SETTLE_QUIET_SECONDS = 0.3
-# Backstop on the echo settle, NOT the mechanism, and deliberately SHORT.
-#
-# It used to be an implicit `max(quiet_seconds, 1.0)` computed at entry — a cap
-# shorter than the event it bounded, so no longer settle was expressible.
-# Making it explicit is what let the window be measured instead of assumed.
-#
-# It must stay short. The readiness gate above is what answers "is the agent
-# busy"; this only covers the echo of the text just written. Codex repaints at
-# ~10Hz forever, so the 0.3s window is often never satisfied, and a generous
-# backstop here becomes a stall on EVERY round: at 60s the Enter arrived a
-# minute late and the PTY had stopped accepting it —
-#   "Could not write 1 bytes to PTY fd=3 (0 bytes accepted before timeout)"
-# — turning a working round into a timeout. Measured: 0/5 micro-harness runs
-# passed at 60s.
-_ENTER_SETTLE_MAX_WAIT_SECONDS = 2.0
 
 # Heartbeat cadence for the ``send_round`` poll loop. Without this, a
 # wedged agent shows up as 17 minutes of total log silence (#6160 e2e
@@ -107,7 +76,6 @@ _ENTER_SETTLE_MAX_WAIT_SECONDS = 2.0
 # growth, and the agent's process state so the next reproduction tells
 # us *which* step is wedged instead of just "something hung."
 _SEND_ROUND_HEARTBEAT_SECONDS = 30.0
-_PTY_WRITE_HEARTBEAT_SECONDS = 5.0
 
 # Readiness gate before typing a turn into a live TUI (#7104).
 #
@@ -116,10 +84,6 @@ _PTY_WRITE_HEARTBEAT_SECONDS = 5.0
 # bootstrap turn, whose busy footer cleared at 38.4s: the agent runs its
 # argv-delivered setup prompt before the first round is injected, and that is
 # the window this exists to cover.
-_READY_POLL_INTERVAL_SECONDS = 0.25
-# Per-poll pump: read whatever the PTY has and let the screen apply it. Short,
-# because the loop re-enters immediately; this is a read, not a settle.
-_READY_PUMP_QUIET_SECONDS = 0.05
 
 
 @dataclass
@@ -240,241 +204,6 @@ def open_persistent_session(
     return session
 
 
-def _write_full(
-    fd: int,
-    payload: bytes,
-    *,
-    deadline: float,
-    now: Callable[[], float],
-    sleep: Callable[[float], None],
-    role_label: str | None = None,
-    pid: int | None = None,
-    heartbeat_seconds: float = _PTY_WRITE_HEARTBEAT_SECONDS,
-    drain_output: Callable[[], int] | None = None,
-) -> int:
-    """Write all of ``payload`` to a non-blocking fd, looping on partial writes.
-
-    The PTY master fd is non-blocking (``open_persistent_session`` sets
-    ``os.set_blocking(master_fd, False)``). On a non-blocking fd
-    ``os.write`` can return *fewer* bytes than requested when the
-    kernel's PTY input buffer is nearly full. The previous
-    single-call ``os.write(fd, payload)`` ignored the return value;
-    any unwritten suffix was silently dropped, the agent got a
-    truncated prompt, and the round hung waiting for a response that
-    would never arrive (#6160 e2e regression).
-
-    Loops until the full payload is on the wire, retrying with a
-    short backoff on ``BlockingIOError`` (kernel buffer momentarily
-    full) and on zero-byte writes. Raises
-    :class:`PersistentRoundTimeoutError` if the deadline expires
-    before the buffer drains enough to accept the rest.
-    """
-    written = 0
-    backoff = 0.005
-    started_at = now()
-    last_heartbeat = started_at
-    label = role_label or f"fd={fd}"
-    while written < len(payload):
-        current = now()
-        if current > deadline:
-            raise PersistentRoundTimeoutError(
-                f"Could not write {len(payload)} bytes to PTY fd={fd} role={label} "
-                f"within deadline ({written} bytes accepted before timeout)"
-            )
-        try:
-            n = os.write(fd, payload[written:])
-        except BlockingIOError:
-            n = 0  # kernel buffer momentarily full — same backoff as a 0-byte write
-        except OSError as exc:
-            raise PersistentRoundError(
-                f"Could not write prompt to PTY fd={fd} role={label}: {exc}",
-                failure_reason=RoundFailureReason.PROMPT_WRITE_FAILED,
-            ) from exc
-        if n == 0:
-            _drain_during_write_backoff(drain_output)
-            if current - last_heartbeat >= heartbeat_seconds:
-                logger.info(
-                    "[send_round] waiting for PTY write role=%s pid=%s fd=%d "
-                    "elapsed=%.1fs deadline_in=%.1fs written=%d remaining=%d",
-                    label,
-                    pid if pid is not None else "n/a",
-                    fd,
-                    current - started_at,
-                    deadline - current,
-                    written,
-                    len(payload) - written,
-                )
-                last_heartbeat = current
-            sleep(backoff)
-            backoff = min(backoff * 2, 0.1)
-            continue
-        written += n
-        backoff = 0.005
-        if written < len(payload):
-            logger.debug(
-                "[send_round] partial PTY write fd=%d wrote=%d total=%d remaining=%d",
-                fd, n, written, len(payload) - written,
-            )
-    return written
-
-
-def _drain_during_write_backoff(drain_output: Callable[[], int] | None) -> None:
-    if drain_output is None:
-        return
-    drained = drain_output()
-    if drained:
-        logger.debug(
-            "[send_round] drained %d PTY output byte(s) while write was blocked",
-            drained,
-        )
-
-
-def _write_prompt_with_timeout_diagnostics(
-    session: PersistentSession,
-    payload: bytes,
-    *,
-    response_file: Path,
-    write_deadline: float,
-    now: Callable[[], float],
-    sleep: Callable[[float], None],
-    role_label: str,
-    timeout_seconds: float,
-    write_timeout_seconds: float,
-) -> int:
-    try:
-        return _write_full(
-            session.master_fd, payload,
-            deadline=write_deadline,
-            now=now,
-            sleep=sleep,
-            role_label=role_label,
-            pid=session.proc.pid,
-            drain_output=lambda: _drain_pty_output(session),
-        )
-    except PersistentRoundTimeoutError as exc:
-        recording_size = _safe_recording_size(session)
-        logger.warning(
-            "[send_round] prompt write timeout role=%s pid=%d alive=%s "
-            "closed=%s response_file=%s prompt_bytes=%d write_timeout=%.1fs "
-            "timeout=%.1fs recording_bytes=%s "
-            "likely_stale_persistent_session=True error=%s",
-            role_label,
-            session.proc.pid,
-            session.proc.poll() is None,
-            session.closed,
-            response_file,
-            len(payload),
-            write_timeout_seconds,
-            timeout_seconds,
-            recording_size if recording_size is not None else "n/a",
-            exc,
-        )
-        raise
-
-
-def _submit_prompt_with_enter(
-    session: PersistentSession,
-    payload: bytes,
-    *,
-    response_file: Path,
-    write_deadline: float,
-    now: Callable[[], float],
-    sleep: Callable[[float], None],
-    label: str,
-    timeout_seconds: float,
-    write_timeout_seconds: float,
-    read_response: Callable[[], dict[str, Any] | None],
-) -> tuple[int, dict[str, Any] | None]:
-    """Write the prompt, let the echo settle, then submit with a standalone Enter.
-
-    Two-write contract (TestPromptSubmissionTerminator; do NOT regress to a
-    single batched write or to ``\\n``): ``\\n`` never submits to a raw-mode
-    TUI (the tixmeup #277/#290 hang), and codex treats a ``\\r`` batched with
-    the prompt text as a literal newline in its input box — only an Enter
-    arriving as its own write after the echo settles submits. claude accepts
-    either form.
-
-    Returns ``(bytes_written, recovered_response)``. ``recovered_response``
-    is non-None when the agent answered from the prompt write alone and
-    exited before the Enter landed (one-shot agents: the dead PTY raises on
-    the Enter write). The response file is authoritative — the same tolerance
-    as the poll loop's exited-after-answering path.
-    """
-    # Do not type at an agent that is mid-turn. The Enter that follows would
-    # not submit, and the prompt would sit in the composer until the round
-    # timed out (#7104). The screen is the only surface that can tell — see
-    # composer_readiness for why byte activity provably cannot.
-    if session.composer_screen is not None:
-        outcome = ComposerGate.for_round(
-            session.composer_screen,
-            round_timeout_seconds=timeout_seconds,
-            poll_interval_seconds=_READY_POLL_INTERVAL_SECONDS,
-        ).await_ready(
-            pump=lambda: drain_pty_output_until_quiet(
-                session,
-                quiet_seconds=_READY_PUMP_QUIET_SECONDS,
-                max_wait_seconds=_READY_PUMP_QUIET_SECONDS,
-                now=now,
-                sleep=sleep,
-            ),
-            now=now,
-            sleep=sleep,
-        )
-        if not outcome.ready:
-            # Still write: a doomed prompt beats failing a round that might
-            # work, and the poll loop's diagnostics take it from here. But name
-            # the cause NOW, so this stops being a ten-minute mystery timeout.
-            logger.warning(
-                "[send_round] %s role=%s pid=%d",
-                outcome.describe(), label, session.proc.pid,
-            )
-
-    written = _write_prompt_with_timeout_diagnostics(
-        session, payload,
-        response_file=response_file, write_deadline=write_deadline,
-        now=now, sleep=sleep, role_label=label,
-        timeout_seconds=timeout_seconds,
-        write_timeout_seconds=write_timeout_seconds,
-    )
-    settled = drain_pty_output_until_quiet(
-        session,
-        quiet_seconds=_ENTER_SETTLE_QUIET_SECONDS,
-        max_wait_seconds=_ENTER_SETTLE_MAX_WAIT_SECONDS,
-        now=now,
-        sleep=sleep,
-    )
-    if not settled:
-        # Expected against a TUI that repaints forever: codex never produces a
-        # 0.3s gap, so this fires on every successful round (measured: 10/10
-        # micro-harness passes all reported it). Readiness is guarded upstream
-        # by ComposerGate, so this is a debug detail about the echo settle, not
-        # a warning — logging it louder would train people to ignore the line.
-        logger.debug(
-            "[send_round] TUI never went quiet within %.0fs; submitting Enter "
-            "anyway and the prompt may strand in the composer (#7104) "
-            "role=%s pid=%d",
-            _ENTER_SETTLE_MAX_WAIT_SECONDS, label, session.proc.pid,
-        )
-    try:
-        written += _write_prompt_with_timeout_diagnostics(
-            session, b"\r",
-            response_file=response_file, write_deadline=write_deadline,
-            now=now, sleep=sleep, role_label=label,
-            timeout_seconds=timeout_seconds,
-            write_timeout_seconds=write_timeout_seconds,
-        )
-    except PersistentRoundError:
-        recovered = read_response()
-        if recovered is None:
-            raise
-        logger.info(
-            "[send_round] enter write failed but agent already answered "
-            "role=%s pid=%d", label, session.proc.pid,
-        )
-        return written, recovered
-    return written, None
-
-
 def send_round(
     session: PersistentSession,
     *,
@@ -574,7 +303,7 @@ def send_round(
     else:
         read_response = response_reader
     write_deadline = started_at + min(timeout_seconds, write_timeout_seconds)
-    written, recovered = _submit_prompt_with_enter(
+    written, recovered = submit_prompt_with_enter(
         session, payload,
         response_file=response_file, write_deadline=write_deadline,
         now=now, sleep=sleep, label=label,
@@ -643,7 +372,7 @@ def _wait_for_round_response(
         poll_interval_seconds=poll_interval_seconds,
         round_started_at=started_at,
         activity_since=now(),
-        recording_bytes=_safe_recording_size(session),
+        recording_bytes=safe_recording_size(session),
     )
     if on_idle_detector is not None:
         # Hand the live detector to the caller's kill-evidence registration so
@@ -656,8 +385,8 @@ def _wait_for_round_response(
         current = now()
         detector.observe(
             current,
-            drained=_drain_pty_output(session),
-            recording_bytes=_safe_recording_size(session),
+            drained=drain_pty_output(session),
+            recording_bytes=safe_recording_size(session),
         )
         poll_iter = detector.poll_iterations
         bytes_drained_total = detector.bytes_drained_total
@@ -767,27 +496,6 @@ def _wait_for_round_response(
     )
 
 
-def _safe_recording_size(session: PersistentSession) -> int | None:
-    """Best-effort read of the role recording's current size in bytes.
-
-    Used by ``send_round``'s heartbeat to surface "is the agent
-    producing output at all" — non-zero growth between heartbeats
-    means the agent is alive and emitting; zero growth means it
-    hasn't even started rendering its prompt yet (or the TUI is
-    wedged on a startup dialog with no auto-responder).
-    """
-    log_writer = session.log_writer
-    if log_writer is None:
-        return None
-    recording_path = getattr(log_writer, "recording_path", None)
-    if recording_path is None or not recording_path.exists():
-        return None
-    try:
-        return recording_path.stat().st_size
-    except OSError:
-        return None
-
-
 def _try_read_response(response_file: Path) -> dict[str, Any] | None:
     """Return the parsed JSON if the file exists and parses, else None.
 
@@ -846,7 +554,7 @@ def close_persistent_session(
                     )
         # Final drain so any tail output makes it into the recording before
         # we close the writer.
-        _drain_pty_output(session)
+        drain_pty_output(session)
     finally:
         session.closed = True
         try:
@@ -856,43 +564,6 @@ def close_persistent_session(
         if session.log_writer is not None:
             session.log_writer.close()
     return session.proc.returncode
-
-
-def _drain_pty_output(session: PersistentSession) -> int:
-    """Read everything currently available on the master fd into the log.
-
-    When no log writer is configured (tests that don't care about
-    output), the chunks are discarded — they've been read off the PTY,
-    which is what matters to free the buffer. Returns the total number
-    of bytes drained on this call so the caller can surface
-    agent-is-alive evidence in heartbeat logs.
-    """
-    drained = 0
-    while True:
-        if session.closed:
-            return drained
-        try:
-            ready, _, _ = select.select([session.master_fd], [], [], 0)
-        except OSError:
-            logger.debug(
-                "[send_round] PTY drain skipped for closed fd=%d pid=%d",
-                session.master_fd,
-                session.proc.pid,
-            )
-            return drained
-        if not ready:
-            return drained
-        try:
-            chunk = os.read(session.master_fd, 4096)
-        except (BlockingIOError, OSError):
-            return drained
-        if not chunk:
-            return drained
-        drained += len(chunk)
-        if session.log_writer is not None:
-            session.log_writer.write(chunk)
-        if session.output_observer is not None:
-            session.output_observer(chunk)
 
 
 def _set_pty_geometry(slave_fd: int, *, rows: int, cols: int) -> None:

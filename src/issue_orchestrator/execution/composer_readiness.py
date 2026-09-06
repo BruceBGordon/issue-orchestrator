@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from typing import Protocol
 from dataclasses import dataclass
 from enum import Enum
 
 from ..infra.terminal_viewport import TerminalViewport
+from .persistent_round_io import drain_pty_output_until_quiet
 from .session_interactions import normalize_terminal_text
 
 logger = logging.getLogger(__name__)
@@ -65,12 +67,12 @@ class LiveComposerScreen:
         if not chunk:
             return
         self._fed = True
-        try:
-            self._viewport.feed(chunk)
-        except Exception:  # noqa: BLE001
-            # A readiness probe must never be able to kill a round. An
-            # unmodelled sequence costs accuracy here, not the exchange.
-            logger.debug("[composer] viewport rejected a chunk", exc_info=True)
+        # No try/except. The viewport consumes unrecognised escape sequences by
+        # design, so a raise here is a viewport bug — and swallowing it would
+        # leave the gate reading a screen that silently stopped updating, which
+        # is precisely the kind of quiet wrongness this whole change exists to
+        # remove.
+        self._viewport.feed(chunk)
 
     def rows(self) -> tuple[str, ...]:
         return self._viewport.render().written_rows
@@ -114,25 +116,21 @@ class LiveComposerScreen:
     def is_ready(self) -> bool:
         """True once the agent has worked and then gone idle at an empty composer.
 
-        Three conditions, and dropping any one of them reintroduces a failure
-        that was observed live:
+        Three conditions, and dropping any one reintroduces a failure observed
+        live:
 
         - **drawn** — typing at a terminal that has painted nothing is the
           spawn race; reporting ready there made the first version of this
           gate a no-op.
         - **seen_busy** — an agent that has drawn its banner but not yet begun
-          its argv turn reads as idle. Codex accepted the typed text into its
+          its argv turn reads as idle. Codex took the typed text into its
           composer and then started booting; the Enter was dropped and the
           turn stranded. This is the condition that catches it.
-        - **not busy and not holding** — the agent has finished, and nothing
-          is left unsent in the composer from a previous round.
+        - **not busy and not holding** — it has finished, and nothing is left
+          unsent in the composer from an earlier round.
         """
-        if not self.has_drawn():
-            return False
         busy, holding = self.sample()
-        if not self._seen_busy:
-            return False
-        return not busy and not holding
+        return self.has_drawn() and self._seen_busy and not busy and not holding
 
 
 class ComposerReadinessReason(str, Enum):
@@ -162,23 +160,26 @@ class ComposerReadiness:
 
     def describe(self) -> str:
         """One log-ready sentence. The caller adds role and pid."""
-        if self.reason is ComposerReadinessReason.READY:
-            return f"composer ready after {self.waited_seconds:.1f}s"
-        if self.reason is ComposerReadinessReason.NO_TUI_TURN:
-            return (
-                f"no TUI turn seen in {self.waited_seconds:.1f}s; treating the "
-                "agent as having nothing to finish"
-            )
-        if self.reason is ComposerReadinessReason.HOLDING_UNSENT:
-            return (
-                f"composer still holds unsent text after "
-                f"{self.waited_seconds:.1f}s — an earlier prompt never "
-                "submitted; writing anyway and it may strand (#7104)"
-            )
-        return (
-            f"agent still working after {self.waited_seconds:.1f}s; writing "
-            "anyway and the prompt may strand in the composer (#7104)"
+        return _READINESS_DESCRIPTIONS[self.reason].format(
+            waited=f"{self.waited_seconds:.1f}"
         )
+
+
+_READINESS_DESCRIPTIONS: dict[ComposerReadinessReason, str] = {
+    ComposerReadinessReason.READY: "composer ready after {waited}s",
+    ComposerReadinessReason.NO_TUI_TURN: (
+        "no TUI turn seen in {waited}s; treating the agent as having nothing "
+        "to finish"
+    ),
+    ComposerReadinessReason.HOLDING_UNSENT: (
+        "composer still holds unsent text after {waited}s — an earlier prompt "
+        "never submitted; writing anyway and it may strand (#7104)"
+    ),
+    ComposerReadinessReason.STILL_BUSY: (
+        "agent still working after {waited}s; writing anyway and the prompt "
+        "may strand in the composer (#7104)"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -271,3 +272,55 @@ class ComposerGate:
                     False, reason, now() - started, busy, holding
                 )
             sleep(self.poll_interval_seconds)
+
+
+#: Cadence of the readiness poll. Small enough that the gate releases promptly
+#: when the agent finishes, large enough not to spin.
+POLL_INTERVAL_SECONDS = 0.25
+#: Per-poll pump budget: read whatever the PTY has and let the screen apply
+#: it. This is a read, not a settle — the loop re-enters immediately.
+PUMP_QUIET_SECONDS = 0.05
+
+
+class _PumpableSession(Protocol):
+    """What the pump needs. Narrower than PersistentSession, and importing the
+    narrow thing is what keeps this module free of a cycle back to the runner."""
+
+    composer_screen: LiveComposerScreen | None
+
+
+def await_ready_before_typing(
+    session: _PumpableSession,
+    *,
+    round_timeout_seconds: float,
+    now: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> ComposerReadiness | None:
+    """Wait for the agent to accept typing, pumping its PTY as we go.
+
+    Returns None when the session has no composer to wait on — a plain
+    stdin-reading agent, which cannot strand a prompt because it has nowhere
+    to strand it.
+
+    Lives here rather than in ``send_round`` so the runner keeps one call and
+    no arithmetic: the bounds, the pump and the verdict are all this module's
+    business, and all of them are unit-tested without a PTY.
+    """
+    screen = session.composer_screen
+    if screen is None:
+        return None
+    return ComposerGate.for_round(
+        screen,
+        round_timeout_seconds=round_timeout_seconds,
+        poll_interval_seconds=POLL_INTERVAL_SECONDS,
+    ).await_ready(
+        pump=lambda: drain_pty_output_until_quiet(
+            session,  # type: ignore[arg-type]
+            quiet_seconds=PUMP_QUIET_SECONDS,
+            max_wait_seconds=PUMP_QUIET_SECONDS,
+            now=now,
+            sleep=sleep,
+        ),
+        now=now,
+        sleep=sleep,
+    )
