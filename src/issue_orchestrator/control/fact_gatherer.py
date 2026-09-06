@@ -447,8 +447,13 @@ class FactGatherer:
         # production: a board holding gated proposals must publish a board that
         # shows them even when nothing else about tech_lead is active.
         gated_proposals = observe_gated_tech_lead_proposals(board_issues)
+        # A backlog that just EMPTIED must still publish: clearing the last
+        # gate is exactly when nothing else arms production, so an early
+        # return would leave the board asserting stale approvals forever.
+        backlog_cleared = state.tech_lead_gated_backlog_seen and not gated_proposals
         if (
-            not batch_armed
+            not backlog_cleared
+            and not batch_armed
             and not health_armed
             and not ops
             and not storm_armed
@@ -491,14 +496,23 @@ class FactGatherer:
                 approved_ops,
                 absent_op_candidates,
                 case_files,
+                scanned_issues,
             ) = self._classify_tech_lead_anchor_scan(ops)
             case_files_scanned = True
+            # Refresh with the exhaustive scan: `board_issues` is the filtered
+            # WORKER fetch, not the approval scope (see the observer).
+            gated_proposals = observe_gated_tech_lead_proposals(
+                board_issues, scanned_issues
+            )
             # Batch anchor classification stays gated on batch_armed: a batch
             # anchor is meaningless while the batch trigger is off.
             if batch_armed:
                 existing_tech_lead_issue = batch_anchor
         prs = self._fetch_tech_lead_prs(watch_label) if batch_armed else []
         all_labels, source_milestones = self._collect_pr_metadata(prs)
+
+        # Lets the next tick tell "still empty" from "just emptied".
+        state.tech_lead_gated_backlog_seen = bool(gated_proposals)
 
         facts = TechLeadFacts(
             pr_count=len(prs),
@@ -628,6 +642,7 @@ class FactGatherer:
         tuple["ApprovedTechLeadOp", ...],
         tuple[int, ...],
         tuple["TechLeadCaseFileSummary", ...],
+        tuple["Issue", ...],
     ]:
         """Classify the ONE shared, exhaustive open tech-lead-agent scan.
 
@@ -655,7 +670,7 @@ class FactGatherer:
         from .tech_lead_proposals import reconcile_tech_lead_proposals
 
         if not self.config.tech_lead_enabled:
-            return None, None, (), (), ()
+            return None, None, (), (), (), ()
         existing = discover_open_tech_lead_anchor_issues(
             self.repository_host, self.config
         )
@@ -666,12 +681,16 @@ class FactGatherer:
         batch, health = classify_tech_lead_anchor_issues(
             remaining, self.config.filtering.label
         )
+        # `existing` is returned UNFILTERED: reconciliation drops gate-labeled
+        # issues from anchor candidates, so they must reach the backlog
+        # observer by this path or go unseen.
         return (
             batch,
             health,
             reconciled.approved,
             reconciled.absent_op_issue_numbers,
             case_files,
+            tuple(existing),
         )
 
     def _collect_pr_metadata(self, prs: list[Any]) -> tuple[set[str], list[tuple[int, str]]]:

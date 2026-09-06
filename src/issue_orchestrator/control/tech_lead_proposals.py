@@ -386,6 +386,13 @@ def observe_gated_tech_lead_proposals(
     issue number and ordered by it, so the projection is deterministic and
     costs zero GitHub calls. Only OPEN issues qualify: a closed issue is
     rejected or already handled, never awaiting approval.
+
+    Pass EVERY set the tick holds, not just the worker board. That board is
+    narrowed by configured agents, milestones, exclusion filters and a fetch
+    limit, so it is a runnable-work fetch rather than the approval scope — a
+    gated issue outside it is still waiting on an operator. Feeding only the
+    board is how this projection could report nothing on a tick that had
+    already fetched a pending approval through the anchor scan.
     """
     # One issue can appear in several observed sets; the LAST observation of it
     # wins, so a set gathered later in the tick refreshes an earlier snapshot.

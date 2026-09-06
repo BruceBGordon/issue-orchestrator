@@ -1899,6 +1899,14 @@ class OrchestratorState:
     # issues (not operator/retry ones). ``tech_lead_expedite_pending`` holds
     # gated (propose-authority) create_issue follow-ups awaiting the
     # proposed-tech-lead gate removal, promoted to the front once un-gated.
+    # #7014 F1: did the LAST tick observe a gated approval backlog? A board
+    # showing pending approvals must be refreshed when the last one clears,
+    # and clearing it is precisely the moment nothing else arms fact
+    # production — so without this the board keeps saying "1 awaiting operator
+    # approval" forever. In-memory like the fields around it: GitHub labels
+    # remain the crash-safe truth, so a restart costs one stale board until
+    # the next armed tick, never a wrong decision.
+    tech_lead_gated_backlog_seen: bool = False
     tech_lead_expedited: list[int] = field(default_factory=list)
     tech_lead_expedite_pending: list[int] = field(default_factory=list)
     # #6873: ledger of priority_queue entries the blocked->front policy owns.

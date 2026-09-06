@@ -1849,3 +1849,98 @@ class TestClearDiscoveredFacts:
 
         remaining = {c.issue_number for c in state.immediate_cleanups}
         assert remaining == {5980}  # disposable retained, normal dropped
+
+
+class TestTheApprovalBacklogIsObservedCompletelyAndCleared:
+    """Two ways the board could assert a backlog that is not what it observed.
+
+    Both come from the same root: the backlog was projected from ONE filtered
+    set, and only when something else had already armed fact production.
+    """
+
+    def _gatherer(self, mock_config, mock_repository_host):
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "tech-lead-agent"
+        mock_config.tech_lead_review_threshold = 5
+        mock_config.code_reviewed_label = "code-reviewed"
+        return FactGatherer(
+            config=mock_config,
+            repository_host=mock_repository_host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+    @staticmethod
+    def _gated(number: int, title: str = "Tech Lead proposal: do a thing"):
+        return Issue(
+            number=number,
+            title=title,
+            labels=["tech-lead-agent", "proposed-tech-lead"],
+        )
+
+    def test_clearing_the_last_approval_still_publishes_an_empty_backlog(
+        self, mock_config, mock_repository_host, sample_state
+    ) -> None:
+        """F1: the tick that empties the backlog is the tick nothing else arms.
+
+        Batch and health disabled, empty ledger, no other trigger. The first
+        tick publishes a backlog of one; the operator then removes the gate.
+        Without the transition trigger the second tick returns None, the
+        publisher is never called, and the board keeps asserting an approval
+        that is no longer pending — indefinitely.
+        """
+        mock_repository_host.list_issues.return_value = []
+        gatherer = self._gatherer(mock_config, mock_repository_host)
+        # The reviewer's conditions, made real rather than assumed: batch off
+        # (threshold <= 0 disables the watch label) and the health interval off.
+        # Without both, some other trigger arms the tick and the bug is hidden.
+        mock_config.tech_lead_review_threshold = 0
+        mock_config.tech_lead.health_review.interval_minutes = 0
+
+        first = gatherer.gather_tech_lead_facts(
+            sample_state, board_issues=[self._gated(8000)]
+        )
+        assert first is not None
+        assert [p.issue_number for p in first.gated_proposals] == [8000]
+        assert sample_state.tech_lead_gated_backlog_seen is True
+
+        # The operator approves it: the gate is gone, so nothing is pending
+        # and nothing else is armed.
+        second = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
+
+        assert second is not None, (
+            "the tick that empties the backlog produced no facts, so the board "
+            "keeps reporting approvals that are no longer pending"
+        )
+        assert second.gated_proposals == ()
+        assert sample_state.tech_lead_gated_backlog_seen is False
+
+        # ...and it settles: with nothing pending and nothing armed, the next
+        # tick is quiet again rather than republishing forever.
+        assert gatherer.gather_tech_lead_facts(sample_state, board_issues=[]) is None
+
+    def test_a_gated_issue_only_the_anchor_scan_saw_still_reaches_the_board(
+        self, mock_config, mock_repository_host, sample_state
+    ) -> None:
+        """F2: `board_issues` is the worker fetch, not the approval scope.
+
+        It is narrowed by configured agents, milestones, exclusion filters and
+        a fetch limit. The exhaustive anchor scan already fetched this issue,
+        but reconciliation drops gate-labeled issues from anchor candidates —
+        right for deciding what to execute, wrong for deciding what is
+        visibly pending.
+        """
+        mock_repository_host.list_issues.return_value = [self._gated(8000)]
+        gatherer = self._gatherer(mock_config, mock_repository_host)
+
+        # Armed by the health interval so the scan runs; the worker board is
+        # empty, as it would be for an issue outside the configured milestone.
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
+
+        assert facts is not None
+        assert [p.issue_number for p in facts.gated_proposals] == [8000], (
+            "a gated issue the tick had already fetched was dropped from the "
+            "backlog because it was absent from the filtered worker board"
+        )
