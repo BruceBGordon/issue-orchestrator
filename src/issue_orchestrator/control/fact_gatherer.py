@@ -452,18 +452,14 @@ class FactGatherer:
         approval_due = approval_refresh_due(
             self.config, state, now_ts, self.tech_lead_authority
         )
-        if (
-            not approval_due
-            and not backlog_cleared
-            and not batch_armed
-            and not health_armed
-            and not ops
-            and not storm_armed
-            and not promotable
-            and not promotion_updates
-            and not settled
-            and not gated_proposals
-        ):
+        # Everything except the approval cadence. Named because the failure
+        # path below needs it: a tick that already gathered real facts must
+        # never report them as "nothing armed" (F5).
+        other_armed = bool(
+            batch_armed or health_armed or ops or storm_armed or promotable
+            or promotion_updates or settled or gated_proposals or backlog_cleared
+        )
+        if not approval_due and not other_armed:
             return None
 
         # The decision carries the board it was decided on, so anchor creation
@@ -506,9 +502,10 @@ class FactGatherer:
         prs = self._fetch_tech_lead_prs(watch_label) if batch_armed else []
         all_labels, source_milestones = self._collect_pr_metadata(prs)
 
-        # None means the scope was unobservable; see tech_lead_approval_scope.
+        # A failed approval query may only cost this tick's OWN trigger.
         gated_proposals = observe_approval_backlog_or_none(
-            self.repository_host, self.config, board_issues, scan_observations
+            self.repository_host, self.config, board_issues, scan_observations,
+            decline_on_failure=not other_armed,
         )
         if gated_proposals is None:
             return None

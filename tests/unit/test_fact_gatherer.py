@@ -2157,3 +2157,102 @@ class TestApprovalDiscoveryDoesNotDependOnTheBoard:
             "the approval scope was re-queried one second later; the cadence "
             "is not bounding the cost"
         )
+
+
+class TestAFailedApprovalQueryDoesNotDiscardObservedFacts:
+    """F5: declining to publish must not read to the planner as "nothing armed".
+
+    The approval query is the last thing a tick does. By then the anchor scan
+    may have succeeded and observed an open health-review anchor. Returning
+    None on that failure throws the observation away, and the storm planner —
+    which treats missing facts as "no anchor exists" — mints a duplicate.
+    """
+
+    class _AnchorOkApprovalFails:
+        """Anchor scan succeeds; only the gate-label query raises."""
+
+        def __init__(self, anchor):
+            self._anchor = anchor
+            self.calls: list[dict] = []
+
+        def list_issues(self, **kwargs):
+            self.calls.append(kwargs)
+            if "proposed-tech-lead" in (kwargs.get("labels") or []):
+                from issue_orchestrator.ports.repository_host import (
+                    RepositoryHostError,
+                )
+
+                raise RepositoryHostError("approval query failed")
+            return list(self._anchor)
+
+        def get_prs_with_label(self, *_a, **_k):
+            return []
+
+    def test_the_observed_anchor_survives_an_approval_query_failure(
+        self, mock_config, sample_state
+    ) -> None:
+        """The facts this tick DID gather must not be discarded.
+
+        Propagating is correct here — the anchor scan has always failed this
+        way — and is what stops the snapshot being planned on a half-observed
+        tick. What must not happen is a silent None carrying the planner into
+        duplicate-anchor territory.
+        """
+        from issue_orchestrator.control.health_review_trigger import (
+            HEALTH_REVIEW_MARKER_LABEL,
+        )
+        from issue_orchestrator.ports.repository_host import RepositoryHostError
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead_review_threshold = 5  # batch armed: real facts exist
+        anchor = Issue(
+            number=500,
+            title="Health Review — walk the floor",
+            labels=["agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL],
+        )
+        host = self._AnchorOkApprovalFails([anchor])
+        gatherer = FactGatherer(
+            config=mock_config,
+            repository_host=host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+        with pytest.raises(RepositoryHostError):
+            gatherer.gather_tech_lead_facts(
+                sample_state, board_issues=[], now=1000.0
+            )
+
+    def test_a_quiet_tick_still_declines_quietly(
+        self, mock_config, sample_state
+    ) -> None:
+        """The other side: with nothing else armed, there is nothing to lose.
+
+        Only the approval cadence armed this tick, so a failed query costs its
+        own trigger and nothing more — the board is left as published and the
+        next tick retries, rather than an outage failing the planning cycle.
+        """
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead_review_threshold = 0
+        mock_config.tech_lead.health_review.interval_minutes = 0
+        host = self._AnchorOkApprovalFails([])
+        gatherer = FactGatherer(
+            config=mock_config,
+            repository_host=host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+        assert (
+            gatherer.gather_tech_lead_facts(
+                sample_state, board_issues=[], now=1000.0
+            )
+            is None
+        )
+        # ...and the retry is not deferred: the cadence timestamp is untouched.
+        assert sample_state.tech_lead_approval_scan_at == 0.0

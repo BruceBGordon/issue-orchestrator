@@ -146,8 +146,20 @@ def observe_approval_backlog_or_none(
     repository_host: "RepositoryHost",
     config: "Config",
     *partial: Sequence["Issue"],
+    decline_on_failure: bool = True,
 ) -> tuple[GatedTechLeadProposal, ...] | None:
     """The backlog, or None when this tick could not observe its scope.
+
+    ``decline_on_failure`` must be False whenever the tick has ALREADY gathered
+    facts of its own — an anchor scan, approved ops, promotion updates. None
+    reaches the planner as "nothing armed", which is not merely a missing
+    board: with a problem storm underway it discards the very
+    ``existing_health_review_issue`` this tick observed, and the storm planner
+    mints a DUPLICATE anchor. Declining to publish is a statement about the
+    approval display only; it must never be a statement about facts that were
+    successfully observed (F5). Where those exist, the failure propagates so
+    the snapshot cannot be planned at all, which is how the anchor scan has
+    always behaved.
 
     None means DECLINE TO PUBLISH. The board is rewritten wholesale from the
     facts a tick produces, so publishing a backlog we could not observe is
@@ -162,6 +174,8 @@ def observe_approval_backlog_or_none(
     try:
         return observe_approval_backlog(repository_host, config, *partial)
     except RepositoryHostError as error:
+        if not decline_on_failure:
+            raise
         logger.warning(
             "[tech_lead] approval scope unobservable this tick, board left as "
             "published: %s",
