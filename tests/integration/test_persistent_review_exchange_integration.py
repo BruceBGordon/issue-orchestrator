@@ -880,7 +880,41 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
     )
     prepare_codex_runtime_home()
     prompt_path = tmp_path / "prompt.md"
-    prompt_path.write_text("Stub agent prompt", encoding="utf-8")
+    # A REAL task, because a real model is on the other end.
+    #
+    # Every other test in this file points its agents at "Stub agent prompt",
+    # which is fine when the agent is a scripted stub that never reads it. Here
+    # the reviewer is live codex, and the turn notice it receives says "Read
+    # the full instructions from: <this file>". Given a placeholder, codex did
+    # the correct thing and refused to invent a verdict:
+    #
+    #   "The prompt file contains only 'Stub agent prompt.' I'll wait for the
+    #    orchestrator's review instructions; no response artifacts have been
+    #    written."
+    #
+    # It then waited, the exchange waited for JSON, and the round died at the
+    # 600s timeout as `reviewer_no_completion` — the same signature this test
+    # exists to catch for real submit hangs, which is what made it look like a
+    # mechanics failure. The test was relying on a model being willing to
+    # fabricate a verdict from a placeholder.
+    #
+    # `_bootstrap_git_worktree` already commits a genuine change to review, so
+    # the fix is to point the reviewer at it. The verdict stays UNPINNED, per
+    # this test's contract: the change is trivially fine, and a reviewer that
+    # approves it or requests changes on it are both protocol-valid outcomes
+    # this test accepts.
+    prompt_path.write_text(
+        "Review the change on this branch and submit your verdict.\n"
+        "\n"
+        f"The branch `{_branch}` adds one file, `work.py`, on top of `main`.\n"
+        "Inspect it however you prefer — `git diff main...HEAD` shows the\n"
+        "whole change — then submit your verdict through the response-file\n"
+        "channel described in your setup message.\n"
+        "\n"
+        "The change is deliberately tiny. Judge it on its merits; there is no\n"
+        "expected answer, and any protocol-valid verdict is acceptable.\n",
+        encoding="utf-8",
+    )
 
     # Coder = scripted stub (it only runs if real codex requests changes;
     # the fixture's coder role responds ok by default, no env needed).

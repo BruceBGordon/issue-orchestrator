@@ -31,6 +31,7 @@ from issue_orchestrator.execution.persistent_round_failures import (
     persistent_round_failure_reason,
     persistent_round_idle_trace,
 )
+from issue_orchestrator.execution import persistent_round_write
 from issue_orchestrator.execution.persistent_round_runner import (
     close_persistent_session,
     open_persistent_session,
@@ -606,10 +607,11 @@ class TestPersistentSessionFailureModes:
 
         monkeypatch.setattr(
             prr,
-            "_submit_prompt_with_enter",
+            "submit_prompt_with_enter",
             lambda _session, payload, **_kwargs: (len(payload) + 1, None),
         )
-        monkeypatch.setattr(prr, "_drain_pty_output", lambda _session: 0)
+        monkeypatch.setattr(persistent_round_write, "drain_pty_output", lambda _session: 0)
+        monkeypatch.setattr(prr, "drain_pty_output", lambda _session: 0)
         session = prr.PersistentSession(proc=_Proc(), master_fd=99)  # type: ignore[arg-type]
         clock = _FakeClock()
 
@@ -648,10 +650,11 @@ class TestPersistentSessionFailureModes:
 
         monkeypatch.setattr(
             prr,
-            "_submit_prompt_with_enter",
+            "submit_prompt_with_enter",
             lambda _session, payload, **_kwargs: (len(payload) + 1, None),
         )
-        monkeypatch.setattr(prr, "_drain_pty_output", lambda _session: 0)
+        monkeypatch.setattr(persistent_round_write, "drain_pty_output", lambda _session: 0)
+        monkeypatch.setattr(prr, "drain_pty_output", lambda _session: 0)
         session = prr.PersistentSession(proc=_Proc(), master_fd=99)  # type: ignore[arg-type]
         clock = _FakeClock()
 
@@ -695,10 +698,11 @@ class TestPersistentSessionFailureModes:
 
         monkeypatch.setattr(
             prr,
-            "_submit_prompt_with_enter",
+            "submit_prompt_with_enter",
             lambda _session, payload, **_kwargs: (len(payload) + 1, None),
         )
-        monkeypatch.setattr(prr, "_drain_pty_output", lambda _session: 3)
+        monkeypatch.setattr(persistent_round_write, "drain_pty_output", lambda _session: 3)
+        monkeypatch.setattr(prr, "drain_pty_output", lambda _session: 3)
         session = prr.PersistentSession(proc=_Proc(), master_fd=99)  # type: ignore[arg-type]
         clock = _FakeClock()
 
@@ -736,10 +740,11 @@ class TestPersistentSessionFailureModes:
                 return 3 if _Proc._polls > 1 else None
 
         monkeypatch.setattr(
-            prr, "_submit_prompt_with_enter",
+            prr, "submit_prompt_with_enter",
             lambda _s, payload, **_k: (len(payload) + 1, None),
         )
-        monkeypatch.setattr(prr, "_drain_pty_output", lambda _s: 5)
+        monkeypatch.setattr(persistent_round_write, "drain_pty_output", lambda _s: 5)
+        monkeypatch.setattr(prr, "drain_pty_output", lambda _s: 5)
         response_file = tmp_path / "response.json"
         session = prr.PersistentSession(proc=_Proc(), master_fd=99)  # type: ignore[arg-type]
 
@@ -796,10 +801,11 @@ class TestPersistentSessionFailureModes:
 
         monkeypatch.setattr(
             prr,
-            "_submit_prompt_with_enter",
+            "submit_prompt_with_enter",
             lambda _session, payload, **_kwargs: (len(payload) + 1, None),
         )
-        monkeypatch.setattr(prr, "_drain_pty_output", _drain)
+        monkeypatch.setattr(persistent_round_write, "drain_pty_output", _drain)
+        monkeypatch.setattr(prr, "drain_pty_output", _drain)
         session = prr.PersistentSession(proc=_Proc(), master_fd=99)  # type: ignore[arg-type]
 
         response = send_round(
@@ -896,7 +902,7 @@ class TestWriteFullHandlesNonBlockingPtyWrites:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from issue_orchestrator.execution import persistent_round_runner
-        from issue_orchestrator.execution.persistent_round_runner import (
+        from issue_orchestrator.execution.persistent_round_write import (
             _write_full,  # noqa: PLC2701 — private helper is the contract under test
         )
 
@@ -923,7 +929,7 @@ class TestWriteFullHandlesNonBlockingPtyWrites:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from issue_orchestrator.execution import persistent_round_runner
-        from issue_orchestrator.execution.persistent_round_runner import (
+        from issue_orchestrator.execution.persistent_round_write import (
             _write_full,  # noqa: PLC2701 — private helper is the contract under test
         )
 
@@ -950,7 +956,7 @@ class TestWriteFullHandlesNonBlockingPtyWrites:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from issue_orchestrator.execution import persistent_round_runner
-        from issue_orchestrator.execution.persistent_round_runner import (
+        from issue_orchestrator.execution.persistent_round_write import (
             _write_full,  # noqa: PLC2701 — private helper is the contract under test
         )
 
@@ -972,7 +978,7 @@ class TestWriteFullHandlesNonBlockingPtyWrites:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from issue_orchestrator.execution import persistent_round_runner
-        from issue_orchestrator.execution.persistent_round_runner import (
+        from issue_orchestrator.execution.persistent_round_write import (
             _write_full,  # noqa: PLC2701 — private helper is the contract under test
         )
 
@@ -1010,7 +1016,7 @@ class TestWriteFullHandlesNonBlockingPtyWrites:
             captured["deadline"] = kwargs["deadline"]  # type: ignore[assignment]
             raise PersistentRoundTimeoutError("stop after write deadline capture")
 
-        monkeypatch.setattr(persistent_round_runner, "_write_full", fake_write_full)
+        monkeypatch.setattr(persistent_round_write, "_write_full", fake_write_full)
         session = persistent_round_runner.PersistentSession(
             proc=_Proc(),  # type: ignore[arg-type]
             master_fd=99,
@@ -1051,7 +1057,7 @@ class TestWriteFullHandlesNonBlockingPtyWrites:
                 "within deadline (0 bytes accepted before timeout)"
             )
 
-        monkeypatch.setattr(persistent_round_runner, "_write_full", fake_write_full)
+        monkeypatch.setattr(persistent_round_write, "_write_full", fake_write_full)
         session = persistent_round_runner.PersistentSession(
             proc=_Proc(),  # type: ignore[arg-type]
             master_fd=99,
@@ -1155,7 +1161,7 @@ class TestPromptSubmissionTerminator:
                 raise PersistentRoundTimeoutError("stop after the Enter write")
             return len(payload)
 
-        monkeypatch.setattr(prr, "_write_full", fake_write_full)
+        monkeypatch.setattr(persistent_round_write, "_write_full", fake_write_full)
 
         class _Proc:
             pid = 1
@@ -1202,7 +1208,7 @@ class TestPromptSubmissionTerminator:
         times out (the original tixmeup #277/#290 hang)."""
         from issue_orchestrator.execution import persistent_round_runner as prr
 
-        orig_write_full = prr._write_full  # noqa: SLF001
+        orig_write_full = persistent_round_write._write_full  # noqa: SLF001
 
         def lf_write_full(
             fd: int,
@@ -1230,7 +1236,7 @@ class TestPromptSubmissionTerminator:
                 drain_output=drain_output,
             )
 
-        monkeypatch.setattr(prr, "_write_full", lf_write_full)
+        monkeypatch.setattr(persistent_round_write, "_write_full", lf_write_full)
 
         stub = _write_raw_mode_stub(tmp_path)
         response_file = tmp_path / "response.json"
@@ -1404,4 +1410,106 @@ class TestSendRoundResponseReaderChannel:
         assert stale_file.exists()  # the legacy file is present...
         assert persistent_round_failure_reason(excinfo.value) == (
             RoundFailureReason.PROCESS_EXITED_BEFORE_RESPONSE.value
+        )
+
+
+class TestReadinessDoesNotConsumeTheWriteAllowance:
+    """F1: the readiness wait and the write allowance are different clocks.
+
+    `send_round` used to precompute
+    `write_deadline = started_at + min(timeout_seconds, write_timeout_seconds)`
+    and hand it into the write path — where the readiness gate then runs, and
+    may wait up to 180s against a 30s allowance. A healthy codex bootstrap that
+    becomes ready at 38.4s (the case this branch measured) therefore reached
+    the first write with an expired deadline and failed having written nothing:
+    `0 bytes accepted before timeout`.
+    """
+
+    class _Proc:
+        pid = 456
+
+        def poll(self) -> None:
+            return None
+
+    @staticmethod
+    def _busy_screen():
+        from issue_orchestrator.execution.composer_readiness import LiveComposerScreen
+
+        screen = LiveComposerScreen(rows=40, cols=120)
+        screen.feed(b"\x1b[2J\x1b[H* Working (1s * esc to interrupt)")
+        return screen
+
+    def _capture_first_write_deadline(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        *, ready_at: float, timeout_seconds: float,
+    ) -> float:
+        from issue_orchestrator.execution import composer_readiness, persistent_round_runner
+
+        clock = _FakeClock()
+        clock.value = 0.0
+        screen = self._busy_screen()
+
+        def fake_pump(_session: object, **_kwargs: object) -> bool:
+            # Each poll costs real time, and the agent finishes at ready_at.
+            clock.value += 5.0
+            if clock.value >= ready_at:
+                screen.feed(b"\x1b[2J\x1b[H  ? for shortcuts")
+            return True
+
+        monkeypatch.setattr(
+            composer_readiness, "drain_pty_output_until_quiet", fake_pump
+        )
+
+        captured: dict[str, float] = {}
+
+        def fake_write_full(_fd: int, _payload: bytes, **kwargs: object) -> int:
+            captured["deadline"] = kwargs["deadline"]  # type: ignore[assignment]
+            raise PersistentRoundTimeoutError("stop after deadline capture")
+
+        monkeypatch.setattr(persistent_round_write, "_write_full", fake_write_full)
+
+        session = persistent_round_runner.PersistentSession(
+            proc=self._Proc(),  # type: ignore[arg-type]
+            master_fd=99,
+            composer_screen=screen,
+        )
+        with pytest.raises(PersistentRoundTimeoutError, match="deadline capture"):
+            send_round(
+                session,
+                prompt="hello",
+                response_file=tmp_path / "response.json",
+                timeout_seconds=timeout_seconds,
+                write_timeout_seconds=30.0,
+                now=clock.now,
+                sleep=clock.make_sleeper(),
+            )
+        return captured["deadline"]
+
+    def test_a_slow_bootstrap_still_gets_a_full_write_allowance(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Ready at ~40s must not arrive at the write with 30s already spent."""
+        deadline = self._capture_first_write_deadline(
+            monkeypatch, tmp_path, ready_at=40.0, timeout_seconds=600.0
+        )
+
+        assert deadline > 60.0, (
+            "the write allowance was spent by the readiness wait: deadline "
+            f"{deadline}s, which is what produced '0 bytes accepted before "
+            "timeout' on a healthy agent"
+        )
+
+    def test_the_round_deadline_still_caps_the_write(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Starting the allowance later must not let a round outlive its budget.
+
+        The fix moves when the allowance starts; it must not remove the ceiling.
+        """
+        deadline = self._capture_first_write_deadline(
+            monkeypatch, tmp_path, ready_at=999.0, timeout_seconds=50.0
+        )
+
+        assert deadline == 50.0, (
+            f"write deadline {deadline}s exceeds the round budget of 50s"
         )

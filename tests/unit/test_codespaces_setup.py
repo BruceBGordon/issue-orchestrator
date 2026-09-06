@@ -79,15 +79,25 @@ def test_main_config_uses_raw_validate_pr_as_publish_gate() -> None:
 
     config = Config.load(config_path)
 
-    # This repo opts its lanes into the condor backend; the publish gate
-    # must still target the RAW suite so pre-push validation cannot
-    # re-enter the cache-aware verify-pr wrapper.
-    assert config.validation.quick.cmd == "LANE_EXECUTOR=condor make validate-quick"
+    # The property this test is named for: the publish gate targets the RAW
+    # suite, so pre-push validation cannot re-enter the cache-aware verify-pr
+    # wrapper. `validate-pr` instead of `validate-pr-raw` is the regression,
+    # and it is caught by the suffix.
+    assert config.validation.quick.cmd.endswith("make validate-quick")
     assert config.validation.quick.timeout_seconds == 600
-    assert (
-        config.validation.publish.cmd == "LANE_EXECUTOR=condor make validate-pr-raw"
-    )
+    assert config.validation.publish.cmd.endswith("make validate-pr-raw")
     assert config.validation.publish.timeout_seconds == 1800
+
+    # The lane backend is deliberately NOT pinned. It is a tuning decision that
+    # legitimately changes — it is `direct` today and was `condor` until #7163 —
+    # and pinning it here meant an unrelated tuning change failed a test whose
+    # subject is the make target. Both backends must still be spelled as a
+    # recognised one, so a typo that silently drops the selection still fails.
+    for cmd in (config.validation.quick.cmd, config.validation.publish.cmd):
+        assert cmd.split()[0] in {
+            "LANE_EXECUTOR=direct",
+            "LANE_EXECUTOR=condor",
+        }, f"unrecognised lane backend selection: {cmd!r}"
 
 
 def test_devcontainer_forwards_codespaces_ports() -> None:

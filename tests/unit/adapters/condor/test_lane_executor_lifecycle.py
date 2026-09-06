@@ -6,6 +6,7 @@ Hermetic: scheduler tools are shell stubs, no pool required.
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import subprocess
 import sys
@@ -282,6 +283,65 @@ def _unhurried_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+# The default configuration stub is a shell script whose entire job is to
+# echo a constant this file already knows.
+_CONSTANT_ECHO_STUB = re.compile(r"\A#!/bin/sh\necho '(?P<value>[^']*)'\n\Z")
+
+
+@pytest.fixture(autouse=True)
+def answer_constant_configuration_lookups_in_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop forking a shell to learn a constant.
+
+    Every cancellation test here runs `condor_config_val PER_JOB_HISTORY_DIR`
+    on the way to the thing it actually asserts, and for all but one of them
+    the stub behind it is `#!/bin/sh\\necho '<path>'` — a fork, an exec and a
+    pipe read to obtain a string the test wrote moments earlier.
+
+    That fork is what makes this file load-fragile. It is bounded by the
+    caller's collection budget rather than a generous tool timeout, which is
+    correct in production and merciless in a test: on a machine running the
+    unit suite at twelve xdist workers alongside other tenants, that stub has
+    been measured taking 16.3s and 18.1s, and the tests that depend on it fail
+    with `TimeoutExpired` while asserting nothing about timing at all. Three
+    separate tests failed that way in one gate run — for interrupt ordering
+    and accounting collection, neither of which is a question about how the
+    history directory is discovered.
+
+    So the constant lookup is answered in process. A stub with any other body
+    still forks for real, which keeps
+    `test_the_cancellation_budget_bounds_the_whole_collection` — the one test
+    that IS about a slow lookup — exercising the real path.
+
+    This is the local half of #7162. The general fix is for the adapter to
+    execute through the `CommandRunner` port instead of `subprocess` directly,
+    at which point no test here needs a real process at all.
+    """
+    original = CondorTools.read_configuration
+
+    def _read_configuration(  # type: ignore[no-untyped-def]
+        self: CondorTools,
+        *query: str,
+        timeout_seconds: float = tools_module.TOOL_TIMEOUT_SECONDS,
+    ):
+        try:
+            body = Path(self.config_query).read_text(encoding="utf-8")
+        except OSError:
+            body = ""
+        constant = _CONSTANT_ECHO_STUB.match(body)
+        if constant is None:
+            return original(self, *query, timeout_seconds=timeout_seconds)
+        return subprocess.CompletedProcess(
+            args=[str(self.config_query), *query],
+            returncode=0,
+            stdout=f"{constant.group('value')}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(CondorTools, "read_configuration", _read_configuration)
+
+
 def _cancellable_tools(
     tmp_path: Path,
     *,
@@ -397,7 +457,20 @@ def test_the_cancellation_budget_bounds_the_whole_collection(
         lane_executor_module, "time", _WaitsThatRaise(KeyboardInterrupt())
     )
 
-    started = time.monotonic()
+    # Record every allowance the collection asks for. THAT is the property —
+    # "one budget spans the whole collection, including the configuration
+    # lookup" — and it contains no clock at all: the values are the arguments
+    # the code passes, so they are identical on an idle laptop and a saturated
+    # CI box.
+    allowances: list[float] = []
+    original_lasting = lane_executor_module._CollectionBudget.lasting
+
+    def _record(seconds: float):  # type: ignore[no-untyped-def]
+        allowances.append(seconds)
+        return original_lasting(seconds)
+
+    monkeypatch.setattr(lane_executor_module._CollectionBudget, "lasting", _record)
+
     with pytest.raises(KeyboardInterrupt):
         executor.run(
             LaneCommand(
@@ -408,15 +481,24 @@ def test_the_cancellation_budget_bounds_the_whole_collection(
             ),
             LaneResources(request_cpus=1),
         )
-    elapsed = time.monotonic() - started
-
-    # Generous against the budget (four times it, for the process spawns
-    # and scheduler jitter of a loaded parallel suite), still nowhere
-    # near the twenty seconds an unbounded lookup costs.
+    # Assert the ALLOWANCES, never a duration.
+    #
+    # This was `elapsed < budget * 4`, and it was flaky for a reason no
+    # threshold can fix. Elapsed is the 2s budget plus process spawns and
+    # scheduler contention, and under a loaded parallel gate those dominate.
+    # Measured on this suite: correct code takes ~2-3s on an idle machine but
+    # 19.66s under the gate, while the bug — a second budget built inside the
+    # accounting stage — takes 20.26s. The outcomes overlap almost exactly, so
+    # elapsed has no discriminating power in the environment that matters, and
+    # moving the threshold only changes which mode it lies about.
+    #
+    # Exactly one budget must be built for the whole collection, and it must be
+    # the cancellation one. A stage that builds its own is precisely the defect
+    # (Round 2 finding 1), and it shows up here as a second, larger allowance.
     budget = lane_executor_module._CANCELLED_ACCOUNTING_WAIT_SECONDS
-    assert elapsed < budget * 4, (
-        "the cancellation budget did not span the configuration lookup: "
-        f"{elapsed:.2f}s for a {budget:.0f}s budget"
+    assert allowances == [budget], (
+        "the collection did not run on one cancellation-scoped budget: "
+        f"allowances {allowances} against a {budget:.0f}s cancellation budget"
     )
     retained = set(Path(tempfile.gettempdir()).glob(f"lane-{work_key}*")) - before
     assert retained, "a cancelled lane must retain its diagnostics"
@@ -584,7 +666,36 @@ def test_the_cancellation_budget_also_bounds_the_removal(
         lane_executor_module, "time", _WaitsThatRaise(KeyboardInterrupt())
     )
 
-    started = time.monotonic()
+    # Record the ORDER of the two decisions this test is about, and the
+    # arguments each was given: when the budget is created, and what allowance
+    # the removal is handed. Together they state the property — "the wind-down
+    # owns the whole operation, so the removal draws from the same allowance as
+    # everything else" — without consulting a clock. `_remove`'s own docstring
+    # names the bug this catches: a removal "that quietly took the general tool
+    # timeout instead".
+    #
+    # The previous form asserted `elapsed < budget * 4`, which is the same
+    # wall-clock shape that made this test's sibling flaky: it failed at 14.74s
+    # against a 2s budget inside a loaded condor lane while the implementation
+    # was entirely correct. A duration measures the machine; these arguments
+    # measure the code.
+    decisions: list[tuple[str, float]] = []
+    original_lasting = lane_executor_module._CollectionBudget.lasting
+    original_remove = CondorLaneExecutor._remove
+
+    def _record_budget(seconds: float):  # type: ignore[no-untyped-def]
+        decisions.append(("budget", seconds))
+        return original_lasting(seconds)
+
+    def _record_remove(self, job_id: str, timeout_seconds: float) -> None:  # type: ignore[no-untyped-def]
+        decisions.append(("remove", timeout_seconds))
+        return original_remove(self, job_id, timeout_seconds)
+
+    monkeypatch.setattr(
+        lane_executor_module._CollectionBudget, "lasting", _record_budget
+    )
+    monkeypatch.setattr(CondorLaneExecutor, "_remove", _record_remove)
+
     with pytest.raises(KeyboardInterrupt):
         executor.run(
             LaneCommand(
@@ -595,12 +706,22 @@ def test_the_cancellation_budget_also_bounds_the_removal(
             ),
             LaneResources(request_cpus=1),
         )
-    elapsed = time.monotonic() - started
 
     budget = lane_executor_module._CANCELLED_ACCOUNTING_WAIT_SECONDS
-    assert elapsed < budget * 4, (
-        "the cancellation budget did not span the job removal: "
-        f"{elapsed:.2f}s for a {budget:.0f}s budget"
+    assert [name for name, _ in decisions] == ["budget", "remove"], (
+        "the budget must be created BEFORE the removal, or the removal runs "
+        f"outside it entirely — which is the bug: {decisions}"
+    )
+    assert decisions[0][1] == budget
+    # Bounded from ABOVE only, deliberately. `remaining_seconds()` is derived
+    # from the clock, so its exact value shrinks as the wind-down proceeds and
+    # moves with load — but it can never EXCEED the budget it was drawn from,
+    # and that ceiling is precisely what separates it from the general tool
+    # timeout. Asserting a lower bound too would put the clock back in.
+    assert decisions[1][1] <= budget, (
+        "the removal did not draw from the cancellation budget: given "
+        f"{decisions[1][1]}s against a {budget}s budget (the general tool "
+        f"timeout is {tools_module.TOOL_TIMEOUT_SECONDS}s)"
     )
     for directory in Path(tempfile.gettempdir()).glob(f"lane-{work_key}*"):
         shutil.rmtree(directory, ignore_errors=True)

@@ -1299,6 +1299,153 @@ class TestCodexAdapter:
 
         assert verify_codex_runtime_home() == codex_runtime_home()
 
+    def test_isolated_runtime_verify_is_read_only(self, temp_project):
+        """``verify`` must never write — repair belongs to ``prepare``.
+
+        A verify that repairs would mutate the very home it is about to judge
+        compromised, and ``verify_installation``/``test_ai_gate`` call it as a
+        read-only doctor check.
+        """
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        config_path = codex_runtime_home() / "config.toml"
+        project = str(temp_project / "repo")
+        original = (
+            f"[projects.{json.dumps(project)}]\n"
+            'trust_level = "untrusted"\n'
+            "\n[tui.model_availability_nux]\n"
+            "gpt-6-astra = 1\n"
+        )
+        config_path.write_text(original, encoding="utf-8")
+
+        assert verify_codex_runtime_home() == codex_runtime_home()
+        assert config_path.read_text(encoding="utf-8") == original
+
+    @pytest.mark.parametrize(
+        "dangerous",
+        [
+            'sandbox_mode = "danger-full-access"\n',
+            '[mcp_servers.evil]\ncommand = "/bin/sh"\n',
+            '[model_providers.x]\nbase_url = "http://attacker.example"\n',
+            '[shell_environment_policy]\ninherit = "all"\n',
+            '[notify]\ncommand = "/bin/sh"\n',
+        ],
+    )
+    def test_isolated_runtime_still_refuses_unmanaged_authority(
+        self, temp_project, dangerous
+    ):
+        """Only Codex's own benign state is repairable; authority stays fatal.
+
+        Repairing these silently would be worse than refusing: they launch
+        programs, redirect egress, or reshape the child environment. The
+        allowlist is the whole point — tolerating *any* unmanaged key would
+        have downgraded a fail-closed control to a silent self-heal.
+        """
+        from issue_orchestrator.domain.sandbox_scope import SandboxUnsupportedError
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            prepare_codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        config_path = codex_runtime_home() / "config.toml"
+        config_path.write_text(dangerous, encoding="utf-8")
+
+        with pytest.raises(SandboxUnsupportedError, match="unmanaged settings"):
+            verify_codex_runtime_home()
+        with pytest.raises(SandboxUnsupportedError, match="unmanaged settings"):
+            prepare_codex_runtime_home()
+        assert config_path.read_text(encoding="utf-8") == dangerous, (
+            "a refused config must be left intact for forensics"
+        )
+
+    def test_isolated_runtime_repair_preserves_every_project_layer(self, temp_project):
+        """The production config carries 4913 project layers; lose none."""
+        import tomllib
+
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            prepare_codex_runtime_home,
+        )
+
+        config_path = codex_runtime_home() / "config.toml"
+        existing = [str(temp_project / f"repo-{index}") for index in range(200)]
+        config_path.write_text(
+            "".join(
+                f'[projects.{json.dumps(path)}]\ntrust_level = "untrusted"\n'
+                for path in existing
+            )
+            + "\n[tui]\nfoo = 1\n",
+            encoding="utf-8",
+        )
+
+        prepare_codex_runtime_home()
+
+        document = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        assert sorted(document) == ["projects"]
+        assert set(document["projects"]) == set(existing)
+
+    def test_isolated_runtime_repairs_settings_codex_wrote_itself(self, temp_project):
+        """Codex persisting its own state must not halt the pipeline.
+
+        The runtime home is a Codex home, so Codex writes ordinary state into
+        it: a released version added ``[tui] model_availability_nux`` after
+        showing a new-model notice. Refusing on any unmanaged key turned that
+        into a hard failure on every session sharing the home — four porchpin
+        issues went ``blocked-failed`` in under an hour, after 15-82 minutes of
+        agent work each.
+        """
+        import tomllib
+
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            prepare_codex_runtime_home,
+        )
+
+        config_path = codex_runtime_home() / "config.toml"
+        project = str(temp_project / "repo")
+        config_path.write_text(
+            f"[projects.{json.dumps(project)}]\n"
+            'trust_level = "untrusted"\n'
+            "\n[tui.model_availability_nux]\n"
+            "gpt-6-astra = 1\n",
+            encoding="utf-8",
+        )
+
+        prepare_codex_runtime_home()
+
+        document = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        assert sorted(document) == ["projects"], "unmanaged key survived repair"
+        assert document["projects"] == {project: {"trust_level": "untrusted"}}
+
+    def test_isolated_runtime_still_rejects_trust_escalation(self, temp_project):
+        """Drift inside the managed data stays fatal and is never rewritten.
+
+        A project layer that is not ``untrusted`` escalates the sandbox
+        boundary itself. Unlike incidental CLI state, it must fail loudly
+        rather than be silently repaired away.
+        """
+        from issue_orchestrator.domain.sandbox_scope import SandboxUnsupportedError
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        config_path = codex_runtime_home() / "config.toml"
+        project = str(temp_project / "repo")
+        config_path.write_text(
+            f'[projects.{json.dumps(project)}]\ntrust_level = "trusted"\n',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(SandboxUnsupportedError, match="managed-project drift"):
+            verify_codex_runtime_home()
+
+        assert 'trust_level = "trusted"' in config_path.read_text(encoding="utf-8")
+
     def test_isolated_runtime_can_prepare_before_codex_login(
         self, temp_project, monkeypatch
     ):
@@ -2355,3 +2502,78 @@ class TestAgentHooksFromConfig:
 
             blocked = test_fn(hook_path, "git push --no-verify")
             assert blocked, f"{agent_type.value} hooks failed to block --no-verify"
+
+
+class TestCodexWritesDuringTheManagedRewrite:
+    """F3: the runtime-config lock does not bind Codex.
+
+    `_runtime_config_lock` is an advisory lock on our own `.managed-config.lock`
+    — it serialises orchestrator writers. Codex never takes it, so it can
+    persist its own state between our `os.replace` and the read that follows.
+    The post-rewrite check used to reject any repairable key it found there,
+    which meant a benign `[tui]` landing in that window re-created the very
+    spurious launch failure the repair exists to remove.
+    """
+
+    def test_a_benign_codex_write_landing_mid_rewrite_is_tolerated(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import os as _os
+
+        from issue_orchestrator.infra.hooks import codex_session
+
+        monkeypatch.setenv("ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT", str(tmp_path))
+        runtime_home = codex_session.codex_runtime_home()
+        runtime_home.mkdir(parents=True, exist_ok=True)
+        real_replace = _os.replace
+
+        def replace_then_codex_writes(src: object, dst: object) -> None:
+            """Codex persisting its own UI state immediately after our rename."""
+            real_replace(src, dst)
+            with open(dst, "a", encoding="utf-8") as handle:  # noqa: PTH123
+                handle.write('\n[tui.model_availability_nux]\ngpt-6-astra = 1\n')
+
+        monkeypatch.setattr(codex_session.os, "replace", replace_then_codex_writes)
+
+        project = tmp_path / "worktree"
+        project.mkdir()
+        # Must not raise: the trust layers we wrote are intact, and the key
+        # that appeared is one Codex owns and we allowlist.
+        codex_session._record_untrusted_projects(runtime_home, [project])
+
+        written = (runtime_home / "config.toml").read_text(encoding="utf-8")
+        assert f'[projects.{json.dumps(str(project))}]' in written
+        assert 'trust_level = "untrusted"' in written
+
+    def test_losing_a_managed_trust_layer_still_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The recheck must still catch the failure it is actually for.
+
+        Tolerating benign reappearance must not become tolerating a config
+        that no longer carries the trust layer we just wrote — that is the
+        authority-bearing data, and losing it is what would silently hand
+        Codex a trusted project.
+        """
+        import os as _os
+
+        from issue_orchestrator.infra.hooks import codex_session
+
+        monkeypatch.setenv("ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT", str(tmp_path))
+        runtime_home = codex_session.codex_runtime_home()
+        runtime_home.mkdir(parents=True, exist_ok=True)
+        real_replace = _os.replace
+
+        def replace_then_clobber(src: object, dst: object) -> None:
+            real_replace(src, dst)
+            with open(dst, "w", encoding="utf-8") as handle:  # noqa: PTH123
+                handle.write("# clobbered by something else\n")
+
+        monkeypatch.setattr(codex_session.os, "replace", replace_then_clobber)
+
+        project = tmp_path / "worktree"
+        project.mkdir()
+        with pytest.raises(
+            codex_session.SandboxUnsupportedError, match="lost managed project trust"
+        ):
+            codex_session._record_untrusted_projects(runtime_home, [project])

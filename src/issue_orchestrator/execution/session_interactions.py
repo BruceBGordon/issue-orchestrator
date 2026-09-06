@@ -212,9 +212,31 @@ def _matching_command_tokens(
 
 
 def _trim_command_prefix(tokens: Sequence[str]) -> list[str] | None:
+    """Strip the wrappers a launcher puts in front of the real executable.
+
+    ``exec`` and bare ``FOO=bar`` assignments were handled from the start. The
+    literal ``env`` COMMAND was not, and that is how the codex rules quietly
+    stopped applying: the provider runs codex through an isolated home as
+
+        env CODEX_HOME=<runtime> codex ...
+
+    so ``tokens[0]`` is ``env``, the executable never matched ``codex``, and
+    every codex rule — including the trust-worktree prompt — was silently
+    inert. Nothing failed loudly, because a rule that never matches just never
+    fires.
+    """
     trimmed = list(tokens)
-    while trimmed and (trimmed[0] == "exec" or _looks_like_env_assignment(trimmed[0])):
-        trimmed = trimmed[1:]
+    while trimmed:
+        head = trimmed[0]
+        if head == "exec" or _looks_like_env_assignment(head):
+            trimmed = trimmed[1:]
+            continue
+        # `env` and `/usr/bin/env`, whose own flags we never generate; a flag
+        # we do not understand stops the trim rather than guessing past it.
+        if head.rsplit("/", 1)[-1] == "env":
+            trimmed = trimmed[1:]
+            continue
+        break
     return trimmed or None
 
 
@@ -310,7 +332,17 @@ def _is_codex_interactive_command_tokens(tokens: Sequence[str]) -> bool:
 
 
 def _looks_like_env_assignment(token: str) -> bool:
-    if "=" not in token or token.startswith("-") or "/" in token:
+    """Whether a token is a ``NAME=value`` prefix rather than the executable.
+
+    The test belongs to the NAME. Rejecting any token containing ``/`` also
+    rejected every assignment whose value is a path, which is most of them —
+    `CODEX_HOME=/Users/...` is the one the codex provider actually emits, and
+    it is why the codex interaction rules matched nothing. The slash guard was
+    there to stop a bare path like ``/usr/bin/foo`` being read as an
+    assignment; requiring the name to be a shell identifier does that job
+    exactly, and a path has no ``=`` before its first slash anyway.
+    """
+    key, sep, _ = token.partition("=")
+    if not sep or token.startswith("-"):
         return False
-    key, _, _ = token.partition("=")
-    return bool(key)
+    return key.isidentifier()

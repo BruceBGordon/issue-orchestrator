@@ -130,17 +130,26 @@ cleanup:
     remove_worktrees: true
 
 validation:
-  # This repo opts its validation lanes into the HTCondor backend
-  # (docs/user/condor_lanes.md): run `scripts/condor-personal.sh up`
-  # once per machine. There is no silent fallback — without a pool the
-  # gate fails loudly (exit 78). Override per invocation with
-  # `make ... LANE_EXECUTOR=direct`. The codespaces config keeps the
-  # direct backend.
+  # TEMPORARILY on the direct backend — see #7163.
+  #
+  # The condor backend submits the unit lane with `request_cpus = 3` and then
+  # runs `UNIT_PARALLEL=12` inside that reservation, so the pool schedules the
+  # rest of the gate believing the job is a quarter of its real width. Under
+  # that oversubscription condor's own adapter tests fail, because they fork
+  # shell stubs and wait on them with 10s timeouts. The same suite passes
+  # 14394/14394 on the direct backend on the same machine, so this is the
+  # dispatcher, not the tests.
+  #
+  # Condor lanes are opt-in (#7113) and direct is the baseline path, so this
+  # restores a gate that can pass. Put `LANE_EXECUTOR=condor` back once the
+  # reservation and the worker count are decided together (#7163); the pool
+  # setup in docs/user/condor_lanes.md is unaffected and still works for
+  # `make ... LANE_EXECUTOR=condor` per invocation.
   quick:
-    cmd: LANE_EXECUTOR=condor make validate-quick
+    cmd: LANE_EXECUTOR=direct make validate-quick
     timeout_seconds: 600
   publish:
-    cmd: LANE_EXECUTOR=condor make validate-pr-raw
+    cmd: LANE_EXECUTOR=direct make validate-pr-raw
     # This repo's local publish gate runs the full PR validation slice
     # (unit/integration/web/vscode) and routinely exceeds 300s on busy machines,
     # even without any live agent work in the loop.

@@ -1272,90 +1272,147 @@ def test_generated_sandbox_settings_enforced_by_os(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not _codex_available(), reason="codex CLI not installed")
-@pytest.mark.skipif(
-    sys.platform.startswith("win"),
-    reason="the raw TCP probe uses /bin/bash; native Windows needs a PowerShell probe",
-)
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="seatbelt is macOS-only")
 @pytest.mark.usefixtures("isolated_codex_home")
-def test_generated_codex_profile_enforced_by_os(tmp_path: Path) -> None:
-    isolated_home = Path(os.environ["CODEX_HOME"])
-    if not (isolated_home / "auth.json").is_file():
-        pytest.skip("codex is not authenticated on this host")
-    prepare_codex_runtime_home()
+def test_generated_codex_profile_is_enforced_by_seatbelt(tmp_path: Path) -> None:
+    """The generated profile is enforced by the OS, proven without a model.
 
-    base_repo = tmp_path / "codex-base"
+    ``codex sandbox`` runs a command under seatbelt directly, so no agent is in
+    the loop. That matters: the live-agent probe below asks a model to run the
+    breach command, and Codex 0.153.4 now *declines* it ("I can't run this
+    command because it attempts to read an explicitly denied path") instead of
+    attempting it. A polite refusal demonstrates model compliance, not OS
+    enforcement — the boundary is never reached, so the property goes
+    unverified while the test still appears to cover it.
+
+    Driving seatbelt directly removes that dependence: the kernel either
+    permits the syscall or it does not, and no change in model behaviour can
+    alter the outcome. It also needs no authentication and no network, and
+    finishes in about a second rather than minutes with retries.
+
+    Both directions are asserted deliberately. A profile that denied
+    everything would satisfy a breach-only check while breaking every real
+    session.
+    """
+    worktree = tmp_path / "seatbelt-worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=worktree, check=True)
+
+    outside = tmp_path / "outside-the-workspace.txt"
+    inside = worktree / "inside.txt"
+
+    agent = AgentConfig(
+        prompt_path=Path(".prompts/backend.md"),
+        prompt_relative=".prompts/backend.md",
+        provider="codex",
+        sandbox=True,
+    )
+    scope = compute_session_scope(
+        agent, SandboxScopeContext(task_kind="code", worktree=worktree)
+    )
+    assert scope is not None
+
+    # `codex sandbox` rejects --strict-config. It governs how unknown config
+    # keys are treated rather than forming part of the permissions profile, so
+    # dropping it leaves the generated enforcement exactly intact.
+    scope_argv = [
+        arg for arg in CodexProvider().apply_scope(scope) if arg != "--strict-config"
+    ]
+    script = (
+        f"printf breach > {shlex.quote(str(outside))} 2>/dev/null; echo outside=$?; "
+        f"printf ok > {shlex.quote(str(inside))} 2>/dev/null; echo inside=$?"
+    )
+    result = subprocess.run(
+        ["codex", *scope_argv, "sandbox", "--", "/bin/sh", "-c", script],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+
+    assert "outside=0" not in combined, (
+        f"write outside the workspace was permitted; profile not enforced:\n{combined}"
+    )
+    assert not outside.exists(), (
+        f"breach file exists outside the workspace: {outside}\n{combined}"
+    )
+    assert "inside=0" in combined, (
+        "write inside the workspace was refused; the profile is too strict for "
+        f"real sessions:\n{combined}"
+    )
+    assert inside.read_text(encoding="utf-8") == "ok"
+
+
+# The live-agent variant of the boundary probe lived here and was removed
+# (#7165). It drove real codex at a command that breaches the generated
+# profile and asserted the OS denied it; since 0.153.4 the model declines
+# before running anything, so no command event is emitted and the assertion
+# fails having neither proved nor disproved enforcement. Its mechanism was a
+# model's willingness to attempt a forbidden action, which is not ours to
+# rely on. OS enforcement is proven above by
+# test_generated_codex_profile_is_enforced_by_seatbelt, which drives seatbelt
+# directly and asserts both directions.
+
+
+
+
+@pytest.mark.skipif(not _codex_available(), reason="codex CLI not installed")
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="seatbelt enforcement is macOS-specific"
+)
+def test_the_generated_profile_denies_secrets_network_and_policy_paths(
+    tmp_path: Path,
+) -> None:
+    """Every restriction the removed live probe covered, proven without a model.
+
+    The probe that used to assert these (#7165) drove a real agent at the
+    breach script. The MODEL was only ever the courier — the script is what
+    exercised the boundary, and `codex sandbox` runs it directly. Removing the
+    probe without porting these left workspace-write confinement as the only
+    thing checked, so a profile that lost secret, network, policy and
+    base-checkout protection would still have passed (F4).
+
+    Each restriction gets its own assertion and its own failure message,
+    because "the sandbox is broken" is not an actionable report.
+    """
+    base_repo = tmp_path / "base"
     base_repo.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=base_repo, check=True)
-    (base_repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    (base_repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
     subprocess.run(["git", "add", "tracked.txt"], cwd=base_repo, check=True)
     subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=Sandbox Test",
-            "-c",
-            "user.email=sandbox@example.invalid",
-            "commit",
-            "-q",
-            "-m",
-            "base",
-        ],
-        cwd=base_repo,
-        check=True,
+        ["git", "-c", "user.name=T", "-c", "user.email=t@e.invalid",
+         "commit", "-qm", "seed"],
+        cwd=base_repo, check=True,
     )
-    base_head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=base_repo,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
     base_ref_name = subprocess.run(
-        ["git", "symbolic-ref", "HEAD"],
-        cwd=base_repo,
-        check=True,
-        capture_output=True,
-        text=True,
+        ["git", "symbolic-ref", "HEAD"], cwd=base_repo,
+        capture_output=True, text=True, check=True,
     ).stdout.strip()
     base_ref = base_repo / ".git" / base_ref_name
-    subprocess.run(
-        ["git", "config", "user.name", "Sandbox Test"], cwd=base_repo, check=True
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "sandbox@example.invalid"],
-        cwd=base_repo,
-        check=True,
-    )
     shared_git_config = base_repo / ".git" / "config"
     shared_git_config_before = shared_git_config.read_text(encoding="utf-8")
-    # Captured as bytes for the per-attempt breach check: appending to a ref is
-    # as much a modification as overwriting it, so the whole file must match.
-    base_ref_before = base_ref.read_bytes()
-    worktree = tmp_path / "codex-worktree"
+    base_ref_before = base_ref.read_text(encoding="utf-8")
+
+    # A LINKED worktree, deliberately: its `.git` is a file pointing into the
+    # base checkout, so the profile has to protect a directory the workspace
+    # legitimately references.
+    worktree = tmp_path / "linked-worktree"
     subprocess.run(
-        ["git", "worktree", "add", "-q", "-b", "sandbox-boundary", str(worktree)],
-        cwd=base_repo,
-        check=True,
+        ["git", "worktree", "add", "-q", "-b", "boundary", str(worktree)],
+        cwd=base_repo, check=True,
     )
     assert (worktree / ".git").is_file(), "fixture must exercise a linked worktree"
 
-    outside_dir = tmp_path / "codex-outside"
-    outside_dir.mkdir()
-    secret = outside_dir / "planted-secret.txt"
+    secret = tmp_path / "planted-secret.txt"
     secret_marker = "CODEX_TOPSECRET_64b1"
     secret.write_text(secret_marker + "\n", encoding="utf-8")
-
-    inside = worktree / "inside.txt"
-    escaped = outside_dir / "escaped.txt"
     secret_read = worktree / "secret-read.txt"
-    secret_status = worktree / "secret-status.txt"
-    network_status = worktree / "network-status.txt"
-    commit_result = worktree / "commit-result.txt"
-
     policy_file = worktree / ".codex" / "config.toml"
-    policy_marker = "CODEX_POLICY_ORIGINAL_b72e"
-    policy_file.parent.mkdir(parents=True)
-    policy_file.write_text(f"# {policy_marker}\n", encoding="utf-8")
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text("# managed\n", encoding="utf-8")
+    policy_before = policy_file.read_text(encoding="utf-8")
 
     agent = AgentConfig(
         prompt_path=Path(".prompts/backend.md"),
@@ -1370,151 +1427,137 @@ def test_generated_codex_profile_enforced_by_os(tmp_path: Path) -> None:
     scope = replace(scope, deny_read_files=scope.deny_read_files + (str(secret),))
 
     quote = shlex.quote
-    network_probe = "/bin/bash -c " + quote("exec 3<>/dev/tcp/1.1.1.1/80")
+    # The network check is NOT here: an unreachable endpoint makes every
+    # failure look like enforcement. It needs a live listener and a positive
+    # control, which is a second sandbox run — see the dedicated test below.
     script = "; ".join(
         [
-            f"printf '%s' INSIDE_OK > {quote(str(inside))}",
-            (
-                f"git -C {quote(str(worktree))} add inside.txt > "
-                f"{quote(str(commit_result))} 2>&1 && git -C "
-                f"{quote(str(worktree))} commit -m sandbox-positive >> "
-                f"{quote(str(commit_result))} 2>&1 || true"
-            ),
-            f"(printf '%s' ESCAPED > {quote(str(escaped))}) 2>/dev/null || true",
-            (
-                f"if head -c 4096 {quote(str(secret))} > {quote(str(secret_read))} "
-                f"2>/dev/null; then printf '%s' READABLE > {quote(str(secret_status))}; "
-                f"else printf '%s' DENIED > {quote(str(secret_status))}; fi"
-            ),
-            (
-                f"if {network_probe} 2>/dev/null; then printf '%s' OPENED > "
-                f"{quote(str(network_status))}; else printf '%s' DENIED > "
-                f"{quote(str(network_status))}; fi"
-            ),
-            f"(printf '%s' TAMPERED > {quote(str(policy_file))}) 2>/dev/null || true",
-            (
-                f"(printf '%s' TAMPERED > {quote(str(shared_git_config))}) "
-                "2>/dev/null || true"
-            ),
-            (f"(printf '%s' {'0' * 40} > {quote(str(base_ref))}) 2>/dev/null || true"),
+            f"if head -c 4096 {quote(str(secret))} > {quote(str(secret_read))} "
+            f"2>/dev/null; then echo secret=READABLE; else echo secret=DENIED; fi",
+            f"(printf TAMPERED > {quote(str(policy_file))}) 2>/dev/null; "
+            "echo policy=$?",
+            f"(printf TAMPERED > {quote(str(shared_git_config))}) 2>/dev/null; "
+            "echo gitconfig=$?",
+            f"(printf '%s' {'0' * 40} > {quote(str(base_ref))}) 2>/dev/null; "
+            "echo baseref=$?",
         ]
     )
-    exact_command = "/bin/sh -c " + quote(script)
-    prompt = (
-        "This is an automated sandbox test. Use the exec tool exactly once to run "
-        f"this exact command, without changing it:\n{exact_command}\n"
-        "Do not use any other tool. After the command finishes, reply DONE."
+    scope_argv = [
+        arg for arg in CodexProvider().apply_scope(scope) if arg != "--strict-config"
+    ]
+    result = subprocess.run(
+        ["codex", *scope_argv, "sandbox", "--", "/bin/sh", "-c", script],
+        cwd=worktree, capture_output=True, text=True, timeout=120,
     )
-    cmd = CodexProvider().build_command(
-        prompt=prompt,
-        model=None,
-        sandbox_scope=scope,
-        execution_mode="exec",
-        json_output="true",
-    )
-    # Same retry owner and the same standard as the Claude probes: an agent that
-    # never ran the exec is an interaction that did not exercise the boundary,
-    # not a boundary failure.
-    #
-    # THE SINKS ARE ALSO THE BREACH RECORD. secret-read holds the secret when
-    # the read was ALLOWED, secret-status holds READABLE, network-status holds
-    # OPENED — and all three are result sinks the reset clears for a retry. A
-    # leaking attempt that then timed out would be erased and a clean retry
-    # would report a pass over the top of it. Naming them in breach_checks is
-    # what captures them on every attempt, before any reset can run.
-    probe = _run_probe(
-        cmd,
-        cwd=worktree,
-        timeout=180,
-        evidence=AllEvidence(
-            (
-                _CodexRanCommand(inside),
-                CreatedPaths((inside, secret_read, secret_status, network_status)),
-            )
-        ),
-        breach_checks=_codex_breach_checks(
-            escaped=escaped,
-            secret_read=secret_read,
-            secret_marker=secret_marker,
-            secret_status=secret_status,
-            network_status=network_status,
-            policy_file=policy_file,
-            policy_marker=policy_marker,
-            shared_git_config=shared_git_config,
-            shared_git_config_before=shared_git_config_before,
-            base_ref=base_ref,
-            base_ref_before=base_ref_before,
-        ),
-        observed_paths=(inside, commit_result),
-    )
-    result = probe.result
-    combined = probe.combined_output
+    combined = f"{result.stdout}\n{result.stderr}"
 
-    if not inside.exists():
-        lowered = combined.lower()
-        if any(sign in lowered for sign in _SANDBOX_UNAVAILABLE_SIGNS):
-            pytest.skip(f"Codex sandbox unavailable on this host: {combined[:400]}")
-        if "please run codex login" in lowered or "not logged in" in lowered:
-            pytest.skip("codex is not authenticated on this host")
-
-    # Every attempt's breach evidence first, then the completion requirement —
-    # owner-enforced, so a leak on a killed attempt cannot be masked by the
-    # timeout nor erased by the retry's reset.
-    probe.require_intact()
-
-    # Non-vacuous execution proof: structured output must contain the completed
-    # command event, and the in-worktree side effect must land with exact content.
-    command_events = _codex_command_events(result.stdout or "")
-    assert command_events, (
-        "Codex emitted no completed command event; the boundary was never "
-        f"exercised, after {len(probe.attempts)} attempt(s): "
-        f"{probe.missing_evidence}\nrc={result.returncode}\n"
-        f"output:\n{combined[:1200]}"
+    assert "secret=DENIED" in combined, (
+        f"an explicitly denied file was readable inside the sandbox:\n{combined}"
     )
-    assert any(str(inside) in event.command for event in command_events), (
-        f"Codex did not execute the requested probe command: {command_events}"
+    # The sink is also the breach record: if the read was permitted, the
+    # secret is sitting in the workspace regardless of what the status line
+    # said, so check the file rather than trusting the echo.
+    leaked = secret_read.read_text(encoding="utf-8") if secret_read.exists() else ""
+    assert secret_marker not in leaked, (
+        f"the denied secret leaked into the workspace at {secret_read}"
     )
-    assert inside.read_text(encoding="utf-8") == "INSIDE_OK"
-
-    worktree_head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=worktree,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    commit_output = (
-        commit_result.read_text(encoding="utf-8")[:800]
-        if commit_result.exists()
-        else "(git did not produce an output file)"
-    )
-    assert worktree_head != base_head, (
-        "Codex could edit the linked worktree but could not commit its current "
-        f"branch. git output:\n{commit_output}"
-    )
-    assert base_ref.read_text(encoding="utf-8").strip() == base_head, (
-        "SANDBOX BREACH: Codex modified the base checkout's branch ref"
+    assert policy_file.read_text(encoding="utf-8") == policy_before, (
+        f"the session's own codex policy file was modifiable:\n{combined}"
     )
     assert shared_git_config.read_text(encoding="utf-8") == shared_git_config_before, (
-        "SANDBOX BREACH: Codex modified shared Git config"
+        f"the shared git config of the base checkout was modifiable:\n{combined}"
     )
-    assert (
-        subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=base_repo,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        == base_head
-    ), "SANDBOX BREACH: Codex moved the base checkout's HEAD"
+    assert base_ref.read_text(encoding="utf-8") == base_ref_before, (
+        f"a base-checkout ref was modifiable from the linked worktree:\n{combined}"
+    )
 
-    assert not escaped.exists(), (
-        f"SANDBOX BREACH: Codex wrote outside its worktree ({escaped})"
-    )
-    assert secret_status.read_text(encoding="utf-8") == "DENIED"
-    assert secret_marker not in secret_read.read_text(encoding="utf-8")
-    assert network_status.read_text(encoding="utf-8") == "DENIED"
-    assert policy_marker in policy_file.read_text(encoding="utf-8"), (
-        "SANDBOX BREACH: Codex modified its own .codex/config.toml"
-    )
+
+@pytest.mark.skipif(not _codex_available(), reason="codex CLI not installed")
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="seatbelt enforcement is macOS-specific"
+)
+def test_the_generated_profile_denies_a_reachable_tcp_endpoint(tmp_path: Path) -> None:
+    """Network denial, distinguished from a connection that would fail anyway.
+
+    The previous probe dialled a public address and treated every nonzero exit
+    as enforcement. That passes when the sandbox permits networking and the
+    endpoint merely refuses — demonstrated in review by keeping a permissive
+    profile and pointing the probe at a bound-but-not-listening port, which
+    made the whole test pass. It could also wait out the subprocess timeout if
+    traffic were dropped rather than refused.
+
+    So the endpoint is a real listener owned by this test, alive for both
+    runs, and the same probe runs twice against it:
+
+    1. **Positive control** — a permissive profile (``egress="model+web"``,
+       which is what sets ``network = { enabled = true }``) MUST connect. If
+       it cannot, the listener or the probe is broken and this test fails as
+       a broken test rather than quietly reporting a secure sandbox.
+    2. **The assertion** — the generated restricted profile must NOT connect.
+
+    Only the policy differs between the two runs, so the difference is
+    attributable to it. The connect is bounded at 3s inside the probe, so a
+    dropped packet costs seconds rather than the subprocess timeout.
+    """
+    import socket
+
+    worktree = tmp_path / "net-worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=worktree, check=True)
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)          # genuinely accepting, not merely bound
+    port = listener.getsockname()[1]
+    try:
+        probe = (
+            "import socket,sys\n"
+            "s=socket.socket(); s.settimeout(3.0)\n"
+            "try:\n"
+            f"    s.connect(('127.0.0.1', {port})); print('net=OPENED')\n"
+            "except Exception as exc:\n"
+            "    print('net=BLOCKED:'+type(exc).__name__)\n"
+        )
+        agent = AgentConfig(
+            prompt_path=Path(".prompts/backend.md"),
+            prompt_relative=".prompts/backend.md",
+            provider="codex",
+            sandbox=True,
+        )
+        restricted = compute_session_scope(
+            agent, SandboxScopeContext(task_kind="code", worktree=worktree)
+        )
+        assert restricted is not None
+
+        def _run(scope: object) -> str:
+            argv = [
+                arg
+                for arg in CodexProvider().apply_scope(scope)  # type: ignore[arg-type]
+                if arg != "--strict-config"
+            ]
+            done = subprocess.run(
+                ["codex", *argv, "sandbox", "--", sys.executable, "-c", probe],
+                cwd=worktree, capture_output=True, text=True, timeout=60,
+            )
+            return f"{done.stdout}\n{done.stderr}"
+
+        permissive = _run(replace(restricted, egress="model+web"))
+        assert "net=OPENED" in permissive, (
+            "POSITIVE CONTROL FAILED: the probe could not reach a listener on "
+            "this machine even with networking permitted, so this test cannot "
+            "distinguish sandbox enforcement from an unreachable endpoint. "
+            f"Fix the fixture, do not read this as a secure sandbox:\n{permissive}"
+        )
+
+        denied = _run(restricted)
+        assert "net=OPENED" not in denied, (
+            "the restricted profile permitted a TCP connection to a listener "
+            f"the positive control just reached; network policy is not "
+            f"enforced:\n{denied}"
+        )
+        assert "net=BLOCKED:" in denied, (
+            f"the probe produced no verdict under the restricted profile:\n{denied}"
+        )
+    finally:
+        listener.close()
