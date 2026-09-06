@@ -19,12 +19,13 @@ GitHub write.
 > path must be unable to finish teardown until the disposition of any
 > completed-and-validated work is durably recorded.
 
-"Completed and validated" means, and only means, orchestrator-owned evidence:
+"Completed and validated" means, and only means, orchestrator-owned evidence
+registered by §5's required intake/validator producer, not mere path ownership:
 
-- a completion record the orchestrator itself preserved (the run-scoped copy under
+- an intake-attested completion record the orchestrator itself preserved (the run-scoped copy under
   `SessionRunAssets.run_dir`, or a record referenced by the run manifest) that
   parses as `CompletionOutcome.COMPLETED` and requests `PUSH_BRANCH`/`CREATE_PR`;
-- a validation record that record points at, with `passed=true`, carrying its own
+- a validator-attested validation record that record points at, with `passed=true`, carrying its own
   `head_sha`;
 - that exact `head_sha` resolving to a commit in the repository's object store.
 
@@ -232,6 +233,7 @@ class ValidatedWorkIdentity:
     review_disposition: ReviewDisposition
     exchange_terminal: ReviewExchangeTerminalState | None  # e.g. STOPPED/MAX_ROUNDS
     branch_binding_verified: bool        # False when HEAD was detached (#7017)
+    reviewer_proof_digest: str | None    # required for EXCHANGE_APPROVED (§5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -665,7 +667,7 @@ peers). When a published head `H` exists for the lineage key:
 | New head vs. published `H` | Result |
 |---|---|
 | ancestor of `H`, or equal to it | escrow re-verified ⇒ `RECOVERED(CONTAINED_IN_PUBLISHED_HEAD)` with `published_head_sha = H`, immediately and without ever being `QUEUED`; escrow fails to verify ⇒ `FAILED(ARTIFACT_HASH_MISMATCH)`, unresolved |
-| descendant of `H` | `HEAD`, drainable, **sequenced from the proven baseline**: `expected_remote_head := H`, permitted only when the new row's captured expectation is `H` itself or the lineage's `published_pre_push_expected` — the same two-durable-records proof the in-flight waiter rule uses. Anything else ⇒ `PARKED(REMOTE_BASELINE_UNPROVEN)` |
+| descendant of `H` | `HEAD`, subject to its persisted evidence admission gate, **sequenced from the proven baseline**: `expected_remote_head := H`, permitted only when the new row's captured expectation is `H` itself or the lineage's `published_pre_push_expected`. This baseline proof never overrides required approval. Anything else ⇒ `PARKED(REMOTE_BASELINE_UNPROVEN)` |
 | divergent from `H` | `PARKED(DIVERGENT_VALIDATED_HEADS)`. A published divergent head is never published over automatically |
 | ancestry unanswerable | `FAILED(VALIDATION_SHA_MISMATCH)` |
 
@@ -696,7 +698,7 @@ never observable in a state its predecessor has already left:
 
 | Predecessor reached | Waiter is | Waiter becomes |
 |---|---|---|
-| `RECOVERED` at `H` | a descendant of `H` | `HEAD`, `QUEUED` — **and its compare-and-set baseline is advanced to `H`**, but only under the proof below |
+| `RECOVERED` at `H` | a descendant of `H` | `HEAD`, with its persisted evidence admission gate restored — **and its compare-and-set baseline is advanced to `H`**, but only under the proof below. Only evidence originally eligible for automatic publication becomes `QUEUED`; approval-required evidence stays `PARKED`. |
 | `RECOVERED` at `H` | an ancestor of `H` | `RECOVERED(CONTAINED_IN_PUBLISHED_HEAD)` if its escrow still verifies, else `FAILED(ARTIFACT_HASH_MISMATCH)` — never resolved by inference |
 | `RECOVERED` at `H` | divergent from `H` | `PARKED(DIVERGENT_VALIDATED_HEADS)` |
 | `FAILED` or `ABANDONED` | any | classified by §2.1.4's ordinary admission rules against the predecessor's **unpublished** head. No baseline moves — nothing was published, so the waiter's captured expectation still stands. |
@@ -741,6 +743,22 @@ leaves the others parked for an explicit choice, which is the correct answer to
 "these two validated heads are incompatible".
 
 **At most one drainable row per lineage key**, enforced durably:
+
+**Lineage eligibility never grants publication authority.** The persisted
+`initial_state`/`initial_failure`/`initial_reason` on the CURRENT evidence are the
+admission gate; lineage classification is an additional gate. Every descendant
+promotion, waiter release, attached-evidence promotion and late admission restores
+that evidence gate before applying the lineage restriction. `HEAD` means the row
+may be considered, not that it is `QUEUED`. In particular, a waiter captured with
+`WORKTREE_AHEAD_OF_VALIDATION`, detached branch binding, or historical operator
+intake remains `PARKED` after its predecessor succeeds. Neither a proven baseline
+advance nor removal of a lineage restriction is an approval. An explicit recovery
+command may override an approval-required gate only after §4.3 check 0; automatic
+reclassification cannot reuse such consent after the evidence or observations
+change. All transitions call this same gate-composition rule, including
+`resolve_attached_evidence()`, so copying an initial `QUEUED` state cannot bypass an
+existing divergent/ancestor restriction either. Tests exercise the cross-product
+of admission gate and lineage outcome, not just ancestry alone.
 
 ```sql
 CREATE UNIQUE INDEX IF NOT EXISTS ux_validated_work_lineage_head
@@ -1545,6 +1563,7 @@ CREATE TABLE IF NOT EXISTS validated_work_records (
     owner_claimed_at      TEXT NOT NULL DEFAULT '',   -- diagnostics/UI only, never authority
     stop_reserved_fence   INTEGER NOT NULL DEFAULT -1, -- §8.4; -1 = no reservation
     stop_reserved_engine  TEXT NOT NULL DEFAULT '',    -- the engine the stop targets
+    stop_reservation_id   TEXT NOT NULL DEFAULT '',    -- unique, never shared by callers
     stop_reserved_at      TEXT NOT NULL DEFAULT '',
     state                 TEXT NOT NULL,              -- ValidatedWorkState
     failure               TEXT NOT NULL DEFAULT '',   -- ValidatedWorkFailure
@@ -2520,7 +2539,7 @@ def relinquish_claim(self, claim: ValidatedWorkClaim) -> bool: ...
     bumps the fence, letting the next drain proceed without waiting for a death
     proof. There is no counterpart that takes a claim from someone else.
 
-    Returns False (`STOP_RESERVED`) while a §8.4 stop reservation is live for
+    Returns False while a §8.4 stop reservation is live for
     this fence: an operator is stopping this engine *because* it owns this
     record, and letting it hand the claim off mid-flight would make that stop
     hit an engine that no longer owns it."""
@@ -3001,7 +3020,7 @@ The stages, in order — the inverse of today's:
 |---|---|---|
 | 1 | Apply the **review routing label** (`pr-pending`, or the review-queue transition the discovered review drives) and append the review candidate + completed history to `OrchestratorState`. | — |
 | 2 | Re-read labels fresh and require the routing label present (write-then-observe, ADR-0002). | `REVIEW_ROUTED` |
-| 3 | Remove `recovery-pending` and **only** the labels in `observed_blocking_labels`. | `RECOVERY_CLEARED` |
+| 3 | Release this record's recovery block through the issue-aggregate reconciliation in §7; remove `recovery-pending` only if no other record holds it, and clear only this record's observed blockers that no remaining owner holds. | `RECOVERY_CLEARED` |
 | 4 | Mark the record `RECOVERED` (with §2.1.4's ancestor resolution in the same transaction). | `COMPLETE` |
 
 A crash at any point leaves `recovery-pending` present until stage 3, so the issue
@@ -3155,6 +3174,16 @@ enforced mechanically (§9).
 
 Admission answers: *which bytes on disk may become executable authority?*
 
+`ReviewDisposition.EXCHANGE_APPROVED` requires separate owner-attested reviewer
+evidence: the exact reviewed SHA equals `validated_head_sha`, reviewer session/run
+identity and approved decision/report hashes match the completed exchange, and
+both review and validation satisfy the active review-cache boundary (including a
+scratch reset). An `OK`/`REVIEWER_OK` terminal enum or publication approval alone
+does not prove any of those facts. Missing reviewer proof routes through ordinary
+PR review; contradictory/corrupt proof fails admission rather than silently
+granting approval. The immutable evidence includes the bound reviewer proof digest
+when this disposition is selected, so changing the approval changes `evidence_id`.
+
 **The candidate set is bounded by the command, not by the filesystem.** Admission
 considers exactly the runs in `AutomaticCaptureCommand.run_evidence.runs` (§2.5) —
 each an exact `SessionRunAssets` recorded by the owner that allocated it. It never
@@ -3164,10 +3193,134 @@ unreadable ledger raised before admission was ever reached.
 
 **Admissible sources within each such run, in this order:**
 
-1. The run-scoped durable completion copy at
-   `SessionRunAssets.completion_record_copy.path` (orchestrator-written).
-2. A completion record referenced by the orchestrator-owned run manifest
-   (`SessionRunAssets.manifest`), whose resolved path is contained by `run_dir`.
+1. An immutable completion intake entry registered by the orchestrator for the
+   exact `SessionRunAssets`, with its content hash and validator attestation.
+2. The run-scoped completion copy or manifest-referenced record, but only when
+   matched to that same registered intake entry. Containment alone is not proof
+   that the orchestrator admitted those bytes.
+
+**The trusted producer is required implementation, not existing behavior.**
+`CompletionRecord.validation_record_path` already exists
+(`domain/models.py:456`), but `CompletionProcessor._attach_validation_artifacts()`
+copies validation into `run_assets.validation_artifacts.record_path` and updates
+the manifest without rewriting that completion field. Moreover,
+`preserve_completion_record()` (`control/completion_result_artifacts.py:158`) runs
+only after parsing and pre-action policies succeeded
+(`control/completion_processor.py:824-853`); failed ingestion can therefore leave
+no preserved copy at all. The existing best-effort audit copy cannot establish
+this design's intake guarantee.
+
+Extend the run-evidence owner with a typed `CompletionEvidenceIntake` boundary,
+called by the orchestrator's completion intake before canonical-record selection
+or any terminal failure can discard the submission. It registers every completion
+submission for the exact allocated run, including a corrected side submission,
+with an immutable entry id, receive order, raw artifact hash and source provenance.
+The launch owner supplies the run identity; agent `session_id`, timestamps and
+paths cannot choose it. Invalid JSON remains an inspectable rejected entry and
+does not hide a later valid entry. CLI-written files remain untrusted until this
+owner registers them; the CLI cannot write the authority ledger.
+
+The concrete producer path is a new authenticated run-scoped
+`POST /api/completion/submissions`: `coding-done` sends a typed
+`SubmitCompletionEvidence(raw_bytes, content_sha256)` using the run-bound
+capability provisioned at launch. The server resolves that capability to the
+allocated `SessionRunAssets`; no payload field selects a run. Its typed
+`CompletionIntakeReceipt(entry_id, content_sha256)` is returned only after durable
+registration. The processing queue consumes the receipt id, never re-selects a
+canonical filename. A later corrected submission receives a second receipt even
+if the first failed schema validation. Unavailable intake returns an explicit
+failure and leaves the raw candidate intact; the CLI cannot claim successful
+submission without a receipt. Bootstrap injects the same intake owner into this
+handler, completion processing and terminal capture; validation completion calls
+`attest_validation` for the receipt that caused that validation. Endpoint auth,
+run capability expiry and terminal intake closure share the run owner: capture
+closes new submissions and drains already-accepted receipts before releasing
+runtime, so a late accepted receipt cannot arrive after the candidate set freezes.
+
+The intake ledger is part of `SqliteIssueRunLedger`, not a second filesystem
+discovery mechanism. Its immutable authority rows and validator attestations live
+under the repository-owned state directory outside all agent worktrees; manifests
+inside a worktree are locators whose hashes must match, never authority. Its API is:
+
+```python
+class CompletionEvidenceIntake(Protocol):
+    def register_submission(
+        self, run: SessionRunAssets, submission: OwnedCompletionSubmission
+    ) -> CompletionIntakeEntry: ...
+    def attest_validation(
+        self, entry_id: str, result: OwnedValidationResult
+    ) -> CompletionIntakeEntry: ...
+    def entries_for_run(self, run: SessionRunIdentity) -> tuple[CompletionIntakeEntry, ...]: ...
+```
+
+The additional tables belong to `issue_run_ledger.sqlite`; they do not change the
+four disposition tables in §4.1:
+
+| Table | Required durable fields / constraints |
+|---|---|
+| `completion_intake_entries` | `entry_id` primary key; `run_key` foreign key to the allocated run; `submission_key`, `receive_sequence`, `raw_sha256`, `byte_size`, state-directory artifact locator, parse status, normalization version, normalized completion hash/locator. Unique `(run_key, submission_key)` makes a retried POST return the same receipt; changed bytes under that key are rejected. Receipt order is owner-assigned, never the agent timestamp. |
+| `completion_validation_attestations` | `entry_id` primary/foreign key; exact `run_key`, raw/normalized completion hashes, full `head_sha`, validator/config digest, validation-result hash/locator, outcome and recorded time. One immutable attestation per entry; another validation creates a new entry rather than rewriting authority. |
+
+`SubmitCompletionEvidence` also carries the client's stable `submission_key`;
+each intentional correction uses a new key. Nullable normalized fields exist
+only for rejected/unprocessed raw entries and cannot pass admission. Startup
+repairs durable intake envelopes before processing receipts or termination, checks
+all hashes against ledger rows, resumes accepted-but-unprocessed entries and
+refuses corrupt/missing authority. Run release and intake artifact retention are
+one owner operation: no run or attestation is released while a referencing
+disposition remains unresolved.
+
+`OwnedCompletionSubmission` is the intake adapter's registered submission event
+and immutable captured bytes, not a path supplied by a completion JSON field.
+`OwnedValidationResult` comes only from the existing configured validation
+execution boundary (`control/validation.py:ValidationRunner.run`), and binds the
+exact run, completion hash, validator/config identity, full commit SHA and result
+hash. A validation JSON with `passed=true` is not sufficient without that match.
+The validator's output is durably copied before success is attested; failed copy
+or ledger write aborts terminal teardown. Producer entries use fsync/atomic rename
+followed by ledger insertion and self-describing orphan repair, as in §2.1.2.
+No authority depends on an agent's ability to edit a run-directory manifest.
+
+The intake owner retains raw completion bytes outside the worktree for audit and
+writes a separate normalized admitted completion whose `validation_record_path`
+names the immutable run-contained validation copy certified by the attestation.
+Both hashes and the normalization version are recorded. It never follows or trusts
+the raw field as authority. §5 selection and evidence hashing use the normalized
+copy plus the attestation-bound validation bytes, with source hashes retained in
+the intake entry. The completion still expresses untrusted intent: requested
+actions must include `PUSH_BRANCH` or `CREATE_PR`, and all policy checks still run.
+
+**Historical sidecars require explicit import and fresh validation.** An existing
+unregistered side artifact does not become trustworthy because it is run-scoped,
+newer, or named by an editable manifest. Add an operator-only historical-intake
+command on the same owner: the operator identifies the repository, issue, branch,
+exact commit and candidate artifact hash/path. The intake adapter reads it as
+untrusted bytes, verifies the selected repository/branch/commit through
+`WorkingCopy`, and allocates a fresh recovery run through the run-evidence owner.
+It executes the repository's configured validation at that exact commit in an
+isolated workspace, then produces the same normalized completion and validator
+attestation through `CompletionEvidenceIntake`. No agent-supplied successful
+validation result is imported as authority. Missing objects, invalid completion,
+failed validation or unavailable prerequisites refuse admission and preserve the
+candidate for inspection. A successful historical intake always admits `PARKED`
+evidence; a separate snapshot-bound recovery approval authorizes publication.
+This gives slice 8 an executable backfill route without pretending pre-ledger
+artifacts were already registered, and without granting agent prose authority.
+
+The concrete historical surface is the new operator-authenticated
+`POST /api/validated-work/intake`, dispatched through the existing typed command
+handler pattern into `import_historical(command) -> HistoricalIntakeOutcome` on
+the intake owner. `HistoricalIntakeCommand` requires `repo_slug`, positive
+`issue_number`, exact `branch_name`, full `target_head_sha`, absolute normalized
+`candidate_path`, `candidate_sha256`, operator `actor` and reason. The selected
+repository comes from configured repository identity, never from the file or
+agent command text. The outcome is discriminated: `PARKED` carries the new
+`record_id`/`evidence_id`, `REFUSED` carries an enumerated admission reason, and
+`VALIDATION_FAILED` carries the owned failed validation reference. The handler
+does not execute a caller-supplied shell command or grant publication approval.
+Tests cover operator request-to-owner mapping and owner outcome-to-HTTP response,
+including path/hash replacement, wrong repository, failed validation and a
+successful `PARKED` intake followed by separate snapshot-bound recovery.
 
 **Inadmissible, always:** any path the agent chose that is not one of the above; any
 path outside the run directory; symlinks escaping the run directory; the
@@ -3306,14 +3459,57 @@ Rules:
 Applied **only after their corresponding effect succeeds** (ADR-0013: labels are
 crash-safe truth, so a label must never claim an effect that did not happen).
 
+**Labels belong to the issue; dispositions belong to records.** All label rows
+below express release of the transitioning record's interest, not an unconditional
+issue-wide removal. One issue can have several divergent records, or records on
+different branches. Recovering or abandoning one must leave `recovery-pending`
+present while any other record remains unresolved. A `FAILED` cause is likewise
+owned per record: its durable cause source includes `record_id`, and withdrawal
+names only that source. The needs-human owner still aggregates across all causes.
+
+`ValidatedWorkDispositionService.reconcile_issue_block(issue_number)` is the one
+behavior that derives and applies this projection. Stage 3 may exclude its own
+claim-bound record only after its publication and `REVIEW_ROUTED` are proven;
+every other unresolved record still holds the block, including ancestors not yet
+resolved by the publication transaction. After resolution, abandonment, admission,
+or failure, this same behavior runs again. It also runs on every drain for issues
+with retained record rows, so a crash between a durable transition and its label
+write converges without requiring a fresh recovery command. Failed writes remain
+pending reconciliation; durable records are never discarded because the label
+temporarily disagrees. `RECOVERY_CLEARED` means this record released its interest,
+not that the issue's aggregate label is necessarily absent.
+
+Admission and aggregate label writes are serialized by one issue-scoped mutation
+gate owned by the disposition service. Its narrow `IssueDispositionMutationGate`
+port provides a context-managed `try_acquire(repo_slug, issue_number)` lease; the
+same-host adapter uses an exclusive kernel file lock under the repository state
+directory, with no timeout takeover, inheritance into child processes, or network
+filesystem support. Busy acquisition returns a typed retry/refusal and teardown
+fails closed; it never blocks shutdown indefinitely. The fresh aggregate read and GitHub
+write occur while that gate is held: a new sibling cannot be admitted between the
+last-holder check and label removal. Acquisition order is record claim, then issue
+gate. A finalizer retains its record claim throughout. No operation holding the
+issue gate may wait for or acquire a record claim: admission attaches/refuses when
+the record is owned, while abandon or reconciliation returns a retry/refusal and
+may acquire the record first on its next invocation. This gate covers only admission
+and short label/transition operations, not validation or publication subprocesses.
+The projection handles resolution of contained ancestors in one pass after the
+store transaction; entrypoints and the finalizer never assemble sibling counts.
+
+Observed blocking labels are not a license to remove another owner's active
+block. Shared `needs-human` labels are cleared only through their owner, and
+recording/withdrawing `VALIDATED_WORK_DISPOSITION` cannot clear a separate cause.
+Other captured blockers are retained while another unresolved disposition still
+holds the issue; clearing is deferred to the aggregate's final release.
+
 | Transition point | Effect that must succeed first | Labels |
 |---|---|---|
 | Evidence recorded (`QUEUED`/`PARKED`) | durable record + escrow committed | add `recovery-pending` (new, `LabelCategory.BLOCKING`). Existing blocking label is **kept** — the issue is not unblocked by being owned. |
 | Admission to publish (`PUBLISHING`) | durable CAS to `PUBLISHING` succeeded | **no label change.** The previous draft added `publish-failed` here purely to satisfy the manual path's `board_block_reason()` precondition; §4.6 removes that round-trip, so the issue is no longer marked with a failure it did not have. |
 | Review routing (stage 1–2 of §4.5b) | remote head == `validated_head_sha`, PR open | apply `pr-pending`/the review-queue transition **first**, and observe it. `recovery-pending` is still present throughout. |
-| Publication + review routing durable (`RECOVERED`) | `finalization_phase == REVIEW_ROUTED` recorded | *then* remove `recovery-pending`; remove **only** the labels in `observed_blocking_labels`. |
+| Publication + review routing durable (`RECOVERED`) | `finalization_phase == REVIEW_ROUTED` recorded | Release this record's interest through the aggregate projection; remove `recovery-pending` only on the last eligible release, and clear only observed blockers whose owners permit release. |
 | Disposition failed (`FAILED`) | — | keep `recovery-pending`, and register `NeedsHumanCause.VALIDATED_WORK_DISPOSITION` through the needs-human owner's API (see below). Never scratch-eligible — `recovery-pending` stays *because* `FAILED` is unresolved (§3.2). |
-| Operator abandoned (`ABANDONED`) | durable `OperatorResolution` recorded | remove `recovery-pending` (the work is now formally resolved and reset may proceed); **withdraw** the needs-human cause; leave pre-existing blocking labels untouched. Escrow and refs are still retained for the retention window. |
+| Operator abandoned (`ABANDONED`) | durable `OperatorResolution` recorded | release this record's recovery block through the aggregate rule; **withdraw only its record-scoped** needs-human cause; leave pre-existing blocking labels untouched. Reset remains blocked by any unresolved sibling. Escrow and refs are still retained for the retention window. |
 | Recovered from a previous `FAILED` (`RECOVERED`) | as above | **withdraw** the needs-human cause in the same step that clears `recovery-pending`. |
 
 The routing-before-clearing order is not cosmetic — §4.5b explains why the reverse
@@ -3513,7 +3709,7 @@ modelled as one:
 |---|---|---|
 | Who holds the claim | `ValidatedWorkDispositionOwner.snapshot()` | `owner: ClaimOwnerFact or None` — engine identity plus owner-computed stop availability |
 | Presenting it | Control Center issue detail | "Owned by engine `<label>` (`Running`)", with a link to that engine's surface. **No engine control is embedded in the issue view** |
-| Guarding the stop | a control-layer coordinator | `StopValidatedWorkOwnerCommand(record_id, expected_engine, actor, reason)` — re-reads the owner and refuses on any mismatch |
+| Guarding the stop | a control-layer coordinator | `StopValidatedWorkOwnerCommand(record_id, expected_engine, expected_owner_fence, actor, reason)` — reserves the exact rendered owner and refuses on any mismatch |
 | Stopping it | `RepositoryEngineLifecycle` (new; §8.4) | a plain instance-targeted `StopEngineCommand(engine, actor, reason)` under the standard **`Stop engine`** label |
 
 ```python
@@ -3532,18 +3728,25 @@ class EngineIdentity:
     instance_id: str | None      # None == the single-instance engine
     host: str
     label: str                   # display name, e.g. "orchestrator-2"
+    process: ProcessIdentity     # exact incarnation; §4.4e, not a reusable instance slot
+
+    def __post_init__(self) -> None:
+        if (self.host, self.instance_id) != (self.process.host, self.process.instance_id):
+            raise ValueError("engine identity and process identity disagree")
 
 
 class EngineStopAvailability(StrEnum):
     """Whether THIS Control Center can stop that engine. Owner-produced."""
     AVAILABLE   = "available"
     REMOTE_HOST = "remote_host"    # present it; never offer a control
+    EXACT_TARGET_UNAVAILABLE = "exact_target_unavailable"  # platform cannot pin this process
 
 
 @dataclass(frozen=True, slots=True)
 class ClaimOwnerFact:
     """What the read model reports about who holds a record's claim."""
     engine: EngineIdentity
+    owner_fence: int                          # render-time claim generation
     stop_availability: EngineStopAvailability   # computed at snapshot time
 ```
 
@@ -3584,26 +3787,11 @@ class StopEngineCommand:
 
 
 class StopEngineStatus(StrEnum):
-    """Only distinctions the underlying port can actually prove.
-
-    An earlier draft promised STOPPED_GRACEFULLY / STOPPED_FORCIBLY /
-    NOT_RUNNING as separate outcomes. `SupervisorOps.stop()` returns a bare
-    `bool` (`infra/supervisor.py:824-835`), and `InterruptibleStopController`
-    returns the same `True` for a graceful exit and a successful force
-    (`infra/shutdown_timing.py:148-168`) — as it does for a missing lock file
-    and for a stale lock it cleaned up. Those four facts are collapsed before
-    any adapter can see them, so a lifecycle owner claiming to distinguish
-    them would be inventing knowledge its port does not have.
-
-    Enriching `SupervisorOps` to preserve them is a change to a shipped port
-    with many callers, and is out of scope here for the same reason the stop
-    consolidation is. The distinction this contract actually needs is the one
-    `bool` does prove: is the engine still running? If it is not, its gate is
-    released and the claim is takeable, which is the entire point.
-    """
-    STOPPED     = "stopped"      # no longer running: gracefully, forcibly, or already gone
-    REMOTE_HOST = "remote_host"  # refused before calling: not ours to stop
-    FAILED      = "failed"       # the supervisor could not stop it; still running
+    """Facts about the requested process incarnation, never its successor."""
+    STOPPED        = "stopped"         # the expected process is provably gone
+    TARGET_CHANGED = "target_changed"  # pre-stop target mismatch; zero effect
+    REMOTE_HOST    = "remote_host"     # refused before calling: not ours to stop
+    FAILED         = "failed"          # stop/identity proof failed; no success asserted
 
 
 @dataclass(frozen=True, slots=True)
@@ -3618,20 +3806,66 @@ class RepositoryEngineLifecycle(Protocol):
     the pre-existing stop surfaces are untouched (see the scope note below)."""
     def stop_engine(self, command: StopEngineCommand) -> StopEngineOutcome: ...
     def engines(self) -> tuple[EngineIdentity, ...]: ...
+    def stop_availability(self, engine: EngineIdentity) -> EngineStopAvailability: ...
+
+
+class IncarnationStopPort(Protocol):
+    """New supervisor capability; the legacy Boolean stop API is insufficient."""
+    def stop_availability(self, engine: EngineIdentity) -> EngineStopAvailability: ...
+    def stop_expected(self, command: StopEngineCommand) -> StopEngineOutcome: ...
 ```
 
-`SupervisorRepositoryEngineLifecycle` implements it over `SupervisorOps` and calls
+`SupervisorRepositoryEngineLifecycle` implements it over `IncarnationStopPort`,
+which is a **new** supervisor capability required by this slice, and calls
 
-```
-stop(repo_root=engine.repo_root,
-     instance_id=engine.instance_id,          # explicit; never the None default
-     force=False,                             # never force *first*
-     graceful_timeout_seconds=command.graceful_timeout_seconds,
-     force_if_graceful_fails=command.force_on_timeout,
-     reason=command.reason, actor=command.actor)
+```python
+incarnation_stop.stop_expected(command)  # includes repo, instance, process and stop policy
 ```
 
-**Force-on-timeout is deliberately `True` here, and that is a decision rather than
+**A reusable instance name is not a process target.** The existing
+`SupervisorOps.stop()` reads the current lock advertisement and returns a Boolean;
+it neither accepts an expected incarnation nor carries an explanatory message.
+It cannot implement this guarded path by checking the record and then calling
+`stop(repo_root, instance_id)`. Between those steps the owner may die and another
+engine may start under the same instance name, so that call could kill its
+successor. The new capability must bind **every effect**, including graceful HTTP,
+signals, force-on-timeout and lock cleanup, to `command.engine.process`.
+
+The supported automatic backend is **Linux pidfd**: acquire `pidfd_open(pid)`,
+validate the target's kernel start identity against the expected `ProcessIdentity`
+while holding that handle, and use `pidfd_send_signal` for both SIGTERM and, after
+the command timeout, SIGKILL. Wait for the handle to report exit. Once acquired,
+that handle cannot redirect a signal to a reused pid. There is no HTTP request to
+a reusable port and no process-group signal in this path. SIGTERM is the graceful
+shutdown request; this engine's signal handler must be covered by the integration
+test. The backend never removes the instance's current advertisement: exit releases
+the kernel gate, and ordinary startup reconciliation owns stale metadata cleanup.
+
+A replaced instance detected before a handle is accepted is `TARGET_CHANGED` with
+zero effects; a provably dead expected process is `STOPPED`. After a handle was
+accepted, the expected process exiting is `STOPPED` even if a replacement now
+exists: no further effect can reach that replacement. A read of pid/start time
+followed by an ordinary signal is **not** a lifetime pin. The Linux backend requires
+real-process tests, including replacement before force escalation.
+
+**macOS, and Linux without usable pidfd support, have no guarded automatic stop in
+this design.** No macOS lifetime-pinning implementation is claimed or left as an
+unspecified implementation prerequisite. The lifecycle capability probe reports
+`EXACT_TARGET_UNAVAILABLE`; the read model carries that availability before render,
+and the Control Center shows text explaining that exact-owner stop is unavailable
+plus navigation to the existing independently authorized engine stop control. That
+control keeps its own explicit engine/repository-wide confirmation and scope. It is
+the actual recovery route on these platforms, without the exact-record guarantee.
+No new guardian process or broad migration is introduced.
+
+A capability disappearing between render and dispatch returns `FAILED` with a
+diagnostic and zero effects; release the reservation normally. Neither platform
+silently falls back to the ordinary `SupervisorOps.stop()` or its newer
+`expected_pid`/tracked-instance helpers: a reusable pid or port is not a process
+lifetime handle. This additional capability leaves existing callers on their
+current APIs and behavior.
+
+**For the supported exact-process backend, force-on-timeout is deliberately `True`, and that is a decision rather than
 an inherited default.** The case this exists for is an engine that has stopped
 responding while holding a claim; a graceful-only stop would leave exactly that
 engine running and the record wedged forever, turning the only recovery path into a
@@ -3642,12 +3876,14 @@ its `flock` released by the kernel, which is what makes death provable (§4.4e).
 `ENGINE_STOP_GRACEFUL_TIMEOUT_SECONDS` is a module constant, not a setting, for the
 same reason `PUBLISH_ATTEMPT_LIMIT` is.
 
-Outcome mapping is total over what the port returns: `True` ⇒ `STOPPED` (the engine
-is not running, whether it exited gracefully, was forced, or was already gone — in
-every case its gate is released and the claim is takeable), `False` ⇒ `FAILED` with
-the supervisor's message preserved, and a non-local target is refused as
-`REMOTE_HOST` before any call. `StopOwnerStatus` drops `ALREADY_STOPPED` for the
-same reason: it was a distinction this stack cannot make.
+Outcome mapping preserves the typed `IncarnationStopPort` result and its message:
+`STOPPED` means the expected process is provably gone, `TARGET_CHANGED` refuses a
+replacement, and `FAILED` reports a failed stop or unavailable identity proof.
+The lifecycle owner refuses a non-local target as `REMOTE_HOST` before any call.
+Graceful exit, successful force and already-gone share `STOPPED`; no consumer needs
+to distinguish them. Messages are produced by this new adapter, not recovered from
+the legacy Boolean return or parsed from logs. None of these outcomes promises that
+the record is still unclaimed: another engine may already have acquired it.
 
 The operator confirmation must say what will happen in those words: that the engine
 will be asked to shut down, that it will be **forcibly terminated** if it has not
@@ -3694,6 +3930,7 @@ class StopValidatedWorkOwnerCommand:
     """Stop the engine that owns this record — if it still does."""
     record_id: str
     expected_engine: EngineIdentity     # exactly what the operator was shown
+    expected_owner_fence: int           # exactly the rendered claim generation
     actor: str
     reason: str
 
@@ -3704,6 +3941,7 @@ class StopOwnerStatus(StrEnum):
     NO_SUCH_RECORD    = "no_such_record"   # record_id resolves to nothing
     NOT_OWNED         = "not_owned"        # the record has no claim holder now
     OWNER_CHANGED     = "owner_changed"    # someone else holds it; re-render
+    STOP_IN_PROGRESS  = "stop_in_progress" # another reservation holds this generation
     REPO_MISMATCH     = "repo_mismatch"    # the engine serves a different repository
     REMOTE_HOST       = "remote_host"      # not ours to stop
     STOP_FAILED       = "stop_failed"      # the lifecycle owner reported failure
@@ -3743,55 +3981,90 @@ contract:
 
 Zero-effect-on-mismatch has to hold at the **effect point**, not at the read. So the
 guard is a durable, store-owned reservation, and it is owned by the disposition
-store because the claim is:
+store because the claim is. The Control Center uses a narrow writable port, not a
+raw store dependency or the engine's HTTP API:
 
 ```python
-def reserve_owner_stop(
-    self, record_id: str, expected_engine: EngineIdentity
-) -> StopReservation | StopReservationRefusal: ...
-    """CAS: the record's owner must BE `expected_engine` at this instant.
+@dataclass(frozen=True, slots=True)
+class StopReservation:
+    reservation_id: str          # fresh unpredictable id; never returned to another caller
+    record_id: str
+    engine: EngineIdentity       # includes the exact process incarnation
+    owner_fence: int
 
-    One transaction: compare the recorded owner (host, instance_id, repo_root)
-    and `owner_fence`; on a match, record a reservation bound to that fence and
-    return it. Refuses `NOT_OWNED` / `OWNER_CHANGED` with no writes.
-    """
 
-def release_owner_stop(self, reservation: StopReservation) -> None: ...
-    """Always called, in a `finally`. Clears the reservation."""
+@dataclass(frozen=True, slots=True)
+class StopReservationRefusal:
+    status: StopOwnerStatus       # one of the pre-stop refusals below
+    observed_owner: ClaimOwnerFact | None
+    message: str
+
+
+class ValidatedWorkStopReservations(Protocol):
+    def reserve_owner_stop(
+        self, command: StopValidatedWorkOwnerCommand
+    ) -> StopReservation | StopReservationRefusal: ...
+        """CAS the repository, full process identity and rendered owner fence.
+
+        One transaction: verify all expected facts and absence of a reservation
+        for this fence; then persist a fresh reservation id and return its token.
+        NO_SUCH_RECORD / NOT_OWNED / OWNER_CHANGED / REPO_MISMATCH / REMOTE_HOST
+        refuse with no writes. ANY existing reservation for this fence returns
+        STOP_IN_PROGRESS, including a second request for the identical owner.
+        An old-fence reservation is invalid and never blocks a current owner.
+        """
+
+    def release_owner_stop(self, reservation: StopReservation) -> bool: ...
+        """Compare-and-clear by (record_id, fence, reservation_id, incarnation).
+
+        True only when this token's reservation was removed. False is a harmless
+        stale/duplicate release; it can never remove another request's reservation.
+        """
 ```
 
 **What the reservation blocks is exactly one thing: `relinquish_claim()`.** While a
-reservation is live for the current fence, relinquish returns `STOP_RESERVED` and
-the owner keeps its claim. That closes the race completely, because relinquish is
-the *only* way a live engine loses a claim — the other way is death, and stopping an
-already-dead engine is the harmless `STOPPED` outcome the operator asked for.
+reservation is live for the current fence, relinquish returns `False` and
+the owner keeps its claim. That closes the live hand-back race, because relinquish
+is the only way a live engine loses a claim. The other way is death, and the
+incarnation-bound lifecycle capability above closes that second race: it can never
+redirect the pending stop to the dead owner's replacement.
 Acquisition needs no separate block: `B` can only acquire when the record is
 unowned or `A` is provably dead, and neither can happen while `A` is alive and
 holding.
 
-So the coordinator's sequence is reserve → stop → release, and every refusal path
-happens before any external call:
+So the coordinator's sequence is reserve → stop → release. Every reservation
+refusal happens before any lifecycle call; a lifecycle refusal performs no stop
+effect, while a `FAILED` result may follow an unsuccessful stop attempt:
 
 ```python
-reservation = store.reserve_owner_stop(record_id, expected_engine)   # CAS
+reservation = reservations.reserve_owner_stop(command)   # CAS through the narrow port
 if isinstance(reservation, StopReservationRefusal):
-    return StopOwnerOutcome(...)              # zero supervisor calls
+    return StopOwnerOutcome(reservation.status, reservation.observed_owner, reservation.message)
 try:
-    outcome = lifecycle.stop_engine(StopEngineCommand(...))
+    outcome = lifecycle.stop_engine(StopEngineCommand(
+        engine=reservation.engine, actor=command.actor, reason=command.reason,
+    ))
+    return map_stop_outcome(outcome)  # TARGET_CHANGED -> OWNER_CHANGED; FAILED -> STOP_FAILED
 finally:
-    store.release_owner_stop(reservation)
+    reservations.release_owner_stop(reservation)
 ```
 
-**A leaked reservation costs a graceful hand-back, never correctness or data.** If
-the Control Center dies between reserve and release, `A` cannot relinquish — so it
-keeps the claim until it dies, which is precisely the behaviour of any record whose
-owner never relinquishes. Ownership still transfers on death, escrow is still
-retained, the record is still unresolved and still blocks reset. Nothing new can
-wedge, and no timer is introduced to "expire" the reservation. The one cleanup is
-free and provable: a reservation is bound to the `owner_fence` it was taken at, so
-any fence change (the owner died and a successor took over) invalidates it, and
-`reserve_owner_stop` refuses while a reservation exists for a different engine or
-fence.
+**Concurrent requests never share a reservation.** Even two clicks with identical
+rendered facts have distinct operation lifetimes. If they shared a token, the first
+could fail and release it while the second had not stopped yet, allowing the owner
+to relinquish before the second stop. Exclusive admission and conditional release
+close that interleaving. No caller may adopt or release a token read from storage.
+
+**A leaked reservation costs liveness until the owner exits.** If the Control Center
+dies between reserve and release, the owner cannot relinquish and subsequent guarded
+stops return `STOP_IN_PROGRESS`; escrow remains retained and unresolved work still
+blocks reset. The surface must explain this state and direct the operator to the
+existing explicit engine stop control, whose confirmation authorizes stopping that
+engine independently of a record guard. No timer expires a reservation. Owner death
+still permits acquisition; the acquisition transaction clears all old reservation
+fields as it advances the fence. A later release carrying the old token cannot
+erase a successor's reservation. This is an explicit recovery cost, not a claim that
+a leaked reservation has no effect on the guarded path.
 
 **The re-read needs an exact record lookup.** `snapshot(issue_number)` is the wrong
 shape here: `record_id` is a canonical hash (§2.1.1), so a coordinator holding only
@@ -3832,23 +4105,33 @@ class ValidatedWorkRecordReader(Protocol):
 (`infra/sqlite_connection.py`). That is the whole reason the disposition state is a
 file in the repository's own state directory rather than engine memory: a reader
 that needed the engine's HTTP API would be unavailable in exactly the failure this
-command exists for. It performs no writes, takes no claim, and cannot mutate
-anything — the write half stays with `RepositoryEngineLifecycle`, which acts on the
-supervisor, not on the engine's cooperation.
+command exists for. It performs no writes and takes no claim.
+
+`SqliteValidatedWorkStopReservations` separately implements the narrow
+`ValidatedWorkStopReservations` port with a writable connection to the same file,
+using the shared SQLite connection helper. It shares the store-owned transaction
+implementation for reservation CAS, conditional release and fence invalidation;
+it does not duplicate those predicates in the Control Center. Its only writes are
+reservation fields: it cannot acquire/relinquish publication claims, change record
+state, or run lifecycle effects. An inaccessible, locked or incompatible database
+fails before any lifecycle call. The connection holds no transaction during stop.
 
 **Control Center composition root:**
 
 ```
-reader    = SqliteValidatedWorkRecordReader()                      # read, out of process
-lifecycle = SupervisorRepositoryEngineLifecycle(supervisor_ops)    # write, via supervisor
-coordinator = ValidatedWorkOwnerStopCoordinator(reader, lifecycle)
+lifecycle = SupervisorRepositoryEngineLifecycle(incarnation_stop) # exact process effects
+reader = SqliteValidatedWorkRecordReader(lifecycle.stop_availability)
+reservations = SqliteValidatedWorkStopReservations()               # narrow durable CAS
+coordinator = ValidatedWorkOwnerStopCoordinator(reader, reservations, lifecycle)
 ControlCenterActions(..., stop_validated_work_owner_cmd=coordinator)
 ```
 
-Neither collaborator requires the target engine to be responsive, which is the
-property that makes this a real escape hatch. The Repository Engine composition root
-is unchanged: it never constructs the coordinator, and §8.4's issue-detail surface
-never posts to it.
+None of these collaborators requires the target engine to be responsive, which is the
+property that makes this a real escape hatch on a supported backend. The Repository
+Engine composition root supplies the same read-only availability capability to its
+disposition snapshot producer, but never constructs the stop coordinator. The
+Control Center recomputes availability for its own platform before offering the
+guarded control. §8.4's issue-detail surface never posts to the coordinator.
 
 **Where the control lives, and how the record context crosses processes.** The
 control is a Control Center engine control, on a Control Center surface, served by
@@ -3865,7 +4148,7 @@ it already resolves per-instance status — and that row is addressable:
 |---|---|---|
 | 1 | Issue detail (served by the engine) | renders the `ClaimOwnerFact` as text — "Owned by engine `<label>` (`Running`)" — and a **link**, never a control, to the Control Center: `{cc_origin}/?repo={repo_key}&engine={instance_key}&stop_owner_of={record_id}`, where `cc_origin` is the embed-context parameter below — rendered as plain text with no anchor when it is absent |
 | 2 | Control Center repository card | with that context, expands the named engine row and renders the native **`Stop engine`** button (accessible name includes the engine label) beside a summary of the record it would unblock. Without the context the card is unchanged |
-| 3 | POST | `POST /api/control-center/repositories/{repo_key}/engines/{instance_key}/stop-validated-work-owner`, body `{record_id, engine: {repo_root, instance_id, host, label}, reason}` — the engine object echoed **verbatim** from what step 2 rendered, exactly as §4.3 check 0's authority snapshot is echoed |
+| 3 | POST | `POST /api/control-center/repositories/{repo_key}/engines/{instance_key}/stop-validated-work-owner`, body `{record_id, engine: {repo_root, instance_id, host, label, process: {host, pid, started_at, instance_id}}, owner_fence, reason}` — the engine and fence echoed **verbatim** from what step 2 rendered, exactly as §4.3 check 0's authority snapshot is echoed |
 | 4 | Handler | builds `StopValidatedWorkOwnerCommand` from the body **and the route**, checks they agree (below), and dispatches to the coordinator; it re-derives nothing and decides nothing |
 
 **Single-instance identity is routable.** `instance_id is None` is the
@@ -3880,10 +4163,12 @@ rather than trusting the body it was handed:
 1. the **route** identity (`repo_key`, `instance_key`),
 2. the **rendered** engine identity in the body,
 3. the record's **repository** (`snapshot_record().key.repo_slug` → its root),
-4. the **current claim owner** on that record.
+4. the **current claim owner**, its exact process incarnation and fence on that record.
 
 Any disagreement is a typed refusal with zero effect: `REPO_MISMATCH` for 1–3,
-`OWNER_CHANGED` for 4. A duplicated path value that contradicts the body is
+`OWNER_CHANGED` for 4. Missing process identity or fence is malformed; the handler
+never fills it from fresh state. The reservation transaction repeats the owner/fence
+comparison at admission. A duplicated path value that contradicts the body is
 therefore a refusal, not an ignored field.
 
 **The origin is supplied by the shell and preserved by embedded navigation.** There
@@ -3921,8 +4206,14 @@ than a bespoke path. `actor` comes from the authenticated session, never the bod
   (not a disabled-looking control), because there is nothing this Control Center can
   do about it. Same conservatism as row 2 of §4.4e's liveness matrix, and the
   coordinator refuses it a second time server-side.
+- **An unavailable exact-process backend is presented before action.**
+  `EXACT_TARGET_UNAVAILABLE` renders explanatory text and navigation to the existing
+  independent engine stop surface, with no guarded stop button. Availability comes
+  from the injected lifecycle capability probe combined with the owner facts, not
+  from platform checks in a template. Dispatch probes again before effects so stale
+  capability data cannot trigger an ordinary pid/port stop.
 - **A stale owner identity is refused, not guessed.** `expected_engine` is the
-  render-time fact; if the claim moved before the click, the coordinator returns
+  render-time fact together with `expected_owner_fence`; if the claim moved before the click, the coordinator returns
   `OWNER_CHANGED` with zero effect and the surface re-renders — the same
   render-time-facts discipline as §4.3 check 0.
 - The disposition owner exposes the holder and nothing else. It has no stop method,
@@ -3964,6 +4255,36 @@ than a bespoke path. `actor` comes from the authenticated session, never the bod
 ---
 
 ## 9. Test surface
+
+Required admission and multi-record regressions (in addition to the tables below):
+
+- Drive `coding-done` submission through the authenticated run-bound endpoint,
+  durable receipt, validator callback and terminal capture. Invalid canonical
+  submission followed by a corrected side submission still yields the valid
+  attested group. Forged run identity, edited manifest, forged `passed=true`,
+  mismatched hash/head and a raw validation path outside the run cannot create
+  authority. Simulate crashes before/after every intake durable write and a
+  submission racing intake closure; no acknowledged receipt is lost.
+- Historical unregistered sidecars remain inadmissible automatically; operator
+  import executes configured validation at the exact chosen commit, generates a
+  new attestation and admits `PARKED` only. A normal completion whose raw validation
+  pointer names an external cache is normalized through the validator's certified
+  copy rather than rejected or trusted by path.
+- `EXCHANGE_APPROVED` requires exact reviewed head, matching reviewer session and
+  report/decision hashes, and the active review-cache boundary. Missing proof
+  routes ordinary review; stale or forged approval never marks a new head reviewed.
+- Cross admission gates (`QUEUED`, ahead/detached/historical `PARKED`, `FAILED`)
+  with descendant waiter release, late descendant admission and attached evidence
+  promotion. A lineage change never erases an approval requirement, and an initial
+  `QUEUED` value never erases a divergent/ancestor lineage restriction.
+- Recover or abandon one of two divergent or different-branch records; the other
+  retains `recovery-pending` and its record-scoped needs-human cause. Only the last
+  eligible release clears the label. Crash after resolution before the label write,
+  then restart; projection converges. Interleave sibling admission with aggregate
+  clear across processes and assert the issue gate prevents a stale clear. Busy
+  gates retry/fail closed, never time out into takeover, and a finalizer's record
+  claim remains valid through every stage. Ancestor resolution clears the aggregate
+  after its transaction without requiring operator action.
 
 **Producer → command** (the fact-gathering half):
 
@@ -4064,17 +4385,20 @@ sweeps above:
 | §4.4e liveness matrix | One deterministic case per row, driven against real gate files: (1) self ⇒ False; (2) different host ⇒ False, with no filesystem access to that host attempted; (3) **same-instance restart** ⇒ True with **no probe issued** — asserted by a gate double that fails the test if the held gate is reopened, since probing it would self-conflict and strand the record forever; (4) single-instance current vs any other owner ⇒ True; (5) named current vs a former single-instance owner ⇒ True; (6) named current vs a *different* live named instance ⇒ False by non-blocking probe, and ⇒ True once that instance's gate is released, with the probe asserted not to disturb the live holder. |
 | §4.4e relinquish | `relinquish_claim()` is callable only by the owner at a stage boundary, clears ownership and bumps the fence, and lets the next drain proceed with no death proof. There is **no** operation that takes a claim from a live owner — asserted by the absence of such a method on the port and by a guardrail. |
 | §8.4 stop engine (producer) | Snapshot → rendered context → guarded request, both hops: the issue detail renders the `ClaimOwnerFact` as text plus a **link carrying `stop_owner_of={record_id}`** and asserts **no engine control in the issue view**; the engine surface with that context renders the native `Stop engine` button and posts a body whose `engine` object is byte-for-field what it rendered. Without the context, the engine surface's ordinary controls are unchanged. |
-| §8.4 stop engine (handler) | Guarded request → coordinator → lifecycle: an exact match reaches `Supervisor.stop(repo_root=<that repo>, instance_id=<that instance>, force=False, graceful_timeout_seconds=…, force_if_graceful_fails=True)` — asserted for a **named** instance in a multi-instance repository (where the repository-scoped route would stop the wrong engine) **and** for the single-instance engine addressed as `default`. One case per `StopOwnerStatus` member, derived from the enum: `NO_SUCH_RECORD`, `NOT_OWNED`, `OWNER_CHANGED`, `REPO_MISMATCH`, `REMOTE_HOST`, `STOP_FAILED` — every refusal with **zero** supervisor calls. |
-| §8.4 reservation | **The race is closed at the effect point, not the read.** Pause the coordinator after `reserve_owner_stop()` succeeds and attempt to move the claim: the owner's `relinquish_claim()` returns `STOP_RESERVED` and keeps the claim, no successor can acquire, and the subsequent stop therefore targets an engine that still owns the record. Then run the mirror case — pause **before** the reservation, move the claim, and assert `reserve_owner_stop()` refuses `OWNER_CHANGED` with **zero** supervisor calls. |
-| §8.4 reservation | Cleanup on every path: `release_owner_stop()` runs in a `finally` for `STOPPED`, `FAILED` and every refusal, and a reservation left behind by a killed coordinator is invalidated by the next `owner_fence` change. Assert a leaked reservation never blocks acquisition after the owner dies, and that `reserve_owner_stop()` refuses while a reservation exists for a different engine or fence. |
-| §8.4 stop policy | One case per `StopEngineStatus` at the port boundary: the supervisor reporting the engine stopped ⇒ `STOPPED` (driven for a graceful exit, a force-after-timeout, and an already-gone holder, all of which the port collapses to `True` — the test asserts they map to one status rather than pretending to tell them apart); the supervisor failing ⇒ `FAILED`; a non-local target ⇒ `REMOTE_HOST` with no call. The timeout and force flag are asserted to be the **command's** values, not `SupervisorOps` defaults — a call that omitted them would silently force-kill on an unstated timeout. The confirmation text is asserted to state graceful-then-force and the engine-wide scope. |
-| §8.4 stop engine (wedged) | **The Control Center command succeeds while the owning Repository Engine is unresponsive.** The engine process is modelled as alive but not serving HTTP; the coordinator still reads the record through `SqliteValidatedWorkRecordReader` against the repository's own state file, the lifecycle owner still stops it via the supervisor, and the record becomes takeable. This is the regression for hosting the escape hatch inside the process it must escape. |
+| §8.4 stop engine (handler) | Guarded request → reservation port → lifecycle → `IncarnationStopPort.stop_expected(command)`: assert exact repository, named or `default` instance, process incarnation, actor/reason and explicit timeout/force policy. One case per `StopOwnerStatus` enum member: pre-reservation refusals have zero lifecycle calls; `STOP_FAILED` follows the typed lifecycle failure; lifecycle `TARGET_CHANGED` maps to `OWNER_CHANGED` without a stop effect. Missing process identity/fence is rejected, never filled from current state. |
+| §8.4 reservation | Pause after `reserve_owner_stop()` succeeds and attempt hand-back: `relinquish_claim()` returns `False`, the live owner keeps its claim, and a successor cannot acquire. Mirror case: move the claim before reservation, including relinquish/reacquire by the same process with a new fence; admission refuses `OWNER_CHANGED` with zero lifecycle calls. |
+| §8.4 reservation concurrency | Two overlapping identical requests never share a reservation: the second returns `STOP_IN_PROGRESS` with zero writes/calls. After the first fails and releases, a new request gets a fresh id; replaying the old release returns `False` and leaves the new reservation intact. Concurrent transactions use the real SQLite store, not a serialized mock. |
+| §8.4 reservation cleanup | Conditional release runs in `finally` after every successful reservation, including lifecycle failure, refusal and exception; reservation refusals have no token to release. A killed coordinator leaves `STOP_IN_PROGRESS` and prevents relinquish; the UI explains the existing independently authorized engine stop route. Owner death still permits acquisition, atomically clears the old reservation and advances the fence; a stale release cannot affect a successor's reservation. |
+| §8.4 stop incarnation | Reserve A, pause before lifecycle dispatch, kill A and start A′ in the same instance without ownership of the record: result `OWNER_CHANGED`, zero effects on A′. Repeat after A's handle is accepted and between graceful request and force escalation: A's exit yields `STOPPED`, with zero effects on A′ despite reused port/pid advertisements and a successor claim/reservation. Every effect remains bound to A's incarnation. Real-process tests demonstrate the stop handle's lifetime binding; check-then-signal or ordinary `SupervisorOps.stop()` delegation fails the guardrail. |
+| §8.4 stop policy | One case per `StopEngineStatus`: graceful exit, successful force and already-gone all yield `STOPPED`; replacement yields `TARGET_CHANGED`; stop/identity-proof failure yields `FAILED`; remote target yields `REMOTE_HOST` without a call. The new adapter produces each message explicitly; no log parsing or message extraction from a Boolean. Assert command timeout/force values and confirmation text stating graceful-then-force and engine-wide scope. |
+| §8.4 stop capability | Linux pidfd integration covers SIGTERM handler shutdown, timeout SIGKILL and handle exit observation without HTTP, process-group effects or advertisement deletion. On macOS or unavailable pidfd, `EXACT_TARGET_UNAVAILABLE` reaches both snapshot and Control Center rendering: no guarded stop button, explanatory text and working navigation to the existing independent stop control with its own scope confirmation. Capability loss after render yields `FAILED` and zero effects, releases the reservation, and never delegates to pid/port-based legacy helpers. |
+| §8.4 stop engine (wedged) | The Control Center succeeds while the Repository Engine serves no HTTP: read through `SqliteValidatedWorkRecordReader`, reserve/release through the writable `SqliteValidatedWorkStopReservations` adapter against the same real database, then stop through the exact-process capability. Database admission failure causes zero lifecycle calls. This proves the full interlock, not just the snapshot, works out of process. |
 | §8.4 stop engine (identity) | All four identities must agree: route (`repo_key`/`instance_key`), rendered body engine, record repository, and current claim owner. A body whose engine contradicts the path is `REPO_MISMATCH` with zero effect — the duplicated path value is checked, not ignored — and `instance_key` round-trips `default` ↔ `None` through the one shared encoder used by both the link builder and the route parser. |
 | §8.4 stop engine (navigation) | All three context cases: embedded (with `cc_origin` stamped by the shell), standalone carrying `cc_origin`, and standalone without it — the last asserted to render **text with instructions and no anchor at all**, never a dead href. Plus the transport itself: `cc_origin` is in `EMBEDDED_CONTEXT_PARAMS` and is stamped by the shell's URL builder, asserted by navigating two hops inside the dashboard and finding it preserved alongside `theme`. |
-| §8.4 stop engine (transport) | The endpoint is registered in the UI OpenAPI contract with its required body and typed response; it uses the shared browser-session auth helper (CSRF/SSE token) rather than a bespoke path; `actor` comes from the session and a body-supplied `actor` is ignored. `snapshot_record()` is the only read the coordinator makes — a store double fails the test if the coordinator touches it directly. |
+| §8.4 stop engine (transport) | The endpoint is registered in the UI OpenAPI contract with its required body and typed response; it uses the shared browser-session auth helper (CSRF/SSE token); `actor` comes from the session, never the body. The coordinator depends only on reader, reservation and lifecycle ports; a guardrail rejects raw store/SQLite access from it. Both store and Control Center adapters invoke one shared reservation transaction owner; the writable adapter cannot acquire/relinquish publication claims or transition record state. |
 | §8.4 stop engine | `EngineIdentity` has no `targetable_here` property and consults no process-global host state; availability arrives as owner-computed data, asserted by constructing the identity in a process whose local host differs from the snapshot's and checking the rendered availability is unchanged. |
 | §8.4 stop engine | `RepositoryEngineLifecycle` owns the targeted graceful stop and **only** that: the guardrail rejects direct `SupervisorOps.stop`/`stop_all_instances` calls from validated-work, disposition and issue-detail modules, and a companion assertion records that the existing bulk/force/port routes are deliberately unmigrated and unclaimed, so a later repo-wide widening is a visible change rather than a silent one. The disposition owner exposes no stop method and reads no supervisor state; the issue-detail handler builds no stop call from pid fields. |
-| §8.4 stop engine | `EngineIdentity` carries `repo_root`, and the adapter's `Supervisor.stop` call uses it rather than any ambient repository — asserted with two repositories present. |
+| §8.4 stop engine | `EngineIdentity` carries `repo_root` and full `ProcessIdentity`; `stop_expected` uses these rather than ambient repository or the instance's current process. Assert with two repositories and with contradictory duplicated host/instance fields rejected by construction. |
 | §4.4e takeover | There is **no** operation that displaces a live owner: the store port exposes none, and a guardrail asserts none is added. A wedged live owner leaves the record `PUBLISHING` — asserted unresolved, escrow retained, reset blocked — and the UI surfaces the owning engine. Stopping that engine (releasing its gate) is what lets the next drain acquire. |
 | §4.4e attempts | Restart at **every** attempt boundary: after the claim/before the call, after the call/before `record_attempt_outcome`, and after the outcome. Each resumes without a duplicate remote write. |
 | §4.4e attempts | A transient failure is followed by a **real second attempt**: attempt 2 is a distinct durable row with its own identity, the operation identity `(record_id, target_head_sha)` is unchanged, and the published head is still exactly one commit. |
@@ -4217,8 +4541,9 @@ failed ingestion → repeated tech-lead diagnosis → no executable recovery act
 
 **Setup.** Coding session for issue *N* on branch `b`. PR *P* exists with head `R`.
 The coder's first `coding-done` writes a completion record that fails schema
-validation. A second `coding-done` writes a valid record; the orchestrator preserves
-it as the run-scoped durable copy. `make validate` passes at local HEAD `L`, three
+validation. A second `coding-done` submits a valid record; the orchestrator preserves
+both submissions through §5's intake receipts before processing them. The configured
+orchestrator validator attests a passing run at local HEAD `L`, three
 commits ahead of `R`.
 
 **Today.** Ingestion consumes the invalid record, the session is classified failed,
@@ -4231,8 +4556,8 @@ remedy — scratch reset — would delete `L`.
 | Step | Behaviour |
 |---|---|
 | Run evidence | `terminate_issue_runtime()` asks `IssueRunEvidenceSource` for issue *N* and gets `RUNS_RECORDED` with the coding session's exact `SessionRunAssets` — the row its launch transaction wrote (§2.5). No worktree is scanned and no "latest run" is chosen. |
-| Admission | Both records are run-scoped and therefore admissible *sources*. Selection (§5) rejects the invalid one because it does not parse, and selects the valid one because its `validation_record_path` resolves in-run to `passed=true` with `head_sha == L`. The worktree HEAD is also exactly `L`, so the target is fixed **by identity, not by ancestry**. The canonical path holds no privileged status. |
-| Evidence | Identity: `validated_head_sha=L`, `worktree_head_sha=L`, `branch_name=b`, `review_disposition=RESUME_REVIEW`, `branch_binding_verified=True`. Observations (outside `evidence_id`): `expected_remote_head_sha=R`, `pr_number=P`, `observed_blocking_labels=("blocked-failed",)`. |
+| Admission | Both submissions have owner-registered intake receipts. Selection rejects invalid JSON and selects the valid normalized completion bound to the owner's validator attestation at `L`. Its pointer names the certified in-run copy. A historical sidecar without a receipt instead requires operator import/fresh validation and becomes `PARKED`; containment alone never admits it. |
+| Evidence | Identity: `validated_head_sha=L`, `branch_name=b`, `review_disposition=RESUME_REVIEW`, `branch_binding_verified=True`. Observations (outside `evidence_id`): `worktree_head_sha=L`, `expected_remote_head_sha=R`, `pr_number=P`, `observed_blocking_labels=("blocked-failed",)`. |
 | Escrow | `capture.json` + completion + validation records written to `<state_dir>/validated-work/N/<evidence_id>/` (temp dir, fsync, atomic rename); `L` pinned at `refs/issue-orchestrator/validated/N/<evidence_id>`. No `observed` ref — the two heads agree. |
 | Admission | `record_id` derived from (repo, N, `b`, `L`); no existing row ⇒ `ADMITTED`. |
 | Disposition | One group, so the batch holds one disposition. Evidence conclusive ⇒ `QUEUED`. `recovery-pending` added; `blocked-failed` kept. `IssueRuntimeTermination.validated_work` reports `QUEUED`, so the session is **not** classified `timed_out`. |
@@ -4267,6 +4592,8 @@ makes a successful-but-unacknowledged push a recoverable state rather than a
 | Branch-absent variant, push landed | `RECONCILING` | The recorded expectation was "absent", but the branch now exists at `L` — allowed for this phase (that is our push), so reconcile. A branch at any other sha ⇒ `FAILED`. A *read failure* is `REMOTE_UNREADABLE` and retries; it never re-authorizes a branch-creating push. |
 | Anywhere, with a rival drainer live | either | Its `acquire_claim()` cannot prove the owner dead and returns `None`; it makes no remote call and no state change. |
 | Anywhere, with the publication workspace lost | either | Recreated idempotently from the pinned ref at the top of the next drain (§4.4a). The workspace holds no unique state. |
+| Record resolution/abandonment committed, aggregate block write lost | — | The next drain projects §7's issue block from retained durable rows. Other unresolved records retain `recovery-pending` and their own needs-human causes; only the last eligible interest releases the label, serialized with sibling admission by the issue gate. |
+| Intake bytes persisted, ledger insert lost; or canonical ingestion fails | — | Intake orphan repair restores the immutable entry before teardown. Invalid bytes remain rejected; the corrected receipt and owner validation attestation remain selectable. An unregistered historical sidecar is never upgraded automatically. |
 
 Every row converges on exactly one published head, one PR, one review routing, and
 one terminal row — which is what the derived submission token, the `record_id`
@@ -4305,6 +4632,16 @@ Ordered so each slice is independently shippable and leaves the tree green.
    shippable and independently useful: it makes "which runs did this issue have,
    exactly" answerable without a worktree scan, which nothing else in the system
    can currently do. Fakes that raise on rediscovery ship with it.
+1c. **Trustworthy completion intake.** Implement §5's `CompletionEvidenceIntake`,
+   immutable submission/validator-attestation rows in the run ledger (separate
+   from the four disposition tables), state-directory artifact retention, typed
+   submission command/receipt and authenticated run-bound endpoint. Wire
+   `coding-done`, the receipt-driven processing queue, `ValidationRunner` results,
+   terminal intake closure and bootstrap to the same owner. Preserve original
+   bytes and normalize admitted validation pointers; no manifest or copied agent
+   JSON grants authority. Add the operator-only historical intake path with fresh
+   configured validation and mandatory `PARKED` admission. This must precede slice
+   3: without it failed ingestion has no trusted evidence for capture to recover.
 2. **Escrow + ref pinning + config.** Filesystem escrow with the capture envelope,
    atomic rename, and `reconcile_escrow_orphans()`; `WorkingCopy` extensions for the
    `validated`/`observed` refs **and `push_exact()`** (§4.4b); **the whole §8.2(b)
@@ -4341,6 +4678,11 @@ Ordered so each slice is independently shippable and leaves the tree green.
    fenced wrapper. Then the publication workspace, the
    `begin_publish_attempt` CAS, and the `QUEUED` → `PUBLISHING` → `RECOVERED` drain with
    the phase-aware check set. Route `STOPPED/MAX_ROUNDS_EXCEEDED` in (this is #7018).
+4a. **Aggregate recovery blocks.** Implement §7's single issue-block projection and
+   `IssueDispositionMutationGate`, per-record needs-human cause source, restart
+   reconciliation and claim-before-issue-gate ordering. Wire admission, finalization,
+   abandonment and failure through it. This ships with automatic recovery, since
+   clearing a shared issue label per record is unsafe once a batch has siblings.
 5. **Classification cleanup.** Session/failure paths and the stuck sweep consume
    `IssueRuntimeTermination.validated_work`; generic `timed_out` becomes illegal for
    an issue with a disposition.
@@ -4351,10 +4693,13 @@ Ordered so each slice is independently shippable and leaves the tree green.
    OpenAPI, the `recover-validated-work` and `abandon-validated-work` endpoints, and
    the dashboard actions (with the §8.4 accessibility requirements). **Also the
    wedged-owner recovery path**, which is its own body of work: the
-   `RepositoryEngineLifecycle` boundary and its `SupervisorOps` adapter, the
+   `RepositoryEngineLifecycle` boundary and its new `IncarnationStopPort` adapter
+   with Linux pidfd exact-process tests and the explicit capability-unavailable
+   navigation on macOS/unsupported Linux (no macOS automatic backend is claimed), the
    `ValidatedWorkOwnerStopCoordinator` with its `reserve_owner_stop` interlock,
    `snapshot_record()` on the owner port, the Control Center-side
-   `ValidatedWorkRecordReader` and composition root, the
+   `ValidatedWorkRecordReader`, writable `ValidatedWorkStopReservations` adapter
+   sharing store-owned transactions, and composition root, the
    `stop-validated-work-owner` endpoint with its OpenAPI/auth wiring, the
    `cc_origin` embed-context parameter, the engine-row control and the issue-detail
    link that carries `stop_owner_of`, and the scoped guardrail. This slice claims
@@ -4363,7 +4708,8 @@ Ordered so each slice is independently shippable and leaves the tree green.
    the last piece, deliberately: until it exists, unresolved work has no exit at all,
    which is the safe direction to be incomplete in.
 8. **Backfill the stranded cohort.** #6327/#6335/#6337 (#6914) and #5204/#5561
-   (#7011) admitted through the owner as `PARKED` records — via the same admission
-   path, not a one-off script.
+   (#7011) admitted through §5's operator historical-intake and fresh-validation
+   command as `PARKED` records. Existing sidecars need no fabricated old ledger
+   entry; the new recovery run supplies trustworthy evidence through the same owner.
 
 Slice 3 is the one that stops the bleeding; slices 4–8 recover what is already lost.

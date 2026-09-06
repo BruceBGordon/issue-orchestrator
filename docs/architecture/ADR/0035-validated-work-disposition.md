@@ -332,7 +332,7 @@ Four concrete mechanisms in today's code destroy or strand the work:
    owns pause/resume/refresh and friends but no stop command, and the stop routes
    call `SupervisorOps` directly, one of them with the default `instance_id=None`,
    which cannot target the named instance holding a claim. So this ADR defines
-   `RepositoryEngineLifecycle` over `SupervisorOps` as a **new boundary with one new
+   `RepositoryEngineLifecycle` over a new `IncarnationStopPort` as a **new boundary with one new
    caller**, owning exactly one behaviour: the targeted stop of one named or
    single-instance engine. It does **not** migrate the existing stop surfaces, and
    an earlier draft claiming it would was a scoping error — those routes also carry
@@ -364,19 +364,43 @@ Four concrete mechanisms in today's code destroy or strand the work:
    operator's stop would halt an engine that no longer owns the record. The
    disposition store therefore owns a conditional **stop reservation** — a
    compare-and-set on the current owner and fence — and while it is held,
-   `relinquish_claim()` is refused. That is sufficient because relinquish is the
-   only way a *live* engine loses a claim, and stopping an engine that has already
-   died is the harmless outcome the operator asked for. A reservation leaked by a
-   dead Control Center costs a graceful hand-back and nothing else: ownership still
-   transfers on death, and no timer is introduced to expire it.
+   `relinquish_claim()` is refused. Reservations are exclusive even for identical
+   callers, carry unique ids, and release only by matching their id, fence and
+   process incarnation. A delayed release cannot clear another request's reservation.
+
+   **The process target must also be pinned.** An instance name can be reused after
+   death, so the legacy `SupervisorOps.stop(repo_root, instance_id)` could kill a
+   replacement that never owned the record. The rendered owner therefore includes
+   its full `ProcessIdentity` and claim fence, and the new `IncarnationStopPort`
+   binds every lifecycle effect and cleanup to that exact process lifetime.
+   `TARGET_CHANGED` refuses a replacement, `FAILED` reports inability to stop or
+   prove exact targeting, and `STOPPED` proves only that the expected process is
+   gone. The new typed result supplies its own message; the existing Boolean API
+   has none to preserve. A snapshot comparison followed by ordinary stop or signal
+   is prohibited. The automatic backend is Linux pidfd, using handle-bound SIGTERM
+   and SIGKILL with exit observation, never a reusable HTTP port or process group.
+   On macOS or unavailable pidfd the snapshot reports `EXACT_TARGET_UNAVAILABLE`
+   before a guarded control is offered; the UI directs the operator to the existing
+   independent stop surface with its own explicit scope confirmation. No macOS
+   automatic backend or unresolved feasibility prerequisite is claimed. Linux
+   real-process tests and capability-unavailable UI tests are required; migrating
+   existing stop consumers remains out of scope.
+
+   A reservation leaked by a dead Control Center prevents graceful hand-back and
+   subsequent guarded stops until the owner exits. The UI reports `STOP_IN_PROGRESS`
+   and points to the existing independently authorized engine stop control.
+   Ownership still transfers on owner death, atomically invalidating the old
+   reservation with the fence change; no timer expires a reservation.
 
    **Both live in the Control Center, because the Repository Engine is the thing
    that is stuck.** Hosting the coordinator or its endpoint in the engine that owns
    the claim would make the escape hatch unavailable in exactly the failure it
-   exists for. The Control Center composes the write half over `SupervisorOps` and
-   the read half over an out-of-process reader that opens the target repository's
-   own `validated_work.sqlite` read-only — which is why that state is a file in the
-   repository's state directory rather than engine memory. Neither half requires the
+   exists for. The Control Center composes three narrow collaborators: an
+   out-of-process reader opening `validated_work.sqlite` read-only, a writable
+   `ValidatedWorkStopReservations` adapter sharing the store-owned reservation
+   transactions, and lifecycle over the incarnation-bound supervisor capability.
+   The reservation adapter can mutate only reservation fields, never publication
+   ownership/state; the coordinator has no raw store access. None requires the
    target engine to be responsive. The issue detail, served by that engine, only
    reports the owner and links to the Control Center.
 
@@ -428,7 +452,9 @@ Four concrete mechanisms in today's code destroy or strand the work:
    `OrchestratorState` and the publisher does not; folding the two together would
    force a hidden global or a back-reference from the executor to the manual
    service, recreating the coupling this split removes. The two admission owners
-   compose the same executor and the same finalizer and never call each other, and
+   compose the same executor and share the review-routing policy; disposition
+   uses the staged finalizer while manual retry retains `RetrySuccessFinalizer`.
+   The admission owners never call each other, and
    `PublishRetryLocators` stays entirely with the manual path — the disposition
    owner has its own escrow, workspace, publisher and finalizer, so it needs no
    locator round-trip and no borrowed board preconditions. This also fixes the
