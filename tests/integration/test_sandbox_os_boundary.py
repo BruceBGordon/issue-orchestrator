@@ -1355,3 +1355,121 @@ def test_generated_codex_profile_is_enforced_by_seatbelt(tmp_path: Path) -> None
 # directly and asserts both directions.
 
 
+
+
+@pytest.mark.skipif(not _codex_available(), reason="codex CLI not installed")
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="seatbelt enforcement is macOS-specific"
+)
+def test_the_generated_profile_denies_secrets_network_and_policy_paths(
+    tmp_path: Path,
+) -> None:
+    """Every restriction the removed live probe covered, proven without a model.
+
+    The probe that used to assert these (#7165) drove a real agent at the
+    breach script. The MODEL was only ever the courier — the script is what
+    exercised the boundary, and `codex sandbox` runs it directly. Removing the
+    probe without porting these left workspace-write confinement as the only
+    thing checked, so a profile that lost secret, network, policy and
+    base-checkout protection would still have passed (F4).
+
+    Each restriction gets its own assertion and its own failure message,
+    because "the sandbox is broken" is not an actionable report.
+    """
+    base_repo = tmp_path / "base"
+    base_repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=base_repo, check=True)
+    (base_repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=base_repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=T", "-c", "user.email=t@e.invalid",
+         "commit", "-qm", "seed"],
+        cwd=base_repo, check=True,
+    )
+    base_ref_name = subprocess.run(
+        ["git", "symbolic-ref", "HEAD"], cwd=base_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    base_ref = base_repo / ".git" / base_ref_name
+    shared_git_config = base_repo / ".git" / "config"
+    shared_git_config_before = shared_git_config.read_text(encoding="utf-8")
+    base_ref_before = base_ref.read_text(encoding="utf-8")
+
+    # A LINKED worktree, deliberately: its `.git` is a file pointing into the
+    # base checkout, so the profile has to protect a directory the workspace
+    # legitimately references.
+    worktree = tmp_path / "linked-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "boundary", str(worktree)],
+        cwd=base_repo, check=True,
+    )
+    assert (worktree / ".git").is_file(), "fixture must exercise a linked worktree"
+
+    secret = tmp_path / "planted-secret.txt"
+    secret_marker = "CODEX_TOPSECRET_64b1"
+    secret.write_text(secret_marker + "\n", encoding="utf-8")
+    secret_read = worktree / "secret-read.txt"
+    policy_file = worktree / ".codex" / "config.toml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text("# managed\n", encoding="utf-8")
+    policy_before = policy_file.read_text(encoding="utf-8")
+
+    agent = AgentConfig(
+        prompt_path=Path(".prompts/backend.md"),
+        prompt_relative=".prompts/backend.md",
+        provider="codex",
+        sandbox=True,
+    )
+    scope = compute_session_scope(
+        agent, SandboxScopeContext(task_kind="code", worktree=worktree)
+    )
+    assert scope is not None
+    scope = replace(scope, deny_read_files=scope.deny_read_files + (str(secret),))
+
+    quote = shlex.quote
+    network_probe = "/bin/bash -c " + quote("exec 3<>/dev/tcp/1.1.1.1/80")
+    script = "; ".join(
+        [
+            f"if head -c 4096 {quote(str(secret))} > {quote(str(secret_read))} "
+            f"2>/dev/null; then echo secret=READABLE; else echo secret=DENIED; fi",
+            f"if {network_probe} 2>/dev/null; then echo net=OPENED; "
+            "else echo net=DENIED; fi",
+            f"(printf TAMPERED > {quote(str(policy_file))}) 2>/dev/null; "
+            "echo policy=$?",
+            f"(printf TAMPERED > {quote(str(shared_git_config))}) 2>/dev/null; "
+            "echo gitconfig=$?",
+            f"(printf '%s' {'0' * 40} > {quote(str(base_ref))}) 2>/dev/null; "
+            "echo baseref=$?",
+        ]
+    )
+    scope_argv = [
+        arg for arg in CodexProvider().apply_scope(scope) if arg != "--strict-config"
+    ]
+    result = subprocess.run(
+        ["codex", *scope_argv, "sandbox", "--", "/bin/sh", "-c", script],
+        cwd=worktree, capture_output=True, text=True, timeout=120,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+
+    assert "secret=DENIED" in combined, (
+        f"an explicitly denied file was readable inside the sandbox:\n{combined}"
+    )
+    # The sink is also the breach record: if the read was permitted, the
+    # secret is sitting in the workspace regardless of what the status line
+    # said, so check the file rather than trusting the echo.
+    leaked = secret_read.read_text(encoding="utf-8") if secret_read.exists() else ""
+    assert secret_marker not in leaked, (
+        f"the denied secret leaked into the workspace at {secret_read}"
+    )
+    assert "net=DENIED" in combined, (
+        f"raw network access was permitted inside the sandbox:\n{combined}"
+    )
+    assert policy_file.read_text(encoding="utf-8") == policy_before, (
+        f"the session's own codex policy file was modifiable:\n{combined}"
+    )
+    assert shared_git_config.read_text(encoding="utf-8") == shared_git_config_before, (
+        f"the shared git config of the base checkout was modifiable:\n{combined}"
+    )
+    assert base_ref.read_text(encoding="utf-8") == base_ref_before, (
+        f"a base-checkout ref was modifiable from the linked worktree:\n{combined}"
+    )

@@ -73,9 +73,22 @@ class LiveComposerScreen:
         # is precisely the kind of quiet wrongness this whole change exists to
         # remove.
         self._viewport.feed(chunk)
+        # Latch "was busy" HERE, on every screen update, not at poll time.
+        # Output arrives continuously while the gate polls at 0.25s, so a busy
+        # frame followed by an idle repaint between two samples was invisible:
+        # the transition this gate waits for had already happened and been
+        # painted over. Sampling only ever sees the latest screen; this latch
+        # is what gives it a memory (F2).
+        if self._busy_on_screen():
+            self._seen_busy = True
 
     def rows(self) -> tuple[str, ...]:
         return self._viewport.render().written_rows
+
+    def _busy_on_screen(self) -> bool:
+        return any(
+            BUSY_MARKER in normalize_terminal_text(row) for row in self.rows()
+        )
 
     def state(self) -> tuple[bool, bool]:
         """Return ``(busy, holding)`` as the current screen shows them."""
@@ -254,7 +267,13 @@ class ComposerGate:
                 return ComposerReadiness(
                     True, ComposerReadinessReason.READY, now() - started, busy, holding
                 )
-            if not self.screen.seen_busy and now() >= grace_ends:
+            # Holding outranks the grace shortcut. `tab to queue message` is
+            # positive evidence that an EARLIER prompt never submitted, and
+            # "we never saw this agent work" is no reason to type a second
+            # prompt on top of the first. Without this the gate returned
+            # ready=True / NO_TUI_TURN with holding=True, and not even the
+            # not-ready warning fired (F2).
+            if not self.screen.seen_busy and not holding and now() >= grace_ends:
                 return ComposerReadiness(
                     True,
                     ComposerReadinessReason.NO_TUI_TURN,

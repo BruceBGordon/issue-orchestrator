@@ -1411,3 +1411,105 @@ class TestSendRoundResponseReaderChannel:
         assert persistent_round_failure_reason(excinfo.value) == (
             RoundFailureReason.PROCESS_EXITED_BEFORE_RESPONSE.value
         )
+
+
+class TestReadinessDoesNotConsumeTheWriteAllowance:
+    """F1: the readiness wait and the write allowance are different clocks.
+
+    `send_round` used to precompute
+    `write_deadline = started_at + min(timeout_seconds, write_timeout_seconds)`
+    and hand it into the write path — where the readiness gate then runs, and
+    may wait up to 180s against a 30s allowance. A healthy codex bootstrap that
+    becomes ready at 38.4s (the case this branch measured) therefore reached
+    the first write with an expired deadline and failed having written nothing:
+    `0 bytes accepted before timeout`.
+    """
+
+    class _Proc:
+        pid = 456
+
+        def poll(self) -> None:
+            return None
+
+    @staticmethod
+    def _busy_screen():
+        from issue_orchestrator.execution.composer_readiness import LiveComposerScreen
+
+        screen = LiveComposerScreen(rows=40, cols=120)
+        screen.feed(b"\x1b[2J\x1b[H* Working (1s * esc to interrupt)")
+        return screen
+
+    def _capture_first_write_deadline(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        *, ready_at: float, timeout_seconds: float,
+    ) -> float:
+        from issue_orchestrator.execution import composer_readiness, persistent_round_runner
+
+        clock = _FakeClock()
+        clock.value = 0.0
+        screen = self._busy_screen()
+
+        def fake_pump(_session: object, **_kwargs: object) -> bool:
+            # Each poll costs real time, and the agent finishes at ready_at.
+            clock.value += 5.0
+            if clock.value >= ready_at:
+                screen.feed(b"\x1b[2J\x1b[H  ? for shortcuts")
+            return True
+
+        monkeypatch.setattr(
+            composer_readiness, "drain_pty_output_until_quiet", fake_pump
+        )
+
+        captured: dict[str, float] = {}
+
+        def fake_write_full(_fd: int, _payload: bytes, **kwargs: object) -> int:
+            captured["deadline"] = kwargs["deadline"]  # type: ignore[assignment]
+            raise PersistentRoundTimeoutError("stop after deadline capture")
+
+        monkeypatch.setattr(persistent_round_write, "_write_full", fake_write_full)
+
+        session = persistent_round_runner.PersistentSession(
+            proc=self._Proc(),  # type: ignore[arg-type]
+            master_fd=99,
+            composer_screen=screen,
+        )
+        with pytest.raises(PersistentRoundTimeoutError, match="deadline capture"):
+            send_round(
+                session,
+                prompt="hello",
+                response_file=tmp_path / "response.json",
+                timeout_seconds=timeout_seconds,
+                write_timeout_seconds=30.0,
+                now=clock.now,
+                sleep=clock.make_sleeper(),
+            )
+        return captured["deadline"]
+
+    def test_a_slow_bootstrap_still_gets_a_full_write_allowance(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Ready at ~40s must not arrive at the write with 30s already spent."""
+        deadline = self._capture_first_write_deadline(
+            monkeypatch, tmp_path, ready_at=40.0, timeout_seconds=600.0
+        )
+
+        assert deadline > 60.0, (
+            "the write allowance was spent by the readiness wait: deadline "
+            f"{deadline}s, which is what produced '0 bytes accepted before "
+            "timeout' on a healthy agent"
+        )
+
+    def test_the_round_deadline_still_caps_the_write(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Starting the allowance later must not let a round outlive its budget.
+
+        The fix moves when the allowance starts; it must not remove the ceiling.
+        """
+        deadline = self._capture_first_write_deadline(
+            monkeypatch, tmp_path, ready_at=999.0, timeout_seconds=50.0
+        )
+
+        assert deadline == 50.0, (
+            f"write deadline {deadline}s exceeds the round budget of 50s"
+        )

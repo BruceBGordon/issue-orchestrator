@@ -17,6 +17,7 @@ import logging
 import os
 import select
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -40,6 +41,38 @@ _PTY_WRITE_HEARTBEAT_SECONDS = 5.0
 # late to a PTY that had stopped accepting it (0/5 in the micro harness).
 _ENTER_SETTLE_QUIET_SECONDS = 0.3
 _ENTER_SETTLE_MAX_WAIT_SECONDS = 2.0
+
+
+@dataclass(frozen=True)
+class PromptDeliveryBudget:
+    """The three clocks prompt delivery runs against, in one place.
+
+    They were split across two owners and the split was a bug (F1/A1). The
+    runner computed a write deadline as
+    ``started_at + min(timeout_seconds, write_timeout_seconds)`` and handed it
+    down; the readiness gate then ran INSIDE the write path and could wait up
+    to 180s against a 30s write allowance. A healthy bootstrap that becomes
+    ready at 38.4s — the very case this PR measured — arrived at the first
+    write with the deadline already expired and failed with
+    ``0 bytes accepted before timeout`` having never written a byte.
+
+    So the write allowance starts when writing starts, and the absolute round
+    deadline is the only thing readiness can eat into. Both writes draw a
+    fresh allowance for the same reason: the echo settle between them is time
+    spent waiting, not time spent writing.
+    """
+
+    #: Wall-clock instant the whole round must not outlive.
+    round_deadline: float
+    #: How long a single write may take, once it begins.
+    write_allowance_seconds: float
+
+    def write_deadline_from(self, start: float) -> float:
+        """Deadline for a write beginning at *start*, never past the round."""
+        return min(start + self.write_allowance_seconds, self.round_deadline)
+
+    def exhausted_at(self, moment: float) -> bool:
+        return moment >= self.round_deadline
 
 
 class WritableSession(Protocol):
@@ -197,7 +230,7 @@ def submit_prompt_with_enter(
     payload: bytes,
     *,
     response_file: Path,
-    write_deadline: float,
+    budget: PromptDeliveryBudget,
     now: Callable[[], float],
     sleep: Callable[[float], None],
     label: str,
@@ -234,9 +267,11 @@ def submit_prompt_with_enter(
             readiness.describe(), label, session.proc.pid,
         )
 
+    # Allowance starts HERE — after readiness — capped by the round deadline.
     written = _write_prompt_with_timeout_diagnostics(
         session, payload,
-        response_file=response_file, write_deadline=write_deadline,
+        response_file=response_file,
+        write_deadline=budget.write_deadline_from(now()),
         now=now, sleep=sleep, role_label=label,
         timeout_seconds=timeout_seconds,
         write_timeout_seconds=write_timeout_seconds,
@@ -263,7 +298,8 @@ def submit_prompt_with_enter(
     try:
         written += _write_prompt_with_timeout_diagnostics(
             session, b"\r",
-            response_file=response_file, write_deadline=write_deadline,
+            response_file=response_file,
+            write_deadline=budget.write_deadline_from(now()),
             now=now, sleep=sleep, role_label=label,
             timeout_seconds=timeout_seconds,
             write_timeout_seconds=write_timeout_seconds,

@@ -45,6 +45,7 @@ from .persistent_round_failures import (
 from .composer_readiness import LiveComposerScreen
 from .persistent_round_io import drain_pty_output_until_quiet
 from .persistent_round_write import (
+    PromptDeliveryBudget,
     drain_pty_output,
     safe_recording_size,
     submit_prompt_with_enter,
@@ -298,10 +299,17 @@ def send_round(
         )
     else:
         read_response = response_reader
-    write_deadline = started_at + min(timeout_seconds, write_timeout_seconds)
+    # The round deadline is the only clock readiness may consume; the write
+    # allowance starts when writing does (F1). Previously this precomputed a
+    # write deadline that the readiness wait could exhaust before any byte
+    # was written.
+    delivery_budget = PromptDeliveryBudget(
+        round_deadline=started_at + timeout_seconds,
+        write_allowance_seconds=write_timeout_seconds,
+    )
     written, recovered = submit_prompt_with_enter(
         session, payload,
-        response_file=response_file, write_deadline=write_deadline,
+        response_file=response_file, budget=delivery_budget,
         now=now, sleep=sleep, label=label,
         timeout_seconds=timeout_seconds,
         write_timeout_seconds=write_timeout_seconds,

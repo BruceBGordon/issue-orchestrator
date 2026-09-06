@@ -267,3 +267,60 @@ def test_a_nonpositive_round_budget_is_refused(bad: float) -> None:
         ComposerGate.for_round(
             LiveComposerScreen(rows=40, cols=120), round_timeout_seconds=bad
         )
+
+
+# -- F2: holding evidence, and remembering the transition ----------------
+
+
+def test_a_holding_composer_is_never_released_by_the_grace_shortcut() -> None:
+    """`tab to queue` outranks "we never saw this agent work".
+
+    The grace branch existed for agents with no TUI turn to finish. It ignored
+    `holding`, so a screen showing unsent text with no prior busy frame came
+    back ready=True/NO_TUI_TURN — positive evidence that an earlier prompt
+    never submitted, and we would have typed a second one on top of it without
+    even the not-ready warning.
+    """
+    clock = _Clock()
+    screen = _screen(HOLDING)
+    assert screen.seen_busy is False, "precondition: no busy frame was observed"
+
+    outcome = _gate(screen, max_wait_seconds=40.0).await_ready(
+        pump=lambda: None, now=clock.now, sleep=clock.sleep
+    )
+
+    assert outcome.ready is False
+    assert outcome.reason is ComposerReadinessReason.HOLDING_UNSENT
+    assert clock.now() >= 40.0, "took the 15s grace shortcut despite holding"
+
+
+def test_a_busy_frame_repainted_before_the_next_poll_is_still_remembered() -> None:
+    """The transition is latched when the screen updates, not when it is polled.
+
+    Output arrives continuously; the gate polls at 0.25s. A busy frame painted
+    over by an idle one between two samples used to vanish — `sample()` sees
+    only the latest screen — leaving `seen_busy` False and the gate waiting out
+    its whole budget for a transition that had already happened.
+    """
+    screen = LiveComposerScreen(rows=40, cols=120)
+    _repaint(screen, BUSY)
+    _repaint(screen, IDLE)   # both repaints land between polls
+
+    assert screen.seen_busy is True, (
+        "the busy frame was painted over before anything sampled it, so the "
+        "transition was lost"
+    )
+    assert screen.is_ready() is True
+
+
+def test_the_latch_does_not_invent_a_transition_that_never_happened() -> None:
+    """A screen that was only ever idle must not report having been busy.
+
+    Otherwise the latch would make every agent look finished the moment it
+    drew anything, which is the banner race the gate exists to stop.
+    """
+    screen = LiveComposerScreen(rows=40, cols=120)
+    _repaint(screen, IDLE)
+
+    assert screen.seen_busy is False
+    assert screen.is_ready() is False

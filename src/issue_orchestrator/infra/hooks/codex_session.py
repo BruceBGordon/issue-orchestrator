@@ -198,12 +198,29 @@ def _record_untrusted_projects(runtime_home: Path, projects: Iterable[Path]) -> 
             # this one, since the drift that triggers a repair is Codex
             # persisting state. Measured at 16.3% spurious failures on the
             # production-sized config when this check sat outside the lock.
+            # Revalidate the AUTHORITY-BEARING data — the project trust layers
+            # we just wrote — and nothing else.
+            #
+            # `_managed_untrusted_projects` still raises on genuinely unmanaged
+            # settings, which is the check that matters. What this must NOT do
+            # is fail because a benign, allowlisted key reappeared: the lock is
+            # advisory between OUR writers and Codex does not take it, so Codex
+            # can persist `[tui]` between the rename and this read. Failing
+            # there re-created the exact spurious launch failure the repair
+            # exists to remove — reproduced by review (F3) with a config
+            # holding only managed layers plus the allowed
+            # `tui.model_availability_nux`.
+            #
+            # A benign key that reappears is not drift to reject; it is state
+            # Codex owns, allowlisted precisely because it carries no
+            # authority, and stripped again by the next prepare.
             residual = _managed_untrusted_projects(config_path)
-            if residual.repairable_keys:
+            missing = configured - set(residual.projects)
+            if missing:
                 raise SandboxUnsupportedError(
-                    "Codex automation config still contains unmanaged settings "
+                    "Codex automation config lost managed project trust layers "
                     f"after rewrite: {config_path} "
-                    f"({', '.join(residual.repairable_keys)})"
+                    f"({', '.join(sorted(missing))})"
                 )
         finally:
             temp_path.unlink(missing_ok=True)

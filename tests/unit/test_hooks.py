@@ -2502,3 +2502,78 @@ class TestAgentHooksFromConfig:
 
             blocked = test_fn(hook_path, "git push --no-verify")
             assert blocked, f"{agent_type.value} hooks failed to block --no-verify"
+
+
+class TestCodexWritesDuringTheManagedRewrite:
+    """F3: the runtime-config lock does not bind Codex.
+
+    `_runtime_config_lock` is an advisory lock on our own `.managed-config.lock`
+    — it serialises orchestrator writers. Codex never takes it, so it can
+    persist its own state between our `os.replace` and the read that follows.
+    The post-rewrite check used to reject any repairable key it found there,
+    which meant a benign `[tui]` landing in that window re-created the very
+    spurious launch failure the repair exists to remove.
+    """
+
+    def test_a_benign_codex_write_landing_mid_rewrite_is_tolerated(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import os as _os
+
+        from issue_orchestrator.infra.hooks import codex_session
+
+        monkeypatch.setenv("ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT", str(tmp_path))
+        runtime_home = codex_session.codex_runtime_home()
+        runtime_home.mkdir(parents=True, exist_ok=True)
+        real_replace = _os.replace
+
+        def replace_then_codex_writes(src: object, dst: object) -> None:
+            """Codex persisting its own UI state immediately after our rename."""
+            real_replace(src, dst)
+            with open(dst, "a", encoding="utf-8") as handle:  # noqa: PTH123
+                handle.write('\n[tui.model_availability_nux]\ngpt-6-astra = 1\n')
+
+        monkeypatch.setattr(codex_session.os, "replace", replace_then_codex_writes)
+
+        project = tmp_path / "worktree"
+        project.mkdir()
+        # Must not raise: the trust layers we wrote are intact, and the key
+        # that appeared is one Codex owns and we allowlist.
+        codex_session._record_untrusted_projects(runtime_home, [project])
+
+        written = (runtime_home / "config.toml").read_text(encoding="utf-8")
+        assert f'[projects.{json.dumps(str(project))}]' in written
+        assert 'trust_level = "untrusted"' in written
+
+    def test_losing_a_managed_trust_layer_still_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The recheck must still catch the failure it is actually for.
+
+        Tolerating benign reappearance must not become tolerating a config
+        that no longer carries the trust layer we just wrote — that is the
+        authority-bearing data, and losing it is what would silently hand
+        Codex a trusted project.
+        """
+        import os as _os
+
+        from issue_orchestrator.infra.hooks import codex_session
+
+        monkeypatch.setenv("ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT", str(tmp_path))
+        runtime_home = codex_session.codex_runtime_home()
+        runtime_home.mkdir(parents=True, exist_ok=True)
+        real_replace = _os.replace
+
+        def replace_then_clobber(src: object, dst: object) -> None:
+            real_replace(src, dst)
+            with open(dst, "w", encoding="utf-8") as handle:  # noqa: PTH123
+                handle.write("# clobbered by something else\n")
+
+        monkeypatch.setattr(codex_session.os, "replace", replace_then_clobber)
+
+        project = tmp_path / "worktree"
+        project.mkdir()
+        with pytest.raises(
+            codex_session.SandboxUnsupportedError, match="lost managed project trust"
+        ):
+            codex_session._record_untrusted_projects(runtime_home, [project])
