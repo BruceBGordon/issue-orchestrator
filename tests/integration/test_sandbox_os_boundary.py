@@ -1427,13 +1427,13 @@ def test_the_generated_profile_denies_secrets_network_and_policy_paths(
     scope = replace(scope, deny_read_files=scope.deny_read_files + (str(secret),))
 
     quote = shlex.quote
-    network_probe = "/bin/bash -c " + quote("exec 3<>/dev/tcp/1.1.1.1/80")
+    # The network check is NOT here: an unreachable endpoint makes every
+    # failure look like enforcement. It needs a live listener and a positive
+    # control, which is a second sandbox run — see the dedicated test below.
     script = "; ".join(
         [
             f"if head -c 4096 {quote(str(secret))} > {quote(str(secret_read))} "
             f"2>/dev/null; then echo secret=READABLE; else echo secret=DENIED; fi",
-            f"if {network_probe} 2>/dev/null; then echo net=OPENED; "
-            "else echo net=DENIED; fi",
             f"(printf TAMPERED > {quote(str(policy_file))}) 2>/dev/null; "
             "echo policy=$?",
             f"(printf TAMPERED > {quote(str(shared_git_config))}) 2>/dev/null; "
@@ -1461,9 +1461,6 @@ def test_the_generated_profile_denies_secrets_network_and_policy_paths(
     assert secret_marker not in leaked, (
         f"the denied secret leaked into the workspace at {secret_read}"
     )
-    assert "net=DENIED" in combined, (
-        f"raw network access was permitted inside the sandbox:\n{combined}"
-    )
     assert policy_file.read_text(encoding="utf-8") == policy_before, (
         f"the session's own codex policy file was modifiable:\n{combined}"
     )
@@ -1473,3 +1470,94 @@ def test_the_generated_profile_denies_secrets_network_and_policy_paths(
     assert base_ref.read_text(encoding="utf-8") == base_ref_before, (
         f"a base-checkout ref was modifiable from the linked worktree:\n{combined}"
     )
+
+
+@pytest.mark.skipif(not _codex_available(), reason="codex CLI not installed")
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="seatbelt enforcement is macOS-specific"
+)
+def test_the_generated_profile_denies_a_reachable_tcp_endpoint(tmp_path: Path) -> None:
+    """Network denial, distinguished from a connection that would fail anyway.
+
+    The previous probe dialled a public address and treated every nonzero exit
+    as enforcement. That passes when the sandbox permits networking and the
+    endpoint merely refuses — demonstrated in review by keeping a permissive
+    profile and pointing the probe at a bound-but-not-listening port, which
+    made the whole test pass. It could also wait out the subprocess timeout if
+    traffic were dropped rather than refused.
+
+    So the endpoint is a real listener owned by this test, alive for both
+    runs, and the same probe runs twice against it:
+
+    1. **Positive control** — a permissive profile (``egress="model+web"``,
+       which is what sets ``network = { enabled = true }``) MUST connect. If
+       it cannot, the listener or the probe is broken and this test fails as
+       a broken test rather than quietly reporting a secure sandbox.
+    2. **The assertion** — the generated restricted profile must NOT connect.
+
+    Only the policy differs between the two runs, so the difference is
+    attributable to it. The connect is bounded at 3s inside the probe, so a
+    dropped packet costs seconds rather than the subprocess timeout.
+    """
+    import socket
+
+    worktree = tmp_path / "net-worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=worktree, check=True)
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)          # genuinely accepting, not merely bound
+    port = listener.getsockname()[1]
+    try:
+        probe = (
+            "import socket,sys\n"
+            "s=socket.socket(); s.settimeout(3.0)\n"
+            "try:\n"
+            f"    s.connect(('127.0.0.1', {port})); print('net=OPENED')\n"
+            "except Exception as exc:\n"
+            "    print('net=BLOCKED:'+type(exc).__name__)\n"
+        )
+        agent = AgentConfig(
+            prompt_path=Path(".prompts/backend.md"),
+            prompt_relative=".prompts/backend.md",
+            provider="codex",
+            sandbox=True,
+        )
+        restricted = compute_session_scope(
+            agent, SandboxScopeContext(task_kind="code", worktree=worktree)
+        )
+        assert restricted is not None
+
+        def _run(scope: object) -> str:
+            argv = [
+                arg
+                for arg in CodexProvider().apply_scope(scope)  # type: ignore[arg-type]
+                if arg != "--strict-config"
+            ]
+            done = subprocess.run(
+                ["codex", *argv, "sandbox", "--", sys.executable, "-c", probe],
+                cwd=worktree, capture_output=True, text=True, timeout=60,
+            )
+            return f"{done.stdout}\n{done.stderr}"
+
+        permissive = _run(replace(restricted, egress="model+web"))
+        assert "net=OPENED" in permissive, (
+            "POSITIVE CONTROL FAILED: the probe could not reach a listener on "
+            "this machine even with networking permitted, so this test cannot "
+            "distinguish sandbox enforcement from an unreachable endpoint. "
+            f"Fix the fixture, do not read this as a secure sandbox:\n{permissive}"
+        )
+
+        denied = _run(restricted)
+        assert "net=OPENED" not in denied, (
+            "the restricted profile permitted a TCP connection to a listener "
+            f"the positive control just reached; network policy is not "
+            f"enforced:\n{denied}"
+        )
+        assert "net=BLOCKED:" in denied, (
+            f"the probe produced no verdict under the restricted profile:\n{denied}"
+        )
+    finally:
+        listener.close()
