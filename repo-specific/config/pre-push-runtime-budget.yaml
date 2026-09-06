@@ -9,8 +9,14 @@
 # records; running the raw target directly bypasses the cache-aware wrapper.
 pre_push_runtime:
   enabled: true
-  # Matches validation.publish.cmd in the io config (condor lane opt-in).
-  command: "LANE_EXECUTOR=condor make validate-pr-raw"
+  # MUST match validation.publish.cmd in the io config exactly — the guard
+  # selects timing records by this string, so a mismatch is not a slow build,
+  # it is "no timing record exists" and the push is refused outright.
+  # Currently the direct backend while #7163 is open (the unit lane is
+  # submitted with request_cpus=3 and then runs UNIT_PARALLEL=12 inside that
+  # reservation); restore the condor string here in the same commit that
+  # restores it there.
+  command: "LANE_EXECUTOR=direct make validate-pr-raw"
   metric: "validation_elapsed_seconds"
   baseline_seconds: 540
   # Raised 240 -> 330 (cap 780 -> 870s, still < the 900s hard max_seconds):

@@ -164,3 +164,38 @@ def test_rejects_bool_metric_value(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "missing numeric 'validation_elapsed_seconds'" in result.stderr
+
+
+def test_the_budget_command_matches_the_configured_publish_command() -> None:
+    """Two files that must agree, with nothing making them.
+
+    The guard selects timing records by exact command string. When they drift,
+    the failure is not "the build got slower" — it is "no timing record
+    exists", and the push is refused with a message about seeding a cache that
+    is already seeded. That happened: moving the publish gate to the direct
+    lane backend (#7163) left this file naming the condor command, and a green,
+    cached validation could not be pushed.
+
+    Nothing tested this pairing, which is why the drift was invisible until a
+    push hit it. Cheap to assert, so asserted.
+    """
+    from pathlib import Path
+
+    import yaml
+
+    from issue_orchestrator.infra.config import Config
+
+    repo_root = Path(__file__).resolve().parents[2]
+    budget = yaml.safe_load(
+        (repo_root / "repo-specific" / "config" / "pre-push-runtime-budget.yaml")
+        .read_text(encoding="utf-8")
+    )
+    config = Config.load(
+        repo_root / ".issue-orchestrator" / "config" / "modes" / "default" / "main.yaml"
+    )
+
+    assert budget["pre_push_runtime"]["command"] == config.validation.publish.cmd, (
+        "pre-push-runtime-budget.yaml selects timing records by this exact "
+        "string; drift from validation.publish.cmd refuses every push with a "
+        "misleading 'run make validate-pr to seed a timing record'"
+    )
