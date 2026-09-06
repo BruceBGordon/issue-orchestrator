@@ -893,9 +893,23 @@ command requires a real one.
 @dataclass(frozen=True, slots=True)
 class OperatorResolution:
     """The ONLY way unresolved work becomes safe to lose. Never inferred."""
-    actor: str            # operator identity or approved tech-lead op id
+    actor: str            # authenticated operator identity; never an agent or op id
     reason: str           # non-empty; recorded verbatim in the durable row
     resolved_at: str      # ISO-8601 UTC
+
+
+@dataclass(frozen=True, slots=True)
+class AbandonValidatedWorkCommand:
+    """Accept loss of exactly the evidence and observations the operator saw."""
+    authority: ValidatedWorkAuthoritySnapshot  # rendered snapshot, echoed unchanged
+    actor: str                               # authenticated operator, supplied by handler
+    reason: str                              # operator-supplied, non-empty
+
+    def __post_init__(self) -> None:
+        if not self.actor.strip() or not self.reason.strip():
+            raise ValueError("abandonment requires an operator and a reason")
+        if not self.authority.record_id or not self.authority.evidence_id:
+            raise ValueError("abandonment requires the exact rendered authority")
 
 
 @dataclass(frozen=True, slots=True)
@@ -948,6 +962,8 @@ class AbandonStatus(StrEnum):
     ALREADY_RESOLVED          = "already_resolved"       # RECOVERED or ABANDONED
     REFUSED_STATE             = "refused_state"          # QUEUED / PUBLISHING: stop it first
     ATTACHED_EVIDENCE_PENDING = "attached_evidence_pending"
+    EVIDENCE_NOT_CURRENT      = "evidence_not_current"   # handle now attached/superseded
+    AUTHORITY_STALE           = "authority_stale"        # same evidence, different approved facts
 
 
 @dataclass(frozen=True, slots=True)
@@ -962,6 +978,10 @@ class AbandonValidatedWorkOutcome:
     status: AbandonStatus
     disposition: ValidatedWorkDisposition | None   # set iff ABANDONED
     pending_evidence_ids: tuple[str, ...]          # non-empty iff ATTACHED_EVIDENCE_PENDING
+    current_authority: ValidatedWorkAuthoritySnapshot | None
+    # Required for EVIDENCE_NOT_CURRENT/AUTHORITY_STALE; otherwise None.
+    # Captured in the refusal transaction: typed record/evidence/revision and
+    # current facts for display, never substituted into an automatic retry.
     message: str
 
 
@@ -1039,9 +1059,18 @@ class ValidatedWorkSnapshot:
     finalization_phase: FinalizationPhase      # §4.5b; where a resumed finalize restarts
     updated_at: str
     can_recover: bool                 # PARKED, or FAILED after the condition is fixed
-    can_abandon: bool                 # PARKED/FAILED **and** no unresolved attached evidence
+    can_abandon: bool                 # PARKED/FAILED, no retained owner, no unresolved attachments
     abandon_unavailable: AbandonStatus | None   # why not, when can_abandon is false
 ```
+
+Snapshot availability uses the same owner rule as abandonment admission: a
+`PARKED`/`FAILED` row retaining a claim (including a leaked stop reservation) has
+`can_abandon=False` and `abandon_unavailable=REFUSED_STATE`. The UI presents the
+owner/recovery explanation instead of offering abandonment; it never infers
+availability from the state string alone.
+Dead retained claims are cleared by the separate startup/drain maintenance in
+§4.4e, including irreparable `FAILED` evidence. Abandonment never performs that
+cleanup as a side effect of checking a stale command.
 
 ### 2.3 Ports
 
@@ -1079,12 +1108,15 @@ class ValidatedWorkDispositionOwner(Protocol):
     """
 
     def abandon(
-        self, issue_number: int, evidence_id: str, resolution: OperatorResolution
+        self, command: AbandonValidatedWorkCommand
     ) -> AbandonValidatedWorkOutcome: ...
     """Operator explicitly accepts the loss: UNRESOLVED -> ABANDONED.
 
     The single modeled route out of FAILED/PARKED without a recovery.
-    Requires an actor and a reason, is refused for QUEUED/PUBLISHING (stop
+    Requires the operator's exact rendered authority, actor and reason. The
+    store atomically compares that authority with CURRENT evidence before
+    recording OperatorResolution (§4.1); it never resolves a newer capture
+    through an old evidence handle. Is refused for QUEUED/PUBLISHING (stop
     the in-flight work first), and retains escrow + refs for the retention
     window regardless. Never callable by an agent.
     """
@@ -1575,6 +1607,7 @@ CREATE TABLE IF NOT EXISTS validated_work_records (
     resolved_by           TEXT NOT NULL DEFAULT '',   -- OperatorResolution.actor
     resolution_reason     TEXT NOT NULL DEFAULT '',
     resolved_at           TEXT NOT NULL DEFAULT '',
+    abandon_authority_json TEXT NOT NULL DEFAULT '', -- most recent accepted abandonment snapshot
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
     terminal_at           TEXT NOT NULL DEFAULT ''    -- entry into a RESOLVED state
@@ -1709,7 +1742,53 @@ def evidence_for_retention(self, *, released_before: str) -> tuple[EvidenceRow, 
 
 def lineage_publication(self, lineage_key: str) -> LineagePublication | None: ...
     """The durable published fact (§2.1.4). Read by EVERY classification."""
+
+def abandon_if_current(
+    self, command: AbandonValidatedWorkCommand
+) -> AbandonValidatedWorkOutcome: ...
+    """One transaction: match rendered authority, then record abandonment.
+    Never resolve a record first and check the approved evidence afterwards."""
 ```
+
+**Abandonment is snapshot-bound in the store transaction.** The owner calls
+`abandon_if_current()` while holding §7's issue mutation gate, which serializes
+admission and label projection. The store owns one `BEGIN IMMEDIATE` transaction;
+no transaction handle, caller-computed freshness boolean, or prebuilt
+`OperatorResolution` crosses its port. It performs these checks before **any**
+durable mutation, in order:
+
+1. Resolve the submitted `record_id` and `evidence_id` exactly. A missing target
+   returns `NO_SUCH_RECORD`; an evidence/record/repository/issue binding mismatch
+   returns `AUTHORITY_STALE` and does not redirect to another target. The handler
+   already verifies configured repository and route issue against the command.
+2. Require the submitted evidence to be the record's CURRENT evidence. A known
+   attached or superseded handle returns `EVIDENCE_NOT_CURRENT`, with
+   `current_authority` naming the actual current evidence (for example `E2` when
+   the dialog was rendered for `E1`). Returning a message alone is insufficient.
+3. Compare **every field** of the submitted `ValidatedWorkAuthoritySnapshot` with
+   the current evidence/record snapshot, including `observation_revision` and
+   remote/PR observations. Any inequality returns `AUTHORITY_STALE` with the typed
+   `current_authority`. This equality and the eventual state change are in the
+   **same transaction**, not a read-before-call freshness check.
+4. Enforce existing state and attachment rules: resolved returns
+   `ALREADY_RESOLVED`; `QUEUED`/`PUBLISHING` or a still-owned record returns
+   `REFUSED_STATE`; unresolved attached entries return `ATTACHED_EVIDENCE_PENDING`.
+   Abandonment neither acquires nor revokes a publish claim under the issue gate.
+5. Only then create `OperatorResolution` using the authenticated actor, exact
+   reason and owner-generated timestamp, and compare-and-set the matching
+   CURRENT evidence/revision and `PARKED`/`FAILED` record to `ABANDONED`. Persist
+   the accepted authority snapshot with that resolution as its audit envelope
+   (`abandon_authority_json` on the record, empty until its first abandonment;
+   reopening preserves it and only another accepted abandonment replaces it). Any failed
+   comparison returns a typed refusal with no writes.
+
+All refusals leave record/evidence states, ownership fences, resolution audit,
+retention timestamps, labels and needs-human causes unchanged. Refusal snapshots
+are taken inside that transaction; the endpoint must not re-read them or parse
+`message` to discover the current evidence. Only an `ABANDONED` result triggers
+§7's aggregate release and the abandonment event. A stale response may refresh
+the display, but another abandonment requires a newly rendered confirmation;
+the owner/handler/browser never retries with the returned authority automatically.
 
 **Resolution is one store-owned command per verified route, not a sequence the
 caller is trusted to complete.** An earlier draft exposed
@@ -1843,7 +1922,7 @@ stale-downgrades (§3.2), and there are exactly three exits:
 |---|---|---|---|
 | `PARKED` | `PUBLISHING` | approved tech-lead op or operator command | full §4.3 pre-submission phase |
 | `FAILED` | `PARKED` | operator re-submits after fixing the external condition (e.g. reopening a closed PR) | re-runs every §4.3 check from scratch |
-| `PARKED`/`FAILED` | `ABANDONED` | `abandon()` with an `OperatorResolution` | actor + non-empty reason; refused for `QUEUED`/`PUBLISHING` |
+| `PARKED`/`FAILED` | `ABANDONED` | `abandon(AbandonValidatedWorkCommand)` → atomic `abandon_if_current()` | rendered authority matches CURRENT evidence/revision in the write transaction; actor + non-empty reason; no retained owner or attached evidence; refused for `QUEUED`/`PUBLISHING` |
 
 `ABANDONED` is the only modeled way unresolved work becomes safe to lose, and it
 still retains escrow and refs for `escrow_retention_days` — an operator saying "I
@@ -2513,11 +2592,16 @@ def acquire_claim(
     self,
     record_id: str,
     *,
-    expected_states: frozenset[ValidatedWorkState],  # {QUEUED, PARKED} or {PUBLISHING}
+    expected_states: frozenset[ValidatedWorkState],  # publication or maintenance sets below
     evidence_id: str,                # must still be the CURRENT evidence
     liveness: OrchestratorLivenessPort,   # gate-backed death proof (see below)
 ) -> ValidatedWorkClaim | None: ...
-    """Take exclusive ownership of the record for its whole PUBLISHING phase.
+    """Take exclusive ownership for publication or quiescent claim cleanup.
+
+    Publication uses {QUEUED, PARKED} or {PUBLISHING}. Retained-claim
+    maintenance uses the candidate's singleton state from
+    {PARKED, FAILED, RECOVERED, ABANDONED}; acquiring a maintenance claim
+    never changes that state or creates a publish attempt.
 
     One transaction: admit the caller only when the record is unowned or its
     recorded owner is ``liveness.is_provably_dead``. Then generate a fresh
@@ -2811,6 +2895,46 @@ death path like any other successor: row 3 of the matrix above, which is exactly
 that row must answer `True` without probing. `acquire_claim()` accordingly has one behaviour:
 mint a new secret, bump the fence, record the new owner. It never returns an
 existing claim, because it cannot.
+
+#### Retained claims on non-publishing records have a maintenance exit
+
+A process may die after writing `FAILED` or `RECOVERED` but before quiescent
+`relinquish_claim()`, and a stop reservation may temporarily refuse that release.
+Refusing abandonment while *any* owner remains therefore requires cleanup even
+when recovery cannot succeed. Fixing validation, escrow or a remote condition is
+not a prerequisite for removing a dead owner's claim.
+
+At startup and before each ordinary drain, the disposition service runs
+`reconcile_retained_claims()`. A store read
+`retained_claims(states: frozenset[ValidatedWorkState])` returns typed candidates
+containing record id, CURRENT evidence id, state and recorded process identity.
+This pass selects retained claims in `PARKED`, `FAILED`, `RECOVERED` and
+`ABANDONED`; `QUEUED`/`PUBLISHING` continue through normal publication/resumption.
+It runs outside the issue mutation gate and obeys the existing claim-before-gate
+ordering:
+
+1. A claim belonging to this live service is already in its private claim map.
+   Once the owning operation has completed and no effect is in flight, retry
+   `relinquish_claim()` with that same handle. State alone never proves quiescence.
+   A stop-reserved refusal keeps the handle for the next quiescent pass.
+2. A candidate belonging to another process is passed to `acquire_claim()` with
+   its exact CURRENT evidence id, singleton expected state and the injected
+   gate-backed liveness port. A live, remote or unproven owner is untouched.
+   Positive death proof permits a fresh claim/fence and invalidates the dead
+   owner's stop reservation in that same transaction. Concurrent state/evidence
+   changes cause refusal through the existing acquisition checks.
+3. Immediately relinquish the new maintenance claim at this quiescent boundary.
+   If a concurrent stop reservation refuses release, retain this service's new
+   handle and retry under rule 1. A crash between acquisition and release is just
+   another dead retained claim for the next startup; no timer grants authority.
+
+This maintenance changes only claim/fence/reservation metadata. It does not publish,
+validate artifacts, alter evidence/record states or observation revisions, emit an
+abandonment, write labels/causes, or change resolution/retention timestamps. It is
+independent of the abandonment request path: a stale command still has **zero**
+writes. After successful cleanup an otherwise eligible `FAILED`/`PARKED` snapshot
+can offer a newly confirmed abandonment, even when its underlying failure is
+irreparable. Resolved rows lose stale owner presentation without reopening work.
 
 A durable claim is still the right shape rather than an in-process lock, because
 the state it guards outlives the process: a record left `PUBLISHING` by a crash must
@@ -3689,8 +3813,11 @@ per the `schema-updates` skill.
   awaiting a choice. Rendering one and hiding the rest is the same collapse-to-a-winner
   the batch exists to prevent, and it is worse in the UI than in the owner, because
   the operator is the one being asked to choose.
-- An operator action posts the rendered `authority` object back **unchanged**, and
-  the endpoint builds the `StoredEvidenceCommand` from the request body alone. So
+- Both operator actions post the rendered `authority` object back **unchanged**.
+  Recovery builds `StoredEvidenceCommand`; abandonment builds
+  `AbandonValidatedWorkCommand`. Authority and reason come from the request body;
+  `actor` comes from the authenticated operator context, never a body identity or
+  agent credential. Neither endpoint fills authority from current server state. So
   the operator, like the tech lead, approves *specific facts*: if the record moved
   between render and click, check 0 refuses with zero writes and the UI re-renders
   the new facts rather than acting on them silently. Registered in the UI OpenAPI
@@ -4094,10 +4221,32 @@ target repository's state without asking that repository's engine anything:
 
 ```python
 class ValidatedWorkRecordReader(Protocol):
-    """Read one record's disposition facts for a repository, out of process."""
+    """Discover and read recovery facts without contacting a Repository Engine."""
+    def discover_repository(
+        self, repo_root: str
+    ) -> ValidatedWorkDiscovery: ...
+    """All unresolved records OR records with a retained claim, in one read
+    snapshot. Repository scope comes from the configured-repository owner."""
+
     def snapshot_record(
         self, repo_root: str, record_id: str
     ) -> ValidatedWorkSnapshot | None: ...
+
+
+class WorkDiscoveryStatus(StrEnum):
+    AVAILABLE          = "available"
+    DATABASE_ABSENT    = "database_absent"
+    UNREADABLE         = "unreadable"
+    UNSUPPORTED_SCHEMA = "unsupported_schema"
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedWorkDiscovery:
+    status: WorkDiscoveryStatus
+    records: tuple[ValidatedWorkSnapshot, ...]
+    message: str
+    # Only AVAILABLE may carry records; AVAILABLE + () proves an empty query.
+    # Every other status is visibly unavailable, never "no preserved work".
 ```
 
 `SqliteValidatedWorkRecordReader` implements it by opening that repository's
@@ -4106,6 +4255,38 @@ class ValidatedWorkRecordReader(Protocol):
 file in the repository's own state directory rather than engine memory: a reader
 that needed the engine's HTTP API would be unavailable in exactly the failure this
 command exists for. It performs no writes and takes no claim.
+
+**Cold discovery is a required read path, not a deep-link prerequisite.** On the
+initial Control Center repository-list load and each existing repository refresh,
+the Control Center query owner calls `discover_repository()` for the configured
+repository roots. It reads the durable records and current evidence in one SQLite
+read snapshot, uses the same snapshot mapper as `snapshot_record()`, and orders
+the result by issue, branch and record id. The predicate includes every unresolved
+state and every retained claim; it never depends on which issue the engine last
+rendered. An unreadable, missing or unsupported database is a typed unavailable
+state with an explanation, not a newly created database or a successful empty list.
+Neither endpoint accepts an arbitrary filesystem path as repository authority.
+
+`ControlCenterRecoveryQueries` composes this reader with the existing configured
+repository registry and supervisor-status reader. It produces
+`ControlCenterRecoveryRows`: a typed repository result containing the discovery
+status, per-engine groups keyed by full `EngineIdentity`, and unowned unresolved
+records. Every record carries its issue, branch, state, owner/fence and computed
+stop availability from `ValidatedWorkSnapshot`. Ownership comes from the durable
+record; supervisor status supplies the engine presentation without relabelling a
+replacement process as the claim owner. A stale or missing engine stays visible
+as such. Unowned records appear in the repository's preserved-work section with
+no stop action. The query owner never reserves a stop or publishes work.
+
+The repository-list view model gains `validated_work: ControlCenterRecoveryRows`
+through this query owner; the authenticated read endpoint
+`GET /api/control-center/repositories/{repo_key}/validated-work` exposes the same
+projection for refresh. Both are served by Control Center even if every engine
+HTTP request fails. Register the payload/endpoint in the public contracts and UI
+OpenAPI. The per-engine row always shows discovered owned work and offers the
+guarded action when its capability permits, without any query string. Multiple
+records are individually inspectable; choosing one binds its rendered identity
+and fence. A deep link only expands and focuses an already-discoverable row.
 
 `SqliteValidatedWorkStopReservations` separately implements the narrow
 `ValidatedWorkStopReservations` port with a writable connection to the same file,
@@ -4123,6 +4304,8 @@ lifecycle = SupervisorRepositoryEngineLifecycle(incarnation_stop) # exact proces
 reader = SqliteValidatedWorkRecordReader(lifecycle.stop_availability)
 reservations = SqliteValidatedWorkStopReservations()               # narrow durable CAS
 coordinator = ValidatedWorkOwnerStopCoordinator(reader, reservations, lifecycle)
+recovery_queries = ControlCenterRecoveryQueries(repository_registry, supervisor_status, reader)
+ControlCenterViewModels(..., recovery_queries=recovery_queries)
 ControlCenterActions(..., stop_validated_work_owner_cmd=coordinator)
 ```
 
@@ -4136,7 +4319,8 @@ guarded control. §8.4's issue-detail surface never posts to the coordinator.
 **Where the control lives, and how the record context crosses processes.** The
 control is a Control Center engine control, on a Control Center surface, served by
 the Control Center API. The issue detail — which the wedged engine serves — only
-ever *reports* and *links*.
+reports facts and offers navigation. Cold discovery above supplies the same facts
+without requiring the issue detail to respond.
 
 There is no instance-addressed page today: the Control Center renders one repository
 card keyed by `repo.path`, and its `Stop engine` action is repository-aggregate
@@ -4146,15 +4330,15 @@ it already resolves per-instance status — and that row is addressable:
 
 | Step | Surface | What it carries |
 |---|---|---|
-| 1 | Issue detail (served by the engine) | renders the `ClaimOwnerFact` as text — "Owned by engine `<label>` (`Running`)" — and a **link**, never a control, to the Control Center: `{cc_origin}/?repo={repo_key}&engine={instance_key}&stop_owner_of={record_id}`, where `cc_origin` is the embed-context parameter below — rendered as plain text with no anchor when it is absent |
-| 2 | Control Center repository card | with that context, expands the named engine row and renders the native **`Stop engine`** button (accessible name includes the engine label) beside a summary of the record it would unblock. Without the context the card is unchanged |
+| 1 | Issue detail (served by the engine) | renders the `ClaimOwnerFact` as text plus the typed **Open in Control Center** navigation described below, never a stop control. Missing or invalid navigation context renders instructions as text. |
+| 2 | Control Center repository card | initial repository discovery renders every owned unresolved record on its engine row and the native **`Stop engine`** button when available. Optional navigation context expands/focuses the named row; it is never required to discover work or expose the action. The accessible name identifies the engine and the confirmation identifies the selected record. |
 | 3 | POST | `POST /api/control-center/repositories/{repo_key}/engines/{instance_key}/stop-validated-work-owner`, body `{record_id, engine: {repo_root, instance_id, host, label, process: {host, pid, started_at, instance_id}}, owner_fence, reason}` — the engine and fence echoed **verbatim** from what step 2 rendered, exactly as §4.3 check 0's authority snapshot is echoed |
 | 4 | Handler | builds `StopValidatedWorkOwnerCommand` from the body **and the route**, checks they agree (below), and dispatches to the coordinator; it re-derives nothing and decides nothing |
 
 **Single-instance identity is routable.** `instance_id is None` is the
 single-instance engine, and `None` has no path representation, so `instance_key`
 encodes it as the reserved literal `default`; every other value is the
-`instance_id`. The encoding is one function used by both the link builder and the
+`instance_id`. The encoding is one function used by both the navigation owner and the
 route parser, so they cannot disagree.
 
 **Four facts must agree before anything stops**, and the handler checks all four
@@ -4162,7 +4346,7 @@ rather than trusting the body it was handed:
 
 1. the **route** identity (`repo_key`, `instance_key`),
 2. the **rendered** engine identity in the body,
-3. the record's **repository** (`snapshot_record().key.repo_slug` → its root),
+3. the record's **repository** (`snapshot_record().disposition.key.repo_slug` → its root),
 4. the **current claim owner**, its exact process incarnation and fence on that record.
 
 Any disagreement is a typed refusal with zero effect: `REPO_MISMATCH` for 1–3,
@@ -4171,29 +4355,53 @@ never fills it from fresh state. The reservation transaction repeats the owner/f
 comparison at admission. A duplicated path value that contradicts the body is
 therefore a refusal, not an ignored field.
 
-**The origin is supplied by the shell and preserved by embedded navigation.** There
-is no `control_center_origin` setting today and this design does not add one: a new
-top-level config surface for a value the shell already knows would be a worse
-answer than passing it, and the engine has no way to discover it on its own.
-Instead it rides the mechanism that already exists for exactly this purpose.
+**One validated, frame-aware navigation owner.** Extend the shared
+`static/js/embedded_nav.js` boundary with
+`controlCenterNavigation(command, context)`. Its typed
+`OpenValidatedWorkInControlCenter` command carries only
+`{type: "cc-open-validated-work", repo_key, instance_key, record_id}` — no destination
+URL and no mutation. A discriminated result is `PARENT_COMMAND` (validated target
+origin and command), `LOCAL_LINK` (constructed href), or `UNAVAILABLE` (explanation).
+Dashboard/Settings handlers consume this result; templates never interpolate raw
+`cc_origin` into an href or independently decide frame/origin policy.
 
-The Control Center shell builds repository dashboard URLs and stamps its embed
-context onto them — today `embedded` and `theme`
-(`static/js/control_center.js:901-906`) — and `embedded_nav.js` preserves that
-context across in-dashboard navigation from a single frozen list,
-`EMBEDDED_CONTEXT_PARAMS` (`static/js/embedded_nav.js:31-43`). This design adds one
-member, `cc_origin`, to **both** places: the shell stamps its own origin, and
-embedded navigation carries it just like `theme`. One list, one rule, no new
-configuration surface, and the link builder reads it from the same place every other
-embed-context consumer does.
-
-Three cases, all specified:
+There is no new origin configuration. The shell's existing
+`buildDashboardUrlFromBase()` stamps its actual `window.location.origin` as
+`cc_origin`; add that key to `EMBEDDED_CONTEXT_PARAMS` so shared embedded navigation
+preserves it alongside `embedded` and `theme`. Query transport is **untrusted** even
+when normally produced by the shell. The one parser accepts exactly one value:
+canonical absolute HTTP(S) with hostname exactly `localhost`, `127.0.0.1`, or
+`[::1]`, and an optional valid port. Require the raw value to equal the parsed
+origin or that origin plus `/`. Reject credentials, non-root paths, query/fragment
+delimiters (even empty), whitespace/control characters, backslashes, encoded or
+noncanonical hosts, duplicate parameters, protocol-relative URLs, executable
+schemes and every other hostname. Missing/rejected values yield `UNAVAILABLE`,
+never an anchor, guessed origin, wildcard target or automatic dispatch. Nonlocal
+Control Center deployments use the manual discovery instruction for this action.
 
 | Context | Behaviour |
 |---|---|
-| Embedded in the shell | `cc_origin` is present; the link is built against it, and the target card is already in the shell |
-| Standalone **with** `cc_origin` (navigated from an embedded session, or supplied explicitly) | same link, opened against that origin |
-| Standalone **without** `cc_origin` | the issue detail renders the owner fact and the record id as **text**, with an explicit "open the Control Center for this repository to stop engine `<label>`" instruction. A link that cannot be built is never rendered as one — no dead href, no guessed origin |
+| Actually embedded (`window.parent !== window`) with a valid origin | Native **Open in Control Center** navigation button sends the typed command using `window.parent.postMessage(command, validatedOrigin)`, never `"*"`; it neither navigates the iframe nor performs an engine operation. The `embedded` query flag alone cannot select this mode. |
+| Top-level with a valid origin | Native anchor built with `URL`/`URLSearchParams` against that origin's root, carrying `repo_key`, `instance_key` and `stop_owner_of=record_id`, with `target="_top"` and `rel="noopener"`. Explicit click navigates the top-level document. |
+| Missing or invalid origin in either frame mode | Owner facts and record id remain text, with an explicit instruction to open Control Center and select the repository/engine. No anchor or dispatch handler is rendered. Cold discovery does not depend on this context. |
+
+The shell gains a `ControlCenterNavigationReceiver` alongside its existing
+`cc-back-to-repos` handler. For this new command it requires
+`event.source === activeIframe.contentWindow`, `event.origin` equal to the engine
+origin independently recorded by the shell when assigning that iframe's `src`, a
+valid command schema, and a `repo_key` matching that iframe's configured repository.
+Unknown origins, wrong sources/repositories and retired frames have zero effect.
+The existing wildcard back-navigation helper is precedent for the frame boundary,
+**not** a security policy to copy for this command.
+
+An accepted command switches the **shell** to the repositories view and uses the
+Control Center recovery projection above to expand/focus the labelled engine and
+record region. A stale/missing record produces an unavailable notice, never a
+guessed selection. Top-level query selection uses the same selection owner after
+resolving the configured repository; record ids are identifiers, not authority.
+Neither path launches/stops an engine, opens a confirmation automatically, or
+requires Repository Engine HTTP. Native button/link keyboard operation and visible
+focus are required; the receiver moves focus to the labelled selected region.
 
 The endpoint is registered in the UI OpenAPI contract per the `ui-openapi` skill
 with a required request body and the typed `StopOwnerOutcome` as its response, and
@@ -4236,13 +4444,32 @@ than a bespoke path. `actor` comes from the authenticated session, never the bod
   `POST /api/issues/{issue_number}/recover-validated-work` →
   `deps.validated_work.recover(...)`, and
   `POST /api/issues/{issue_number}/abandon-validated-work` →
-  `deps.validated_work.abandon(...)` with the operator's identity and a
-  **required** non-empty reason from the request body.
+  `deps.validated_work.abandon(AbandonValidatedWorkCommand(...))` with the exact
+  rendered authority, authenticated operator identity and a **required** non-empty
+  reason. The required OpenAPI body is `{authority: ValidatedWorkAuthoritySnapshot,
+  reason: non-empty string}`; omission of any authority field is a malformed
+  request, not permission to refill it. Repository and route issue must match the
+  snapshot before dispatch.
+
+  The abandonment response is the public counterpart of
+  `AbandonValidatedWorkOutcome`: enum `status`, optional success `disposition`,
+  `pending_evidence_ids`, optional typed `current_authority`, and display-only
+  `message`. OpenAPI discriminates on status: `EVIDENCE_NOT_CURRENT` and
+  `AUTHORITY_STALE` return HTTP 409 and **require** `current_authority`;
+  `NO_SUCH_RECORD` returns 404; `REFUSED_STATE` and `ATTACHED_EVIDENCE_PENDING`
+  return 409; `ABANDONED` and idempotent `ALREADY_RESOLVED` return 200. Malformed
+  input returns 400 before owner dispatch. The handler maps the owner's result
+  directly, without re-reading records or parsing message text. On stale outcomes,
+  the UI names the current evidence/record from `current_authority`, invalidates
+  the old confirmation and refreshes the displayed facts. It does not substitute
+  that snapshot into the old command or resubmit automatically. A new confirmation
+  must show the new evidence id, head, branch, PR and baseline before accepting loss.
 - One endpoint on the **Control Center** API — not the Repository Engine's, because
   the engine may be the wedged process:
   `POST /api/control-center/repositories/{repo_key}/engines/{instance_key}/stop-validated-work-owner`
   → the Control Center-composed `ValidatedWorkOwnerStopCoordinator`, returning the
-  typed `StopOwnerOutcome`. Register all three endpoints and their payloads in the
+  typed `StopOwnerOutcome`. Register these three mutation endpoints, the discovery
+  GET above, and their payloads in the
   UI OpenAPI contract per the `ui-openapi` skill.
 - Accessibility for the new action buttons: native `<button>`, keyboard reachable,
   visible focus ring, accessible name that includes the issue number, and a
@@ -4384,7 +4611,8 @@ sweeps above:
 | §4.4e liveness | `RepoLockLiveness` proves death from the **gate**, never from `lock.json`: a hand-written or stale advertisement naming a dead pid does not authorize takeover. |
 | §4.4e liveness matrix | One deterministic case per row, driven against real gate files: (1) self ⇒ False; (2) different host ⇒ False, with no filesystem access to that host attempted; (3) **same-instance restart** ⇒ True with **no probe issued** — asserted by a gate double that fails the test if the held gate is reopened, since probing it would self-conflict and strand the record forever; (4) single-instance current vs any other owner ⇒ True; (5) named current vs a former single-instance owner ⇒ True; (6) named current vs a *different* live named instance ⇒ False by non-blocking probe, and ⇒ True once that instance's gate is released, with the probe asserted not to disturb the live holder. |
 | §4.4e relinquish | `relinquish_claim()` is callable only by the owner at a stage boundary, clears ownership and bumps the fence, and lets the next drain proceed with no death proof. There is **no** operation that takes a claim from a live owner — asserted by the absence of such a method on the port and by a guardrail. |
-| §8.4 stop engine (producer) | Snapshot → rendered context → guarded request, both hops: the issue detail renders the `ClaimOwnerFact` as text plus a **link carrying `stop_owner_of={record_id}`** and asserts **no engine control in the issue view**; the engine surface with that context renders the native `Stop engine` button and posts a body whose `engine` object is byte-for-field what it rendered. Without the context, the engine surface's ordinary controls are unchanged. |
+| §8.4 stop engine (producer) | Discovery snapshots → `ControlCenterRecoveryRows` → rendered engine/record → guarded request: the native stop control posts the selected record's exact rendered engine and fence. Cover multiple records and engine incarnations so selection cannot mix facts. Issue detail shows facts and typed navigation only, never an engine control; absence of deep-link context does not hide discovered records/actions. |
+| §8.4 cold discovery | Open a cold Control Center with **no query parameters**, real SQLite records and supervisor state, and an unavailable engine HTTP server. The configured repository list discovers records, groups full owner identities, renders the selected recovery action and dispatches its exact snapshot to the guarded coordinator without any engine HTTP request. Cover unowned work, retained claims, multiple/replaced engines, and a replacement supervisor advertisement that must not relabel an old owner. Absent/unreadable/unsupported databases visibly report their typed status and never masquerade as success-empty or get created by a read. |
 | §8.4 stop engine (handler) | Guarded request → reservation port → lifecycle → `IncarnationStopPort.stop_expected(command)`: assert exact repository, named or `default` instance, process incarnation, actor/reason and explicit timeout/force policy. One case per `StopOwnerStatus` enum member: pre-reservation refusals have zero lifecycle calls; `STOP_FAILED` follows the typed lifecycle failure; lifecycle `TARGET_CHANGED` maps to `OWNER_CHANGED` without a stop effect. Missing process identity/fence is rejected, never filled from current state. |
 | §8.4 reservation | Pause after `reserve_owner_stop()` succeeds and attempt hand-back: `relinquish_claim()` returns `False`, the live owner keeps its claim, and a successor cannot acquire. Mirror case: move the claim before reservation, including relinquish/reacquire by the same process with a new fence; admission refuses `OWNER_CHANGED` with zero lifecycle calls. |
 | §8.4 reservation concurrency | Two overlapping identical requests never share a reservation: the second returns `STOP_IN_PROGRESS` with zero writes/calls. After the first fails and releases, a new request gets a fresh id; replaying the old release returns `False` and leaves the new reservation intact. Concurrent transactions use the real SQLite store, not a serialized mock. |
@@ -4393,8 +4621,10 @@ sweeps above:
 | §8.4 stop policy | One case per `StopEngineStatus`: graceful exit, successful force and already-gone all yield `STOPPED`; replacement yields `TARGET_CHANGED`; stop/identity-proof failure yields `FAILED`; remote target yields `REMOTE_HOST` without a call. The new adapter produces each message explicitly; no log parsing or message extraction from a Boolean. Assert command timeout/force values and confirmation text stating graceful-then-force and engine-wide scope. |
 | §8.4 stop capability | Linux pidfd integration covers SIGTERM handler shutdown, timeout SIGKILL and handle exit observation without HTTP, process-group effects or advertisement deletion. On macOS or unavailable pidfd, `EXACT_TARGET_UNAVAILABLE` reaches both snapshot and Control Center rendering: no guarded stop button, explanatory text and working navigation to the existing independent stop control with its own scope confirmation. Capability loss after render yields `FAILED` and zero effects, releases the reservation, and never delegates to pid/port-based legacy helpers. |
 | §8.4 stop engine (wedged) | The Control Center succeeds while the Repository Engine serves no HTTP: read through `SqliteValidatedWorkRecordReader`, reserve/release through the writable `SqliteValidatedWorkStopReservations` adapter against the same real database, then stop through the exact-process capability. Database admission failure causes zero lifecycle calls. This proves the full interlock, not just the snapshot, works out of process. |
-| §8.4 stop engine (identity) | All four identities must agree: route (`repo_key`/`instance_key`), rendered body engine, record repository, and current claim owner. A body whose engine contradicts the path is `REPO_MISMATCH` with zero effect — the duplicated path value is checked, not ignored — and `instance_key` round-trips `default` ↔ `None` through the one shared encoder used by both the link builder and the route parser. |
-| §8.4 stop engine (navigation) | All three context cases: embedded (with `cc_origin` stamped by the shell), standalone carrying `cc_origin`, and standalone without it — the last asserted to render **text with instructions and no anchor at all**, never a dead href. Plus the transport itself: `cc_origin` is in `EMBEDDED_CONTEXT_PARAMS` and is stamped by the shell's URL builder, asserted by navigating two hops inside the dashboard and finding it preserved alongside `theme`. |
+| §8.4 stop engine (identity) | All four identities must agree: route (`repo_key`/`instance_key`), rendered body engine, record repository, and current claim owner. A body whose engine contradicts the path is `REPO_MISMATCH` with zero effect — the duplicated path value is checked, not ignored — and `instance_key` round-trips `default` ↔ `None` through the shared navigation/route encoder. |
+| §8.4 navigation producer and real click | Shell URL builder → two Dashboard/Settings hops preserve `cc_origin` and `theme` → typed navigation result → actual keyboard/click activation inside the iframe → parent receiver selects the repositories view and focuses the requested labelled engine/record region. Assert the top-level shell changes view, the iframe does not navigate/nest Control Center, and no engine mutation occurs. Wrong source/origin/repository, retired frame and malformed command produce zero navigation/effects. Valid standalone localhost, IPv4 and IPv6 origins produce constructed top-level links and an actual click selects the same row. |
+| §8.4 navigation rejection | Parser and rendered-output cases for missing/duplicate origin, `javascript:`, `data:`, protocol-relative URL, hostile hostname, credentials, path, query/fragment (including empty delimiters), backslash, whitespace/control characters and encoded/noncanonical hostname. Assert `UNAVAILABLE`, visible instructions, **no anchor or dispatch handler**, and no network/navigation on activation. A false `embedded=1` on a top-level page cannot select parent messaging. |
+| §8.4 discovery transport | Initial repository view model and authenticated `GET /api/control-center/repositories/{repo_key}/validated-work` share `ControlCenterRecoveryQueries` and typed `ControlCenterRecoveryRows` with generated public/OpenAPI contracts. Assert configured-repository resolution, no caller-controlled filesystem root, every discovery status, accessible empty/error/unowned/owned rendering, and no repository-engine client dependency. |
 | §8.4 stop engine (transport) | The endpoint is registered in the UI OpenAPI contract with its required body and typed response; it uses the shared browser-session auth helper (CSRF/SSE token); `actor` comes from the session, never the body. The coordinator depends only on reader, reservation and lifecycle ports; a guardrail rejects raw store/SQLite access from it. Both store and Control Center adapters invoke one shared reservation transaction owner; the writable adapter cannot acquire/relinquish publication claims or transition record state. |
 | §8.4 stop engine | `EngineIdentity` has no `targetable_here` property and consults no process-global host state; availability arrives as owner-computed data, asserted by constructing the identity in a process whose local host differs from the snapshot's and checking the rendered availability is unchanged. |
 | §8.4 stop engine | `RepositoryEngineLifecycle` owns the targeted graceful stop and **only** that: the guardrail rejects direct `SupervisorOps.stop`/`stop_all_instances` calls from validated-work, disposition and issue-detail modules, and a companion assertion records that the existing bulk/force/port routes are deliberately unmigrated and unclaimed, so a later repo-wide widening is a visible change rather than a silent one. The disposition owner exposes no stop method and reads no supervisor state; the issue-detail handler builds no stop call from pid fields. |
@@ -4416,8 +4646,13 @@ sweeps above:
 | §2.1.3 attached | The auto-eligible counterpart, as its own case: a single attached row admitted `QUEUED` (worktree head == validated head, branch binding verified) promotes to `QUEUED` and drains. Both this and the case above are then repeated **across a restart**, with the worktree deleted and no escrow envelope readable, so the values can only have come from the evidence relation. A store that defaults or re-derives publishes work a human was meant to approve. |
 | §2.1.3 attached | **Multiple attached rows drain one per pass.** Attach a `QUEUED` row and a `PARKED` row, fail the current: the oldest promotes and the other stays attached; a second failure/resolution pass promotes the second. Assert the parked one never drains automatically whichever order it arrives in, and that the record is never observed with two `CURRENT` rows. |
 | §2.1.3 attached | `resolve_attached_evidence()` runs on **every** drain for a non-`PUBLISHING` record, not only on the leaving edge: a record that failed, promoted one row and still holds another has the second promoted on a later drain — the regression for rows stranded until retention. |
-| §2.1.3 attached | `abandon()` on a record with unresolved attached evidence returns `AbandonValidatedWorkOutcome(ATTACHED_EVIDENCE_PENDING)` with **zero** effect and the waiting ids in `pending_evidence_ids`; after the drain promotes them and none remain, the same call returns `ABANDONED` with its disposition. Retention is asserted to release **no** attached row while the owning record is unresolved. |
+| §2.1.3 attached | `abandon()` on a record with unresolved attached evidence returns `AbandonValidatedWorkOutcome(ATTACHED_EVIDENCE_PENDING)` with **zero** effect and the waiting ids in `pending_evidence_ids`; after promotion, the old command returns `EVIDENCE_NOT_CURRENT` naming the new current authority. Only a newly rendered and confirmed command can return `ABANDONED`. Retention releases **no** attached row while its owning record remains unresolved. |
 | §8.4 abandon contract | Both sides of the command boundary, one case per `AbandonStatus` member derived from the enum: the owner returns each status, the endpoint maps each to its response, and the **public contract** carries `can_abandon` plus `abandon_unavailable`. A record with unresolved attached evidence renders with the abandon action **absent** and the typed reason shown — the regression for a UI offering an action the owner refuses, with no response shape for why. |
+| §8.4 stale abandonment (F24/A19) | Render `E1`/revision `r1`, supersede it with `E2`, then submit the unchanged abandon confirmation. The store returns `EVIDENCE_NOT_CURRENT` with typed `current_authority.evidence_id == E2`; the API returns 409 and the UI names `E2` without parsing message text. Assert zero changes to record/evidence state, fences, resolution audit, retention timestamps, labels, needs-human causes and abandonment events. No automatic retry or client/server substitution of `E2` is permitted. |
+| §4.1 abandonment CAS | Keep the same evidence id but change observation revision, PR or baseline after rendering: `AUTHORITY_STALE` names the transactional current snapshot with zero mutation. Interleave supersession after an optimistic owner read but before store entry; the store's in-transaction CURRENT/revision CAS still refuses. A new confirmed snapshot succeeds once, records that exact authority with operator actor/reason/time, and releases only its issue-block interest. |
+| §8.4 abandon command mapping | Owner snapshot → public authority → confirmation → required POST body → `AbandonValidatedWorkCommand`, field by field. Missing authority, wrong route/repository, empty reason and unauthenticated or agent requests cannot dispatch. Every status has a typed OpenAPI response and exact HTTP mapping; stale responses require `current_authority`, and the handler performs no fresh-state reconstruction. |
+| §8.4 abandon retained owner | `PARKED`/`FAILED` with a retained claim, including a leaked stop reservation: owner snapshot → public view model → rendered UI preserves `can_abandon=False` and `REFUSED_STATE`, shows the owner/recovery explanation and no abandon action. A previously rendered command is refused with zero writes. Quiescent owner release restores eligibility only when no unresolved attachments remain. |
+| §4.4e retained-claim maintenance | Crash after durable `FAILED` with irreparable escrow/validation failure but before relinquish, with and without a stop reservation. Startup/drain proves owner death, acquires a maintenance claim and relinquishes it without publishing, artifact validation, state/revision, label/cause, audit or retention changes. A fresh snapshot then allows confirmed abandonment; a stale abandonment still refuses with zero writes. Repeat for `PARKED` and resolved retained claims, crash between maintenance acquire/release, live/remote/unproven owners, and a stop reservation racing the maintenance release. No clock advancement steals ownership and no issue gate is held during acquisition. |
 | §2.1.3 attached | Every admission branch that inserts evidence writes `initial_state`/`initial_failure`/`initial_reason`: driven once per branch — new record, attached-during-publishing, retained-on-`RECOVERED`, reopened-from-`ABANDONED`, and ordinary supersede — with the `NOT NULL` constraint asserted to reject a branch that omits them. |
 | §2.1.3 attached | Resolution after the current submission **succeeds**: every attached row becomes `SUPERSEDED` and the record stays `RECOVERED`. The regression is the row that stayed `attached` forever — assert it is not re-selected on the next drain, or on any drain after that. |
 | §2.1.3 replay | **Repeating the same attached capture while the record is still `PUBLISHING`** returns `ATTACHED` with no insert and no integrity error. Repeating a `CURRENT` id converges; repeating a `SUPERSEDED` id returns `RETAINED` and changes nothing. Every role is replayed twice in a row. |
@@ -4528,6 +4763,12 @@ reset now stale-downgrades while unresolved work exists.
 - `StoredTechLeadOp` for `recover_validated_work` cannot be constructed without a
   `ValidatedWorkAuthoritySnapshot`, and no module builds a `StoredEvidenceCommand`
   without one.
+- Abandonment dispatch accepts only `AbandonValidatedWorkCommand`; no entrypoint
+  or owner resolves loss with bare issue/evidence ids or a caller-created
+  `OperatorResolution`. Only `abandon_if_current()` checks CURRENT evidence and
+  full authority in the same transaction that records resolution. Stale outcomes
+  must expose typed `current_authority`; UI/HTTP adapters never parse messages to
+  find current evidence or retry destructive commands with refreshed snapshots.
 - `dispose_at_termination()` returns `ValidatedWorkDispositionBatch`; no call site
   indexes a single member out of it to stand for the whole result.
 
@@ -4683,6 +4924,8 @@ Ordered so each slice is independently shippable and leaves the tree green.
    reconciliation and claim-before-issue-gate ordering. Wire admission, finalization,
    abandonment and failure through it. This ships with automatic recovery, since
    clearing a shared issue label per record is unsafe once a batch has siblings.
+   Include §4.4e startup/drain retained-claim maintenance outside the issue gate so
+   a dead owner cannot strand `FAILED`/`PARKED` abandonment or resolved-row cleanup.
 5. **Classification cleanup.** Session/failure paths and the stuck sweep consume
    `IssueRuntimeTermination.validated_work`; generic `timed_out` becomes illegal for
    an issue with a disposition.
@@ -4698,15 +4941,22 @@ Ordered so each slice is independently shippable and leaves the tree green.
    navigation on macOS/unsupported Linux (no macOS automatic backend is claimed), the
    `ValidatedWorkOwnerStopCoordinator` with its `reserve_owner_stop` interlock,
    `snapshot_record()` on the owner port, the Control Center-side
-   `ValidatedWorkRecordReader`, writable `ValidatedWorkStopReservations` adapter
-   sharing store-owned transactions, and composition root, the
+   `ValidatedWorkRecordReader.discover_repository()`, `ControlCenterRecoveryQueries`
+   and its typed per-engine repository-list projection/authenticated GET, writable
+   `ValidatedWorkStopReservations` adapter sharing store-owned transactions, and
+   composition root, the
    `stop-validated-work-owner` endpoint with its OpenAPI/auth wiring, the
-   `cc_origin` embed-context parameter, the engine-row control and the issue-detail
-   link that carries `stop_owner_of`, and the scoped guardrail. This slice claims
+   validated `cc_origin` embed context, shared frame-aware navigation owner and
+   source/origin-checked parent receiver, cold-discovered engine-row controls,
+   real-click navigation and cold-start regression tests, and the scoped guardrail.
+   This slice claims
    **no** consolidation of the pre-existing stop surfaces: they are untouched, so
-   nothing here is deferred and nothing waits on a follow-up. `abandon()` is
-   the last piece, deliberately: until it exists, unresolved work has no exit at all,
-   which is the safe direction to be incomplete in.
+   nothing here is deferred and nothing waits on a follow-up. Abandonment includes
+   `AbandonValidatedWorkCommand`, the store-owned `abandon_if_current()` transaction
+   and `abandon_authority_json` audit column, stale/current-evidence typed outcomes,
+   and the unchanged-authority UI/OpenAPI round trip with F24/A19 regressions.
+   `abandon()` is the last piece, deliberately: until it exists, unresolved work
+   has no exit at all, which is the safe direction to be incomplete in.
 8. **Backfill the stranded cohort.** #6327/#6335/#6337 (#6914) and #5204/#5561
    (#7011) admitted through §5's operator historical-intake and fresh-validation
    command as `PARKED` records. Existing sidecars need no fabricated old ledger

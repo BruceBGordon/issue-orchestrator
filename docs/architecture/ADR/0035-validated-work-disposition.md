@@ -392,6 +392,15 @@ Four concrete mechanisms in today's code destroy or strand the work:
    Ownership still transfers on owner death, atomically invalidating the old
    reservation with the fence change; no timer expires a reservation.
 
+   Retained ownership on `PARKED`, `FAILED` and resolved records is reconciled at
+   startup and each drain: gate-backed death proof permits a maintenance claim,
+   followed by quiescent relinquish outside the issue mutation gate. This changes
+   only claim/fence/reservation metadata and requires no successful artifact
+   validation or publication. A live service retries its own quiescent release
+   with its retained handle; another live or unproven owner is never displaced.
+   Thus irreparable `FAILED` work can become abandonment-eligible after owner
+   death, while stale abandonment commands themselves still cause zero writes.
+
    **Both live in the Control Center, because the Repository Engine is the thing
    that is stuck.** Hosting the coordinator or its endpoint in the engine that owns
    the claim would make the escape hatch unavailable in exactly the failure it
@@ -402,7 +411,25 @@ Four concrete mechanisms in today's code destroy or strand the work:
    The reservation adapter can mutate only reservation fields, never publication
    ownership/state; the coordinator has no raw store access. None requires the
    target engine to be responsive. The issue detail, served by that engine, only
-   reports the owner and links to the Control Center.
+   reports the owner and offers navigation to the Control Center.
+
+   Cold discovery is part of that boundary, not a prerequisite supplied by the
+   wedged engine. `ValidatedWorkRecordReader.discover_repository()` enumerates
+   unresolved records and retained owners directly from the configured repository's
+   database. `ControlCenterRecoveryQueries` projects typed per-engine rows on the
+   initial repository list and its authenticated refresh endpoint. Full persisted
+   owner identities remain distinct from replacement supervisor advertisements;
+   absent/unreadable/unsupported databases are explicit statuses, not empty success.
+   No deep link or engine HTTP response is needed to discover and invoke recovery.
+
+   One shared frame-aware navigation owner validates the transported `cc_origin`
+   as a canonical local HTTP(S) origin before constructing any link or message.
+   Embedded navigation sends a typed parent command; the shell checks the active
+   iframe source, independently recorded engine origin and configured repository,
+   then selects/focuses its own engine row. Standalone navigation uses a constructed
+   top-level link; missing/hostile origins render instructions without an anchor.
+   Neither navigation path performs an engine operation. Cold-start recovery,
+   actual embedded clicks and hostile-origin cases are required boundary tests.
 
    The disposition owner stays read-only with respect to engine lifecycle: it
    publishes the claim holder as a fact, with **stop availability computed by the
@@ -437,6 +464,17 @@ Four concrete mechanisms in today's code destroy or strand the work:
    approval with zero writes and asks for a fresh one. The snapshot is
    authorization input, never a competing source of truth: every stale check still
    runs against freshly read state after it matches.
+
+   Abandonment uses the same approval boundary: `AbandonValidatedWorkCommand`
+   carries the exact rendered authority plus authenticated operator and reason.
+   The store's `abandon_if_current()` compares CURRENT evidence and every snapshot
+   field, including observation revision, in the same transaction that records
+   `ABANDONED` and its authority audit. A superseded handle returns
+   `EVIDENCE_NOT_CURRENT`; moved observations return `AUTHORITY_STALE`. Both
+   carry the typed current authority and make zero mutations. Neither a handler
+   nor the UI may silently retarget abandonment to the returned evidence; the
+   operator must see and confirm the new facts. This policy has one store owner,
+   rather than separate route freshness checks and unconditional state writes.
 
 12. **This owner writes exactly one label of its own.** A failed disposition keeps
    `recovery-pending` and registers its escalation through the needs-human owner's
