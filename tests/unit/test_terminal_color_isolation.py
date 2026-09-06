@@ -226,23 +226,55 @@ def test_the_fixture_restores_an_environment_a_test_dirties() -> None:
         os.environ["COLUMNS"] = TERMINAL_TEST_COLUMNS
 
 
-def test_the_colour_fixture_is_registered_autouse() -> None:
-    """Registration, not just behaviour.
+def test_the_colour_fixture_is_applied_without_being_requested() -> None:
+    """Autouse, proven through pytest rather than through its internals.
 
-    The test above pins what the fixture DOES; it calls the function directly,
-    so it keeps passing if `autouse=True` is dropped. Autouse is the entire
-    reason the fixture protects tests that never mention it, so it is asserted
-    separately — verified by mutation: removing `autouse=True` leaves the
-    body test green and fails this one.
+    An earlier version read `_fixture_function_marker` off the decorated
+    fixture. That was wrong twice: it is a private attribute (SLF001), and it
+    does not exist on the declared floor of `pytest>=8.0`, so the test would
+    raise `AttributeError` on a supported version. The repo's ruff run scans
+    `src` only, so a green gate said nothing about it.
+
+    What autouse actually means is observable without touching internals: a
+    case that never mentions the fixture still gets it. So a child suite is
+    written INTO `tests/unit/`, where the real shared conftest applies, with
+    two cases in order — the first dirties the environment, the second
+    asserts it came back clean. Neither requests the fixture by name.
+
+    Goes red if `autouse=True` is dropped (the second case sees the dirt) and
+    if the scrub loop is deleted (same). Serial by construction, and the probe
+    file is removed in `finally`.
     """
-    from tests import conftest as shared_conftest
-
-    # pytest 8 exposes the decorator's arguments here; `__wrapped__` (used by
-    # the test above) deliberately hands back the undecorated function, which
-    # is why that one cannot see this.
-    marker = shared_conftest.isolate_terminal_color_env._fixture_function_marker
-
-    assert marker.autouse is True, (
-        "the colour fixture is no longer autouse, so it protects only tests "
-        "that request it by name — which is none of them"
+    probe = _repo_root() / "tests" / "unit" / f"_autouse_probe_{os.getpid()}.py"
+    probe.write_text(
+        "import os\n"
+        "\n"
+        "def test_a_dirties_the_environment():\n"
+        "    os.environ['FORCE_COLOR'] = '3'\n"
+        "\n"
+        "def test_b_sees_it_cleaned_without_asking():\n"
+        "    assert 'FORCE_COLOR' not in os.environ\n",
+        encoding="utf-8",
     )
+    try:
+        completed = run_in_process_group(
+            [
+                sys.executable, "-m", "pytest",
+                str(probe.relative_to(_repo_root())),
+                "-q", "-p", "no:xdist", "-p", "no:cacheprovider",
+                "-p", "no:randomly", "--no-header",
+            ],
+            cwd=_repo_root(),
+            env={k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")},
+            timeout=300,
+        )
+    finally:
+        probe.unlink(missing_ok=True)
+
+    assert completed.returncode == 0, (
+        "a case that never requested the colour fixture did not get it, so "
+        "the fixture is not protecting the tests it exists for.\n"
+        f"stdout tail:\n{completed.stdout[-2000:]}"
+    )
+    summary = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
+    assert "2 passed" in summary, f"probe did not run both cases: {summary!r}"
