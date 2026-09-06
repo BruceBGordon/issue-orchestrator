@@ -24,6 +24,7 @@ from .session_run import SessionRunAssets
 from .tech_lead_findings import PromotionUpdate, PromotableFinding, SettledPromotion
 from .tech_lead_session import (
     ApprovedTechLeadOp,
+    GatedTechLeadProposal,
     TechLeadCaseFileSummary,
     TechLeadLaunchScope,
     TechLeadSessionFlavor,
@@ -1477,6 +1478,13 @@ class TechLeadFacts:
     # a fresh targeted read before discarding. Surfacing these as a fact keeps
     # fact gathering read-only (#6779 R10).
     absent_proposal_op_candidates: tuple[int, ...] = field(default_factory=tuple)
+    # The operator-approval backlog as LABEL truth (#7014): every OPEN issue the
+    # tick observed carrying the proposed-tech-lead gate, whether or not an op
+    # ledger row backs it. Promoted findings and plain follow-up proposals carry
+    # the same gate with no ledger row, so this is the only fact that can say
+    # how many approvals are actually pending. Projected onto the operator board
+    # beside the ledger rows; no planning reads it (approval is a human act).
+    gated_proposals: tuple["GatedTechLeadProposal", ...] = field(default_factory=tuple)
     # Open pattern case files (#6781): observation-labeled issues classified
     # from the SAME anchor scan. Projected into the board snapshot so health
     # reviews mine accumulated evidence, and into the tech_lead board file.
@@ -1891,6 +1899,19 @@ class OrchestratorState:
     # issues (not operator/retry ones). ``tech_lead_expedite_pending`` holds
     # gated (propose-authority) create_issue follow-ups awaiting the
     # proposed-tech-lead gate removal, promoted to the front once un-gated.
+    # #7014 F1: did the LAST tick observe a gated approval backlog? A board
+    # showing pending approvals must be refreshed when the last one clears,
+    # and clearing it is precisely the moment nothing else arms fact
+    # production — so without this the board keeps saying "1 awaiting operator
+    # approval" forever. In-memory like the fields around it: GitHub labels
+    # remain the crash-safe truth, so a restart costs one stale board until
+    # the next armed tick, never a wrong decision.
+    # #7014 F2: when the approval scope was last observed. Approval discovery
+    # cannot be armed by the worker board — that fetch is the blind spot the
+    # gate query exists to cover, so "the board saw nothing" is not evidence
+    # that nothing is pending. 0.0 means never, which arms it on startup.
+    tech_lead_approval_scan_at: float = 0.0
+    tech_lead_gated_backlog_seen: bool = False
     tech_lead_expedited: list[int] = field(default_factory=list)
     tech_lead_expedite_pending: list[int] = field(default_factory=list)
     # #6873: ledger of priority_queue entries the blocked->front policy owns.

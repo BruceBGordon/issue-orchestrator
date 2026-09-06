@@ -281,7 +281,7 @@ class TestBoundariesConsumeTheSameDecision:
 
         from issue_orchestrator.domain.models import OrchestratorState
 
-        facts = gatherer.gather_tech_lead_facts(OrchestratorState())
+        facts = gatherer.gather_tech_lead_facts(OrchestratorState(), board_issues=[])
 
         expected_active = promotion_lane_readiness(config).ready
         has_promotion_facts = facts is not None and bool(facts.promotable_findings)

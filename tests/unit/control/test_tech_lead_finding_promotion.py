@@ -1571,7 +1571,7 @@ class TestFactGatheringAndPlanning:
             authority, signature="anchor-close", issue_number=65, observations=2
         )
 
-        facts = _fact_gatherer(config, authority).gather_tech_lead_facts(_state())
+        facts = _fact_gatherer(config, authority).gather_tech_lead_facts(_state(), board_issues=[])
 
         assert facts is not None
         assert [item.evidence.signature for item in facts.promotable_findings] == [
@@ -1588,11 +1588,19 @@ class TestFactGatheringAndPlanning:
         authority.record_promotion(promotion=_promotion("other"))
 
         facts = _fact_gatherer(config, authority, target).gather_tech_lead_facts(
-            _state()
+            _state(), board_issues=[]
         )
 
-        # Nothing armed: no facts at all, and no cross-repo read was attempted.
-        assert facts is None
+        # The PROMOTION lane is what must stay quiet here, and it does: no
+        # promotable findings, no updates, and no cross-repo read attempted.
+        # Facts themselves are produced because approval discovery arms on its
+        # own cadence (#7014 F2) — a board with no gated issues is not evidence
+        # that no approvals are pending, so that observation cannot be gated on
+        # this lane being active.
+        assert facts is not None
+        assert facts.promotable_findings == ()
+        assert facts.promotion_updates == ()
+        assert facts.settled_promotions == ()
 
     def test_gathered_facts_become_filing_update_and_settlement_actions(self):
         from issue_orchestrator.control.tech_lead_finding_promotion import (
@@ -1641,7 +1649,7 @@ class TestFactGatheringAndPlanning:
 
         facts = _fact_gatherer(
             config, authority, InMemoryPromotionTargetHost()
-        ).gather_tech_lead_facts(_state())
+        ).gather_tech_lead_facts(_state(), board_issues=[])
 
         assert facts is not None
         assert facts.promotion_updates == (

@@ -31,6 +31,42 @@ from issue_orchestrator.ports.event_sink import InMemoryEventSink
 from tests.unit.session_run_helpers import make_session_run_assets
 
 
+def _host_sees_gated(mock_repository_host, *gated) -> None:
+    """Answer the GATE query with these issues and the anchor scan with none.
+
+    A single `return_value` hands the same list to both queries, so a test
+    using one cannot tell which observation produced the backlog. It also
+    describes an impossible state once the gate query decides membership: a
+    board showing a gated issue that the exhaustive gate query says is absent.
+    """
+    def _list(**kwargs):
+        labels = kwargs.get("labels") or []
+        return list(gated) if "proposed-tech-lead" in labels else []
+
+    mock_repository_host.list_issues.side_effect = _list
+
+def _anchor_scan_calls(mock_repository_host) -> list:
+    """The ANCHOR scan calls only, ignoring the approval-scope query.
+
+    The invariant these assertions protect is that anchor classification and
+    proposal reconciliation share ONE exhaustive scan (#6779 R4) — not that the
+    tick makes exactly one GitHub call ever. The approval backlog needs a query
+    for the GATE label, because promoted findings carry the target's WORKER
+    agent label (`promotion_issue_labels`: "DISCOVERABLE the moment the gate
+    comes off") and so are structurally invisible to an agent-label scan.
+
+    Counting total calls would have made this a choice between a complete
+    backlog and a guarded invariant; counting the anchor calls keeps both.
+    """
+    return [
+        call
+        for call in mock_repository_host.list_issues.call_args_list
+        if "proposed-tech-lead" not in (call.kwargs.get("labels") or [])
+    ]
+
+
+
+
 @pytest.fixture
 def mock_config():
     """Create a mock config for testing."""
@@ -321,7 +357,7 @@ class TestFactGathererTechLeadFacts:
         self, fact_gatherer, sample_state
     ):
         """Test returns None when tech_lead review not configured."""
-        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert result is None
 
@@ -339,7 +375,7 @@ class TestFactGathererTechLeadFacts:
         mock_config.tech_lead.health_review.interval_minutes = 60
         mock_config.tech_lead.stuck_sweep.enabled = True
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert result is None
         mock_repository_host.get_prs_with_label.assert_not_called()
@@ -352,7 +388,7 @@ class TestFactGathererTechLeadFacts:
         mock_config.tech_lead_review_agent = "agent:tech-lead"
         mock_config.tech_lead_review_threshold = 0
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert result is None
 
@@ -373,7 +409,7 @@ class TestFactGathererTechLeadFacts:
         mock_repository_host.get_prs_with_label.return_value = []
         mock_repository_host.list_issues.return_value = []
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert result is not None
         assert result.watch_label == "code-reviewed"
@@ -393,7 +429,7 @@ class TestFactGathererTechLeadFacts:
         ]
         mock_repository_host.list_issues.return_value = []
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert result is not None
         assert result.pr_count == 3
@@ -423,7 +459,7 @@ class TestFactGathererTechLeadFacts:
         ]
         mock_repository_host.list_issues.return_value = []
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert result is not None
         assert result.pr_count == 1
@@ -445,7 +481,7 @@ class TestFactGathererTechLeadFacts:
         ]
         mock_repository_host.list_issues.return_value = []
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert result is not None
         assert result.pr_count == 1
@@ -464,7 +500,7 @@ class TestFactGathererTechLeadFacts:
             Issue(number=100, title="Batch Review: 5 PRs", labels=["agent:tech-lead"]),
         ]
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert result is not None
         assert result.existing_tech_lead_issue == 100
@@ -497,7 +533,7 @@ class TestFactGathererTechLeadFacts:
         mock_repository_host.get_prs_with_label.return_value = []
         mock_repository_host.list_issues.side_effect = list_issues
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert result is not None
         assert result.existing_tech_lead_issue is None
@@ -516,7 +552,7 @@ class TestFactGathererTechLeadFacts:
             Issue(number=100, title="Batch Review: 5 PRs", labels=["agent:tech-lead"]),
         ]
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert result is not None
         assert result.existing_tech_lead_issue is None
@@ -533,7 +569,7 @@ class TestFactGathererTechLeadFacts:
         mock_repository_host.get_prs_with_label.return_value = []
         mock_repository_host.list_issues.return_value = []
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert result is not None
         assert result.watch_label == "ready-for-tech-lead"
@@ -588,7 +624,7 @@ class TestFactGathererTechLeadFacts:
 
         mock_repository_host.get_issue.side_effect = get_issue_side_effect
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert result is not None
         # Should include PR labels
@@ -658,7 +694,7 @@ class TestFactGathererHealthReviewFacts:
         sample_state.last_health_review_at = 1_000.0
         sample_state.priority_queue = [42]  # non-empty board: not suppressed by the change-gate
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state, now=1_000.0 + 3600)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=1_000.0 + 3600)
 
         assert result is not None
         assert result.health_review_due is True
@@ -671,7 +707,7 @@ class TestFactGathererHealthReviewFacts:
         # No PR fetch when batch is disabled — health review costs only the
         # single exhaustive anchor/case-file scan.
         mock_repository_host.get_prs_with_label.assert_not_called()
-        mock_repository_host.list_issues.assert_called_once()
+        assert len(_anchor_scan_calls(mock_repository_host)) == 1
         assert mock_repository_host.list_issues.call_args.kwargs["exhaustive"] is True
 
     def test_not_due_within_interval(
@@ -680,7 +716,7 @@ class TestFactGathererHealthReviewFacts:
         self._arm_health_review(mock_config, interval_minutes=60)
         sample_state.last_health_review_at = 1_000.0
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state, now=1_000.0 + 1800)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=1_000.0 + 1800)
 
         assert result is not None
         assert result.health_review_due is False
@@ -692,7 +728,7 @@ class TestFactGathererHealthReviewFacts:
         self._arm_health_review(mock_config, interval_minutes=60)
         sample_state.priority_queue = [42]  # a backlog item to review on first run
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state, now=999_999.0)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=999_999.0)
 
         assert result is not None
         assert result.health_review_due is True
@@ -704,7 +740,7 @@ class TestFactGathererHealthReviewFacts:
         mock_config.tech_lead_review_agent = "agent:tech-lead"
         mock_config.tech_lead.health_review.interval_minutes = 0
 
-        assert fact_gatherer.gather_tech_lead_facts(sample_state) is None
+        assert fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[]) is None
         mock_repository_host.list_issues.assert_not_called()
         mock_repository_host.get_prs_with_label.assert_not_called()
 
@@ -714,7 +750,7 @@ class TestFactGathererHealthReviewFacts:
         mock_config.tech_lead_review_agent = None
         mock_config.tech_lead.health_review.interval_minutes = 60
 
-        assert fact_gatherer.gather_tech_lead_facts(sample_state) is None
+        assert fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[]) is None
         mock_repository_host.list_issues.assert_not_called()
 
     def test_health_only_facts_skip_explicit_milestone_resolution(
@@ -729,7 +765,7 @@ class TestFactGathererHealthReviewFacts:
         self._arm_health_review(mock_config)
         mock_config.tech_lead.milestone_strategy.explicit = "M9"
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state, now=999_999.0)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=999_999.0)
 
         assert result is not None
         mock_repository_host.list_milestones.assert_not_called()
@@ -776,7 +812,7 @@ class TestFactGathererHealthReviewFacts:
         self._arm_storm(mock_config, sample_state)
         mock_repository_host.list_issues.return_value = [self._open_anchor()]
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state, now=999_060.0)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=999_060.0)
 
         assert result is not None
         assert result.health_review_due is False
@@ -795,7 +831,7 @@ class TestFactGathererHealthReviewFacts:
         self._arm_storm(mock_config, sample_state)
         mock_repository_host.list_issues.return_value = [self._open_anchor()]
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state, now=999_999.0)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=999_999.0)
 
         assert result is not None
         assert result.health_review_due is False
@@ -811,7 +847,7 @@ class TestFactGathererHealthReviewFacts:
         mock_config.tech_lead.health_review.interval_minutes = 0
         self._arm_storm(mock_config, sample_state, count=2)
 
-        assert fact_gatherer.gather_tech_lead_facts(sample_state, now=999_999.0) is None
+        assert fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=999_999.0) is None
         mock_repository_host.list_issues.assert_not_called()
 
     def test_disabled_storm_threshold_arms_no_scan(
@@ -822,7 +858,7 @@ class TestFactGathererHealthReviewFacts:
         self._arm_storm(mock_config, sample_state, count=5)
         mock_config.tech_lead.health_review.storm_threshold = 0
 
-        assert fact_gatherer.gather_tech_lead_facts(sample_state, now=999_999.0) is None
+        assert fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=999_999.0) is None
         mock_repository_host.list_issues.assert_not_called()
 
     def test_existing_marker_labeled_issue_detected(
@@ -843,14 +879,14 @@ class TestFactGathererHealthReviewFacts:
         ]
 
         sample_state.priority_queue = [42]  # non-empty board so the anchor scan runs
-        result = fact_gatherer.gather_tech_lead_facts(sample_state, now=999_999.0)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=999_999.0)
 
         assert result is not None
         assert result.health_review_due is True
         assert result.existing_health_review_issue == 200
         # The marker-labeled anchor must NOT be misread as a batch anchor.
         assert result.existing_tech_lead_issue is None
-        mock_repository_host.list_issues.assert_called_once()
+        assert len(_anchor_scan_calls(mock_repository_host)) == 1
 
     def test_both_triggers_share_one_issue_scan(
         self, fact_gatherer, sample_state, mock_config, mock_repository_host
@@ -872,13 +908,13 @@ class TestFactGathererHealthReviewFacts:
             ),
         ]
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state, now=999_999.0)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=999_999.0)
 
         assert result is not None
         assert result.existing_tech_lead_issue == 100
         assert result.existing_health_review_issue == 200
         assert result.watch_label == "code-reviewed"
-        mock_repository_host.list_issues.assert_called_once()
+        assert len(_anchor_scan_calls(mock_repository_host)) == 1
 
     def test_marker_issue_outside_filter_label_ignored(
         self, fact_gatherer, sample_state, mock_config, mock_repository_host
@@ -898,7 +934,7 @@ class TestFactGathererHealthReviewFacts:
             ),
         ]
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state, now=999_999.0)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=999_999.0)
 
         assert result is not None
         assert result.existing_health_review_issue is None
@@ -912,7 +948,7 @@ class TestFactGathererHealthReviewFacts:
         self._arm_health_review(mock_config, interval_minutes=60)
         sample_state.last_health_review_at = 1_000.0
 
-        result = fact_gatherer.gather_tech_lead_facts(sample_state, now=1_000.0 + 1800)
+        result = fact_gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=1_000.0 + 1800)
 
         assert result is not None
         assert result.health_review_due is False
@@ -922,7 +958,10 @@ class TestFactGathererHealthReviewFacts:
         # projection instead of wiping it with the empty tuple (#6781 R2).
         assert result.case_files_scanned is False
         assert result.open_case_files == ()
-        mock_repository_host.list_issues.assert_not_called()
+        # The APPROVAL-SCOPE query still runs: the board is written from these
+        # facts, so an incomplete backlog would be published as fact. What must
+        # not happen on a cheap tick is the exhaustive ANCHOR scan.
+        assert _anchor_scan_calls(mock_repository_host) == []
         mock_repository_host.get_prs_with_label.assert_not_called()
 
     def test_marker_anchor_beyond_first_page_is_deduped(
@@ -954,7 +993,7 @@ class TestFactGathererHealthReviewFacts:
         gatherer = FactGatherer(config=mock_config, repository_host=tracker)
         sample_state.priority_queue = [42]  # non-empty board so the anchor scan runs
 
-        result = gatherer.gather_tech_lead_facts(sample_state, now=999_999.0)
+        result = gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=999_999.0)
 
         assert result is not None
         assert result.health_review_due is True
@@ -962,9 +1001,20 @@ class TestFactGathererHealthReviewFacts:
         # The due health review uses the shared exhaustive tech-lead-agent scan,
         # which both finds the anchor beyond the first page and supplies open
         # case files to the health-review snapshot (#6781).
-        assert tracker.calls == [
+        assert [call for call in tracker.calls if "proposed-tech-lead" not in call["labels"]] == [
             {
                 "labels": ["agent:tech-lead"],
+                "state": "open",
+                "limit": 2000,
+                "exhaustive": True,
+            }
+        ]
+        # The approval-scope query is a SEPARATE observation, by gate label
+        # rather than agent label, because promoted findings carry the target's
+        # worker agent label and no agent-scoped scan can see them.
+        assert [call for call in tracker.calls if "proposed-tech-lead" in call["labels"]] == [
+            {
+                "labels": ["proposed-tech-lead"],
                 "state": "open",
                 "limit": 2000,
                 "exhaustive": True,
@@ -1295,7 +1345,7 @@ class TestGatedProposalScanClassification:
             mock_config, mock_repository_host, [(500, self._op(13))]
         )
 
-        facts = gatherer.gather_tech_lead_facts(sample_state)
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert facts is not None
         [approved] = facts.approved_tech_lead_ops
@@ -1303,7 +1353,7 @@ class TestGatedProposalScanClassification:
         assert approved.op.target_issue_number == 13
         assert facts.existing_tech_lead_issue == 7
         # Exactly one issue scan was made for anchors + proposals.
-        assert mock_repository_host.list_issues.call_count == 1
+        assert len(_anchor_scan_calls(mock_repository_host)) == 1
 
     def test_still_gated_proposal_yields_nothing_and_never_becomes_anchor(
         self, mock_config, mock_repository_host, sample_state
@@ -1321,7 +1371,7 @@ class TestGatedProposalScanClassification:
             [(500, self._op(14, "kill_hung_session"))],
         )
 
-        facts = gatherer.gather_tech_lead_facts(sample_state)
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert facts is not None
         assert facts.approved_tech_lead_ops == ()
@@ -1339,7 +1389,7 @@ class TestGatedProposalScanClassification:
         mock_repository_host.list_issues.return_value = []
         gatherer = self._gatherer(mock_config, mock_repository_host, [])
 
-        gatherer.gather_tech_lead_facts(sample_state)
+        gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         _, kwargs = mock_repository_host.list_issues.call_args
         assert kwargs["limit"] == TECH_LEAD_PROPOSAL_SCAN_LIMIT
@@ -1364,7 +1414,7 @@ class TestGatedProposalScanClassification:
             [(500, self._op(13)), (501, self._op(14, "kill_hung_session"))],
         )
 
-        facts = gatherer.gather_tech_lead_facts(sample_state)
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         # The absent row is surfaced as a candidate...
         assert facts is not None
@@ -1372,7 +1422,7 @@ class TestGatedProposalScanClassification:
         # ...but the store is UNTOUCHED — observation never mutates the ledger.
         assert sorted(n for n, _ in gatherer.tech_lead_authority.list_ops()) == [500, 501]
         # A second scan is still read-only (no self-heal happens here).
-        gatherer.gather_tech_lead_facts(sample_state)
+        gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
         assert sorted(n for n, _ in gatherer.tech_lead_authority.list_ops()) == [500, 501]
 
     def test_without_store_gate_labeled_issues_are_still_excluded(
@@ -1392,7 +1442,7 @@ class TestGatedProposalScanClassification:
             config=mock_config, repository_host=mock_repository_host
         )
 
-        facts = gatherer.gather_tech_lead_facts(sample_state)
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert facts is not None
         assert facts.approved_tech_lead_ops == ()
@@ -1439,7 +1489,7 @@ class TestGatedProposalScanClassification:
             [(500, self._op(13)), (501, self._op(14, "kill_hung_session"))],
         )
 
-        facts = gatherer.gather_tech_lead_facts(sample_state)
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert facts is not None
         assert facts.threshold == 0  # batch trigger stays OFF
@@ -1460,8 +1510,13 @@ class TestGatedProposalScanClassification:
         mock_config.tech_lead.health_review.interval_minutes = 0
         gatherer = self._gatherer_batch_disabled(mock_config, mock_repository_host, [])
 
-        assert gatherer.gather_tech_lead_facts(sample_state) is None
-        mock_repository_host.list_issues.assert_not_called()
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
+
+        # Approval discovery arms on its own cadence, so facts exist; the
+        # exhaustive ANCHOR scan is what an empty ledger must not trigger.
+        assert facts is not None
+        assert facts.gated_proposals == ()
+        assert _anchor_scan_calls(mock_repository_host) == []
 
 
 class TestCaseFileScanClassification:
@@ -1502,7 +1557,7 @@ class TestCaseFileScanClassification:
         ]
         gatherer = self._gatherer(mock_config, mock_repository_host)
 
-        facts = gatherer.gather_tech_lead_facts(sample_state)
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         assert facts is not None
         [case_file] = facts.open_case_files
@@ -1513,7 +1568,7 @@ class TestCaseFileScanClassification:
         # The anchor scan ran, so the projection is authoritative this tick.
         assert facts.case_files_scanned is True
         # Still just one issue scan for anchors + proposals + case files.
-        assert mock_repository_host.list_issues.call_count == 1
+        assert len(_anchor_scan_calls(mock_repository_host)) == 1
 
     def test_board_publisher_receives_facts_and_health_review_timestamp(
         self, mock_config, mock_repository_host, sample_state
@@ -1539,7 +1594,7 @@ class TestCaseFileScanClassification:
             mock_config, mock_repository_host, board_publisher=publisher
         )
 
-        facts = gatherer.gather_tech_lead_facts(sample_state)
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
 
         # Fire-and-forget projection sink got the gathered facts + state.
         assert len(publisher.calls) == 1
@@ -1598,7 +1653,7 @@ class TestCaseFileScanClassification:
         ]
         sample_state.last_health_review_at = 1_000.0
         sample_state.priority_queue = [42]  # non-empty board so tick 1 is due
-        scanned = gatherer.gather_tech_lead_facts(sample_state, now=1_000.0 + 3600)
+        scanned = gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=1_000.0 + 3600)
         assert scanned is not None
         assert scanned.case_files_scanned is True
         assert [cf.issue_number for cf in publisher.case_files()] == [800]
@@ -1610,16 +1665,168 @@ class TestCaseFileScanClassification:
         mock_repository_host.list_issues.reset_mock()
         mock_repository_host.list_issues.return_value = []
         not_scanned = gatherer.gather_tech_lead_facts(
-            sample_state, now=1_000.0 + 3600 + 60
+            sample_state, board_issues=[], now=1_000.0 + 3600 + 60
         )
         assert not_scanned is not None
         assert not_scanned.case_files_scanned is False
         assert not_scanned.open_case_files == ()
         # Zero GitHub calls on the frugal tick (GitHub API discipline).
-        mock_repository_host.list_issues.assert_not_called()
+        # The approval-scope query still runs (the board is written from these
+        # facts); the exhaustive ANCHOR scan is what this tick must skip.
+        assert _anchor_scan_calls(mock_repository_host) == []
         # The projection the board snapshot builder reads is preserved, not
         # wiped by the empty tuple the frugal tick carried.
         assert [cf.issue_number for cf in publisher.case_files()] == [800]
+
+
+class TestApprovalBacklogFacts:
+    """The operator-approval backlog is LABEL truth, not ledger truth (#7014).
+
+    Health review #6997 found ``tech-lead-board.md`` reporting "Open proposals:
+    None." while twenty gate-labeled issues waited for an operator, because the
+    only proposals the board could see were the ones with a
+    ``tech_lead_proposal_ops`` row — and that ledger was empty.
+    """
+
+    @staticmethod
+    def _gated(number: int, title: str = "gated") -> Issue:
+        from issue_orchestrator.domain.tech_lead_session import (
+            PROPOSED_TECH_LEAD_LABEL,
+        )
+
+        return Issue(
+            number=number,
+            title=title,
+            labels=["agent:backend", PROPOSED_TECH_LEAD_LABEL],
+            created_at="2026-07-28T00:00:00+00:00",
+        )
+
+    @staticmethod
+    def _gatherer(mock_config, mock_repository_host, **kwargs) -> FactGatherer:
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "tech-lead-agent"
+        # Batch and health triggers both OFF, ledger empty: without the backlog
+        # this tick has nothing whatsoever to say about tech_lead.
+        mock_config.tech_lead_review_threshold = 0
+        mock_config.tech_lead.health_review.interval_minutes = 0
+        return FactGatherer(
+            config=mock_config,
+            repository_host=mock_repository_host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+            **kwargs,
+        )
+
+    def test_gated_board_issues_become_backlog_facts(
+        self, mock_config, mock_repository_host, sample_state
+    ) -> None:
+        _host_sees_gated(mock_repository_host, self._gated(6922, "oldest"))
+        gatherer = self._gatherer(mock_config, mock_repository_host)
+
+        facts = gatherer.gather_tech_lead_facts(
+            sample_state,
+            board_issues=[
+                self._gated(6922, "oldest"),
+                Issue(number=7, title="plain work", labels=["agent:backend"]),
+            ],
+        )
+
+        assert facts is not None
+        [pending] = facts.gated_proposals
+        assert (pending.issue_number, pending.title) == (6922, "oldest")
+        assert pending.created_at == "2026-07-28T00:00:00+00:00"
+
+    def test_a_gated_backlog_alone_arms_the_facts_without_any_read(
+        self, mock_config, mock_repository_host, sample_state
+    ) -> None:
+        """Nothing else armed, so before #7014 this tick produced NO facts —
+        and therefore never published a board that could show the backlog. The
+        board is already in hand, so arming on it costs zero GitHub calls."""
+        _host_sees_gated(mock_repository_host, self._gated(6922))
+        gatherer = self._gatherer(mock_config, mock_repository_host)
+
+        facts = gatherer.gather_tech_lead_facts(
+            sample_state, board_issues=[self._gated(6922)]
+        )
+
+        assert facts is not None
+        assert [p.issue_number for p in facts.gated_proposals] == [6922]
+        # The APPROVAL-SCOPE query still runs: the board is written from these
+        # facts, so an incomplete backlog would be published as fact. What must
+        # not happen on a cheap tick is the exhaustive ANCHOR scan.
+        assert _anchor_scan_calls(mock_repository_host) == []
+        mock_repository_host.get_prs_with_label.assert_not_called()
+
+    def test_an_ungated_board_arms_nothing(
+        self, mock_config, mock_repository_host, sample_state
+    ) -> None:
+        _host_sees_gated(mock_repository_host)  # the gate query finds nothing
+        gatherer = self._gatherer(mock_config, mock_repository_host)
+
+        facts = gatherer.gather_tech_lead_facts(
+            sample_state,
+            board_issues=[Issue(number=7, title="plain", labels=["agent:backend"])],
+        )
+
+        # Facts ARE produced now: approval discovery arms on its own cadence,
+        # because a board with no gated issues is not evidence that none are
+        # pending — that board is the blind spot the gate query exists to
+        # cover. What an ungated board must still mean is an EMPTY backlog.
+        assert facts is not None
+        assert facts.gated_proposals == ()
+
+    def test_master_switch_still_suppresses_the_backlog(
+        self, mock_config, mock_repository_host, sample_state
+    ) -> None:
+        """``tech_lead.enabled: false`` means zero tech-lead facts, backlog
+        included: the gate label is inert vocabulary in a repo with the
+        subsystem switched off."""
+        gatherer = self._gatherer(mock_config, mock_repository_host)
+        mock_config.tech_lead.enabled = False
+
+        assert gatherer.gather_tech_lead_facts(
+            sample_state, board_issues=[self._gated(6922)]
+        ) is None
+
+    def test_snapshot_publishes_a_board_that_shows_the_backlog(
+        self, mock_config, mock_repository_host, sample_state, tmp_path
+    ) -> None:
+        """End-to-end #7014: the tick's board fetch -> facts -> board file.
+
+        Wires the real gatherer to the real publisher with an EMPTY op ledger —
+        the exact state that printed "Open proposals: None." — and proves the
+        rendered operator board names the gated issue instead.
+        """
+        from issue_orchestrator.control.tech_lead_board import (
+            TechLeadBoardPublisher,
+            tech_lead_board_path,
+        )
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        _host_sees_gated(
+            mock_repository_host, self._gated(6922, "[P1-003] fix the seam")
+        )
+        publisher = TechLeadBoardPublisher(
+            board_path=tech_lead_board_path(tmp_path),
+            authority=InMemoryTechLeadAuthorityStore(),
+        )
+        gatherer = self._gatherer(
+            mock_config, mock_repository_host, board_publisher=publisher
+        )
+
+        gatherer.create_snapshot(
+            sample_state, [self._gated(6922, "[P1-003] fix the seam")]
+        )
+
+        content = tech_lead_board_path(tmp_path).read_text()
+        assert "## Open proposals\n\nNone." not in content
+        assert "1 awaiting operator approval" in content
+        assert "#6922" in content
+        assert "[P1-003] fix the seam" in content
 
 
 class TestClearDiscoveredFacts:
@@ -1715,3 +1922,337 @@ class TestClearDiscoveredFacts:
 
         remaining = {c.issue_number for c in state.immediate_cleanups}
         assert remaining == {5980}  # disposable retained, normal dropped
+
+
+class TestTheApprovalBacklogIsObservedCompletelyAndCleared:
+    """Two ways the board could assert a backlog that is not what it observed.
+
+    Both come from the same root: the backlog was projected from ONE filtered
+    set, and only when something else had already armed fact production.
+    """
+
+    def _gatherer(self, mock_config, mock_repository_host):
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "tech-lead-agent"
+        mock_config.tech_lead_review_threshold = 5
+        mock_config.code_reviewed_label = "code-reviewed"
+        return FactGatherer(
+            config=mock_config,
+            repository_host=mock_repository_host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+    @staticmethod
+    def _gated(number: int, title: str = "Tech Lead proposal: do a thing"):
+        return Issue(
+            number=number,
+            title=title,
+            labels=["tech-lead-agent", "proposed-tech-lead"],
+        )
+
+    def test_clearing_the_last_approval_still_publishes_an_empty_backlog(
+        self, mock_config, mock_repository_host, sample_state
+    ) -> None:
+        """F1: the tick that empties the backlog is the tick nothing else arms.
+
+        Batch and health disabled, empty ledger, no other trigger. The first
+        tick publishes a backlog of one; the operator then removes the gate.
+        Without the transition trigger the second tick returns None, the
+        publisher is never called, and the board keeps asserting an approval
+        that is no longer pending — indefinitely.
+        """
+        mock_repository_host.list_issues.return_value = []
+        gatherer = self._gatherer(mock_config, mock_repository_host)
+        # The reviewer's conditions, made real rather than assumed: batch off
+        # (threshold <= 0 disables the watch label) and the health interval off.
+        # Without both, some other trigger arms the tick and the bug is hidden.
+        mock_config.tech_lead_review_threshold = 0
+        mock_config.tech_lead.health_review.interval_minutes = 0
+
+        _host_sees_gated(mock_repository_host, self._gated(8000))
+        first = gatherer.gather_tech_lead_facts(
+            sample_state, board_issues=[self._gated(8000)]
+        )
+        assert first is not None
+        assert [p.issue_number for p in first.gated_proposals] == [8000]
+        assert sample_state.tech_lead_gated_backlog_seen is True
+
+        # The operator approves it: the gate is gone everywhere, including the
+        # authoritative query, so nothing is pending and nothing else is armed.
+        _host_sees_gated(mock_repository_host)
+        second = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
+
+        assert second is not None, (
+            "the tick that empties the backlog produced no facts, so the board "
+            "keeps reporting approvals that are no longer pending"
+        )
+        assert second.gated_proposals == ()
+        assert sample_state.tech_lead_gated_backlog_seen is False
+
+        # ...and it settles: with nothing pending and nothing armed, the next
+        # tick is quiet again rather than republishing forever.
+        assert gatherer.gather_tech_lead_facts(sample_state, board_issues=[]) is None
+
+    def test_a_gated_issue_only_the_anchor_scan_saw_still_reaches_the_board(
+        self, mock_config, mock_repository_host, sample_state
+    ) -> None:
+        """F2: `board_issues` is the worker fetch, not the approval scope.
+
+        It is narrowed by configured agents, milestones, exclusion filters and
+        a fetch limit. The exhaustive anchor scan already fetched this issue,
+        but reconciliation drops gate-labeled issues from anchor candidates —
+        right for deciding what to execute, wrong for deciding what is
+        visibly pending.
+        """
+        mock_repository_host.list_issues.return_value = [self._gated(8000)]
+        gatherer = self._gatherer(mock_config, mock_repository_host)
+
+        # Armed by the health interval so the scan runs; the worker board is
+        # empty, as it would be for an issue outside the configured milestone.
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
+
+        assert facts is not None
+        assert [p.issue_number for p in facts.gated_proposals] == [8000], (
+            "a gated issue the tick had already fetched was dropped from the "
+            "backlog because it was absent from the filtered worker board"
+        )
+
+
+class _LabelAwareIssueHost:
+    """A host that answers each query with only what that query could see.
+
+    A single `return_value` stub hands the SAME issues to the anchor scan and
+    the approval-scope query, so a test using one cannot tell whether the
+    backlog came from the query it claims to be about. That is why the
+    existing coverage could not detect the approval query being removed.
+    """
+
+    def __init__(self, *, anchor: list, approval: list) -> None:
+        self._anchor = anchor
+        self._approval = approval
+        self.calls: list[dict] = []
+
+    def list_issues(self, **kwargs):
+        self.calls.append(kwargs)
+        labels = kwargs.get("labels") or []
+        return list(self._approval if "proposed-tech-lead" in labels else self._anchor)
+
+    def get_prs_with_label(self, *_a, **_k):
+        return []
+
+
+class TestTheBacklogSeesWhatOnlyItsOwnScopeCanSee:
+    """The completeness property, tested where it can actually fail."""
+
+    def test_a_worker_labelled_gated_issue_reaches_the_board(
+        self, mock_config, sample_state
+    ) -> None:
+        """A promoted finding carries the TARGET'S worker agent label.
+
+        `promotion_issue_labels` attaches it deliberately, so the issue is
+        "DISCOVERABLE the moment the gate comes off". The consequence is that
+        no agent-scoped scan can see it while it is still gated, and the
+        filtered worker board need not either — so the only observation that
+        finds it is a query for the gate label itself.
+        """
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead_review_threshold = 5
+        mock_config.code_reviewed_label = "code-reviewed"
+        promoted = Issue(
+            number=8100,
+            title="Promoted finding: condor lane forks a shell",
+            labels=["agent:backend", "proposed-tech-lead"],
+        )
+        host = _LabelAwareIssueHost(anchor=[], approval=[promoted])
+        gatherer = FactGatherer(
+            config=mock_config,
+            repository_host=host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+        facts = gatherer.gather_tech_lead_facts(sample_state, board_issues=[])
+
+        assert facts is not None
+        assert [p.issue_number for p in facts.gated_proposals] == [8100], (
+            "a gated issue that only the approval-scope query can see never "
+            "reached the board, so the operator is not told it is waiting"
+        )
+
+
+class TestApprovalDiscoveryDoesNotDependOnTheBoard:
+    """F2 round 3: the query must be REACHABLE when only hidden approvals exist.
+
+    Adding the complete query is not enough if the only path to it runs
+    through an early return armed by the worker board — the very fetch whose
+    blind spot the query exists to cover. A repo whose only tech-lead activity
+    is worker-labelled proposals outside that board armed nothing, queried
+    nothing, and showed nothing, indefinitely.
+    """
+
+    def test_only_hidden_approvals_still_reach_the_board_from_startup(
+        self, mock_config, sample_state
+    ) -> None:
+        """Startup, batch and health disabled, empty ledger, empty board."""
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead_review_threshold = 0
+        mock_config.tech_lead.health_review.interval_minutes = 0
+        hidden = Issue(
+            number=8100,
+            title="Promoted finding: condor lane forks a shell",
+            labels=["agent:backend", "proposed-tech-lead"],
+        )
+        host = _LabelAwareIssueHost(anchor=[], approval=[hidden])
+        gatherer = FactGatherer(
+            config=mock_config,
+            repository_host=host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+        # `tech_lead_approval_scan_at` is 0.0 on a fresh state, so the very
+        # first tick is due — no prior sighting required.
+        facts = gatherer.gather_tech_lead_facts(
+            sample_state, board_issues=[], now=1000.0
+        )
+
+        assert facts is not None, (
+            "nothing armed the tick, so the approval query never ran and a "
+            "pending approval invisible to the worker board can never surface"
+        )
+        assert [p.issue_number for p in facts.gated_proposals] == [8100]
+
+    def test_the_refresh_is_bounded_rather_than_every_tick(
+        self, mock_config, sample_state
+    ) -> None:
+        """Cost control: the cadence, not the tick, decides when to re-observe."""
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead_review_threshold = 0
+        mock_config.tech_lead.health_review.interval_minutes = 0
+        host = _LabelAwareIssueHost(anchor=[], approval=[])
+        gatherer = FactGatherer(
+            config=mock_config,
+            repository_host=host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+        gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=1000.0)
+        queries_after_first = len(host.calls)
+        gatherer.gather_tech_lead_facts(sample_state, board_issues=[], now=1001.0)
+
+        assert len(host.calls) == queries_after_first, (
+            "the approval scope was re-queried one second later; the cadence "
+            "is not bounding the cost"
+        )
+
+
+class TestAFailedApprovalQueryDoesNotDiscardObservedFacts:
+    """F5: declining to publish must not read to the planner as "nothing armed".
+
+    The approval query is the last thing a tick does. By then the anchor scan
+    may have succeeded and observed an open health-review anchor. Returning
+    None on that failure throws the observation away, and the storm planner —
+    which treats missing facts as "no anchor exists" — mints a duplicate.
+    """
+
+    class _AnchorOkApprovalFails:
+        """Anchor scan succeeds; only the gate-label query raises."""
+
+        def __init__(self, anchor):
+            self._anchor = anchor
+            self.calls: list[dict] = []
+
+        def list_issues(self, **kwargs):
+            self.calls.append(kwargs)
+            if "proposed-tech-lead" in (kwargs.get("labels") or []):
+                from issue_orchestrator.ports.repository_host import (
+                    RepositoryHostError,
+                )
+
+                raise RepositoryHostError("approval query failed")
+            return list(self._anchor)
+
+        def get_prs_with_label(self, *_a, **_k):
+            return []
+
+    def test_the_observed_anchor_survives_an_approval_query_failure(
+        self, mock_config, sample_state
+    ) -> None:
+        """The facts this tick DID gather must not be discarded.
+
+        Propagating is correct here — the anchor scan has always failed this
+        way — and is what stops the snapshot being planned on a half-observed
+        tick. What must not happen is a silent None carrying the planner into
+        duplicate-anchor territory.
+        """
+        from issue_orchestrator.control.health_review_trigger import (
+            HEALTH_REVIEW_MARKER_LABEL,
+        )
+        from issue_orchestrator.ports.repository_host import RepositoryHostError
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead_review_threshold = 5  # batch armed: real facts exist
+        anchor = Issue(
+            number=500,
+            title="Health Review — walk the floor",
+            labels=["agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL],
+        )
+        host = self._AnchorOkApprovalFails([anchor])
+        gatherer = FactGatherer(
+            config=mock_config,
+            repository_host=host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+        with pytest.raises(RepositoryHostError):
+            gatherer.gather_tech_lead_facts(
+                sample_state, board_issues=[], now=1000.0
+            )
+
+    def test_a_quiet_tick_still_declines_quietly(
+        self, mock_config, sample_state
+    ) -> None:
+        """The other side: with nothing else armed, there is nothing to lose.
+
+        Only the approval cadence armed this tick, so a failed query costs its
+        own trigger and nothing more — the board is left as published and the
+        next tick retries, rather than an outage failing the planning cycle.
+        """
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead_review_threshold = 0
+        mock_config.tech_lead.health_review.interval_minutes = 0
+        host = self._AnchorOkApprovalFails([])
+        gatherer = FactGatherer(
+            config=mock_config,
+            repository_host=host,
+            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+        assert (
+            gatherer.gather_tech_lead_facts(
+                sample_state, board_issues=[], now=1000.0
+            )
+            is None
+        )
+        # ...and the retry is not deferred: the cadence timestamp is untouched.
+        assert sample_state.tech_lead_approval_scan_at == 0.0

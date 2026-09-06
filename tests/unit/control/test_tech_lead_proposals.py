@@ -32,6 +32,7 @@ from issue_orchestrator.control.tech_lead_proposals import (
     build_op_ledger,
     build_tech_lead_proposal_issue_action,
     finalize_tech_lead_op_execution,
+    observe_gated_tech_lead_proposals,
     plan_approved_tech_lead_op_executions,
     reconcile_tech_lead_proposals,
 )
@@ -256,6 +257,72 @@ def test_reconcile_flags_ledger_row_absent_from_scan_as_candidate_only() -> None
     assert reconciled.approved == ()
     assert reconciled.anchor_candidate_issues == []
     assert reconciled.absent_op_issue_numbers == (501,)
+
+
+# --- Approval backlog: label truth (#7014) --------------------------------
+
+
+def test_backlog_includes_a_gated_issue_with_no_ledger_row() -> None:
+    """The #7014 defect: only act-level proposals leave a ledger row.
+
+    Promoted findings and proposed follow-up issues carry the same gate with no
+    ``tech_lead_proposal_ops`` row, so a backlog derived from the ledger reports
+    nothing pending while they wait on the operator.
+    """
+    promoted = _issue(6922, ["agent:backend", PROPOSED_TECH_LEAD_LABEL], title="Fix seam")
+
+    [pending] = observe_gated_tech_lead_proposals([promoted])
+
+    assert (pending.issue_number, pending.title) == (6922, "Fix seam")
+
+
+def test_backlog_excludes_issues_without_the_gate() -> None:
+    ungated = _issue(7, ["agent:backend"])
+    approved = _issue(8, ["agent:tech-lead"])  # gate removed = approved
+
+    assert observe_gated_tech_lead_proposals([ungated, approved]) == ()
+
+
+def test_backlog_folds_gate_label_case() -> None:
+    """R15: GitHub folds label names, so a canonical spelling still gates."""
+    canonical = Issue(
+        number=500, title="t", labels=["agent:tech-lead", "Proposed-Tech-Lead"]
+    )
+
+    assert [p.issue_number for p in observe_gated_tech_lead_proposals([canonical])] == [500]
+
+
+def test_backlog_excludes_a_closed_gated_issue() -> None:
+    """A closed proposal was rejected or already handled: nobody is waiting."""
+    closed = Issue(
+        number=500, title="t", labels=[PROPOSED_TECH_LEAD_LABEL], state="closed"
+    )
+
+    assert observe_gated_tech_lead_proposals([closed]) == ()
+
+
+def test_backlog_unions_observed_sets_and_orders_by_issue_number() -> None:
+    """Callers pass whatever open-issue sets the tick already holds."""
+    board = [_issue(7008, [PROPOSED_TECH_LEAD_LABEL]), _issue(6922, [PROPOSED_TECH_LEAD_LABEL])]
+    scan = [_issue(500, [PROPOSED_TECH_LEAD_LABEL]), _issue(6922, [PROPOSED_TECH_LEAD_LABEL])]
+
+    backlog = observe_gated_tech_lead_proposals(board, scan)
+
+    # Deduplicated by issue number, ordered by it, deterministic.
+    assert [p.issue_number for p in backlog] == [500, 6922, 7008]
+
+
+def test_backlog_carries_the_filing_time_the_board_ages_it_by() -> None:
+    filed = Issue(
+        number=6922,
+        title="t",
+        labels=[PROPOSED_TECH_LEAD_LABEL],
+        created_at="2026-07-28T00:00:00+00:00",
+    )
+
+    [pending] = observe_gated_tech_lead_proposals([filed])
+
+    assert pending.created_at == "2026-07-28T00:00:00+00:00"
 
 
 # --- Confirm-and-discard owner (#6779 R7/R10) -----------------------------
@@ -1604,3 +1671,122 @@ def test_end_to_end_gated_reset_proposal_executes_once() -> None:
         [approved_issue], ops=dict(ops.list_ops())
     ).approved
     assert plan_approved_tech_lead_op_executions(leftover) == []
+
+
+class TestALaterObservationCanRetireAnEarlierOne:
+    """F3: "last observation wins" must include observing that it is done.
+
+    The observer filtered on `_awaits_approval` BEFORE resolving duplicate
+    issue numbers, so a later observation without the gate was discarded
+    rather than superseding the earlier gated one. Connecting a second source
+    made that reachable: an issue approved between the worker fetch and the
+    anchor scan stayed advertised as pending despite fresher evidence in the
+    very same tick.
+    """
+
+    @staticmethod
+    def _issue(number: int, *, labels: list[str], state: str = "open"):
+        from issue_orchestrator.domain.models import Issue
+
+        return Issue(number=number, title="Proposal", labels=labels, state=state)
+
+    def test_a_later_ungated_observation_removes_the_proposal(self) -> None:
+        from issue_orchestrator.control.tech_lead_proposals import (
+            observe_gated_tech_lead_proposals,
+        )
+
+        gated = self._issue(9000, labels=["agent:tech-lead", "proposed-tech-lead"])
+        approved = self._issue(9000, labels=["agent:tech-lead"])
+
+        assert observe_gated_tech_lead_proposals([gated], [approved]) == ()
+
+    def test_a_later_closed_observation_removes_the_proposal(self) -> None:
+        from issue_orchestrator.control.tech_lead_proposals import (
+            observe_gated_tech_lead_proposals,
+        )
+
+        gated = self._issue(9000, labels=["agent:tech-lead", "proposed-tech-lead"])
+        closed = self._issue(
+            9000, labels=["agent:tech-lead", "proposed-tech-lead"], state="closed"
+        )
+
+        assert observe_gated_tech_lead_proposals([gated], [closed]) == ()
+
+    def test_the_earlier_observation_still_wins_when_nothing_supersedes_it(
+        self,
+    ) -> None:
+        """The fix must not make a proposal vanish for being absent elsewhere.
+
+        Absence from a later set is not an observation of that issue; only an
+        actual later observation of the SAME issue may retire it.
+        """
+        from issue_orchestrator.control.tech_lead_proposals import (
+            observe_gated_tech_lead_proposals,
+        )
+
+        gated = self._issue(9000, labels=["agent:tech-lead", "proposed-tech-lead"])
+        unrelated = self._issue(9001, labels=["agent:tech-lead"])
+
+        observed = observe_gated_tech_lead_proposals([gated], [unrelated])
+
+        assert [p.issue_number for p in observed] == [9000]
+
+
+class TestTheAuthoritativeQueryDecidesMembership:
+    """F4: absence in the complete set retires an entry a partial set held.
+
+    Appending an exhaustive gate-filtered query to a union does not make it
+    authoritative. Its verdict on a retired proposal is ABSENCE, and absence
+    supersedes nothing in a union — so a proposal approved between the worker
+    fetch and the gate query stayed advertised on the strength of the older,
+    narrower observation.
+    """
+
+    class _Host:
+        def __init__(self, approval):
+            self._approval = approval
+
+        def list_issues(self, **_kwargs):
+            return list(self._approval)
+
+    @staticmethod
+    def _issue(number: int, *, gated: bool = True):
+        from issue_orchestrator.domain.models import Issue
+
+        labels = ["agent:backend"] + (["proposed-tech-lead"] if gated else [])
+        return Issue(number=number, title="Proposal", labels=labels)
+
+    @staticmethod
+    def _config():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(filtering=SimpleNamespace(label=""))
+
+    def test_an_empty_authoritative_result_retires_a_partial_entry(self) -> None:
+        from issue_orchestrator.control.tech_lead_approval_scope import (
+            observe_approval_backlog,
+        )
+
+        observed = observe_approval_backlog(
+            self._Host([]), self._config(), [self._issue(9000)]
+        )
+
+        assert observed == (), (
+            "the complete observation says #9000 is not pending, but the "
+            "older worker fetch kept it on the board"
+        )
+
+    def test_an_authoritative_result_for_a_different_issue_also_retires_it(
+        self,
+    ) -> None:
+        from issue_orchestrator.control.tech_lead_approval_scope import (
+            observe_approval_backlog,
+        )
+
+        observed = observe_approval_backlog(
+            self._Host([self._issue(9001)]),
+            self._config(),
+            [self._issue(9000)],
+        )
+
+        assert [p.issue_number for p in observed] == [9001]

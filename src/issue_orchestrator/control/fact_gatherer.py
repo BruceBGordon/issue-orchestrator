@@ -23,9 +23,9 @@ Usage:
 import logging
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, TYPE_CHECKING
+from typing import Any, Callable, Optional, TYPE_CHECKING, cast
 
 from ..infra.config import Config
 from ..events import EventName
@@ -46,6 +46,11 @@ from .tech_lead_artifact_retention import (
     clear_discovered_facts as _clear_discovered_facts,
     tech_lead_problem_artifact_hold_issue_numbers,
 )
+from .tech_lead_approval_scope import (
+    approval_refresh_due,
+    observe_approval_backlog_or_none,
+)
+from .tech_lead_proposals import observe_gated_tech_lead_proposals
 from .tech_lead_reaction import storm_possible
 
 # Compatibility export: this policy lived in fact_gatherer before it gained a
@@ -73,6 +78,7 @@ if TYPE_CHECKING:
     from .tech_lead_board import TechLeadBoardPublisher
 
 logger = logging.getLogger(__name__)
+
 
 
 def _pr_labels(pr: Any) -> list[str]:
@@ -224,7 +230,7 @@ class FactGatherer:
         # discovered_failures is captured below, so the reaction model sees the
         # recovered failures this tick (a next-tick capture would be dropped by
         # the end-of-tick discovered-fact clear).
-        tech_lead_facts = self.gather_tech_lead_facts(state)
+        tech_lead_facts = self.gather_tech_lead_facts(state, board_issues=issues)
         tech_lead_subjects = self.gather_tech_lead_subject_facts(state, issues)
         cleanup_facts = self.gather_cleanup_facts(state)
         e2e_occupies_slot, e2e_due = self._read_e2e_slot_facts()
@@ -343,11 +349,17 @@ class FactGatherer:
     def gather_tech_lead_facts(
         self,
         state: "OrchestratorState",
+        *,
+        board_issues: Sequence["Issue"],
         now: float | None = None,
     ) -> Optional["TechLeadFacts"]:
         """Gather facts for the tech_lead batch and health-review triggers.
 
-        Three independent triggers can each produce facts (only the case where
+        ``board_issues`` is the tick's already-fetched runnable board, required
+        rather than optional so this can never silently report an EMPTY approval
+        backlog because a caller forgot to hand over its observation (#7014).
+
+        Four independent triggers can each produce facts (only the case where
         none is active yields None):
           * BATCH fields, gated by ``tech_lead_review_threshold`` (via the watch
             label);
@@ -362,6 +374,11 @@ class FactGatherer:
             reconciled whenever it holds an op — INDEPENDENT of the batch
             review threshold (#6779 R12), so a manual-approval / default
             (threshold=0) proposal still advances and self-heals.
+          * APPROVAL-BACKLOG fields, armed by observing a gate-labeled open
+            issue on the board (#7014). This one costs no read at all — the
+            board is already in hand — and it arms independently so a repo
+            whose only tech-lead activity is a pile of gated proposals still
+            publishes an operator board that shows them.
 
         GitHub API discipline shapes every read here: due-ness and storm
         possibility are pure state/config math computed FIRST, so a health-only
@@ -398,20 +415,16 @@ class FactGatherer:
         batch_armed = bool(watch_label)
         tech_lead_workflow_enabled = self.config.tech_lead_enabled
         health_armed = health_review_interval_minutes(self.config) > 0
-        # A storm can fire an anchor on a tick the interval is NOT due — and a
-        # storm-only configuration (interval_minutes=0) is never due at all.
-        # Arming the scan on the storm predicate is what keeps
-        # ``existing_health_review_issue`` trustworthy on those ticks; without
-        # it the dedup fact is unconditionally None and every storm mints a
-        # duplicate anchor. Pure state/config math, so it costs no API call.
+        # A storm can fire an anchor on a tick the interval is NOT due, and a
+        # storm-only config (interval_minutes=0) is never due at all. Arming on
+        # the storm predicate keeps ``existing_health_review_issue`` trustworthy
+        # there; without it every storm mints a duplicate anchor. No API call.
         storm_armed = storm_possible(state, self.config)
 
-        # The act-level PROPOSAL machinery is armed by having a tech lead agent, so
-        # it reconciles INDEPENDENT of the batch review threshold (#6779 R12):
-        # approved gated proposals must execute and terminal/absent proposals
-        # must be surfaced for cleanup even when threshold=0 (batch disabled).
-        # The local op ledger (no GitHub call) says whether there is anything to
-        # reconcile — an empty ledger produces no facts and no scan.
+        # The act-level PROPOSAL machinery reconciles INDEPENDENT of the batch
+        # threshold (#6779 R12): approved proposals must execute and absent ones
+        # be surfaced even at threshold=0. The local op ledger (no GitHub call)
+        # says whether there is anything to reconcile.
         ops = (
             dict(self.tech_lead_authority.list_ops())
             if tech_lead_workflow_enabled and self.tech_lead_authority is not None
@@ -428,15 +441,25 @@ class FactGatherer:
             target=self.promotion_target,
             read_budget=self.promotion_read_budget,
         )
-        if (
-            not batch_armed
-            and not health_armed
-            and not ops
-            and not storm_armed
-            and not promotable
-            and not promotion_updates
-            and not settled
-        ):
+        # LABEL truth about the approval backlog (#7014): only act-level ops
+        # leave a ledger row, so ``ops`` cannot say what is pending. Also ARMS
+        # fact production.
+        gated_proposals = observe_gated_tech_lead_proposals(board_issues)
+        # A just-EMPTIED backlog must still publish: clearing the last gate is
+        # when nothing else arms production.
+        backlog_cleared = state.tech_lead_gated_backlog_seen and not gated_proposals
+        # Arms independently; tech_lead_approval_scope says why.
+        approval_due = approval_refresh_due(
+            self.config, state, now_ts, self.tech_lead_authority
+        )
+        # Everything except the approval cadence. Named because the failure
+        # path below needs it: a tick that already gathered real facts must
+        # never report them as "nothing armed" (F5).
+        other_armed = bool(
+            batch_armed or health_armed or ops or storm_armed or promotable
+            or promotion_updates or settled or gated_proposals or backlog_cleared
+        )
+        if not approval_due and not other_armed:
             return None
 
         # The decision carries the board it was decided on, so anchor creation
@@ -455,30 +478,41 @@ class FactGatherer:
         # anchor scan actually observed the ledger (#6781 R2). A frugal tick
         # (health armed but not due, no batch, empty ledger) leaves this False
         # and its empty ``case_files`` must NOT wipe the retained projection.
-        case_files_scanned = False
+        case_files_scanned, scan_observations = False, cast(Sequence["Issue"], ())
         if batch_armed or ops or due or storm_armed:
             # The ONE exhaustive open tech-lead-agent scan classifies batch +
-            # health anchors, open proposals, approved ops, and absent-ledger
-            # cleanup candidates in a single reconcile (#6778/#6779).
-            # It runs when the batch trigger is armed OR the ledger has ops to
-            # reconcile — decoupling proposal advancement from the batch
-            # threshold. A due health review also needs this scan so its board
-            # snapshot includes every open pattern case file (#6781), and a
-            # possible storm needs it to dedup its anchor (#6780).
+            # health anchors, open proposals, approved ops and absent-ledger
+            # cleanup candidates in a single reconcile (#6778/#6779). It also
+            # feeds the health snapshot's case files (#6781) and the storm
+            # anchor dedup (#6780).
             (
                 batch_anchor,
                 existing_health_review_issue,
                 approved_ops,
                 absent_op_candidates,
                 case_files,
+                scanned_issues,
             ) = self._classify_tech_lead_anchor_scan(ops)
             case_files_scanned = True
+            scan_observations = scanned_issues
             # Batch anchor classification stays gated on batch_armed: a batch
             # anchor is meaningless while the batch trigger is off.
             if batch_armed:
                 existing_tech_lead_issue = batch_anchor
         prs = self._fetch_tech_lead_prs(watch_label) if batch_armed else []
         all_labels, source_milestones = self._collect_pr_metadata(prs)
+
+        # A failed approval query may only cost this tick's OWN trigger.
+        gated_proposals = observe_approval_backlog_or_none(
+            self.repository_host, self.config, board_issues, scan_observations,
+            decline_on_failure=not other_armed,
+        )
+        if gated_proposals is None:
+            return None
+        state.tech_lead_approval_scan_at = now_ts
+
+        # Lets the next tick tell "still empty" from "just emptied".
+        state.tech_lead_gated_backlog_seen = bool(gated_proposals)
 
         facts = TechLeadFacts(
             pr_count=len(prs),
@@ -493,6 +527,7 @@ class FactGatherer:
             existing_health_review_issue=existing_health_review_issue,
             approved_tech_lead_ops=approved_ops,
             absent_proposal_op_candidates=absent_op_candidates,
+            gated_proposals=gated_proposals,
             open_case_files=case_files,
             case_files_scanned=case_files_scanned,
             promotable_findings=promotable,
@@ -607,6 +642,7 @@ class FactGatherer:
         tuple["ApprovedTechLeadOp", ...],
         tuple[int, ...],
         tuple["TechLeadCaseFileSummary", ...],
+        tuple["Issue", ...],
     ]:
         """Classify the ONE shared, exhaustive open tech-lead-agent scan.
 
@@ -634,7 +670,7 @@ class FactGatherer:
         from .tech_lead_proposals import reconcile_tech_lead_proposals
 
         if not self.config.tech_lead_enabled:
-            return None, None, (), (), ()
+            return None, None, (), (), (), ()
         existing = discover_open_tech_lead_anchor_issues(
             self.repository_host, self.config
         )
@@ -645,12 +681,15 @@ class FactGatherer:
         batch, health = classify_tech_lead_anchor_issues(
             remaining, self.config.filtering.label
         )
+        # `existing` is returned UNFILTERED: reconciliation drops gate-labeled
+        # issues from anchor candidates.
         return (
             batch,
             health,
             reconciled.approved,
             reconciled.absent_op_issue_numbers,
             case_files,
+            tuple(existing),
         )
 
     def _collect_pr_metadata(self, prs: list[Any]) -> tuple[set[str], list[tuple[int, str]]]:

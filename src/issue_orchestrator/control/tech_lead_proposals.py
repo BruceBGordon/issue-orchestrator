@@ -19,6 +19,10 @@ the whole gated lifecycle:
   :func:`build_op_ledger` projects the store's rows; a duplicate proposal
   plans an :class:`AddCommentAction` on the existing proposal issue instead
   of filing a second one (:func:`build_duplicate_proposal_comment`).
+* **Approval backlog** — :func:`observe_gated_tech_lead_proposals` answers
+  "what is waiting on the operator?" from LABEL truth over the open issues a
+  tick already observed, because only act-level proposals leave a ledger row
+  (#7014). It is the visibility counterpart to reconciliation below.
 * **Reconciliation** — :func:`reconcile_tech_lead_proposals` is the lifecycle
   owner that partitions the fact gatherer's EXHAUSTIVE open-issue scan (#6779
   R2/R4) against the durable ledger in one pass: a gate-labeled issue is an
@@ -55,6 +59,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence, TypeVar
 from ..domain.tech_lead_session import (
     PROPOSED_TECH_LEAD_LABEL,
     ApprovedTechLeadOp,
+    GatedTechLeadProposal,
     StoredTechLeadOp,
     TechLeadCreationOrigin,
     TechLeadSessionGeneration,
@@ -358,6 +363,68 @@ def reconcile_tech_lead_proposals(
         approved=tuple(approved),
         absent_op_issue_numbers=absent,
     )
+
+
+def observe_gated_tech_lead_proposals(
+    *observed: Sequence["Issue"],
+) -> tuple[GatedTechLeadProposal, ...]:
+    """The approval backlog as LABEL truth: every open gate-labeled issue (#7014).
+
+    The lifecycle owner's answer to "what is waiting on the operator?", and the
+    counterpart to :func:`reconcile_tech_lead_proposals`, which classifies the
+    same gate against the op ledger. Reconciliation exists to decide what to
+    EXECUTE, so it can afford to look only at ledger-backed issues; visibility
+    cannot. Act-level op proposals are the only gated issues that leave a
+    ``tech_lead_proposal_ops`` row — promoted findings (#6957) and plain
+    follow-up issues carry the same gate with no row at all — so a projection
+    built from the ledger renders "no open proposals" while a backlog of gated
+    issues waits on GitHub. That is what #7014 hid: 20 gated issues, empty
+    ledger, and an operator board that said ``None.``
+
+    Callers pass whatever open-issue sets the tick ALREADY holds (the runnable
+    board fetch, the exhaustive anchor scan); the union is deduplicated by
+    issue number and ordered by it, so the projection is deterministic and
+    costs zero GitHub calls. Only OPEN issues qualify: a closed issue is
+    rejected or already handled, never awaiting approval.
+
+    Pass EVERY set the tick holds, not just the worker board. That board is
+    narrowed by configured agents, milestones, exclusion filters and a fetch
+    limit, so it is a runnable-work fetch rather than the approval scope — a
+    gated issue outside it is still waiting on an operator. Feeding only the
+    board is how this projection could report nothing on a tick that had
+    already fetched a pending approval through the anchor scan.
+    """
+    # One issue can appear in several observed sets; the LAST observation of it
+    # wins, so a set gathered later in the tick refreshes an earlier snapshot.
+    # Resolve the LATEST observation of each issue FIRST, then judge approval
+    # state. Filtering first meant a later observation that does NOT await
+    # approval was discarded instead of superseding the earlier one, so an
+    # issue approved or closed between two of this tick's fetches stayed
+    # advertised as pending despite fresher evidence in the same tick. "Last
+    # observation wins" has to include observing that it is no longer waiting.
+    latest: dict[int, "Issue"] = {
+        issue.number: issue for issues in observed for issue in issues
+    }
+    backlog: dict[int, GatedTechLeadProposal] = {
+        number: _gated_proposal_summary(issue)
+        for number, issue in latest.items()
+        if _awaits_approval(issue)
+    }
+    return tuple(backlog[number] for number in sorted(backlog))
+
+
+def _gated_proposal_summary(issue: "Issue") -> GatedTechLeadProposal:
+    """Project one observed issue onto the backlog fact."""
+    return GatedTechLeadProposal(
+        issue_number=issue.number,
+        title=issue.title,
+        created_at=issue.created_at or "",
+    )
+
+
+def _awaits_approval(issue: "Issue") -> bool:
+    """True iff *issue* is open and still carries the operator-approval gate."""
+    return issue.state == "open" and _issue_carries_gate(issue)
 
 
 def _proposal_issue_is_open(tracker: "RepositoryHost", issue_number: int) -> bool:

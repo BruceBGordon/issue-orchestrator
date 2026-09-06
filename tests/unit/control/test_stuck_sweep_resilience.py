@@ -69,7 +69,7 @@ class TestStuckSweepTransientFailure:
         state = OrchestratorState()
 
         # Must not raise.
-        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT, board_issues=[])
 
     def test_failed_sweep_is_never_recorded_as_swept(self) -> None:
         """Not stamping the SUCCESS timer is what makes the skip a retry.
@@ -88,14 +88,17 @@ class TestStuckSweepTransientFailure:
         state = OrchestratorState()
         before = state.last_stuck_sweep_at
 
-        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT, board_issues=[])
 
         assert state.last_stuck_sweep_at == before
-        assert stuck_sweep_due(
-            _sweep_config(),
-            state,
-            SWEEP_DUE_AT + STUCK_SWEEP_FAILURE_RETRY_SECONDS + 1,
-        ) is True
+        assert (
+            stuck_sweep_due(
+                _sweep_config(),
+                state,
+                SWEEP_DUE_AT + STUCK_SWEEP_FAILURE_RETRY_SECONDS + 1,
+            )
+            is True
+        )
 
     def test_a_real_bug_still_propagates(self) -> None:
         """Only repository-host failures are absorbed; genuine defects must not be."""
@@ -104,7 +107,9 @@ class TestStuckSweepTransientFailure:
         gatherer = _gatherer(host)
 
         with pytest.raises(ValueError, match="a real bug"):
-            gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)
+            gatherer.gather_tech_lead_facts(
+                OrchestratorState(), now=SWEEP_DUE_AT, board_issues=[]
+            )
 
     def test_a_sweep_that_is_not_due_never_touches_the_network(self) -> None:
         host = MagicMock()
@@ -112,7 +117,7 @@ class TestStuckSweepTransientFailure:
         state = OrchestratorState()
         state.last_stuck_sweep_at = SWEEP_DUE_AT
 
-        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT, board_issues=[])
 
         host.list_issues.assert_not_called()
 
@@ -147,7 +152,9 @@ class TestCompletenessFailuresAreLoudButBounded:
         )
 
         # Must not raise: every other subsystem keeps running.
-        gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(
+            OrchestratorState(), now=SWEEP_DUE_AT, board_issues=[]
+        )
 
     def test_an_unprovable_scan_never_marks_the_sweep_done(self) -> None:
         """Not stamping the success timer is what stops it counting as swept."""
@@ -155,7 +162,7 @@ class TestCompletenessFailuresAreLoudButBounded:
         state = OrchestratorState()
         before = state.last_stuck_sweep_at
 
-        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT, board_issues=[])
 
         assert state.last_stuck_sweep_at == before
 
@@ -169,7 +176,9 @@ class TestCompletenessFailuresAreLoudButBounded:
             events=events,
         )
 
-        gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(
+            OrchestratorState(), now=SWEEP_DUE_AT, board_issues=[]
+        )
 
         incomplete = [
             e for e in events.published if e.data.get("scan_incomplete") is True
@@ -197,14 +206,17 @@ class TestCompletenessFailuresAreLoudButBounded:
         gatherer = _gatherer(host)
         state = OrchestratorState()
 
-        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT, board_issues=[])
 
         assert state.last_stuck_sweep_at == 0.0
-        assert stuck_sweep_due(
-            _sweep_config(),
-            state,
-            SWEEP_DUE_AT + STUCK_SWEEP_FAILURE_RETRY_SECONDS + 1,
-        ) is True
+        assert (
+            stuck_sweep_due(
+                _sweep_config(),
+                state,
+                SWEEP_DUE_AT + STUCK_SWEEP_FAILURE_RETRY_SECONDS + 1,
+            )
+            is True
+        )
 
 
 class _RecordingEvents:
@@ -245,11 +257,11 @@ class TestFailedSweepBacksOffInsteadOfHammeringGitHub:
         gatherer = _gatherer(host)
         state = OrchestratorState()
 
-        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT, board_issues=[])
         assert host.list_issues.call_count == 1
 
         # The next tick, ~10 seconds later.
-        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT + 10)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT + 10, board_issues=[])
         assert host.list_issues.call_count == 1, (
             "the sweep rescanned on the next tick; a permanent failure would "
             "hammer GitHub every 10 seconds"
@@ -277,7 +289,9 @@ class TestFailedSweepBacksOffInsteadOfHammeringGitHub:
 
         # An hour of ticks at 10s each.
         for i in range(360):
-            gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT + i * 10)
+            gatherer.gather_tech_lead_facts(
+                state, now=SWEEP_DUE_AT + i * 10, board_issues=[]
+            )
 
         expected = 1 + (3600 // STUCK_SWEEP_FAILURE_RETRY_SECONDS)
         assert host.list_issues.call_count <= expected, (
@@ -295,9 +309,11 @@ class TestFailedSweepBacksOffInsteadOfHammeringGitHub:
         gatherer = _gatherer(host)
         state = OrchestratorState()
 
-        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT, board_issues=[])
         gatherer.gather_tech_lead_facts(
-            state, now=SWEEP_DUE_AT + STUCK_SWEEP_FAILURE_RETRY_SECONDS + 1
+            state,
+            now=SWEEP_DUE_AT + STUCK_SWEEP_FAILURE_RETRY_SECONDS + 1,
+            board_issues=[],
         )
 
         assert host.list_issues.call_count == 2
@@ -308,7 +324,7 @@ class TestFailedSweepBacksOffInsteadOfHammeringGitHub:
         gatherer = _gatherer(host)
         state = OrchestratorState()
 
-        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT, board_issues=[])
 
         assert state.last_stuck_sweep_at == 0.0
         assert state.last_stuck_sweep_failure_at == SWEEP_DUE_AT
@@ -320,7 +336,9 @@ class TestFailedSweepBacksOffInsteadOfHammeringGitHub:
         state = OrchestratorState()
         state.last_stuck_sweep_failure_at = SWEEP_DUE_AT - 1
 
-        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT + 10_000)
+        gatherer.gather_tech_lead_facts(
+            state, now=SWEEP_DUE_AT + 10_000, board_issues=[]
+        )
 
         assert state.last_stuck_sweep_failure_at == 0.0
         assert state.last_stuck_sweep_at == SWEEP_DUE_AT + 10_000
