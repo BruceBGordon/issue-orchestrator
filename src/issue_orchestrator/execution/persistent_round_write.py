@@ -13,11 +13,9 @@ write, after the echo settles, submits.
 
 from __future__ import annotations
 
-import errno
 import logging
 import os
 import select
-import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -28,7 +26,7 @@ from .persistent_round_failures import (
     PersistentRoundError,
     PersistentRoundTimeoutError,
 )
-from .composer_readiness import await_ready_before_typing
+from .composer_readiness import LiveComposerScreen, await_ready_before_typing
 from .persistent_round_io import drain_pty_output_until_quiet
 
 logger = logging.getLogger(__name__)
@@ -46,12 +44,20 @@ _ENTER_SETTLE_MAX_WAIT_SECONDS = 2.0
 
 class WritableSession(Protocol):
     """What writing needs — narrower than PersistentSession, and narrow enough
-    that this module never imports the runner back."""
+    that this module never imports the runner back.
+
+    It has to cover everything the write path touches transitively, not just
+    what it names directly: the pump reads through ``output_observer`` and the
+    readiness gate reads ``composer_screen``, so leaving either out makes this
+    Protocol a lie that only the type checker notices.
+    """
 
     master_fd: int
     closed: bool
     proc: Any
     log_writer: MirroredTerminalRecordingWriter | None
+    output_observer: Callable[[bytes], None] | None
+    composer_screen: LiveComposerScreen | None
 
 
 def _write_full(

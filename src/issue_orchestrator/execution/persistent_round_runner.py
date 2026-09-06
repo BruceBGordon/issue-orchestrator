@@ -23,7 +23,6 @@ import fcntl
 import json
 import logging
 import os
-import select
 import shutil
 import signal
 import struct
@@ -43,10 +42,7 @@ from .persistent_round_failures import (
     PersistentRoundError,
     PersistentRoundTimeoutError,
 )
-from .composer_readiness import (
-    LiveComposerScreen,
-    await_ready_before_typing,
-)
+from .composer_readiness import LiveComposerScreen
 from .persistent_round_io import drain_pty_output_until_quiet
 from .persistent_round_write import (
     drain_pty_output,

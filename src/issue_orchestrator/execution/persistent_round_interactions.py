@@ -52,7 +52,10 @@ def bind_interaction_sender(
 def prepare_startup_interactions(
     state: PersistentInteractionState | None,
     *,
-    drain_output: Callable[[], None],
+    # `object`, not `None`: the caller only needs the side effect, and
+    # `drain_pty_output_until_quiet` now reports whether it observed quiet.
+    # Demanding None would force every caller to wrap a useful return away.
+    drain_output: Callable[[], object],
     now: Callable[[], float],
     sleep: Callable[[float], None],
 ) -> None:
