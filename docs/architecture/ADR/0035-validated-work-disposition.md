@@ -401,6 +401,19 @@ Four concrete mechanisms in today's code destroy or strand the work:
    Thus irreparable `FAILED` work can become abandonment-eligible after owner
    death, while stale abandonment commands themselves still cause zero writes.
 
+   Quiescence is enforced by one service-owned `ValidatedWorkExecutionOwner`,
+   injected into recovery, drain, the fenced publisher, staged finalizer,
+   maintenance and shutdown release. It owns non-reentrant per-record locks and
+   the private claim map; only an active record/invocation token permits claim
+   access or relinquish. The lease spans each fence check and subsequent effect,
+   outcome/phase writes and synchronous child cleanup. Maintenance must enter the
+   same lease before it can release a live service's cached claim, so it cannot
+   race an effect paused after its fence check. Ordering is execution lease →
+   durable record claim → issue gate, with no reverse acquisition. Request
+   cancellation cannot release a worker's lease, and unjoined asynchronous effects
+   are forbidden. Deterministic before/after-check, cancellation and stale-candidate
+   tests establish that release waits for actual operation completion.
+
    **Both live in the Control Center, because the Repository Engine is the thing
    that is stuck.** Hosting the coordinator or its endpoint in the engine that owns
    the claim would make the escape hatch unavailable in exactly the failure it
@@ -422,12 +435,26 @@ Four concrete mechanisms in today's code destroy or strand the work:
    absent/unreadable/unsupported databases are explicit statuses, not empty success.
    No deep link or engine HTTP response is needed to discover and invoke recovery.
 
+   Read-only discovery requires a **new shared strict connection profile**, not
+   the current `open_sqlite()` writer helper. Safe `mode=ro` URI construction and
+   skipped write pragmas are necessary but insufficient: even a read-only SQLite
+   connection can create WAL/SHM files. Slice 7 therefore includes an isolated,
+   non-elevated observer worker and native certified local Unix VFS I/O guard,
+   enforcing no write/create operations while preserving live-WAL read locking.
+   Missing sidecars or unsupported guard/runtime profiles are explicit unavailable
+   results, never an unsafe fallback. Tests prove no observer-attributable database
+   or sidecar changes, including writer-close races; atime and advisory locks are
+   excluded from that file-mutation definition. This access-policy owner stays
+   separate from the writable stop-reservation adapter.
+
    One shared frame-aware navigation owner validates the transported `cc_origin`
    as a canonical local HTTP(S) origin before constructing any link or message.
    Embedded navigation sends a typed parent command; the shell checks the active
    iframe source, independently recorded engine origin and configured repository,
-   then selects/focuses its own engine row. Standalone navigation uses a constructed
-   top-level link; missing/hostile origins render instructions without an anchor.
+   then selects/focuses its own engine row. Standalone has no authoritative origin
+   capability today: even canonical loopback URLs can name unrelated listeners.
+   It therefore always renders manual discovery instructions, with no anchor or
+   dispatch; a query parameter cannot authorize a trusted-looking destination.
    Neither navigation path performs an engine operation. Cold-start recovery,
    actual embedded clicks and hostile-origin cases are required boundary tests.
 
@@ -475,6 +502,18 @@ Four concrete mechanisms in today's code destroy or strand the work:
    nor the UI may silently retarget abandonment to the returned evidence; the
    operator must see and confirm the new facts. This policy has one store owner,
    rather than separate route freshness checks and unconditional state writes.
+
+   Result typing enforces these promises at construction: every abandonment
+   status has one allowed payload shape, with an exhaustive validator rejecting
+   missing stale authority, false success dispositions and unrelated refusal
+   payloads. Discovery likewise rejects unavailable results carrying records.
+   `ControlCenterRecoveryRows` defines explicit empty/unavailable results,
+   owned/unowned records and groups by complete engine identity; its constructors
+   bind each offered stop action to the row's exact owner and fence and forbid
+   actions when capability is unavailable. The query owner produces these values
+   for both initial and refreshed views, and public schemas/strict parsers preserve
+   their discriminators and invariants. Constructor-rejection and producer-to-UI
+   mapping tests are required alongside the happy paths.
 
 12. **This owner writes exactly one label of its own.** A failed disposition keeps
    `recovery-pending` and registers its escalation through the needs-human owner's

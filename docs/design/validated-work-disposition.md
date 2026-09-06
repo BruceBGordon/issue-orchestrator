@@ -984,6 +984,50 @@ class AbandonValidatedWorkOutcome:
     # current facts for display, never substituted into an automatic retry.
     message: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, AbandonStatus):
+            raise ValueError("abandon status must be an AbandonStatus")
+        if not isinstance(self.message, str) or not self.message.strip():
+            raise ValueError("every abandon outcome requires a display message")
+        if not isinstance(self.pending_evidence_ids, tuple) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in self.pending_evidence_ids
+        ):
+            raise ValueError("pending evidence must be a tuple of non-empty ids")
+        if len(set(self.pending_evidence_ids)) != len(self.pending_evidence_ids):
+            raise ValueError("pending evidence ids must be distinct")
+        if self.disposition is not None and not isinstance(
+            self.disposition, ValidatedWorkDisposition
+        ):
+            raise ValueError("disposition must be a typed disposition")
+        if self.current_authority is not None and not isinstance(
+            self.current_authority, ValidatedWorkAuthoritySnapshot
+        ):
+            raise ValueError("current authority must be a typed snapshot")
+
+        # Exhaustive payload matrix; a newly added status must specify its shape.
+        match self.status:
+            case AbandonStatus.ABANDONED:
+                if self.disposition is None or self.disposition.state is not ValidatedWorkState.ABANDONED:
+                    raise ValueError("ABANDONED requires an ABANDONED disposition")
+                if self.pending_evidence_ids or self.current_authority is not None:
+                    raise ValueError("ABANDONED cannot carry refusal payloads")
+            case AbandonStatus.ATTACHED_EVIDENCE_PENDING:
+                if not self.pending_evidence_ids:
+                    raise ValueError("ATTACHED_EVIDENCE_PENDING requires pending ids")
+                if self.disposition is not None or self.current_authority is not None:
+                    raise ValueError("attached refusal carries only pending ids")
+            case AbandonStatus.EVIDENCE_NOT_CURRENT | AbandonStatus.AUTHORITY_STALE:
+                if self.current_authority is None:
+                    raise ValueError("stale refusal requires current authority")
+                if self.disposition is not None or self.pending_evidence_ids:
+                    raise ValueError("stale refusal carries only current authority")
+            case AbandonStatus.NO_SUCH_RECORD | AbandonStatus.ALREADY_RESOLVED | AbandonStatus.REFUSED_STATE:
+                if self.disposition is not None or self.pending_evidence_ids or self.current_authority is not None:
+                    raise ValueError("this refusal/status carries no result payload")
+            case _:
+                assert_never(self.status)
+
 
 @dataclass(frozen=True, slots=True)
 class ValidatedWorkDispositionBatch:
@@ -1436,11 +1480,12 @@ that resolves it, because every such heuristic is a fresh way to lose the work.
 SqliteIssueRunLedger(state_dir/"issue_run_ledger.sqlite")                    # §2.5
 IssueRunEvidenceService(run_ledger, active_sessions_view)                    # §2.5
 SqliteValidatedWorkStore(state_dir/"validated_work.sqlite")
+LocalValidatedWorkExecutionOwner(store)                                    # §4.4e; one shared instance
 FilesystemValidatedWorkEscrow(state_dir/"validated-work")
 GitValidatedHeadExecutor(working_copy, worktree_manager, repository_host)    # §4.4
-FencedValidatedHeadPublisher(executor, store)                                # §4.4f
+FencedValidatedHeadPublisher(executor, store, execution_owner)               # §4.4f
 StagedPublishedWorkFinalizer(                                                # §4.5b
-    review_routing=RetryReviewRouting, phase_recorder=store,
+    review_routing=RetryReviewRouting, phase_recorder=store, execution_owner=execution_owner,
     fresh_issue_reader=..., action_applier=..., label_manager=...,
 )
 CoreIssueRuntimeOwners(                                      # the four pre-existing owners
@@ -1450,7 +1495,7 @@ OtherRuntimeActivity(core)                                   # §4.3 check 5; no
 RepoLockLiveness(repo_root, instance_id)                     # §4.4e gate-backed death proof
 ValidatedWorkDispositionService(
     store, escrow, working_copy, worktree_manager, repository_host,
-    publisher, finalizer, other_activity, liveness, action_applier, label_manager,
+    publisher, finalizer, execution_owner, other_activity, liveness, action_applier, label_manager,
     needs_human_block, events,
 )
 IssueRuntimeLifecycleOwners(core, validated_work, issue_run_evidence)
@@ -2884,9 +2929,12 @@ than data.
 #### The owner keeps its own secret; `acquire_claim()` never hands one back
 
 The row stores only `sha256(secret)`, so nothing can reconstruct an existing claim —
-including the store. `ValidatedWorkDispositionService` therefore holds the claims it
-acquired in memory for the lifetime of the process and re-presents them on later
-ticks; `acquire_claim()` is called only for a record it does not already hold.
+including the store. The service's `ValidatedWorkExecutionOwner` therefore holds
+acquired claims in its private map for the lifetime of the process and re-presents
+them on later ticks. Claim-map reads and writes require the active execution token
+defined below; no service, finalizer or maintenance caller accesses the map directly.
+`acquire_claim()` is called only for a record that execution owner does not already
+hold.
 
 There is no case that needs reconstruction. A process that lost its in-memory claim
 has, by definition, a different `ProcessIdentity` — a restart changes the pid and
@@ -2895,6 +2943,114 @@ death path like any other successor: row 3 of the matrix above, which is exactly
 that row must answer `True` without probing. `acquire_claim()` accordingly has one behaviour:
 mint a new secret, bump the fence, record the new owner. It never returns an
 existing claim, because it cannot.
+
+#### One execution owner proves in-process quiescence
+
+The durable fence excludes a different process; it does not serialize two callers
+inside the same live service. In particular, maintenance could otherwise release a
+cached claim while `recover()` or the finalizer is paused just after `holds_claim()`.
+That effect would still run, while a successor acquired the released claim. Saying
+"release only when quiescent" is insufficient unless an owner enforces it.
+
+`ValidatedWorkExecutionOwner` is constructed once per repository engine in bootstrap
+and injected into its disposition service, fenced publisher and staged finalizer.
+It owns both the private claim map and one non-reentrant `threading.Lock` per
+`record_id`. A short registry mutex owns creation of these entries; entries remain
+for the service lifetime, so a cleanup cannot replace a lock while another caller
+still references it. This is an in-process mechanism; durable acquisition and
+gate-backed death proof still exclude another engine.
+
+```python
+@dataclass(frozen=True, slots=True)
+class RecordExecutionBusy:
+    record_id: str
+
+
+class RecordExecutionBusyError(RuntimeError):
+    """Transient explicit-recovery refusal carrying record_id, with no writes."""
+
+    def __init__(self, record_id: str) -> None:
+        if not isinstance(record_id, str) or not record_id.strip():
+            raise ValueError("busy execution requires a record id")
+        self.record_id = record_id
+        super().__init__("Validated-work execution is busy")
+
+
+class RecordExecutionToken:
+    """Opaque owner-minted capability: exact record, invocation and worker thread.
+    No public constructor, serialization, copying or claim fields.
+    """
+
+
+class RecordExecutionLease(ContextManager[RecordExecutionToken]):
+    """Keeps one record locked for the complete synchronous operation lifetime."""
+
+
+class ValidatedWorkExecutionOwner(Protocol):
+    def try_enter(self, record_id: str) -> RecordExecutionLease | RecordExecutionBusy: ...
+    def claim(self, token: RecordExecutionToken) -> ValidatedWorkClaim | None: ...
+    def remember_claim(self, token: RecordExecutionToken, claim: ValidatedWorkClaim) -> None: ...
+    def relinquish(self, token: RecordExecutionToken) -> bool: ...
+    def require_active(self, token: RecordExecutionToken, record_id: str) -> None: ...
+```
+
+The concrete owner performs `lock.acquire(blocking=False)` in `try_enter()`. The
+returned lease is already reserved for its caller; its context yields a fresh token
+and invalidates it before releasing the lock on exit. Tokens are checked against
+the owner's active entry by object identity and executing thread, not by comparing
+caller-supplied strings. Nested code receives the existing token; attempting to
+re-enter the same record returns `RecordExecutionBusy`, including on the same thread.
+`remember_claim()` verifies the claim's record matches the token before storing it.
+`relinquish()` requires that token, calls the fenced store release with the cached
+claim and removes the cached handle **only on success**. Refused release retains it.
+The store never receives an execution token: local scheduling and durable fences
+remain separate ownership concerns.
+
+**Every claim-using or record-effecting execution route enters this boundary.**
+Explicit `recover()`, each record pass of `drain()`, publication, failure handling,
+staged finalization/replay, retained-claim maintenance and graceful-shutdown claim
+release all use the same instance. The outer service method acquires the lease
+before reading/acquiring its cached claim and holds it through the last effect,
+outcome/phase write and permitted relinquish. The fenced publisher and staged
+finalizer require the token on their requests and call `require_active()` before
+each fenced effect, including the in-memory review/history append; they never
+re-enter or independently release it. Thus the token protects both sides of the
+`holds_claim()`-then-effect window, not just the check.
+
+Busy drain/maintenance passes skip that record with no writes and retry next tick.
+Explicit recovery propagates a typed `RecordExecutionBusyError(record_id)` to the
+command-error adapter as HTTP 409 with `{error: "validated_work_busy", record_id}`
+(declared in that endpoint's OpenAPI errors), or a tech-lead retryable refusal
+retaining the original immutable command. It does not mark the disposition `FAILED`
+or manufacture a successful disposition. Any later attempt re-runs authority check
+0 unchanged. Adapters read `error.record_id` directly, never parse `args` or the
+display message; an explicit mapping test asserts that field survives both HTTP
+and tech-lead responses. A same-record abandonment attempt uses the same admission guard and maps busy to
+`REFUSED_STATE` without taking a claim or changing state. Read-only snapshots need
+no execution lease. Capture/admission and issue-only label projection retain their
+store/issue-gate boundaries: they cannot read cached claims, relinquish ownership,
+or run a claim-bound effect. In particular, attached capture remains possible while
+a publication holds its lease; it uses the existing owner-preserving store command.
+
+**The lease follows the actual operation, not the HTTP request waiting for it.**
+Service execution and its effect adapters are synchronous: a subprocess/worker call
+must return only after that child has completed or has been terminated and joined.
+An async HTTP adapter may offload the *whole* service call to a worker; cancellation
+of the awaiter does not exit the worker's lease. It must retain and observe that
+worker until completion. No publisher/finalizer may spawn an unjoined thread/task,
+return a pending future, or schedule a callback containing a later effect. Exceptions
+release the lease only after nested effect cleanup has completed. If cleanup cannot
+prove the worker/child is finished, the operation remains inside the lease with its
+claim retained; shutdown reports the blocked operation and engine-stop recovery
+applies. A request timeout or cancellation is never evidence of quiescence. The
+guardrail and cancellation tests below enforce this synchronous boundary.
+
+Lock ordering is **execution lease → durable record claim → issue mutation gate**,
+with reverse-order release. No code holding an issue gate may enter execution or
+acquire a claim. Cross-record store classification stays one issue-gated transaction
+and does not acquire sibling execution leases or access sibling claim maps. A
+finalizer keeps its execution lease while applying that transaction and its own
+effects; maintenance takes the lease and claim but never the issue gate.
 
 #### Retained claims on non-publishing records have a maintenance exit
 
@@ -2910,20 +3066,25 @@ At startup and before each ordinary drain, the disposition service runs
 containing record id, CURRENT evidence id, state and recorded process identity.
 This pass selects retained claims in `PARKED`, `FAILED`, `RECOVERED` and
 `ABANDONED`; `QUEUED`/`PUBLISHING` continue through normal publication/resumption.
-It runs outside the issue mutation gate and obeys the existing claim-before-gate
-ordering:
+For each candidate it first acquires the **same execution lease** used by recovery
+and finalization, then re-reads its state/CURRENT evidence/owner under that lease;
+changed or busy candidates are skipped without effects. It runs outside the issue
+mutation gate and obeys execution-lease-before-claim ordering:
 
-1. A claim belonging to this live service is already in its private claim map.
-   Once the owning operation has completed and no effect is in flight, retry
-   `relinquish_claim()` with that same handle. State alone never proves quiescence.
-   A stop-reserved refusal keeps the handle for the next quiescent pass.
+1. A claim belonging to this live service is read through `execution.claim(token)`.
+   Successfully entering the non-reentrant lease proves that no previous
+   claim-using operation or joined child is still active. Retry
+   `execution.relinquish(token)` with that same cached handle while holding the
+   lease. State alone never proves quiescence. A stop-reserved refusal keeps the
+   handle for the next pass.
 2. A candidate belonging to another process is passed to `acquire_claim()` with
    its exact CURRENT evidence id, singleton expected state and the injected
    gate-backed liveness port. A live, remote or unproven owner is untouched.
    Positive death proof permits a fresh claim/fence and invalidates the dead
    owner's stop reservation in that same transaction. Concurrent state/evidence
-   changes cause refusal through the existing acquisition checks.
-3. Immediately relinquish the new maintenance claim at this quiescent boundary.
+   changes cause refusal through the existing acquisition checks. Store the new
+   handle with `execution.remember_claim(token, claim)` before doing anything else.
+3. Immediately call `execution.relinquish(token)` while still holding that lease.
    If a concurrent stop reservation refuses release, retain this service's new
    handle and retry under rule 1. A crash between acquisition and release is just
    another dead retained claim for the next startup; no timer grants authority.
@@ -3046,22 +3207,25 @@ The split is therefore by layer, not by parameter:
 | Layer | Type | Who calls it | Authorization |
 |---|---|---|---|
 | Remote execution | `ValidatedHeadExecutor` | **both** admission owners | none of its own — it executes what it is told |
-| Fenced validated-work publication | `FencedValidatedHeadPublisher` | `ValidatedWorkDispositionService` only | holds a `ValidatedWorkClaim`; re-checks `holds_claim()` before each executor step |
+| Fenced validated-work publication | `FencedValidatedHeadPublisher` | `ValidatedWorkDispositionService` only | requires the active `RecordExecutionToken` and `ValidatedWorkClaim`; re-checks `holds_claim()` before each executor step |
 | Manual publication | `PublishRecoveryService`, calling the executor directly | manual retry only | its existing locator + background-job authority, unchanged |
 
-`FencedValidatedHeadPublisher` is a thin wrapper constructed by the disposition
-service around the shared executor and its own claim. Its whole body is
-check-then-delegate:
+`FencedValidatedHeadPublisher` is a thin wrapper constructed in bootstrap with the
+shared executor, store and the service's single execution owner. The caller keeps
+the execution lease across its entire check-then-delegate body:
 
 ```python
 def publish(
-    self, claim: ValidatedWorkClaim, command: PublishValidatedHeadCommand
+    self, token: RecordExecutionToken, claim: ValidatedWorkClaim,
+    command: PublishValidatedHeadCommand,
 ) -> PublishValidatedHeadOutcome:
+    self._execution.require_active(token, claim.record_id)
     if not self._store.holds_claim(claim):
         return superseded_outcome(SupersededStage.BEFORE_BRANCH_WRITE, None)
     branch = self._executor.push_validated_head(command)
     if not branch.at_target:
         return compose_publication_outcome(branch, None)
+    self._execution.require_active(token, claim.record_id)
     if not self._store.holds_claim(claim):        # re-check BETWEEN the two writes
         return superseded_outcome(SupersededStage.BETWEEN_STEPS, branch)
     return compose_publication_outcome(branch, self._executor.ensure_pull_request(command))
@@ -3168,6 +3332,7 @@ an effect of the transition, never evidence of it.
 @dataclass(frozen=True, slots=True)
 class PublishedWorkFinalizationRequest:
     state: OrchestratorState              # the caller supplies it; no hidden state
+    execution_token: RecordExecutionToken # active throughout every stage and replay
     claim: ValidatedWorkClaim             # §4.4e; every stage is gated on it
     resume_from: FinalizationPhase        # NOT_STARTED on the first pass
     issue_number: int
@@ -3229,7 +3394,8 @@ class PublishedWorkFinalizer(Protocol):
 The implementation **composes** `RetryReviewRouting` and the review-candidate
 construction of `RetrySuccessFinalizer` — one review-routing policy in the system,
 reached by two admission owners — but owns the staging and the label ordering
-itself, and records each phase through the injected `FinalizationPhaseRecorder` as
+itself, requires its request's active execution token before each fenced effect
+and in-memory append, and records each phase through the injected `FinalizationPhaseRecorder` as
 it completes. A `FreshIssueReadError` is `TRANSIENT` with the phase reached so far
 (the disposition owner retries next drain rather than failing the record), and a
 review-routing failure is `FAILED(REVIEW_ROUTING_FAILED)`.
@@ -3248,6 +3414,7 @@ routing decision, not the ordering.
 | Run evidence | `IssueRunEvidenceSource` (§2.5) | which runs exist for an issue, with exact assets | **no** |
 | Runtime activity | `OtherRuntimeActivityPort` (§4.3 check 5) | which *other* issue-runtime owners are live, as one typed fact | **no** |
 | Owner liveness | `OrchestratorLivenessPort` (§4.4e) | gate-backed proof that a claim's owner is dead | **no** |
+| In-process execution | `ValidatedWorkExecutionOwner` (§4.4e) | per-record non-reentrant admission, private claim handles and complete effect lifetime | **no** |
 | Durable state | `ValidatedWorkStore` | records, evidence roles, publish attempts, finalization phase | **no** |
 | Remote execution | `ValidatedHeadExecutor` | exact-object/exact-lease branch write, PR ensure — two separately callable steps | **no** |
 | Fenced publication | `FencedValidatedHeadPublisher` | re-checks the claim between and before executor steps (§4.4f) | **no** |
@@ -3271,6 +3438,11 @@ construction and the disposition path satisfies by not needing them.
 
 **Handoff performed by the disposition owner:**
 
+After selecting a candidate, enter its execution lease before step 2 and re-read
+its admissibility under the lease. Read/acquire and remember the durable claim
+through that token before any claim-bound effect. Hold the lease through step 9
+and all synchronous child cleanup; every nested call receives the same token.
+
 1. Select the drainable row for the lineage key (§2.1.4); an `ANCESTOR` or
    `DIVERGENT` row is never drained.
 2. Create or refresh the §4.4a publication workspace at the pinned validated ref;
@@ -3278,16 +3450,17 @@ construction and the disposition path satisfies by not needing them.
 3. Run §4.3 in `PRE_SUBMISSION` (or `RECONCILING` for a row already `PUBLISHING`).
 4. `store.begin_publish_attempt(...)` — one transaction: CAS to `PUBLISHING` and
    insert attempt *n+1* under the claim (§4.4e). Abort silently on a stale claim.
-5. `publisher.publish_or_reconcile(command)` — exact write, then PR ensure.
+5. `publisher.publish(token, claim, command)` — exact write, then PR ensure.
 6. `store.record_attempt_outcome(...)` — before anything is read from the outcome.
-7. `finalizer.finalize(request)` with the live state and `resume_from` — staged
+7. `finalizer.finalize(request)` with the token, live state and `resume_from` — staged
    routing, observation, then recovery clear (§4.5b).
 8. `store.resolve_published(claim, ...)` — one command marking `RECOVERED`,
    advancing the lineage fact, resolving contained ancestors and classifying
    waiters in a single transaction (§4.1). Then remove the workspace; retain
    escrow and refs for the window.
-9. `store.relinquish_claim(claim)` — the record is terminal, so ownership ends at a
-   quiescent point rather than waiting for this process to die (§4.4e).
+9. `execution.relinquish(token)` — after all effects and child cleanup complete,
+   ownership ends while the execution lease still excludes maintenance/recovery.
+   A refused store release retains the cached claim for guarded maintenance (§4.4e).
 
 Only `ValidatedWorkDispositionService` claims disposition publish attempts. This is
 enforced mechanically (§9).
@@ -3611,9 +3784,10 @@ directory, with no timeout takeover, inheritance into child processes, or networ
 filesystem support. Busy acquisition returns a typed retry/refusal and teardown
 fails closed; it never blocks shutdown indefinitely. The fresh aggregate read and GitHub
 write occur while that gate is held: a new sibling cannot be admitted between the
-last-holder check and label removal. Acquisition order is record claim, then issue
-gate. A finalizer retains its record claim throughout. No operation holding the
-issue gate may wait for or acquire a record claim: admission attaches/refuses when
+last-holder check and label removal. Acquisition order is execution lease, then
+record claim, then issue gate. A finalizer retains its execution lease and record
+claim throughout. No operation holding the issue gate may enter an execution lease
+or acquire a record claim: admission attaches/refuses when
 the record is owned, while abandon or reconciliation returns a retry/refusal and
 may acquire the record first on its next invocation. This gate covers only admission
 and short label/transition operations, not validation or publication subprocesses.
@@ -4066,6 +4240,7 @@ class StopOwnerStatus(StrEnum):
     """Total. Every dispatch ends on exactly one of these."""
     STOPPED           = "stopped"          # the engine is no longer running
     NO_SUCH_RECORD    = "no_such_record"   # record_id resolves to nothing
+    RECORD_UNAVAILABLE = "record_unavailable" # no trustworthy read; never a missing-row claim
     NOT_OWNED         = "not_owned"        # the record has no claim holder now
     OWNER_CHANGED     = "owner_changed"    # someone else holds it; re-render
     STOP_IN_PROGRESS  = "stop_in_progress" # another reservation holds this generation
@@ -4093,6 +4268,15 @@ non-local target with zero effect, and only on an exact match delegates a plain
 the disposition owner remains read-only with respect to engine lifecycle, the engine
 owner remains ignorant of validated work, and the route dispatches a typed command
 instead of implementing policy.
+
+Before reservation it catches the reader's typed `ReadOnlySqliteAccessError`
+(defined below) and returns `RECORD_UNAVAILABLE`, `observed_owner=None` and a
+display explanation. The Control Center endpoint maps this to HTTP 503 and its
+typed OpenAPI response; the UI shows unavailable facts and no guarded action.
+No reservation or lifecycle call occurs. `NO_SUCH_RECORD` is instead HTTP 404 and
+means a successful supported-schema lookup found no row. Neither the handler nor
+coordinator converts database/worker failure into absence or parses error messages
+to select policy.
 
 #### A read-then-stop is not a guard: the reservation interlock
 
@@ -4231,6 +4415,27 @@ class ValidatedWorkRecordReader(Protocol):
     def snapshot_record(
         self, repo_root: str, record_id: str
     ) -> ValidatedWorkSnapshot | None: ...
+    """None iff a successful supported-schema read found no such row.
+    Raises ReadOnlySqliteAccessError for access/schema/worker failures."""
+
+
+class ReadOnlySqliteFailure(StrEnum):
+    DATABASE_ABSENT = "database_absent"
+    UNREADABLE = "unreadable"          # permissions, corruption, missing sidecars, lock failure
+    UNSUPPORTED_SCHEMA = "unsupported_schema"
+    UNSUPPORTED_PROFILE = "unsupported_profile"
+    WORKER_UNAVAILABLE = "worker_unavailable"
+    TIMEOUT = "timeout"
+
+
+class ReadOnlySqliteAccessError(RuntimeError):
+    reason: ReadOnlySqliteFailure
+
+    def __init__(self, reason: ReadOnlySqliteFailure, message: str) -> None:
+        if not isinstance(reason, ReadOnlySqliteFailure) or not message.strip():
+            raise ValueError("read failure requires a typed reason and explanation")
+        self.reason = reason
+        super().__init__(message)
 
 
 class WorkDiscoveryStatus(StrEnum):
@@ -4247,14 +4452,116 @@ class ValidatedWorkDiscovery:
     message: str
     # Only AVAILABLE may carry records; AVAILABLE + () proves an empty query.
     # Every other status is visibly unavailable, never "no preserved work".
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, WorkDiscoveryStatus):
+            raise ValueError("discovery status must be a WorkDiscoveryStatus")
+        if not isinstance(self.records, tuple) or any(
+            not isinstance(record, ValidatedWorkSnapshot) for record in self.records
+        ):
+            raise ValueError("discovery records must be typed snapshots in a tuple")
+        if not isinstance(self.message, str) or not self.message.strip():
+            raise ValueError("discovery requires a display message")
+        if self.status is not WorkDiscoveryStatus.AVAILABLE and self.records:
+            raise ValueError("unavailable discovery cannot carry records")
+        record_ids = [record.record_id for record in self.records]
+        if len(set(record_ids)) != len(record_ids):
+            raise ValueError("discovery cannot repeat a record")
+        if any(
+            not record.disposition.unresolved and record.owner is None
+            for record in self.records
+        ):
+            raise ValueError("discovery includes only unresolved or retained-owner records")
 ```
 
-`SqliteValidatedWorkRecordReader` implements it by opening that repository's
-`state/validated_work.sqlite` **read-only**, through the shared connection helper
-(`infra/sqlite_connection.py`). That is the whole reason the disposition state is a
-file in the repository's own state directory rather than engine memory: a reader
-that needed the engine's HTTP API would be unavailable in exactly the failure this
-command exists for. It performs no writes and takes no claim.
+`SqliteValidatedWorkRecordReader` implements it through the **new** shared strict
+read-only access profile below, not today's write-capable `open_sqlite()`.
+It reads `state/validated_work.sqlite` without engine HTTP, performs no record
+writes and takes no claim.
+
+**Shared read-only SQLite access is implementation scope (F27/A21).** Add
+`open_sqlite_readonly(path: Path, *, timeout: float, row_factory: Callable)` to
+`infra/sqlite_connection.py`, exposed only inside the isolated observer described
+below. The existing `open_sqlite()` stays the writer profile; disabling its
+pragmas does **not** make ordinary `sqlite3.connect(str(path))` read-only/no-create.
+The new helper converts a configured absolute filesystem `Path` with `as_uri()`
+(escaping `?`, `#`, `%`, spaces and Unicode), then appends fixed parameters
+`mode=ro&readonly_shm=1&vfs=unix&cache=private` and uses `uri=True`. It accepts no
+caller-supplied URI/query/VFS. It skips durability, checkpoint and schema-migration
+pragmas; bounded busy timeout, connection-local `query_only=ON` and
+`temp_store=MEMORY` are allowed. All schema/version and record/evidence reads share
+one explicit read transaction, closed before returning the detached typed facts.
+
+**A URI alone does not enforce file-level observation.** SQLite's default Unix
+VFS can create WAL/SHM files for a read-only database, and process-local SHM mappings
+can be reused from a writable connection. `readonly_shm=1` avoids writable SHM
+opening but does not prevent an absent WAL from being created. `immutable=1`,
+`nolock=1`, raw live-file copies and check-exists-then-open are forbidden: they do
+not provide a locked coherent live snapshot with race-safe no-create behavior.
+See SQLite's [WAL read-only rules](https://www.sqlite.org/wal.html#readonly),
+[URI semantics](https://www.sqlite.org/uri.html), and
+[Unix VFS SHM implementation](https://sqlite.org/src/artifact/410185df49).
+
+The supported strict profile therefore includes a small **native Unix VFS I/O
+guard**, installed via `xSetSystemCall` in the observer **before any repository
+database is opened**. It uses the same loaded SQLite library/VFS as the Python
+connection; startup verifies that binding and the supported runtime/VFS profile.
+Its native `open` callback rejects `O_CREAT`, `O_TRUNC`, `O_RDWR` and `O_WRONLY`
+with `EACCES`; it never silently rewrites access flags. SQLite may then perform
+its own read-only WAL fallback; absent sidecars fail rather than being created.
+The guard denies unlink, truncation, chmod/chown and other write-affecting VFS
+syscalls, and denies writable **shared** mappings. It preserves read calls and
+kernel advisory locks, and permits private heap memory used for a read-only
+WAL-index. Native callbacks own their lifetime and `errno`; Python `ctypes`
+callbacks or a pathname preflight are not substitutes. The helper cannot expose
+a connection unless the complete guard is installed; partial installation exits
+the worker. The exact registered syscall inventory is part of the certified
+SQLite/VFS profile, checked by complete `xNextSystemCall` enumeration and required
+interception checks; unknown profiles fail closed before repository access.
+Certification is limited to the plain **local POSIX Unix VFS**, not network,
+proxy-locking (including `SQLITE_FORCE_PROXY_LOCKING`), exclusive or no-lock
+profiles. Those can contain I/O outside the certified interception surface and
+are refused. The writer's local-filesystem requirement is unchanged.
+
+`ReadOnlySqliteObserver` owns a fresh **exec/spawn**, never fork-inherited, worker
+with no writable SQLite connection, no elevated/root identity, and no inherited
+database descriptors. This isolation is necessary because Unix VFS syscall hooks
+and SHM nodes are process-local shared state: installing the guard in Control
+Center would also interfere with its writable reservation adapter. The worker
+serves only typed `discover_repository`/`snapshot_record` reads through the shared
+helper; repository roots are resolved by the parent registry, not browser input.
+The worker returns only schema-checked durable record/evidence facts; the reader's
+shared snapshot mapper runs in Control Center and adds stop availability through
+its injected local lifecycle probe. No lifecycle callback, writable connection or
+claim secret is serialized to the worker. Control Center sends bounded typed
+requests over pipe IPC and maps startup,
+timeout, worker loss and unsupported-profile failures to `UNREADABLE` with an
+explicit explanation and no records/actions. A five-second end-to-end request
+budget bounds startup/open/query; expiry terminates and reaps the read-only worker,
+never returns cached success, and does not affect the separate writer/stop owner.
+The helper and guard own access policy once; the validated-work reader contains
+no private SQLite URI, syscall or connection recipe. This native backend and its
+packaging/certification are required in slice 7, not assumed existing facilities
+or deferred work. Other existing read-only consumers need not migrate in this PR.
+
+Absent database paths return `DATABASE_ABSENT` without creating DB/WAL/SHM files.
+Present-but-unreadable files, absent/unreadable WAL sidecars, corruption, lock
+timeouts and unavailable strict profiles return `UNREADABLE`; a successfully read
+but unsupported schema/version returns `UNSUPPORTED_SCHEMA`. Only a successful
+supported-schema transaction may return `AVAILABLE`, including an empty result.
+Open-error classification belongs to the shared access boundary and is carried
+as `ReadOnlySqliteAccessError.reason`, never inferred by the UI from SQLite message
+text. `discover_repository()` catches this typed error: `DATABASE_ABSENT` and
+`UNSUPPORTED_SCHEMA` map to their matching discovery statuses; all remaining reasons
+map to `UNREADABLE`. Exact `snapshot_record()` propagates it to the coordinator's
+`RECORD_UNAVAILABLE` mapping above rather than returning `None`. The
+observer never creates directories, repairs/checkpoints databases, changes
+permissions or deletes sidecars. “No file mutation” means no observer-attributable
+content, existence, size, ownership, mode or modification-time change to database
+or sidecar files; ordinary read-induced access-time updates and kernel advisory
+locks are explicitly excluded. Tests separate writer-attributable WAL changes
+from observer activity rather than comparing a live writer's whole directory
+without controlling its schedule.
 
 **Cold discovery is a required read path, not a deep-link prerequisite.** On the
 initial Control Center repository-list load and each existing repository refresh,
@@ -4277,6 +4584,200 @@ record; supervisor status supplies the engine presentation without relabelling a
 replacement process as the claim owner. A stale or missing engine stays visible
 as such. Unowned records appear in the repository's preserved-work section with
 no stop action. The query owner never reserves a stop or publishes work.
+
+**The public projection is a complete typed contract.** The following types live
+in `contracts/public.py` and are generated into the public/OpenAPI schemas. They
+are not dictionaries assembled by handlers. `EngineIdentity`, `ClaimOwnerFact`
+and `ValidatedWorkAuthoritySnapshot` below denote their field-for-field public
+counterparts; serializers preserve the complete incarnation, fence and authority.
+Discriminators and status/payload shapes are reflected in JSON Schema
+(`oneOf`/required fields). Relational constraints such as matching owner fences
+and uniqueness across groups are enforced by the typed constructors and strict
+transport parsers; JSON Schema alone is not claimed to prove those equalities.
+
+```python
+class RecoveryRowsStatus(StrEnum):
+    AVAILABLE          = "available"          # one or more records
+    EMPTY              = "empty"              # successful discovery, zero records
+    DATABASE_ABSENT    = "database_absent"
+    UNREADABLE         = "unreadable"
+    UNSUPPORTED_SCHEMA = "unsupported_schema"
+
+
+class RecoveryEnginePresentation(StrEnum):
+    OBSERVED = "observed"  # supervisor describes this exact incarnation
+    MISSING  = "missing"   # no supervisor advertisement for this instance
+    REPLACED = "replaced"  # advertised instance now names another incarnation
+    UNKNOWN  = "unknown"  # supervisor status unavailable
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryRecordFact:
+    authority: ValidatedWorkAuthoritySnapshot
+    state: ValidatedWorkState
+    failure: ValidatedWorkFailure | None
+    reason: str
+    escrow_retained: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.authority, ValidatedWorkAuthoritySnapshot):
+            raise ValueError("recovery fact requires typed authority")
+        if not isinstance(self.state, ValidatedWorkState):
+            raise ValueError("recovery fact requires a typed state")
+        if self.failure is not None and not isinstance(self.failure, ValidatedWorkFailure):
+            raise ValueError("failure must be an enumerated reason")
+        if self.state is ValidatedWorkState.FAILED and self.failure is None:
+            raise ValueError("FAILED requires an enumerated failure")
+        if not isinstance(self.reason, str):
+            raise ValueError("recovery fact reason must be a string")
+        if type(self.escrow_retained) is not bool:
+            raise ValueError("escrow_retained must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class GuardedRecoveryStopAction:
+    record_id: str
+    expected_engine: EngineIdentity
+    expected_owner_fence: int
+    # Actor is supplied by authentication and reason by confirmation at dispatch.
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record_id, str) or not self.record_id.strip():
+            raise ValueError("stop action requires a record id")
+        if not isinstance(self.expected_engine, EngineIdentity):
+            raise ValueError("stop action requires a typed engine")
+        if type(self.expected_owner_fence) is not int or self.expected_owner_fence < 0:
+            raise ValueError("stop action requires a non-negative integer fence")
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedRecoveryRecord:
+    kind: Literal["owned"]
+    work: RecoveryRecordFact
+    owner: ClaimOwnerFact
+    stop_action: GuardedRecoveryStopAction | None
+    # stop_action is present iff owner.stop_availability == AVAILABLE.
+    # A missing action always exposes that owner's typed unavailable reason.
+
+    def __post_init__(self) -> None:
+        if self.kind != "owned":
+            raise ValueError("owned record requires the owned discriminator")
+        if not isinstance(self.work, RecoveryRecordFact) or not isinstance(self.owner, ClaimOwnerFact):
+            raise ValueError("owned record requires typed work and owner facts")
+        if not isinstance(self.owner.stop_availability, EngineStopAvailability):
+            raise ValueError("owner requires enumerated stop availability")
+        if not isinstance(self.owner.engine, EngineIdentity):
+            raise ValueError("owner requires a typed engine")
+        if type(self.owner.owner_fence) is not int or self.owner.owner_fence < 0:
+            raise ValueError("owner requires a non-negative integer fence")
+        available = self.owner.stop_availability is EngineStopAvailability.AVAILABLE
+        if available != (self.stop_action is not None):
+            raise ValueError("stop action must match owner-produced availability")
+        if self.stop_action is not None:
+            if not isinstance(self.stop_action, GuardedRecoveryStopAction):
+                raise ValueError("stop action must be typed")
+            if (
+                self.stop_action.record_id != self.work.authority.record_id
+                or self.stop_action.expected_engine != self.owner.engine
+                or self.stop_action.expected_owner_fence != self.owner.owner_fence
+            ):
+                raise ValueError("stop action must bind this exact record, owner and fence")
+
+
+@dataclass(frozen=True, slots=True)
+class UnownedRecoveryRecord:
+    kind: Literal["unowned"]
+    work: RecoveryRecordFact
+    # No owner or stop_action field exists on this variant.
+
+    def __post_init__(self) -> None:
+        if self.kind != "unowned" or not isinstance(self.work, RecoveryRecordFact):
+            raise ValueError("unowned record requires typed work and its discriminator")
+        if self.work.state not in UNRESOLVED_STATES:
+            raise ValueError("resolved unowned work is outside discovery")
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryEngineGroup:
+    engine: EngineIdentity                    # durable claim owner's incarnation
+    presentation: RecoveryEnginePresentation  # supervisor observation, not authority
+    presentation_message: str
+    records: tuple[OwnedRecoveryRecord, ...]   # non-empty
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.engine, EngineIdentity) or not isinstance(self.presentation, RecoveryEnginePresentation):
+            raise ValueError("engine group requires typed identity and presentation")
+        if not isinstance(self.presentation_message, str) or not self.presentation_message.strip():
+            raise ValueError("engine presentation requires a message")
+        if not isinstance(self.records, tuple) or not self.records:
+            raise ValueError("an engine group requires owned records")
+        if any(not isinstance(row, OwnedRecoveryRecord) or row.owner.engine != self.engine for row in self.records):
+            raise ValueError("every grouped row must name this exact engine")
+        ids = [row.work.authority.record_id for row in self.records]
+        if len(ids) != len(set(ids)):
+            raise ValueError("engine group cannot repeat a record")
+
+
+@dataclass(frozen=True, slots=True)
+class ControlCenterRecoveryRows:
+    repo_key: str                             # configured-repository public key
+    status: RecoveryRowsStatus
+    engine_groups: tuple[RecoveryEngineGroup, ...]
+    unowned_records: tuple[UnownedRecoveryRecord, ...]
+    message: str                              # visible empty/error/status explanation
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.repo_key, str) or not self.repo_key.strip():
+            raise ValueError("recovery rows require a configured repository key")
+        if not isinstance(self.status, RecoveryRowsStatus):
+            raise ValueError("recovery rows require a typed status")
+        if not isinstance(self.message, str) or not self.message.strip():
+            raise ValueError("recovery rows require a display message")
+        if not isinstance(self.engine_groups, tuple) or any(not isinstance(group, RecoveryEngineGroup) for group in self.engine_groups):
+            raise ValueError("engine_groups must be typed groups in a tuple")
+        if not isinstance(self.unowned_records, tuple) or any(not isinstance(row, UnownedRecoveryRecord) for row in self.unowned_records):
+            raise ValueError("unowned_records must be typed rows in a tuple")
+        has_rows = bool(self.engine_groups or self.unowned_records)
+        if (self.status is RecoveryRowsStatus.AVAILABLE) != has_rows:
+            raise ValueError("only AVAILABLE carries rows and it must carry at least one")
+        engines = [group.engine for group in self.engine_groups]
+        if any(engine in engines[:index] for index, engine in enumerate(engines)):
+            raise ValueError("a full engine identity has exactly one group")
+        ids = [row.work.authority.record_id for group in self.engine_groups for row in group.records]
+        ids.extend(row.work.authority.record_id for row in self.unowned_records)
+        if len(ids) != len(set(ids)):
+            raise ValueError("a record occurs exactly once across all groups and unowned rows")
+```
+
+`RecoveryRecordFact` validates its leaf types and requires an enumerated failure
+for `FAILED`, as `ValidatedWorkDisposition` does. Its reason may be empty because
+the source disposition permits that; the mapper preserves it verbatim and the UI
+always renders the typed state label independently. No placeholder reason or
+stricter admission policy is introduced by a projection.
+`GuardedRecoveryStopAction` validates non-empty record id, typed engine identity
+and a non-negative integer fence (booleans are rejected). Strict parsers reject
+unknown fields, so an unowned variant cannot smuggle an action into the payload.
+The query owner maps each snapshot once, verifies its repository against the
+configured root/slug, and derives its authority from that same snapshot. It never
+mixes a later record read with an earlier owner fact.
+
+| Discovery fact | Public projection | Render/action behavior |
+|---|---|---|
+| `AVAILABLE`, no records | `EMPTY`, both collections empty | Explicit "No preserved work"; no engine/record action. |
+| `AVAILABLE`, records | `AVAILABLE`; each owned row in exactly one full-identity group, each unowned unresolved row in `unowned_records` | Show all records. Owned `AVAILABLE` capability carries its exact stop action; `REMOTE_HOST`/`EXACT_TARGET_UNAVAILABLE` carry no action and show the typed reason. Unowned rows never carry a stop action. |
+| `DATABASE_ABSENT` | `DATABASE_ABSENT`, both collections empty | Explain state database is absent; do not present a successful empty query. |
+| `UNREADABLE` | `UNREADABLE`, both collections empty | Durable error presentation; no mutation action. |
+| `UNSUPPORTED_SCHEMA` | `UNSUPPORTED_SCHEMA`, both collections empty | Explain incompatible schema; no mutation action. |
+
+The mapper exhaustively matches `WorkDiscoveryStatus` (`assert_never` for new
+members); it never maps a failure to `EMPTY`. Supervisor observations set only
+`presentation`/`presentation_message`; `MISSING`, `REPLACED` and `UNKNOWN` keep
+the original owner visible and never rebind its identity. Stop availability comes
+from the Control Center's exact-target capability read, not from a presentation
+label. The serialized action payload becomes `StopValidatedWorkOwnerCommand`
+only after authenticated actor and confirmation reason are added. Neither
+recovery nor abandonment mutation controls are invented on this Control Center
+projection; those retain their separately defined issue command surfaces.
 
 The repository-list view model gains `validated_work: ControlCenterRecoveryRows`
 through this query owner; the authenticated read endpoint
@@ -4301,7 +4802,8 @@ fails before any lifecycle call. The connection holds no transaction during stop
 
 ```
 lifecycle = SupervisorRepositoryEngineLifecycle(incarnation_stop) # exact process effects
-reader = SqliteValidatedWorkRecordReader(lifecycle.stop_availability)
+observer = ReadOnlySqliteObserver(strict_readonly_profile)        # isolated, certified worker
+reader = SqliteValidatedWorkRecordReader(observer, lifecycle.stop_availability)
 reservations = SqliteValidatedWorkStopReservations()               # narrow durable CAS
 coordinator = ValidatedWorkOwnerStopCoordinator(reader, reservations, lifecycle)
 recovery_queries = ControlCenterRecoveryQueries(repository_registry, supervisor_status, reader)
@@ -4361,7 +4863,7 @@ therefore a refusal, not an ignored field.
 `OpenValidatedWorkInControlCenter` command carries only
 `{type: "cc-open-validated-work", repo_key, instance_key, record_id}` — no destination
 URL and no mutation. A discriminated result is `PARENT_COMMAND` (validated target
-origin and command), `LOCAL_LINK` (constructed href), or `UNAVAILABLE` (explanation).
+origin, active parent window and command), or `UNAVAILABLE` (explanation).
 Dashboard/Settings handlers consume this result; templates never interpolate raw
 `cc_origin` into an href or independently decide frame/origin policy.
 
@@ -4376,13 +4878,26 @@ origin or that origin plus `/`. Reject credentials, non-root paths, query/fragme
 delimiters (even empty), whitespace/control characters, backslashes, encoded or
 noncanonical hosts, duplicate parameters, protocol-relative URLs, executable
 schemes and every other hostname. Missing/rejected values yield `UNAVAILABLE`,
-never an anchor, guessed origin, wildcard target or automatic dispatch. Nonlocal
+never an anchor, guessed origin, wildcard target or automatic dispatch. Passing
+this parser proves URL syntax/locality only, **not Control Center identity**. It
+cannot mint a trusted navigation capability or authorize a standalone link. Nonlocal
 Control Center deployments use the manual discovery instruction for this action.
+
+**Standalone has no trusted origin capability in this slice.** Neither a query
+parameter, a copied embedded URL, referrer, browser storage nor an arbitrary
+loopback listener establishes the intended Control Center. Accordingly the owner
+returns `UNAVAILABLE` for **every top-level context**, including a syntactically
+valid `cc_origin` and URLs previously opened by the shell. There is no `LOCAL_LINK`
+variant or anchor builder. The existing manual instruction and cold discovery are
+the complete supported standalone path, not an unfinished automatic-navigation
+feature. Adding a configured or cryptographically shell-attested origin capability
+would be a separate feature; this design neither invents such authority nor claims
+that transporting an origin string provides it.
 
 | Context | Behaviour |
 |---|---|
 | Actually embedded (`window.parent !== window`) with a valid origin | Native **Open in Control Center** navigation button sends the typed command using `window.parent.postMessage(command, validatedOrigin)`, never `"*"`; it neither navigates the iframe nor performs an engine operation. The `embedded` query flag alone cannot select this mode. |
-| Top-level with a valid origin | Native anchor built with `URL`/`URLSearchParams` against that origin's root, carrying `repo_key`, `instance_key` and `stop_owner_of=record_id`, with `target="_top"` and `rel="noopener"`. Explicit click navigates the top-level document. |
+| Top-level, even with a valid origin | `UNAVAILABLE`: owner facts and record id plus manual Control Center discovery instructions. No anchor or dispatch handler. An unrelated loopback port and the actual Control Center port are equally unauthoritative when supplied only by query. |
 | Missing or invalid origin in either frame mode | Owner facts and record id remain text, with an explicit instruction to open Control Center and select the repository/engine. No anchor or dispatch handler is rendered. Cold discovery does not depend on this context. |
 
 The shell gains a `ControlCenterNavigationReceiver` alongside its existing
@@ -4397,8 +4912,9 @@ The existing wildcard back-navigation helper is precedent for the frame boundary
 An accepted command switches the **shell** to the repositories view and uses the
 Control Center recovery projection above to expand/focus the labelled engine and
 record region. A stale/missing record produces an unavailable notice, never a
-guessed selection. Top-level query selection uses the same selection owner after
-resolving the configured repository; record ids are identifiers, not authority.
+guessed selection. Explicit selection within Control Center uses the same
+selection owner after resolving the configured repository; record ids are
+identifiers, not authority.
 Neither path launches/stops an engine, opens a confirmation automatically, or
 requires Repository Engine HTTP. Native button/link keyboard operation and visible
 focus are required; the receiver moves focus to the labelled selected region.
@@ -4621,10 +5137,17 @@ sweeps above:
 | §8.4 stop policy | One case per `StopEngineStatus`: graceful exit, successful force and already-gone all yield `STOPPED`; replacement yields `TARGET_CHANGED`; stop/identity-proof failure yields `FAILED`; remote target yields `REMOTE_HOST` without a call. The new adapter produces each message explicitly; no log parsing or message extraction from a Boolean. Assert command timeout/force values and confirmation text stating graceful-then-force and engine-wide scope. |
 | §8.4 stop capability | Linux pidfd integration covers SIGTERM handler shutdown, timeout SIGKILL and handle exit observation without HTTP, process-group effects or advertisement deletion. On macOS or unavailable pidfd, `EXACT_TARGET_UNAVAILABLE` reaches both snapshot and Control Center rendering: no guarded stop button, explanatory text and working navigation to the existing independent stop control with its own scope confirmation. Capability loss after render yields `FAILED` and zero effects, releases the reservation, and never delegates to pid/port-based legacy helpers. |
 | §8.4 stop engine (wedged) | The Control Center succeeds while the Repository Engine serves no HTTP: read through `SqliteValidatedWorkRecordReader`, reserve/release through the writable `SqliteValidatedWorkStopReservations` adapter against the same real database, then stop through the exact-process capability. Database admission failure causes zero lifecycle calls. This proves the full interlock, not just the snapshot, works out of process. |
+| §8.4 strict SQLite observer (F27/A21) | Shared helper → fresh guarded worker → read transaction → typed reader result. Absent DB creates no DB/WAL/SHM/directory. Present DB with absent sidecars, including disappearance between preflight and open, fails without file creation. Paths containing spaces, Unicode, `?`, `#` and `%` cannot inject URI parameters. Missing native guard, partial syscall installation, unknown SQLite/VFS, proxy/network profile and elevated worker fail before repository access. No mode fallback, writable connection or inherited SHM mapping is permitted. |
+| §8.4 exact read unavailable | Successful supported-schema lookup with no row yields `None` → `NO_SUCH_RECORD`/404. Absent DB, unreadable/corrupt/unsupported DB, missing native guard, worker startup/loss and timeout raise the declared typed reason → `RECORD_UNAVAILABLE`/503 with no observed owner, reservation call, lifecycle call or mutation. Every discovery-error mapping is separately asserted; none can become AVAILABLE-empty. |
+| §8.4 live WAL observation | With writer barriers and an independent worker, read committed WAL-only rows; hold one read transaction across a writer commit and assert coherent old record/evidence facts, then a second observation sees the new commit. Exercise writer close/checkpoint, dead/crash-stale SHM, missing/unreadable sidecars, corruption, unsupported schema, timeout and last-reader close. Attribute observer I/O separately: no content/existence/inode/size/ownership/mode/mtime changes to DB/WAL/SHM; only read-induced atime and advisory locks are excluded. An ordinary `mode=ro` reader and a URI-only `readonly_shm=1` reader fail this guardrail. Native backend tests verify denied syscall flags, errno, read-only WAL fallback and writable-shared-mapping rejection. |
 | §8.4 stop engine (identity) | All four identities must agree: route (`repo_key`/`instance_key`), rendered body engine, record repository, and current claim owner. A body whose engine contradicts the path is `REPO_MISMATCH` with zero effect — the duplicated path value is checked, not ignored — and `instance_key` round-trips `default` ↔ `None` through the shared navigation/route encoder. |
-| §8.4 navigation producer and real click | Shell URL builder → two Dashboard/Settings hops preserve `cc_origin` and `theme` → typed navigation result → actual keyboard/click activation inside the iframe → parent receiver selects the repositories view and focuses the requested labelled engine/record region. Assert the top-level shell changes view, the iframe does not navigate/nest Control Center, and no engine mutation occurs. Wrong source/origin/repository, retired frame and malformed command produce zero navigation/effects. Valid standalone localhost, IPv4 and IPv6 origins produce constructed top-level links and an actual click selects the same row. |
+| §8.4 navigation producer and real click | Shell URL builder → two Dashboard/Settings hops preserve `cc_origin` and `theme` → typed navigation result → actual keyboard/click activation inside the iframe → parent receiver selects the repositories view and focuses the requested labelled engine/record region. Assert the top-level shell changes view, the iframe does not navigate/nest Control Center, and no engine mutation occurs. Wrong source/origin/repository, retired frame and malformed command produce zero navigation/effects. |
+| §8.4 standalone identity (F23/A17) | Top-level contexts with valid localhost/IPv4/IPv6 origins, the actual configured Control Center port, an otherwise-valid **unrelated loopback port**, a copied embedded URL, and no origin all produce `UNAVAILABLE`: visible manual instructions, no anchor, no dispatch and no identifier disclosure to any listener. `LOCAL_LINK` is absent from the result union; the parser cannot mint a trusted standalone capability. Cold manual discovery remains usable. |
 | §8.4 navigation rejection | Parser and rendered-output cases for missing/duplicate origin, `javascript:`, `data:`, protocol-relative URL, hostile hostname, credentials, path, query/fragment (including empty delimiters), backslash, whitespace/control characters and encoded/noncanonical hostname. Assert `UNAVAILABLE`, visible instructions, **no anchor or dispatch handler**, and no network/navigation on activation. A false `embedded=1` on a top-level page cannot select parent messaging. |
 | §8.4 discovery transport | Initial repository view model and authenticated `GET /api/control-center/repositories/{repo_key}/validated-work` share `ControlCenterRecoveryQueries` and typed `ControlCenterRecoveryRows` with generated public/OpenAPI contracts. Assert configured-repository resolution, no caller-controlled filesystem root, every discovery status, accessible empty/error/unowned/owned rendering, and no repository-engine client dependency. |
+| §8.4 discovery construction (F26) | Construct every `WorkDiscoveryStatus` with empty and nonempty records. Only `AVAILABLE` permits nonempty records; successful empty discovery is valid. Reject raw-string/unknown status, non-tuple or untyped records, duplicates, empty message, and resolved records lacking a retained owner. `UNREADABLE` explicitly covers unavailable read-only access and never carries stale records. |
+| §8.4 projection construction (F26) | Construct every `RecoveryRowsStatus` value and every owned/unowned mix. Reject `AVAILABLE` without rows, `EMPTY` or any unavailable status with rows, duplicate records across/between groups and unowned rows, empty engine groups, mixed owner incarnations, repeated full-engine groups, resolved unowned rows, and malformed leaf facts. A source disposition with an empty reason maps unchanged to a valid fact and still renders its state label. For every `EngineStopAvailability`, require a stop action iff `AVAILABLE`; reject action record/engine/fence mismatch, invalid fence and unknown availability. Strict public parsers reject owner/action fields on the unowned variant. |
+| §8.4 projection mapping (F26) | Drive each discovery status through query owner → public payload → initial/refresh HTTP → rendered state. Empty `AVAILABLE` maps only to `EMPTY`; each unavailable status remains distinct and action-free. Map multiple incarnations and unowned work once each, preserving authority/owner/fence byte-for-byte. Cross `OBSERVED`/`MISSING`/`REPLACED`/`UNKNOWN` presentation with stop availability: presentation never replaces the owner or manufactures capability. The rendered exact stop payload maps to the coordinator command only after authenticated actor and confirmation reason are added. |
 | §8.4 stop engine (transport) | The endpoint is registered in the UI OpenAPI contract with its required body and typed response; it uses the shared browser-session auth helper (CSRF/SSE token); `actor` comes from the session, never the body. The coordinator depends only on reader, reservation and lifecycle ports; a guardrail rejects raw store/SQLite access from it. Both store and Control Center adapters invoke one shared reservation transaction owner; the writable adapter cannot acquire/relinquish publication claims or transition record state. |
 | §8.4 stop engine | `EngineIdentity` has no `targetable_here` property and consults no process-global host state; availability arrives as owner-computed data, asserted by constructing the identity in a process whose local host differs from the snapshot's and checking the rendered availability is unchanged. |
 | §8.4 stop engine | `RepositoryEngineLifecycle` owns the targeted graceful stop and **only** that: the guardrail rejects direct `SupervisorOps.stop`/`stop_all_instances` calls from validated-work, disposition and issue-detail modules, and a companion assertion records that the existing bulk/force/port routes are deliberately unmigrated and unclaimed, so a later repo-wide widening is a visible change rather than a silent one. The disposition owner exposes no stop method and reads no supervisor state; the issue-detail handler builds no stop call from pid fields. |
@@ -4648,11 +5171,15 @@ sweeps above:
 | §2.1.3 attached | `resolve_attached_evidence()` runs on **every** drain for a non-`PUBLISHING` record, not only on the leaving edge: a record that failed, promoted one row and still holds another has the second promoted on a later drain — the regression for rows stranded until retention. |
 | §2.1.3 attached | `abandon()` on a record with unresolved attached evidence returns `AbandonValidatedWorkOutcome(ATTACHED_EVIDENCE_PENDING)` with **zero** effect and the waiting ids in `pending_evidence_ids`; after promotion, the old command returns `EVIDENCE_NOT_CURRENT` naming the new current authority. Only a newly rendered and confirmed command can return `ABANDONED`. Retention releases **no** attached row while its owning record remains unresolved. |
 | §8.4 abandon contract | Both sides of the command boundary, one case per `AbandonStatus` member derived from the enum: the owner returns each status, the endpoint maps each to its response, and the **public contract** carries `can_abandon` plus `abandon_unavailable`. A record with unresolved attached evidence renders with the abandon action **absent** and the typed reason shown — the regression for a UI offering an action the owner refuses, with no response shape for why. |
+| §2.2 abandonment construction (F24) | Construct one valid outcome per enum member, then reject every forbidden status/payload combination: success without an `ABANDONED` disposition or with a different state; success carrying pending ids/current authority; attached refusal without ids or with disposition/authority; stale refusal without typed current authority or with disposition/ids; and every payload on `NO_SUCH_RECORD`/`ALREADY_RESOLVED`/`REFUSED_STATE`. Reject duplicate/blank/non-tuple pending ids, untyped dispositions/snapshots, raw-string or unknown status, and empty message. Exhaustive matching fails type checks when a new status lacks a case. |
 | §8.4 stale abandonment (F24/A19) | Render `E1`/revision `r1`, supersede it with `E2`, then submit the unchanged abandon confirmation. The store returns `EVIDENCE_NOT_CURRENT` with typed `current_authority.evidence_id == E2`; the API returns 409 and the UI names `E2` without parsing message text. Assert zero changes to record/evidence state, fences, resolution audit, retention timestamps, labels, needs-human causes and abandonment events. No automatic retry or client/server substitution of `E2` is permitted. |
 | §4.1 abandonment CAS | Keep the same evidence id but change observation revision, PR or baseline after rendering: `AUTHORITY_STALE` names the transactional current snapshot with zero mutation. Interleave supersession after an optimistic owner read but before store entry; the store's in-transaction CURRENT/revision CAS still refuses. A new confirmed snapshot succeeds once, records that exact authority with operator actor/reason/time, and releases only its issue-block interest. |
 | §8.4 abandon command mapping | Owner snapshot → public authority → confirmation → required POST body → `AbandonValidatedWorkCommand`, field by field. Missing authority, wrong route/repository, empty reason and unauthenticated or agent requests cannot dispatch. Every status has a typed OpenAPI response and exact HTTP mapping; stale responses require `current_authority`, and the handler performs no fresh-state reconstruction. |
 | §8.4 abandon retained owner | `PARKED`/`FAILED` with a retained claim, including a leaked stop reservation: owner snapshot → public view model → rendered UI preserves `can_abandon=False` and `REFUSED_STATE`, shows the owner/recovery explanation and no abandon action. A previously rendered command is refused with zero writes. Quiescent owner release restores eligibility only when no unresolved attachments remain. |
 | §4.4e retained-claim maintenance | Crash after durable `FAILED` with irreparable escrow/validation failure but before relinquish, with and without a stop reservation. Startup/drain proves owner death, acquires a maintenance claim and relinquishes it without publishing, artifact validation, state/revision, label/cause, audit or retention changes. A fresh snapshot then allows confirmed abandonment; a stale abandonment still refuses with zero writes. Repeat for `PARKED` and resolved retained claims, crash between maintenance acquire/release, live/remote/unproven owners, and a stop reservation racing the maintenance release. No clock advancement steals ownership and no issue gate is held during acquisition. |
+| §4.4e execution admission (F28/A22) | Real threads and deterministic barriers exercise `recover`, record drain, failure handling, staged finalization/replay, maintenance and shutdown release through the same execution owner. Pause an active operation immediately **before** and **after** its `holds_claim()` check; maintenance returns busy without reading/removing its cached claim or calling relinquish, and a rival process cannot acquire. Resume: the original effect occurs exactly once; only after the operation exits may maintenance enter and release. Include a stale maintenance candidate selected while PARKED before recovery starts, and a RECOVERED/FAILED state written before the original operation finishes cleanup, so state filtering cannot substitute for exclusion. |
+| §4.4e execution capability | Same-record recovery/recovery and recovery/maintenance overlap have one admitted invocation; different records can proceed independently. Same-thread re-entry is busy. Wrong-record, copied, expired or other-worker tokens are rejected before claim-map access/effects. The private map is read/written only through its owner with an active token; failed relinquish retains the handle. Bootstrap tests assert the service, publisher and finalizer receive the identical owner instance. Explicit recovery busy maps to typed HTTP 409/tech-lead retryable refusal with no durable writes or altered command authority; abandonment busy maps to `REFUSED_STATE`. |
+| §4.4e cancellation and ordering | Cancel the HTTP awaiter while its service worker/subprocess is paused after a fence check: maintenance remains busy and no lease/claim is released. Resume or terminate-and-join the child, then allow release. Exercise normal exceptions and failed child cleanup; the latter retains exclusion until completion/engine exit. No returned pending future or detached callback may perform a later effect. Instrument lock acquisition to reject issue-gate→execution/claim ordering; every finalizer effect holds execution→claim→issue ordering where applicable. |
 | §2.1.3 attached | Every admission branch that inserts evidence writes `initial_state`/`initial_failure`/`initial_reason`: driven once per branch — new record, attached-during-publishing, retained-on-`RECOVERED`, reopened-from-`ABANDONED`, and ordinary supersede — with the `NOT NULL` constraint asserted to reject a branch that omits them. |
 | §2.1.3 attached | Resolution after the current submission **succeeds**: every attached row becomes `SUPERSEDED` and the record stays `RECOVERED`. The regression is the row that stayed `attached` forever — assert it is not re-selected on the next drain, or on any drain after that. |
 | §2.1.3 replay | **Repeating the same attached capture while the record is still `PUBLISHING`** returns `ATTACHED` with no insert and no integrity error. Repeating a `CURRENT` id converges; repeating a `SUPERSEDED` id returns `RETAINED` and changes nothing. Every role is replayed twice in a row. |
@@ -4708,6 +5235,15 @@ reset now stale-downgrades while unresolved work exists.
 
 **Mechanical guardrails** (ADR-0012), added to the existing AST guardrail suite:
 
+- `LocalValidatedWorkExecutionOwner` is constructed once in bootstrap and is the
+  only owner of the per-record locks, active tokens and cached claims. No service,
+  finalizer, maintenance or shutdown code indexes/mutates that map or calls store
+  relinquish directly. Every fenced publisher and staged-finalizer request carries
+  an execution token, and their effect paths require the active token before their
+  fence check. Claim-using service entrypoints enter the same boundary; inner calls
+  reuse its token rather than reacquiring. New detached tasks/threads, deferred
+  callbacks and future-returning effect adapters in this path fail the guardrail;
+  integration tests additionally prove worker/child completion before lease exit.
 - `PublishRetryLocators` is constructed only by `PublishRetryLocatorFactory`
   (§4.6). The disposition owner never constructs or stores them.
 - No module outside the owner adds/removes `recovery-pending`.
@@ -4926,6 +5462,11 @@ Ordered so each slice is independently shippable and leaves the tree green.
    clearing a shared issue label per record is unsafe once a batch has siblings.
    Include §4.4e startup/drain retained-claim maintenance outside the issue gate so
    a dead owner cannot strand `FAILED`/`PARKED` abandonment or resolved-row cleanup.
+   Its `ValidatedWorkExecutionOwner` ships with the first publication caller in
+   slice 4: non-reentrant record leases, owner-private claim handles, token-bound
+   publisher/finalizer requests, worker-lifetime cancellation handling and the
+   F28/A22 before/after-fence-check races. Maintenance cannot ship with a separate
+   lock or an inferred quiescence boolean.
 5. **Classification cleanup.** Session/failure paths and the stuck sweep consume
    `IssueRuntimeTermination.validated_work`; generic `timed_out` becomes illegal for
    an issue with a disposition.
@@ -4941,8 +5482,14 @@ Ordered so each slice is independently shippable and leaves the tree green.
    navigation on macOS/unsupported Linux (no macOS automatic backend is claimed), the
    `ValidatedWorkOwnerStopCoordinator` with its `reserve_owner_stop` interlock,
    `snapshot_record()` on the owner port, the Control Center-side
-   `ValidatedWorkRecordReader.discover_repository()`, `ControlCenterRecoveryQueries`
-   and its typed per-engine repository-list projection/authenticated GET, writable
+   `ValidatedWorkRecordReader.discover_repository()`, the shared
+   `open_sqlite_readonly()` profile, native certified Unix VFS I/O guard and isolated
+   `ReadOnlySqliteObserver` worker/typed IPC (including packaging, unsupported-profile
+   refusals and no-file-mutation/live-WAL tests), `ControlCenterRecoveryQueries`
+   and the complete `ControlCenterRecoveryRows` contract (status-checked discovery,
+   explicit empty/unavailable results, owned/unowned rows, full-identity groups and
+   exact action/availability invariants) with constructor and mapping regression
+   coverage on the repository-list projection/authenticated GET, writable
    `ValidatedWorkStopReservations` adapter sharing store-owned transactions, and
    composition root, the
    `stop-validated-work-owner` endpoint with its OpenAPI/auth wiring, the
@@ -4954,7 +5501,8 @@ Ordered so each slice is independently shippable and leaves the tree green.
    nothing here is deferred and nothing waits on a follow-up. Abandonment includes
    `AbandonValidatedWorkCommand`, the store-owned `abandon_if_current()` transaction
    and `abandon_authority_json` audit column, stale/current-evidence typed outcomes,
-   and the unchanged-authority UI/OpenAPI round trip with F24/A19 regressions.
+   the exhaustive fail-fast `AbandonValidatedWorkOutcome` payload matrix, and the
+   unchanged-authority UI/OpenAPI round trip with F24/A19 regressions.
    `abandon()` is the last piece, deliberately: until it exists, unresolved work
    has no exit at all, which is the safe direction to be incomplete in.
 8. **Backfill the stranded cohort.** #6327/#6335/#6337 (#6914) and #5204/#5561
